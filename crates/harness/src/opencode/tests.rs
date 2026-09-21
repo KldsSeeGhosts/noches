@@ -38,17 +38,19 @@ impl TurnWire {
         auto_approve: bool,
         answer: Option<bool>,
     ) -> Self {
-        Self::start_config(queued, v2, auto_approve, answer, json!({})).await
+        Self::start_config(queued, v2, auto_approve, answer, "2.0.3", json!({})).await
     }
 
-    /// `overrides` tunes the fixture: `holdPrompt` stalls the prompt POST,
-    /// `delayPromptMs` answers it only after that many milliseconds, and
-    /// `busyPolls` answers that many status polls busy before going idle.
+    /// `version` is the 2.x health answer; `overrides` tunes the fixture:
+    /// `holdPrompt` stalls the prompt POST, `delayPromptMs` answers it only
+    /// after that many milliseconds, and `busyPolls` answers that many
+    /// status polls busy before going idle.
     async fn start_config(
         queued: bool,
         v2: bool,
         auto_approve: bool,
         answer: Option<bool>,
+        version: &'static str,
         overrides: Value,
     ) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,9 +120,10 @@ impl TurnWire {
                         socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                         return;
                     }
+                    let health = json!({"healthy":true,"version":version}).to_string();
                     let body = if v2 {
                         match path.as_str() {
-                            "/api/health" => r#"{"healthy":true,"version":"2.0.3"}"#,
+                            "/api/health" => health.as_str(),
                             "/api/session" => r#"{"data":{"id":"fixture"}}"#,
                             "/api/command" => r#"{"data":[]}"#,
                             // Non-empty: the catalog-sync retry loop must not stall tests.
@@ -1250,31 +1253,39 @@ async fn permissions_stay_session_scoped_and_never_persist_grants() {
 
 #[tokio::test]
 async fn permissions_without_auto_approve_require_an_explicit_answer() {
-    for accept in [false, true] {
-        let mut wire = TurnWire::start_policy(false, true, false, Some(accept)).await;
-        wire.request("/api/model").await;
-        wire.request("/prompt").await;
-        wire.v2(
-            "permission.asked",
-            json!({"id":"approval", "sessionID":"fixture"}),
-        );
-        let body = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some((_, body)) = wire
-                    .posts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(p, _)| p.contains("permission"))
-                {
-                    break body.clone();
+    for version in ["2.0.0", "2.0.3", "2.0.4", "2.0.11"] {
+        for accept in [false, true] {
+            let mut wire =
+                TurnWire::start_config(false, true, false, Some(accept), version, json!({})).await;
+            wire.request("/api/model").await;
+            wire.request("/prompt").await;
+            wire.v2(
+                "permission.asked",
+                json!({"id":"approval", "sessionID":"fixture"}),
+            );
+            let body = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some((_, body)) = wire
+                        .posts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(p, _)| p.contains("permission"))
+                    {
+                        break body.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(body["reply"], if accept { "once" } else { "reject" });
+            })
+            .await
+            .unwrap();
+            let key = if version == "2.0.0" || version == "2.0.3" {
+                "reply"
+            } else {
+                "decision"
+            };
+            assert_eq!(body, json!({key: if accept { "once" } else { "reject" }}));
+        }
     }
 }
 
@@ -1463,8 +1474,15 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
 
 #[tokio::test]
 async fn stalled_prompt_post_does_not_block_bus_completion() {
-    let mut wire =
-        TurnWire::start_config(false, false, true, None, json!({"holdPrompt": true})).await;
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "2.0.3",
+        json!({"holdPrompt": true}),
+    )
+    .await;
     wire.request("/prompt_async").await;
     wire.status("busy");
     wire.status("idle");
@@ -1475,8 +1493,15 @@ async fn stalled_prompt_post_does_not_block_bus_completion() {
 
 #[tokio::test]
 async fn stalled_prompt_post_has_a_bounded_timeout() {
-    let mut wire =
-        TurnWire::start_config(false, false, true, None, json!({"holdPrompt": true})).await;
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "2.0.3",
+        json!({"holdPrompt": true}),
+    )
+    .await;
     wire.request("/prompt_async").await;
     wire.status("busy");
     tokio::task::yield_now().await;
@@ -1487,7 +1512,8 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
 
 #[tokio::test]
 async fn ambiguous_idle_polls_status_with_backoff_until_idle() {
-    let mut wire = TurnWire::start_config(false, false, true, None, json!({"busyPolls": 2})).await;
+    let mut wire =
+        TurnWire::start_config(false, false, true, None, "2.0.3", json!({"busyPolls": 2})).await;
     wire.request("/prompt_async").await;
     wire.status("busy");
     wire.idle();
@@ -1542,6 +1568,7 @@ async fn idle_poll_does_not_settle_while_prompt_post_is_pending() {
         false,
         true,
         None,
+        "2.0.3",
         json!({"delayPromptMs": 350}),
     )
     .await;

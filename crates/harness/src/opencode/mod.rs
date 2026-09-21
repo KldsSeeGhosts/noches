@@ -407,6 +407,34 @@ struct Server {
     stderr_tail: crate::StderrTail,
     /// Wire generation, resolved once via the health endpoints.
     protocol: tokio::sync::OnceCell<Protocol>,
+    /// Version the health endpoints reported, when the build exposes one.
+    version: tokio::sync::OnceCell<ServerVersion>,
+}
+
+/// The server version parsed from a version-bearing health answer. `number`
+/// is absent when the string carries no `major.minor.patch`.
+#[derive(Clone, Debug)]
+struct ServerVersion {
+    number: Option<(u64, u64, u64)>,
+}
+
+impl ServerVersion {
+    fn parse(raw: &str) -> Self {
+        let number = (|| {
+            let start = raw.find(|c: char| c.is_ascii_digit())?;
+            let mut parts = raw[start..].split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts
+                .next()?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()?;
+            Some((major, minor, patch))
+        })();
+        Self { number }
+    }
 }
 
 /// The attached server's wire generation: the 1.x "v1" global namespace
@@ -434,8 +462,17 @@ impl Protocol {
             if let Ok(resp) = server.get_raw(path).await
                 && resp.status().is_success()
                 && let Ok(v) = resp.json::<Value>().await
-                && v.get("version").and_then(Value::as_str).is_some()
+                && let Some(version) = v
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| {
+                        v.pointer("/data/version")
+                            .and_then(Value::as_str)
+                            .filter(|v| !v.trim().is_empty())
+                    })
             {
+                let _ = server.version.set(ServerVersion::parse(version));
                 return Some(protocol);
             }
         }
@@ -464,6 +501,7 @@ impl Server {
             client: http_client(),
             stderr_tail: crate::StderrTail::default(),
             protocol: tokio::sync::OnceCell::new(),
+            version: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -535,6 +573,7 @@ impl Server {
             client: http_client(),
             stderr_tail,
             protocol: tokio::sync::OnceCell::new(),
+            version: tokio::sync::OnceCell::new(),
         };
 
         // Readiness: the server binds a few seconds into the process's life
@@ -2037,6 +2076,7 @@ async fn post_prompt(
                     client: http_client(),
                     stderr_tail: crate::StderrTail::default(),
                     protocol,
+                    version: tokio::sync::OnceCell::new(),
                 };
                 // The command endpoint blocks for the whole turn; the bus
                 // carries the real events — but a REJECTED command emits no
@@ -2088,6 +2128,7 @@ async fn post_prompt(
         client: server.client.clone(),
         stderr_tail: crate::StderrTail::default(),
         protocol: server.protocol.clone(),
+        version: tokio::sync::OnceCell::new(),
     };
     let bus_tx = bus_tx.clone();
     let dir = dir.map(str::to_owned);
@@ -2519,7 +2560,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let protocol = server.protocol().await;
             // 1.x: global permission endpoint + a session-scoped fallback;
             // 2.x: the reply rides the session's permission route
-            // (`{"reply": "once" | "always" | "reject"}`).
+            // (the key changed from reply to decision in 2.0.4).
             let (reply_path, fallback_path) = match protocol {
                 Protocol::V1 => (
                     format!("/permission/{id}/reply"),
@@ -2534,6 +2575,21 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let auth = server.auth.clone();
             let dir_owned = dir.map(str::to_owned);
             let protocol_cell = server.protocol.clone();
+            // 2.0.18+ dropped the version from `/api/health`: detection still
+            // resolves V2 off any `/api/*` JSON route, and that fallback only
+            // matches builds newer than the 2.0.4 key change, so an unknown
+            // version on V2 keeps the `decision` key.
+            let reply_key = if protocol == Protocol::V2
+                && server
+                    .version
+                    .get()
+                    .and_then(|v| v.number)
+                    .is_none_or(|v| v >= (2, 0, 4))
+            {
+                "decision"
+            } else {
+                "reply"
+            };
             let permission_input = Arc::clone(request_input);
             let question = UserInputQuestion {
                 id: format!("permission:{id}"),
@@ -2550,6 +2606,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     client: http_client(),
                     stderr_tail: crate::StderrTail::default(),
                     protocol: protocol_cell,
+                    version: tokio::sync::OnceCell::new(),
                 };
                 let allowed = auto_approve
                     || (permission_input)(vec![question.clone()])
@@ -2570,7 +2627,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     .post_json(
                         &reply_path,
                         dir_owned.as_deref(),
-                        &json!({ "reply": reply }),
+                        &json!({ reply_key: reply }),
                     )
                     .await
                     .is_err()
@@ -2628,6 +2685,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     client: http_client(),
                     stderr_tail: crate::StderrTail::default(),
                     protocol: protocol_cell,
+                    version: tokio::sync::OnceCell::new(),
                 };
                 let reply = match rx.await {
                     Ok(answers) => {
