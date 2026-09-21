@@ -928,7 +928,7 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (mut child, _stderr, _scratch) =
+        let (_scratch, mut child, _stderr) =
             self.spawn_agent(home.as_deref(), false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1399,7 +1399,7 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
         extra_env: &[(&str, String)],
-    ) -> Result<(Child, crate::StderrTail, Option<ScratchDir>), HarnessError> {
+    ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
@@ -1454,7 +1454,7 @@ impl AcpHarness {
                 tail.close();
             });
         }
-        Ok((child, stderr_tail, scratch))
+        Ok((scratch, child, stderr_tail))
     }
 
     /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
@@ -1463,7 +1463,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr, _scratch) = self.spawn_agent(None, false, &[], &[]).await?;
+        let (_scratch, mut child, _stderr) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1527,7 +1527,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail, _scratch) = self.spawn_agent(None, false, &[], &[]).await?;
+        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1941,7 +1941,7 @@ impl Harness for AcpHarness {
             } else {
                 (Vec::new(), None, self.pi_usage_file_override.clone())
             };
-        let (mut child, stderr_tail, scratch) = self
+        let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
             .await?;
         let stdin = child
@@ -5226,4 +5226,13 @@ mod tests {
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn explicit_program_launches_do_not_get_archive_scratch_roots() {
+    let harness = AcpHarness::antigravity().with_executable(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh"),
+    );
+    assert!(harness.adapter_scratch().unwrap().is_none());
 }
