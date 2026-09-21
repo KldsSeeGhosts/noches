@@ -761,7 +761,9 @@ impl Server {
             Protocol::V2 => "/api/session/active",
         };
         let map = unwrap_data(self.get_json(path, directory).await?);
-        Ok(map.get(session_id).is_some())
+        Ok(map
+            .get(session_id)
+            .is_some_and(|state| state.get("type").and_then(Value::as_str) != Some("idle")))
     }
 
     /// End the live turn.
@@ -1110,9 +1112,17 @@ enum BusMsg {
     /// re-syncs from `GET /session/status`.
     Connected,
     Event(Value),
+    /// A detached prompt POST was accepted (any HTTP status): the session
+    /// status surface now reflects this turn, so a polled idle can settle
+    /// it. Until this arrives, an idle/absent poll answers for the
+    /// pre-prompt state and must not end the turn.
+    PromptAck,
     /// The stream is gone past the reconnect budget (or the reader saw the
     /// consumer close).
     Disconnected,
+    /// A detached prompt/command POST failed on the wire. The bus owns turn
+    /// completion, so the loop settles the turn from here.
+    CommandFailed(String),
 }
 
 /// Per-part streaming state (dedup between full-part snapshots and deltas).
@@ -1158,6 +1168,14 @@ struct TurnState {
     /// or after we explicitly abort it. A trailing idle from the previous
     /// turn must not settle a just-submitted boundary steer.
     idle_ready: bool,
+    idle_confirmations: u8,
+    status_poll: Option<tokio::time::Instant>,
+    status_backoff: Duration,
+    /// The turn's prompt POST is still in flight: a status poll (or a
+    /// post-reconnect re-sync) that reports the session idle is answering
+    /// for the PREVIOUS state, not this unaccepted prompt. An absent/idle
+    /// status is not terminal until the POST is accepted.
+    post_pending: bool,
     /// Bus events about our session seen since the prompt was posted.
     saw_activity: bool,
     /// Renderable content (text/reasoning/tool) seen this turn.
@@ -1177,6 +1195,10 @@ impl TurnState {
         Self {
             active: true,
             idle_ready: false,
+            idle_confirmations: 0,
+            status_poll: None,
+            status_backoff: Duration::from_millis(100),
+            post_pending: true,
             saw_activity: false,
             saw_content: false,
             error: None,
@@ -1355,7 +1377,7 @@ async fn run_session(session: Session) {
         server.base.clone(),
         server.auth.clone(),
         server.protocol().await,
-        bus_tx,
+        bus_tx.clone(),
     ));
 
     // ---- first prompt -----------------------------------------------------
@@ -1382,6 +1404,7 @@ async fn run_session(session: Session) {
     let stall = stall_bound();
     if let Err(e) = post_prompt(
         &server,
+        &bus_tx,
         &session_id,
         dir,
         &commands,
@@ -1445,6 +1468,7 @@ async fn run_session(session: Session) {
             }
             turn.active = false;
             if let Some(usage) = pending_usage.take()
+                && !interrupt_requested
                 && !send(&event_tx, usage).await
             {
                 break $label;
@@ -1470,6 +1494,7 @@ async fn run_session(session: Session) {
                 }
                 match post_prompt(
                     &server,
+                    &bus_tx,
                     &session_id,
                     dir,
                     &commands,
@@ -1590,6 +1615,7 @@ async fn run_session(session: Session) {
                             }).await;
                             if post_prompt(
                                 &server,
+                                &bus_tx,
                                 &session_id,
                                 dir,
                                 &commands,
@@ -1641,9 +1667,40 @@ async fn run_session(session: Session) {
                 break 'main;
             }
 
+            _ = tokio::time::sleep_until(turn.status_poll.unwrap_or_else(tokio::time::Instant::now)),
+                if turn.status_poll.is_some() && turn.active => {
+                if turn.post_pending {
+                    // The prompt POST has not been accepted: an absent/idle
+                    // status answers for the pre-prompt state and must not
+                    // settle the turn (the server may run the prompt after
+                    // we report Done). Keep polling until it lands.
+                    turn.status_poll = Some(tokio::time::Instant::now() + turn.status_backoff);
+                } else {
+                    match tokio::time::timeout(Duration::from_secs(2), server.session_running(&session_id, dir)).await {
+                        Ok(Ok(false)) => settle_idle!('main),
+                        _ => {
+                            turn.status_backoff = (turn.status_backoff * 2).min(Duration::from_secs(2));
+                            turn.status_poll = Some(tokio::time::Instant::now() + turn.status_backoff);
+                        }
+                    }
+                }
+            }
+
             msg = bus_rx.recv() => {
                 let Some(msg) = msg else { break 'main };
                 match msg {
+                    BusMsg::PromptAck => {
+                        turn.post_pending = false;
+                    }
+                    BusMsg::CommandFailed(_) if interrupt_requested => {}
+                    BusMsg::CommandFailed(message) => {
+                        let _ = send(&event_tx, AgentEvent::Done {
+                            status: DoneStatus::Errored, result: None,
+                            error: Some(message), session_id: Some(session_id.clone()),
+                        }).await;
+                        done_sent = true;
+                        break 'main;
+                    }
                     BusMsg::Connected => {
                         // A RECONNECT mid-turn may have swallowed our idle
                         // (no replay): re-sync from the server's own status
@@ -1651,6 +1708,7 @@ async fn run_session(session: Session) {
                         // leave the turn running; the next disconnect or
                         // event decides.
                         if turn.active
+                            && !turn.post_pending
                             && !server
                                 .session_running(&session_id, dir)
                                 .await
@@ -1687,6 +1745,16 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     BusMsg::Event(event) => {
+                        if interrupt_requested {
+                            // Only the terminal idle/interrupt acknowledgement may
+                            // affect an aborted turn; discard late content and usage.
+                            let kind = event.get("type").and_then(Value::as_str);
+                            let ours = event.pointer("/properties/sessionID").and_then(Value::as_str) == Some(session_id.as_str());
+                            let idle = kind == Some("session.idle") || kind == Some("session.interrupted")
+                                || (kind == Some("session.status") && event.pointer("/properties/status/type").and_then(Value::as_str) == Some("idle"));
+                            if ours && idle { settle_idle!('main); }
+                            continue;
+                        }
                         let outcome = handle_bus_event(BusCtx {
                             event: &event,
                             session_id: &session_id,
@@ -1920,9 +1988,13 @@ struct TurnSpec<'a> {
 /// text out of an ordinary prompt); everything else is a prompt.
 /// Both are fire-and-forget for the loop: the command endpoint is
 /// synchronous on the wire, so it rides a detached task and the bus
-/// delivers the actual turn.
+/// delivers the actual turn. Each detached task reports back: `PromptAck`
+/// once the POST was accepted (so a status poll only then trusts an
+/// absent/idle answer) and `CommandFailed` when it was rejected or failed
+/// on the wire.
 async fn post_prompt(
     server: &Server,
+    bus_tx: &mpsc::Sender<BusMsg>,
     session_id: &str,
     dir: Option<&str>,
     commands: &[SlashCommand],
@@ -1956,6 +2028,7 @@ async fn post_prompt(
             let dir_owned = dir.map(str::to_owned);
             let path_owned = path.clone();
             let protocol = server.protocol.clone();
+            let bus_tx = bus_tx.clone();
             tokio::spawn(async move {
                 let server = Server {
                     child: None,
@@ -1966,41 +2039,80 @@ async fn post_prompt(
                     protocol,
                 };
                 // The command endpoint blocks for the whole turn; the bus
-                // carries the real events, so this response is ignored —
-                // but it must not be cut off mid-turn by CALL_TIMEOUT.
+                // carries the real events — but a REJECTED command emits no
+                // turn frames, so surface HTTP failures to the loop instead
+                // of leaving it to the stall watchdog. Do not cut the
+                // request off mid-turn with CALL_TIMEOUT.
                 let mut req = server
                     .request(reqwest::Method::POST, &path_owned)
                     .json(&cmd_body);
                 req = server.scoped(req, dir_owned.as_deref()).await;
-                if let Err(e) = req.send().await {
-                    tracing::debug!(
-                        target: "zeron_harness::opencode",
-                        "command turn failed: {e}"
-                    );
+                let error = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let _ = bus_tx.send(BusMsg::PromptAck).await;
+                        None
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        Some(post_error_message(&path_owned, status, &text))
+                    }
+                    Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
+                };
+                if let Some(error) = error {
+                    let _ = bus_tx.send(BusMsg::CommandFailed(error)).await;
                 }
             });
             return Ok(());
         }
     }
-    match protocol {
-        Protocol::V1 => {
-            let body = prompt_body(
+    let (path, body) = match protocol {
+        Protocol::V1 => (
+            format!("/session/{session_id}/prompt_async"),
+            prompt_body(
                 prompt,
                 model.map(|(provider, model)| (provider.as_str(), model.as_str())),
                 variant,
                 attachments,
-            );
-            let path = format!("/session/{session_id}/prompt_async");
-            server.post_json(&path, dir, &body).await.map(|_| ())
+            ),
+        ),
+        Protocol::V2 => (
+            format!("/api/session/{session_id}/prompt"),
+            prompt_body_v2(prompt, attachments),
+        ),
+    };
+    let server = Server {
+        child: None,
+        base: server.base.clone(),
+        auth: server.auth.clone(),
+        client: server.client.clone(),
+        stderr_tail: crate::StderrTail::default(),
+        protocol: server.protocol.clone(),
+    };
+    let bus_tx = bus_tx.clone();
+    let dir = dir.map(str::to_owned);
+    // The bus owns turn completion. A stalled HTTP acknowledgement must not
+    // prevent cancellation or event consumption; post_json bounds the request.
+    // PromptAck marks acceptance so a status poll's absent/idle answer only
+    // settles the turn once it reflects THIS prompt, not the pre-post state.
+    tokio::spawn(async move {
+        match server.post_json_raw(&path, dir.as_deref(), &body).await {
+            Ok((status, _)) if status.is_success() => {
+                let _ = bus_tx.send(BusMsg::PromptAck).await;
+            }
+            Ok((status, text)) => {
+                let _ = bus_tx
+                    .send(BusMsg::CommandFailed(post_error_message(
+                        &path, status, &text,
+                    )))
+                    .await;
+            }
+            Err(error) => {
+                let _ = bus_tx.send(BusMsg::CommandFailed(error.to_string())).await;
+            }
         }
-        Protocol::V2 => {
-            // 2.x prompts carry text + `{uri, name}` files; model/variant
-            // were set on the session at run start.
-            let body = prompt_body_v2(prompt, attachments);
-            let path = format!("/api/session/{session_id}/prompt");
-            server.post_json(&path, dir, &body).await.map(|_| ())
-        }
-    }
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2126,13 +2238,19 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         // may submit a queued prompt before we consume the second. Until that
         // prompt starts (or fails/gets aborted), the second is stale. It must
         // neither complete the prompt nor disarm its startup watchdog.
-        return if turn.idle_ready || turn.error.is_some() {
-            BusOutcome::TurnIdle
-        } else {
-            BusOutcome::Continue
-        };
+        if turn.idle_ready || turn.error.is_some() {
+            turn.idle_confirmations += 1;
+            if turn.idle_confirmations >= 2 {
+                return BusOutcome::TurnIdle;
+            }
+        }
+        turn.status_poll = Some(tokio::time::Instant::now() + turn.status_backoff);
+        return BusOutcome::Continue;
     }
     if is_ours && turn.active {
+        turn.idle_confirmations = 0;
+        turn.status_poll = None;
+        turn.status_backoff = Duration::from_millis(100);
         turn.note_activity();
     }
 

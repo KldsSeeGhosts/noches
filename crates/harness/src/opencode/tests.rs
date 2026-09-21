@@ -8,6 +8,7 @@ struct TurnWire {
     requests: mpsc::UnboundedReceiver<String>,
     events: mpsc::Receiver<Result<AgentEvent, HarnessError>>,
     interrupt: tokio_util::sync::CancellationToken,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
     run: tokio::task::JoinHandle<()>,
 }
@@ -37,6 +38,19 @@ impl TurnWire {
         auto_approve: bool,
         answer: Option<bool>,
     ) -> Self {
+        Self::start_config(queued, v2, auto_approve, answer, json!({})).await
+    }
+
+    /// `overrides` tunes the fixture: `holdPrompt` stalls the prompt POST,
+    /// `delayPromptMs` answers it only after that many milliseconds, and
+    /// `busyPolls` answers that many status polls busy before going idle.
+    async fn start_config(
+        queued: bool,
+        v2: bool,
+        auto_approve: bool,
+        answer: Option<bool>,
+        overrides: Value,
+    ) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -45,6 +59,11 @@ impl TurnWire {
         let (request_tx, requests) = mpsc::unbounded_channel();
         let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = posts.clone();
+        let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
+        let delay_prompt_ms = overrides["delayPromptMs"].as_u64().unwrap_or(0);
+        let busy_polls = overrides["busyPolls"].as_u64().unwrap_or(0) as usize;
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_polls = polls.clone();
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -52,6 +71,7 @@ impl TurnWire {
                 let bus_rx = bus_rx.clone();
                 let request_tx = request_tx.clone();
                 let recorded = recorded.clone();
+                let polls = server_polls.clone();
                 connections.spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -82,6 +102,20 @@ impl TurnWire {
                         while let Some(event) = events.recv().await {
                             if socket.write_all(format!("data: {event}\n\n").as_bytes()).await.is_err() { break; }
                         }
+                        return;
+                    }
+                    if hold_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
+                        let _ = request_tx.send(path);
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    if delay_prompt_ms > 0 && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
+                        tokio::time::sleep(Duration::from_millis(delay_prompt_ms)).await;
+                    }
+                    if path == "/session/status" || path == "/api/session/active" {
+                        let count = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = if count < busy_polls { r#"{"fixture":{"type":"busy"}}"# } else { r#"{"fixture":{"type":"idle"}}"# };
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                         return;
                     }
                     let body = if v2 {
@@ -157,6 +191,7 @@ impl TurnWire {
             requests,
             events,
             interrupt,
+            polls,
             server,
             run,
         }
@@ -1424,4 +1459,101 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
     let (status, text) = wire.done().await;
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "Recovered");
+}
+
+#[tokio::test]
+async fn stalled_prompt_post_does_not_block_bus_completion() {
+    let mut wire =
+        TurnWire::start_config(false, false, true, None, json!({"holdPrompt": true})).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stalled_prompt_post_has_a_bounded_timeout() {
+    let mut wire =
+        TurnWire::start_config(false, false, true, None, json!({"holdPrompt": true})).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn ambiguous_idle_polls_status_with_backoff_until_idle() {
+    let mut wire = TurnWire::start_config(false, false, true, None, json!({"busyPolls": 2})).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.idle();
+    let start = tokio::time::Instant::now();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(start.elapsed() >= Duration::from_millis(650));
+}
+
+#[tokio::test]
+async fn abort_ignores_late_bus_text_and_usage() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.interrupt.cancel();
+    wire.request("/abort").await;
+    wire.bus.send(json!({"type":"message.updated", "properties":{"info":{"id":"late", "sessionID":"fixture", "role":"assistant", "tokens":{"input":999,"output":999}}}})).unwrap();
+    wire.bus.send(json!({"type":"message.part.updated", "properties":{"part":{"id":"text", "messageID":"late", "sessionID":"fixture", "type":"text", "text":"LATE"}}})).unwrap();
+    wire.idle();
+    let mut dones = 0;
+    while let Some(event) = wire.events.recv().await {
+        match event.unwrap() {
+            AgentEvent::TextDelta { .. } | AgentEvent::Usage { .. } => {
+                panic!("late content after abort")
+            }
+            AgentEvent::Done { status, .. } => {
+                assert_eq!(status, DoneStatus::Interrupted);
+                dones += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(dones, 1);
+}
+
+#[tokio::test]
+async fn idle_without_busy_resolves_through_status_poll() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn idle_poll_does_not_settle_while_prompt_post_is_pending() {
+    // A stale/absent status answer while the prompt POST is still in flight
+    // describes the pre-prompt state; the run must not report Done (the
+    // server may execute the prompt afterwards).
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        json!({"delayPromptMs": 350}),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.idle();
+    // The 100ms status poll lands while the POST is still held: it must be
+    // re-armed rather than trusted, or the run ends before the turn starts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    // The first poll raced the pending POST; settlement needed a later one.
+    assert!(wire.polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
 }
