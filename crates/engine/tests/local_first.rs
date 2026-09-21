@@ -52,8 +52,12 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
                         Ok(0) | Err(_) => return,
                         Ok(n) => used += n,
                     }
-                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") { break; }
-                    if used == request.len() { return; }
+                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if used == request.len() {
+                        return;
+                    }
                 }
                 // Local port-discovery tools probe new listeners with HEAD /.
                 // That is not an Edge protocol request from this runtime.
