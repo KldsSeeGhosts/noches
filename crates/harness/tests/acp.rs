@@ -1523,3 +1523,117 @@ async fn pi_dropping_stream_terminates_tool_tree() {
     .await
     .expect("consumer shutdown must terminate the tool tree");
 }
+
+#[tokio::test]
+async fn cancel_watchdog_ignores_late_settlement_for_all_acp_specs() {
+    for adapter in [
+        AcpHarness::grok(),
+        AcpHarness::pi(),
+        AcpHarness::antigravity(),
+    ] {
+        let adapter = adapter
+            .with_executable(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-robust-acp.py"),
+            )
+            .with_graces(Duration::from_millis(50), Duration::from_millis(50));
+        for scenario in ["wedge", "late-settle"] {
+            let (ctl, _steer, token) = controls();
+            let mut req = request(scenario);
+            req.model = None;
+            req.cwd = std::env::temp_dir().display().to_string();
+            let mut stream = adapter.run(req, ctl).await.unwrap();
+            let mut events = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    let event = event.unwrap();
+                    if matches!(&event, AgentEvent::TextDelta { text } if text == "ready") {
+                        token.cancel();
+                    }
+                    assert!(
+                        !matches!(event, AgentEvent::Usage { .. }),
+                        "late usage in {scenario}"
+                    );
+                    events.push(event);
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                dones(&events),
+                vec![(DoneStatus::Interrupted, None)],
+                "{scenario}"
+            );
+        }
+    }
+}
+
+/// The Pi context-usage snapshot must land BEFORE the terminal Done on a
+/// normal turn, and must not be emitted at all after a cancellation (the
+/// ring is torn down with the turn).
+#[tokio::test]
+async fn pi_usage_snapshot_precedes_done_and_is_dropped_on_cancel() {
+    use zeron_proto::ContextUsage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let usage_file = dir.path().join("context-usage.json");
+    std::fs::write(&usage_file, r#"{"tokens": 1234, "contextWindow": 200000}"#).unwrap();
+
+    // Normal completion: snapshot arrives before Done.
+    let mut harness = pi_fixture();
+    harness.pi_usage_file_override = Some(usage_file.clone());
+    let (ctl, steer, _token) = controls();
+    drop(steer);
+    let events = run_to_end(&harness, request("fresh"), ctl).await;
+    let snapshot_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ContextUsageSnapshot { .. }));
+    let done_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }));
+    assert!(
+        snapshot_idx.is_some(),
+        "expected a ContextUsageSnapshot before Done: {events:?}"
+    );
+    assert!(
+        snapshot_idx < done_idx,
+        "snapshot must precede the terminal Done: {events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)],);
+
+    // Cancellation: no snapshot after the interrupted Done.
+    std::fs::write(&usage_file, r#"{"tokens": 9999, "contextWindow": 200000}"#).unwrap();
+    let mut harness = pi_fixture();
+    harness.pi_usage_file_override = Some(usage_file);
+    let (ctl, _steer, token) = controls();
+    let mut stream = harness.run(request("interrupt-error"), ctl).await.unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if matches!(&event, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
+    let done_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(
+        !events[done_idx..].iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextUsageSnapshot {
+                usage: ContextUsage {
+                    tokens: Some(9999),
+                    ..
+                }
+            }
+        )),
+        "cancel must not emit the post-Done snapshot: {events:?}"
+    );
+}

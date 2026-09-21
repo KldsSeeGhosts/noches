@@ -872,6 +872,10 @@ pub struct AcpHarness {
     /// opens must see account changes and newly available models.
     models_cache: tokio::sync::Mutex<Option<(Instant, Vec<Model>)>>,
     devin_models: devin_models::Catalog,
+    /// Test seam: a pre-existing context-usage file path, bypassing the
+    /// real-Pi launch-dir provisioning in `prepare_pi_cua`.
+    #[doc(hidden)]
+    pub pi_usage_file_override: Option<PathBuf>,
 }
 
 impl AcpHarness {
@@ -890,6 +894,7 @@ impl AcpHarness {
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::Mutex::new(None),
             devin_models: devin_models::Catalog::default(),
+            pi_usage_file_override: None,
         }
     }
 
@@ -1934,7 +1939,7 @@ impl Harness for AcpHarness {
             if self.spec.id == HarnessId::Pi && self.executable.is_none() {
                 Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
             } else {
-                (Vec::new(), None, None)
+                (Vec::new(), None, self.pi_usage_file_override.clone())
             };
         let (mut child, stderr_tail, scratch) = self
             .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
@@ -3454,6 +3459,16 @@ async fn run_session(session: Session) {
                     break 'main;
                 }
                 let (status, error) = stop_outcome(&res, interrupted);
+                // The context ring is torn down at Done, so the extension's
+                // final snapshot must land first; a cancelled turn skips it
+                // (the write races teardown and is not meaningful).
+                if !interrupted
+                    && let Some(path) = pi_usage_file.as_deref()
+                    && let Some(ev) = pi_usage::read_event(path)
+                    && !send(&event_tx, ev).await
+                {
+                    break 'main;
+                }
                 done_current = true;
                 if interrupted {
                     done_after_interrupt = true;
@@ -3633,6 +3648,12 @@ async fn run_session(session: Session) {
                         .await;
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
+                        }
+                        if !interrupted
+                            && let Some(path) = pi_usage_file.as_deref()
+                            && let Some(ev) = pi_usage::read_event(path)
+                        {
+                            let _ = send(&event_tx, ev).await;
                         }
                         let (status, error) = stop_outcome(&res, interrupted);
                         done_current = true;
@@ -4071,6 +4092,9 @@ async fn run_session(session: Session) {
             // or signal a pid after the child has been reaped.
             _ = tokio::time::sleep_until(escalation_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if escalation_deadline.is_some() => {
+                // Once signal escalation starts, a late prompt response no longer
+                // owns this turn (including any usage attached to that response).
+                turn = None;
                 if let Some(target) = &escalation_target {
                     send_signal(target, escalation_signal);
                 }
@@ -4097,6 +4121,23 @@ async fn run_session(session: Session) {
     for event in subagents.finish_open(subagent_status) {
         if !send(&event_tx, event).await {
             break;
+        }
+    }
+
+    // The extension's last write can race the poll's final tick; a direct
+    // read lands the settled number. The turn-settle path already emitted
+    // it before its Done; this covers exits that reach bookkeeping without
+    // one (a crash mid-turn). Skip on cancellation - the ring is torn down
+    // with the turn and a post-Done snapshot is dead weight.
+    if !interrupted
+        && !done_current
+        && let Some(watcher) = &usage_watcher
+    {
+        watcher.abort();
+        if let Some(path) = pi_usage_file.as_deref()
+            && let Some(ev) = pi_usage::read_event(path)
+        {
+            let _ = send(&event_tx, ev).await;
         }
     }
 
@@ -4135,16 +4176,10 @@ async fn run_session(session: Session) {
     }
 
     // Escalation now lives in the owner task's select, so it cannot outlive
-    // the reaped child; there is no detached handle left to abort.
+    // the reaped child; there is no detached handle left to abort. (May
+    // already be aborted above; aborting twice is a no-op.)
     if let Some(watcher) = usage_watcher {
         watcher.abort();
-    }
-    // The extension's last write can race the poll's final tick; a direct
-    // read lands the settled number before the stream ends.
-    if let Some(path) = pi_usage_file.as_deref()
-        && let Some(ev) = pi_usage::read_event(path)
-    {
-        let _ = send(&event_tx, ev).await;
     }
     child.shutdown(kill_grace).await;
 }
