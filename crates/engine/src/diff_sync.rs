@@ -203,13 +203,18 @@ impl CheckoutDiffSync {
         orphan_grace: Duration,
     ) -> Self {
         let (diffs_tx, _) = watch::channel(Vec::new());
+        // The only outbound calls go to `edge.url` with a bearer token; a
+        // local or tailnet edge must connect directly, not through a proxy.
+        let http = edge.as_ref().map_or_else(reqwest::Client::new, |e| {
+            crate::http_error::client_for(&e.url)
+        });
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
                 repos,
                 workspace: workspace.clone(),
                 device_id: device_id.to_string(),
                 edge,
-                http: reqwest::Client::new(),
+                http,
                 entries: Mutex::new(HashMap::new()),
                 reconcile_gate: tokio::sync::Mutex::new(()),
                 identities: Mutex::new(HashMap::new()),

@@ -749,6 +749,10 @@ impl ChatDocHandle {
 
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
+        // The shared HTTP client only ever talks to `edge.url`; when that is a
+        // local or tailnet edge it must connect directly rather than leak its
+        // bearer token through a machine-wide proxy.
+        let edge_url = config.edge.as_ref().map(|e| e.url.clone());
         Self {
             inner: Arc::new(DocHostInner {
                 store,
@@ -772,7 +776,10 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
-                http: reqwest::Client::builder()
+                http: edge_url
+                    .as_deref()
+                    .map(crate::http_error::client_builder_for)
+                    .unwrap_or_else(reqwest::Client::builder)
                     .connect_timeout(std::time::Duration::from_secs(15))
                     .read_timeout(std::time::Duration::from_secs(30))
                     .timeout(std::time::Duration::from_secs(30))
@@ -3275,7 +3282,7 @@ impl DocHost {
                     return;
                 }
             };
-            let send = reqwest::Client::new()
+            let send = crate::http_error::client_for(&url)
                 .post(&url)
                 .bearer_auth(&bearer)
                 .json(&serde_json::json!({ "chatId": chat }))

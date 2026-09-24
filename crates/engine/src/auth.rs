@@ -304,7 +304,10 @@ impl Auth {
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
         let (retry_tx, _) = watch::channel(0);
-        let http = reqwest::Client::builder()
+        // Exchange codes, refresh tokens and bearer requests all go to the
+        // configured edge; a local or tailnet edge must be dialed directly so
+        // those credentials never traverse a machine-wide proxy.
+        let http = crate::http_error::client_builder_for(&config.edge_url)
             .timeout(HTTP_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -339,7 +342,7 @@ impl Auth {
             }
             let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
             let probe = async {
-                reqwest::Client::new()
+                crate::http_error::client_for(&url)
                     .get(&url)
                     .timeout(Duration::from_secs(3))
                     .send()
