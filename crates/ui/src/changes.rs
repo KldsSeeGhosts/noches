@@ -1700,6 +1700,8 @@ pub struct Changes {
 pub enum ChangesEvent {
     /// A History row was clicked — open this commit as its own diff tab.
     OpenCommit(GitHistoryCommit),
+    /// Open the post-change path in the workspace file browser.
+    OpenFile(String),
 }
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
@@ -3569,6 +3571,38 @@ impl Changes {
                         .text_size(px(11.0))
                         .text_color(del_color(theme))
                         .child(SharedString::from(format!("−{dels}"))),
+                )
+            })
+            // A deleted file no longer exists on disk, so open-in-files
+            // would point at a dead path - hide the button.
+            .when(file.status != FileStatus::Deleted, |el| {
+                el.child(
+                    div()
+                        .id(("diff-open-file", ix))
+                        .flex_none()
+                        .size(px(crate::surface_chrome::CONTROL_SIZE))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
+                        .hover(|s| s.bg(theme.ink(0.08)))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(ChangesEvent::OpenFile(path.clone()));
+                        }))
+                        .tooltip(|_, cx| {
+                            cx.new(|_| DiffHeaderTooltip("Open in file browser")).into()
+                        })
+                        .tooltip_show_delay(Duration::from_millis(350))
+                        .child(
+                            crate::icons::icon(crate::icons::DOCUMENT)
+                                .size(px(crate::surface_chrome::ICON_SIZE))
+                                .text_color(theme.text_muted),
+                        ),
                 )
             })
             .into_any_element()
