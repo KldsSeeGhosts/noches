@@ -1187,8 +1187,10 @@ impl AppState {
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
     /// reach its executor promptly? Locally-hosted chats are never degraded
     /// (a queued command executes on this device even fully offline). Remote
-    /// chats degrade when the OS says offline, when the chat's own edge room
-    /// is down, or when the host device has gone presence-dark.
+    /// chats degrade when the OS is offline, when registry recovery is needed
+    /// to restore their delivery path, when an active room stays down, or when
+    /// the host device has gone presence-dark. A Local sync state is normal
+    /// dormancy while the global connection and remote host are healthy.
     pub fn chat_delivery_degraded(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         use zeron_proto::ConnectivityState as S;
         if self.connectivity.state == S::Disabled {
@@ -1197,24 +1199,29 @@ impl AppState {
         let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
             // Unknown chat (a just-minted canvas send): only the global
             // state can speak.
-            return self.connectivity.state == S::Offline;
+            return self.connectivity.state != S::Connected;
         };
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline {
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, now) {
             return true;
         }
-        let room_down = match self
+        let net = self
             .connectivity
             .chats
             .iter()
-            .find(|c| c.chat_id == chat_id)
-        {
+            .find(|c| c.chat_id == chat_id);
+        if self.connectivity.state == S::Reconnecting {
+            // The registry can be down while this chat's room or HTTP fallback
+            // still delivers. A dormant or unknown chat has no such proof.
+            return !net.is_some_and(|net| net.delivery_live);
+        }
+        match net {
+            Some(net) if net.sync_state == zeron_proto::ChatSyncState::Local => false,
             Some(net) => !net.connected,
-            None => self.connectivity.state != S::Connected,
-        };
-        room_down || !self.device_online(&chat.device_id, now)
+            None => false,
+        }
     }
 
     /// A send is queued: in flight AND its delivery path is degraded — the
@@ -5379,6 +5386,7 @@ mod tests {
             sync_state: zeron_proto::ChatSyncState::Unknown,
             chat_id: "c-remote".into(),
             connected: true,
+            delivery_live: false,
             pending_pushes: 0,
         }];
 
@@ -5386,12 +5394,55 @@ mod tests {
         assert!(!s.chat_delivery_degraded("c-remote", now));
         assert!(!s.chat_delivery_degraded("c-local", now));
 
-        // The chat's own room down → degraded even while globally Connected.
+        // Idle chats can remain without a socket for longer than the engine's
+        // grace. A stale down sample during focus must not flash a warning.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
         s.connectivity.chats[0].connected = false;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+
+        // A requested reconnect stays quiet inside its fresh grace window.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = true;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+
+        // A requested or active room down past grace degrades even while
+        // globally Connected.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = false;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
         assert!(s.chat_delivery_degraded("c-remote", now));
         s.connectivity.chats[0].connected = true;
 
+        // Global registry failure and host presence loss still warn for a
+        // dormant chat.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
+        s.connectivity.state = ConnectivityState::Reconnecting;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+
+        // A live chat room can deliver while the registry reconnects. The
+        // graced `connected` bit alone is not proof, but delivery_live is.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Synced;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].delivery_live = true;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.begin_pending_send("c-remote", "m-live", now);
+        assert!(!s.send_queued("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        s.connectivity.chats[0].connected = false; // HTTP delivery can outlive the socket.
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].delivery_live = false;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        s.connectivity.chats[0].connected = true;
+        s.connectivity.state = ConnectivityState::Connected;
+
         // Host gone presence-dark → degraded (a send would queue at best).
+        s.connectivity.chats[0].delivery_live = true;
         s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
         assert!(s.chat_delivery_degraded("c-remote", now));
         s.devices[0].last_seen_at = Some(now);
@@ -5401,6 +5452,7 @@ mod tests {
         s.connectivity.state = ConnectivityState::Offline;
         assert!(s.chat_delivery_degraded("c-remote", now));
         assert!(!s.chat_delivery_degraded("c-local", now));
+        s.connectivity.chats[0].delivery_live = false;
 
         // Local profile (Disabled): nothing degrades.
         s.connectivity.state = ConnectivityState::Disabled;
