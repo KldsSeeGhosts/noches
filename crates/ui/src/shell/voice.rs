@@ -704,7 +704,7 @@ impl Shell {
                 if !self.right_pane_open(cx) {
                     self.toggle_right_pane(cx);
                 }
-                self.add_diff_surface(cx);
+                self.add_diff_surface(window, cx);
                 Ok(ok())
             }
             "open_file" => {

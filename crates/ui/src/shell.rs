@@ -11,9 +11,9 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
-mod updates;
 #[cfg(all(unix, not(feature = "webkit-browser")))]
 mod browser_agent;
+mod updates;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,7 +32,7 @@ use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 use zeron_workspace::Direction;
 
-use crate::changes::{Changes, ChangesEvent};
+use crate::changes::{Changes, ChangesEvent, DiscardWorkingTreeRequest};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
@@ -43,8 +43,8 @@ use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
-use crate::settings::devices::DevicesPage;
 use crate::settings::connections::ConnectionsPage;
+use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -927,11 +927,11 @@ fn sidebar_footer_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .child(
-            icon(glyph)
-                .size(px(15.0))
-                .text_color(motion::hover_blend(&motion_key, theme.text_muted, theme.text)),
-        )
+        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend(
+            &motion_key,
+            theme.text_muted,
+            theme.text,
+        )))
 }
 
 /// Plain one-line tooltip for sidebar icon buttons.
@@ -1391,6 +1391,17 @@ enum AccountMenuAction {
     SignOut,
 }
 
+#[derive(Debug, Clone)]
+enum DiscardWorkingTreeFlow {
+    Confirm(DiscardWorkingTreeRequest),
+    /// Definite failure - the host answered with an error.
+    Failed(SharedString),
+    /// The reply never arrived (deadline or dropped link). The host lets a
+    /// started discard finish after the caller goes away, so the working
+    /// tree may already be clean - say so instead of claiming failure.
+    Unknown(SharedString),
+}
+
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1796,6 +1807,10 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Global confirmation/error dialog for the Changes-pane trash action. The
+    /// RPC task is retained separately so rerenders do not cancel it.
+    discard_working_tree: Option<DiscardWorkingTreeFlow>,
+    discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -2102,11 +2117,14 @@ impl Shell {
         // Host IDs are untrusted pairing data: encode bytes rather than joining
         // a raw ID as a filesystem path. Local and remote projectless layouts
         // must never overwrite each other.
-        let layout_dir = boot.remote.as_ref().map_or_else(|| data_dir.clone(), |host| {
-            use sha2::Digest;
-            let key = format!("{:x}", sha2::Sha256::digest(host.device_id.as_bytes()));
-            data_dir.join("remote-layouts").join(key)
-        });
+        let layout_dir = boot.remote.as_ref().map_or_else(
+            || data_dir.clone(),
+            |host| {
+                use sha2::Digest;
+                let key = format!("{:x}", sha2::Sha256::digest(host.device_id.as_bytes()));
+                data_dir.join("remote-layouts").join(key)
+            },
+        );
         let mut settings = settings::current(cx);
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
@@ -2172,10 +2190,19 @@ impl Shell {
         });
         let shell = cx.entity();
         let update_poll = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(20)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(20))
+                .await;
             loop {
-                if this.update(cx, |shell, cx| shell.check_for_updates(false, cx)).is_err() { break; }
-                cx.background_executor().timer(Duration::from_secs(6 * 60 * 60)).await;
+                if this
+                    .update(cx, |shell, cx| shell.check_for_updates(false, cx))
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
             }
         });
         let sidebar_pane = cx.new(|cx| SidebarPane {
@@ -2196,7 +2223,9 @@ impl Shell {
             sidebar_session_pointer: None,
             sidebar_drag_suppressed_click: false,
             sidebar_drop_outlet: Default::default(),
-            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&layout_dir),
+            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(
+                &layout_dir,
+            ),
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
@@ -2270,6 +2299,8 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            discard_working_tree: None,
+            discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -3309,7 +3340,11 @@ impl Shell {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
                     // A background page cannot open a tab in the wrong session.
-                    if this.right_tabs.get(&owner).is_some_and(|tabs| tabs.contains(&RightSurface::Browser(id))) {
+                    if this
+                        .right_tabs
+                        .get(&owner)
+                        .is_some_and(|tabs| tabs.contains(&RightSurface::Browser(id)))
+                    {
                         this.add_browser_for_session(owner.clone(), url.clone(), window, cx);
                     }
                 }
@@ -3347,9 +3382,9 @@ impl Shell {
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
-    fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
     /// Files is single-instance per chat: both the picker and the `+` menu
@@ -3540,9 +3575,9 @@ impl Shell {
 
     /// The dedicated History surface. Keeping it as its own tab preserves its
     /// graph/search state while Diff tabs retain their ordinary scope picker.
-    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_history_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
-        self.register_diff_surface(history, cx);
+        self.register_diff_surface(history, window, cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -3550,20 +3585,41 @@ impl Shell {
     fn add_commit_diff_surface(
         &mut self,
         commit: zeron_proto::GitHistoryCommit,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
-    fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
+    fn register_diff_surface(
+        &mut self,
+        changes: Entity<Changes>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.diff_seq += 1;
         let id = self.diff_seq;
-        let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
-            ChangesEvent::OpenCommit(commit) => {
-                this.add_commit_diff_surface(commit.clone(), cx);
-            }
-        });
+        let sub =
+            cx.subscribe_in(
+                &changes,
+                window,
+                |this: &mut Self, _, event, window, cx| match event {
+                    ChangesEvent::OpenCommit(commit) => {
+                        this.add_commit_diff_surface(commit.clone(), window, cx);
+                    }
+                    ChangesEvent::OpenFile(path) => {
+                        this.add_file_surface(path.clone(), window, cx);
+                    }
+                    ChangesEvent::DiscardWorkingTree(request) => {
+                        if this.discard_working_tree_task.is_none() {
+                            this.discard_working_tree =
+                                Some(DiscardWorkingTreeFlow::Confirm(request.clone()));
+                            cx.notify();
+                        }
+                    }
+                },
+            );
         self.diffs.insert(id, changes);
         self.diff_subs.insert(id, sub);
         let key = self.panel_key(cx);
@@ -4455,9 +4511,14 @@ impl Shell {
                 if self.connections_page.is_none() {
                     let state = self.state.clone();
                     let boot = self.boot.clone();
-                    self.connections_page = Some(cx.new(|cx| ConnectionsPage::new(state, boot, cx)));
+                    self.connections_page =
+                        Some(cx.new(|cx| ConnectionsPage::new(state, boot, cx)));
                 }
-                self.connections_page.as_ref().unwrap().clone().into_any_element()
+                self.connections_page
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .into_any_element()
             }
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
@@ -4874,8 +4935,70 @@ impl Shell {
         cx.notify();
     }
 
+    fn confirm_discard_working_tree(&mut self, cx: &mut Context<Self>) {
+        if self.discard_working_tree_task.is_some() {
+            return;
+        }
+        let Some(DiscardWorkingTreeFlow::Confirm(request)) = self.discard_working_tree.clone()
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.discard_working_tree = Some(DiscardWorkingTreeFlow::Failed(
+                "Engine is not connected.".into(),
+            ));
+            cx.notify();
+            return;
+        };
+
+        let mut params = serde_json::Map::new();
+        params.insert("chatId".into(), serde_json::Value::String(request.chat_id));
+        params.insert(
+            "checkoutId".into(),
+            serde_json::Value::String(request.checkout_id),
+        );
+        params.insert(
+            "expectedChecksum".into(),
+            serde_json::Value::String(request.expected_checksum),
+        );
+        if let Some(target) = request.target_device_id {
+            params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+        }
+
+        // Dismiss the confirmation immediately. The task remains retained so
+        // repeat clicks cannot issue a second destructive request.
+        self.discard_working_tree = None;
+        self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::DISCARD_WORKING_TREE,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.discard_working_tree_task = None;
+                shell.discard_working_tree = match result {
+                    Ok(_) => None,
+                    // Transport errors mean the reply never arrived; the host
+                    // finishes a started discard without the caller, so the
+                    // outcome is unknown - never report it as a failure.
+                    Err(
+                        error @ (zeron_rpc::RpcError::Transport(_) | zeron_rpc::RpcError::Closed),
+                    ) => Some(DiscardWorkingTreeFlow::Unknown(format!("{error}").into())),
+                    Err(error) => Some(DiscardWorkingTreeFlow::Failed(format!("{error}").into())),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         self.close_user_menu(cx);
         if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
             return;
@@ -5030,7 +5153,9 @@ impl Shell {
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -5283,7 +5408,9 @@ impl Shell {
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         let scope = self.state.read(cx).workspace_scope;
         if scope == Some(WorkspaceScope::Development) {
             return;
@@ -6937,20 +7064,24 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let menu_identity: SharedString = if let Some(remote) = &self.boot.remote { format!("Work runs on {}", remote.name).into() } else { match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart".into()
-                } else {
-                    "Stored on this device".into()
+        let menu_identity: SharedString = if let Some(remote) = &self.boot.remote {
+            format!("Work runs on {}", remote.name).into()
+        } else {
+            match workspace_scope {
+                Some(WorkspaceScope::Local) => {
+                    if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+                        "Sync ready after restart".into()
+                    } else {
+                        "Stored on this device".into()
+                    }
                 }
+                Some(WorkspaceScope::Development) => "Authentication disabled".into(),
+                Some(WorkspaceScope::Synced) | None => user
+                    .as_ref()
+                    .map(|u| SharedString::from(u.email.clone()))
+                    .unwrap_or_else(|| SharedString::from("Not signed in")),
             }
-            Some(WorkspaceScope::Development) => "Authentication disabled".into(),
-            Some(WorkspaceScope::Synced) | None => user
-                .as_ref()
-                .map(|u| SharedString::from(u.email.clone()))
-                .unwrap_or_else(|| SharedString::from("Not signed in")),
-        } };
+        };
         let user_menu = self.render_user_menu(
             local_device_name,
             // The dot already says "online"; words only for remote states
@@ -6959,7 +7090,9 @@ impl Shell {
                 .remote
                 .is_some()
                 .then(|| self.state.read(cx).remote_connection.clone())
-                .filter(|status| !matches!(status, Some(zeron_rpc::remote::ConnectionState::Connected)))
+                .filter(|status| {
+                    !matches!(status, Some(zeron_rpc::remote::ConnectionState::Connected))
+                })
                 .map(|status| {
                     SharedString::from(crate::settings::connections::status_label(status.as_ref()))
                 }),
@@ -7150,16 +7283,18 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
-                                div()
-                                    .size(px(7.0))
-                                    .rounded_full()
-                            .bg(match self.state.read(cx).remote_connection.as_ref() {
-                                Some(zeron_rpc::remote::ConnectionState::Unauthorized) => theme.danger,
-                                Some(zeron_rpc::remote::ConnectionState::Connecting | zeron_rpc::remote::ConnectionState::Reconnecting) => theme.text_muted,
-                                _ => theme.success,
-                            }),
-                            ),
+                            .child(div().size(px(7.0)).rounded_full().bg(
+                                match self.state.read(cx).remote_connection.as_ref() {
+                                    Some(zeron_rpc::remote::ConnectionState::Unauthorized) => {
+                                        theme.danger
+                                    }
+                                    Some(
+                                        zeron_rpc::remote::ConnectionState::Connecting
+                                        | zeron_rpc::remote::ConnectionState::Reconnecting,
+                                    ) => theme.text_muted,
+                                    _ => theme.success,
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -7726,6 +7861,11 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.discard_working_tree.is_some() {
+            self.discard_working_tree = None;
+            cx.notify();
+            return true;
+        }
         if self.add_space.is_some() {
             self.add_space = None;
             cx.notify();
@@ -8119,6 +8259,91 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(flow) = self.discard_working_tree.clone() {
+            let card = match flow {
+                DiscardWorkingTreeFlow::Confirm(_) => {
+                    popover::dialog_card(&theme)
+                        .child(popover::dialog_title(
+                            &theme,
+                            "Discard working tree changes?",
+                        ))
+                        .child(div().mt(px(6.0)).child(popover::dialog_body(
+                            &theme,
+                            "Discard all uncommitted changes in this working tree? This can’t be undone.",
+                        )))
+                        .child(
+                            div()
+                                .mt(px(16.0))
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    popover::btn_ghost(
+                                        &theme,
+                                        "Cancel",
+                                        "discard-working-tree-cancel",
+                                    )
+                                    .id("discard-working-tree-cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_working_tree = None;
+                                        cx.notify();
+                                    })),
+                                )
+                                .child(
+                                    popover::btn_danger(&theme, "Discard changes")
+                                        .id("discard-working-tree-confirm")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_discard_working_tree(cx)
+                                        })),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                DiscardWorkingTreeFlow::Failed(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("discard-working-tree-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+                DiscardWorkingTreeFlow::Unknown(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(
+                        &theme,
+                        "Discard may have completed",
+                    ))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        format!(
+                            "No reply from the device ({error}). The discard keeps running on the host - refresh the changes list to see the outcome.",
+                        ),
+                    )))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("discard-working-tree-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            };
+            overlays.push(popover::modal(
+                "discard-working-tree-dialog",
+                viewport,
+                card,
+            ));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
@@ -8655,9 +8880,11 @@ impl Shell {
             // view-level ring inside the content area without clipping the
             // whole dropzone.
             .children(self.split_drag_preview().map(|(bounds, kind)| {
-                div().absolute().inset_0().overflow_hidden().child(
-                    crate::pane::render::split_drop_preview(bounds, kind, theme),
-                )
+                div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_hidden()
+                    .child(crate::pane::render::split_drop_preview(bounds, kind, theme))
             }))
             .into_any_element()
     }
@@ -9236,14 +9463,14 @@ impl Shell {
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
                         el.child(row("surface-card-diffs", icons::LIST, "Diffs").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.add_diff_surface(cx);
+                            cx.listener(|this, _, window, cx| {
+                                this.add_diff_surface(window, cx);
                             }),
                         ))
                         .child(
                             row("surface-card-history", icons::GIT_BRANCH, "History").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.add_history_surface(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_history_surface(window, cx);
                                 }),
                             ),
                         )
@@ -9769,8 +9996,8 @@ impl Shell {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")
                                     .id("right-plus-diff-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_diff_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_diff_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -9783,8 +10010,8 @@ impl Shell {
                             .child(
                                 popover::menu_row(&theme, false, "right-plus-history")
                                     .id("right-plus-history-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_history_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_history_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -10882,9 +11109,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &SplitViewDown, _, cx| {
                 this.split_workspace_view(Direction::Down, cx)
             }))
-            .on_action(cx.listener(|this, _: &CloseSplitView, _, cx| {
-                this.close_workspace_view(cx)
-            }));
+            .on_action(
+                cx.listener(|this, _: &CloseSplitView, _, cx| this.close_workspace_view(cx)),
+            );
 
         let render_gate = if restart_required {
             GatePhase::Loading
@@ -13879,7 +14106,13 @@ mod workspace_persistence {
                 shell.on_state_changed(&shell.state.clone(), cx);
                 // First pass: the tree restores, unknown sessions are kept
                 // optimistically (chats could still be syncing elsewhere).
-                assert!(shell.workspace.layout.pane(zeron_workspace::PaneId(3)).is_some());
+                assert!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(zeron_workspace::PaneId(3))
+                        .is_some()
+                );
                 // Next frame: chats are synced, the dead binding clears.
                 shell.on_state_changed(&shell.state.clone(), cx);
                 let pane = shell
@@ -13949,7 +14182,9 @@ mod workspace_persistence {
                     shell.workspace_save_task.is_none(),
                     "mid-gesture saves are forbidden"
                 );
-                assert!(!crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists());
+                assert!(
+                    !crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists()
+                );
                 // The drag commits: end_divider_drag clears the latch and
                 // arms the save (still debounced, so the file only appears
                 // once the flush runs).
@@ -13979,7 +14214,11 @@ mod settings_reopen_regressions {
     use super::*;
     use gpui::{AppContext, TestAppContext};
 
-    fn init_settings_test(saved: settings::UiSettings, dir: &std::path::Path, cx: &mut TestAppContext) {
+    fn init_settings_test(
+        saved: settings::UiSettings,
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             settings::init(saved, dir, cx);
             crate::history::init(
@@ -14098,10 +14337,7 @@ mod settings_reopen_regressions {
                 );
                 // Switching sections inside Settings is remembered.
                 shell.open_settings(SettingsSection::Shortcuts, cx);
-                assert_eq!(
-                    shell.settings.settings_section,
-                    SettingsSection::Shortcuts
-                );
+                assert_eq!(shell.settings.settings_section, SettingsSection::Shortcuts);
                 assert_eq!(
                     settings::current(cx).settings_section,
                     SettingsSection::Shortcuts
