@@ -148,11 +148,29 @@ impl Shell {
     /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
+    ///
+    /// A new chat always starts with the terminal hidden: when the drawer is
+    /// open it just hides (detach, not close - the source chat's tabs and
+    /// PTYs survive for the return trip).
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
         self.enter_solo_session(cx);
         self.focus_composer(cx);
+        // Pre-hide before the selection flips so the state change can't
+        // auto-create a canvas tab (the panel's observer runs on the same
+        // update). The source chat's flag stays set - returning restores it.
+        let was_open = self.terminal_open(cx)
+            || self
+                .terminal
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).is_open());
+        if was_open {
+            self.terminal_tween = None;
+            if let Some(panel) = self.terminal.clone() {
+                panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            }
+        }
         // A fresh canvas lives outside the preserved workspace. Selection
         // notifications still run, but there is no pane-rebinding intent.
         self.pending_explicit_nav = None;
@@ -177,6 +195,26 @@ impl Shell {
             }
             s.select_chat(None, cx);
         });
+        // The canvas never restores a drawer: a previously opened canvas
+        // terminal must not pop open on a fresh new chat.
+        let key = self.panel_key(cx);
+        if self.panels.get(&key).terminal_open {
+            self.panels.update(&key, |panels| {
+                panels.terminal_open = false;
+            });
+        }
+        // The panel observer reads `state.terminal_panels` on every key
+        // change, not the shell map - leave the stale entry and returning to
+        // this canvas key (new session A -> B -> A) reopens the drawer.
+        self.state.update(cx, |state, _| {
+            state.terminal_panels.insert(key.clone(), false);
+        });
+        self.terminal_tween = None;
+        if let Some(panel) = self.terminal.clone()
+            && panel.read(cx).is_open()
+        {
+            panel.update(cx, |panel, cx| panel.set_open(false, cx));
+        }
         cx.notify();
     }
 

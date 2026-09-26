@@ -2710,7 +2710,9 @@ impl Shell {
             self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
-        // snap, no tween — the panels belong to the destination chat).
+        // snap, no tween - the panels belong to the destination chat). The
+        // new-chat canvas is the exception: it always lands with the terminal
+        // hidden.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if !selected.is_empty() {
             self.last_appshot_chat = Some(selected.clone());
@@ -2744,7 +2746,24 @@ impl Shell {
             self.right_takeover_content_tween = None;
             self.main_takeover_tween = None;
             self.terminal_tween = None;
-            let panels = self.panels.get(&self.panel_key(cx));
+            let key = self.panel_key(cx);
+            // Entering the new-chat canvas always lands with the terminal
+            // hidden (user request) - a previously opened canvas drawer must
+            // not pop open on a fresh canvas. The source chat's flag stays in
+            // the map, so returning restores it.
+            let panels = if self.active_chat.is_empty() {
+                self.panels.update(&key, |panels| {
+                    panels.terminal_open = false;
+                });
+                self.panels.get(&key)
+            } else {
+                self.panels.get(&key)
+            };
+            self.state.update(cx, |state, _| {
+                state
+                    .terminal_panels
+                    .insert(key.clone(), panels.terminal_open);
+            });
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -2798,16 +2817,11 @@ impl Shell {
     /// the pane after switching into a non-git space.
     /// The per-session panel key. The new-chat canvas (no selection) keys per
     /// SPACE — one shared "" key made a canvas toggle read as global state
-    /// (user report).
+    /// (user report) - and the project-less canvas further keys per picked
+    /// device (see [`AppState::panel_session_key`]).
     fn panel_key(&self, cx: &App) -> String {
         if self.active_chat.is_empty() {
-            let space = self
-                .state
-                .read(cx)
-                .selected_space
-                .clone()
-                .unwrap_or_default();
-            format!("space-canvas:{space}")
+            self.state.read(cx).panel_session_key()
         } else {
             self.active_chat.clone()
         }
@@ -4066,6 +4080,9 @@ impl Shell {
         let from = self.terminal_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
+        self.state.update(cx, |state, _| {
+            state.terminal_panels.insert(key.clone(), open);
+        });
         self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
@@ -8758,6 +8775,10 @@ impl Shell {
         // toggle_terminal never created one.
         if self.terminal_open(cx) && self.terminal.is_none() {
             let panel = self.terminal_panel(cx);
+            let key = self.panel_key(cx);
+            self.state.update(cx, |state, _| {
+                state.terminal_panels.insert(key, true);
+            });
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
         }
         let Some(panel) = self.terminal.clone() else {
