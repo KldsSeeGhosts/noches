@@ -2,11 +2,13 @@
 //! ownership has been established from the process's actual working directory.
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 
 #[derive(Debug, Clone)]
 pub struct Listener {
