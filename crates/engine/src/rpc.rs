@@ -2495,6 +2495,7 @@ impl RpcService for EngineRpc {
                     .ok()
                     .flatten()
                     .and_then(|chat| chat.cwd)
+                    .map(|cwd| crate::sessions::expand_home(&cwd))
                     .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
                 let session = self
                     .terminals

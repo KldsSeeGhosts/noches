@@ -862,6 +862,10 @@ impl ChatDocHandle {
 
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
+        // The shared HTTP client only ever talks to `edge.url`; when that is a
+        // local or tailnet edge it must connect directly rather than leak its
+        // bearer token through a machine-wide proxy.
+        let edge_url = config.edge.as_ref().map(|e| e.url.clone());
         let host = Self {
             inner: Arc::new(DocHostInner {
                 store,
@@ -887,7 +891,10 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
-                http: reqwest::Client::builder()
+                http: edge_url
+                    .as_deref()
+                    .map(crate::http_error::client_builder_for)
+                    .unwrap_or_else(reqwest::Client::builder)
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(std::time::Duration::from_secs(10))
                     .connect_timeout(std::time::Duration::from_secs(15))
@@ -4099,7 +4106,7 @@ impl DocHost {
         );
         let chat = chat_id.to_string();
         self.spawn_worker_on(&runtime, async move {
-            let client = reqwest::Client::new();
+            let client = crate::http_error::client_for(&url);
             let give_up = tokio::time::Instant::now() + NUDGE_GIVE_UP;
             let mut backoff = NUDGE_BACKOFF_BASE;
             for attempt in 1..=NUDGE_ATTEMPTS {

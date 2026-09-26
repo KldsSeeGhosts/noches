@@ -243,6 +243,29 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
+/// The chat's working directory as the host device spells it - the folder the
+/// harness runs in (a worktree chat's worktree). Projectless `~` chats have
+/// none. Deliberately not `source_context.repo_root`: that is canonicalized
+/// (symlinks resolved, `\\?\` verbatim prefix on Windows hosts).
+fn chat_copy_path(chat: &zeron_proto::Chat) -> Option<&str> {
+    chat.cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| is_host_absolute_path(cwd))
+}
+
+/// Absolute on the HOST, whatever the viewer's OS: a remote engine may hand a
+/// POSIX path to a Windows viewport (no drive, so `Path::is_absolute` says
+/// no) or a drive path to a POSIX one.
+fn is_host_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
 fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
     if is_chat_route && has_selected_chat {
         1.0
@@ -1733,6 +1756,8 @@ pub struct Shell {
     /// The add-space palette (device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
+    /// The New project palette's collapsed-breadcrumbs (`…`) menu.
+    project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -1964,6 +1989,12 @@ impl Shell {
             this.on_state_changed(&state, cx);
             cx.notify();
         });
+        // A reopened window reuses AppState, so the engine may already be
+        // ready. Only show the boot splash while it is actually connecting.
+        let splash = match &state.read(cx).connection {
+            ConnectionStatus::Connecting => SplashPhase::Visible,
+            ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -2196,6 +2227,7 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
+            project_crumb_menu: popover::Popup::default(),
             command_palette: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
@@ -2268,7 +2300,7 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
-            splash: SplashPhase::Visible,
+            splash,
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -3262,9 +3294,9 @@ impl Shell {
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
-    fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
     /// Files is single-instance per chat: both the picker and the `+` menu
@@ -3333,6 +3365,16 @@ impl Shell {
     /// a separate FilesSurface so its tree, search, watcher and split layout
     /// stay stable while users move among open files.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_file_surface_at(path, None, window, cx);
+    }
+
+    fn add_file_surface_at(
+        &mut self,
+        path: String,
+        location: Option<(u32, Option<u32>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3341,6 +3383,11 @@ impl Shell {
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
+            if let Some((line, column)) = location
+                && let Some(file) = self.file_surfaces.get(&id).cloned()
+            {
+                file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+            }
             self.focus_right_file_editor(surface, window, cx);
             return;
         }
@@ -3398,6 +3445,11 @@ impl Shell {
             .or_default()
             .push(RightSurface::File(id));
         self.set_right_active(RightSurface::File(id), cx);
+        if let Some((line, column)) = location
+            && let Some(file) = self.file_surfaces.get(&id).cloned()
+        {
+            file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+        }
     }
 
     fn open_workspace_file_link(
@@ -3429,7 +3481,12 @@ impl Shell {
         if !was_open {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
-        self.add_file_surface(link.path, window, cx);
+        self.add_file_surface_at(
+            link.path,
+            link.line.map(|line| (line, link.column)),
+            window,
+            cx,
+        );
         true
     }
 
@@ -3455,9 +3512,9 @@ impl Shell {
 
     /// The dedicated History surface. Keeping it as its own tab preserves its
     /// graph/search state while Diff tabs retain their ordinary scope picker.
-    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_history_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
-        self.register_diff_surface(history, cx);
+        self.register_diff_surface(history, window, cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -3465,20 +3522,34 @@ impl Shell {
     fn add_commit_diff_surface(
         &mut self,
         commit: zeron_proto::GitHistoryCommit,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
-    fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
+    fn register_diff_surface(
+        &mut self,
+        changes: Entity<Changes>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.diff_seq += 1;
         let id = self.diff_seq;
-        let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
-            ChangesEvent::OpenCommit(commit) => {
-                this.add_commit_diff_surface(commit.clone(), cx);
-            }
-        });
+        let sub =
+            cx.subscribe_in(
+                &changes,
+                window,
+                |this: &mut Self, _, event, window, cx| match event {
+                    ChangesEvent::OpenCommit(commit) => {
+                        this.add_commit_diff_surface(commit.clone(), window, cx);
+                    }
+                    ChangesEvent::OpenFile(path) => {
+                        this.add_file_surface(path.clone(), window, cx);
+                    }
+                },
+            );
         self.diffs.insert(id, changes);
         self.diff_subs.insert(id, sub);
         let key = self.panel_key(cx);
@@ -4242,6 +4313,23 @@ impl Shell {
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
             self.sidebar_notice = Some("Harness session ID copied".into());
+        }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn copy_chat_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let path = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(chat_copy_path)
+            .map(str::to_owned);
+        if let Some(path) = path {
+            cx.write_to_clipboard(ClipboardItem::new_string(path));
+            self.sidebar_notice = Some("Path copied".into());
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -7614,6 +7702,11 @@ impl Shell {
             cx.notify();
             return true;
         }
+        // The folded-breadcrumbs menu floats over the palette; it closes first.
+        if self.add_space.is_some() && self.project_crumb_menu.is_open() {
+            self.close_project_crumb_menu(cx);
+            return true;
+        }
         if self.add_space.is_some() {
             self.add_space = None;
             cx.notify();
@@ -7816,9 +7909,11 @@ impl Shell {
                         .as_ref()
                         .and_then(|chat| chat.harness_session_id.as_deref())
                         .is_some_and(|id| !id.trim().is_empty());
+                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
                     let zeron_id = chat_id.clone();
                     let harness_id = chat_id.clone();
                     let session_chat_id = chat_id.clone();
+                    let path_chat_id = chat_id.clone();
                     menu.child(
                         popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
                             .id("chat-copy-back")
@@ -7836,6 +7931,21 @@ impl Shell {
                             .child(SharedString::from("Back")),
                     )
                     .child(popover::menu_separator())
+                    .when(has_path, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
+                                .id("chat-copy-path")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_chat_path(&path_chat_id, cx)
+                                }))
+                                .child(
+                                    icon(icons::COPY)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Path")),
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
                             .id("chat-copy-zeron")
@@ -9114,14 +9224,14 @@ impl Shell {
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
                         el.child(row("surface-card-diffs", icons::LIST, "Diffs").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.add_diff_surface(cx);
+                            cx.listener(|this, _, window, cx| {
+                                this.add_diff_surface(window, cx);
                             }),
                         ))
                         .child(
                             row("surface-card-history", icons::GIT_BRANCH, "History").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.add_history_surface(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_history_surface(window, cx);
                                 }),
                             ),
                         )
@@ -9424,6 +9534,30 @@ impl Shell {
                         },
                     )
                 })
+                // The chip's BlockMouse hitbox (the titlebar/scroll carve-out
+                // below) cuts the strip out of the hover stack, so the
+                // strip's own on_drop can never fire while the pointer is
+                // over a chip - tabs tile the strip. Receiving the drop on
+                // the chip itself keeps drag-reorder working without giving
+                // up the carve-out. The bubble dispatch reaches the chip
+                // before the strip, and the handler consumes the drag, so
+                // the two never double-apply.
+                .on_drop::<RightTabDrag>(cx.listener(
+                    move |this, payload: &RightTabDrag, _, cx| {
+                        if payload.panel_key != this.panel_key(cx) {
+                            this.right_tab_drag = None;
+                            cx.notify();
+                            return;
+                        }
+                        let to = this
+                            .right_tab_drag
+                            .as_ref()
+                            .map(|d| d.over)
+                            .unwrap_or(payload.from);
+                        this.right_tab_drag = None;
+                        this.reorder_right_tabs(payload.from, to, cx);
+                    },
+                ))
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -9647,8 +9781,8 @@ impl Shell {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")
                                     .id("right-plus-diff-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_diff_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_diff_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -9661,8 +9795,8 @@ impl Shell {
                             .child(
                                 popover::menu_row(&theme, false, "right-plus-history")
                                     .id("right-plus-history-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_history_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_history_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -11117,6 +11251,81 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
+    fn chat_with_path(cwd: Option<&str>, source: Option<(&str, &str)>) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: "chat".into(),
+            device_id: "remote-device".into(),
+            title: None,
+            archived: false,
+            cwd: cwd.map(str::to_owned),
+            branch: None,
+            checkout_id: None,
+            source_context: source.map(|(source_cwd, repo_root)| {
+                zeron_proto::ConversationSourceContext {
+                    checkout_id: "checkout".into(),
+                    repo_root: repo_root.into(),
+                    cwd: source_cwd.into(),
+                    branch: "main".into(),
+                    head_sha: None,
+                    observed_at: chrono::Utc::now(),
+                }
+            }),
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn copy_path_copies_the_chat_cwd_not_the_canonical_repo_root() {
+        let chat = chat_with_path(
+            Some("/remote/repo/packages/app"),
+            Some(("/remote/repo/packages/app", "/remote/repo")),
+        );
+        assert_eq!(chat_copy_path(&chat), Some("/remote/repo/packages/app"));
+
+        let windows = chat_with_path(
+            Some(r"C:\Users\me\repo"),
+            Some((r"C:\Users\me\repo", r"\\?\C:\Users\me\repo")),
+        );
+        assert_eq!(chat_copy_path(&windows), Some(r"C:\Users\me\repo"));
+    }
+
+    #[test]
+    fn copy_path_accepts_host_absolute_paths_from_any_os() {
+        for cwd in [
+            "/home/me/repo",
+            r"C:\Users\me\repo",
+            "D:/work/repo",
+            r"\\server\share\repo",
+        ] {
+            let chat = chat_with_path(Some(cwd), None);
+            assert_eq!(chat_copy_path(&chat), Some(cwd));
+        }
+    }
+
+    #[test]
+    fn copy_path_is_unavailable_without_an_absolute_path() {
+        for cwd in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("~"),
+            Some("~/repo"),
+            Some("."),
+            Some("C:"),
+        ] {
+            let chat = chat_with_path(cwd, None);
+            assert_eq!(chat_copy_path(&chat), None);
+        }
+    }
+
     #[test]
     fn sidebar_sync_status_waits_for_grace_or_queued_changes() {
         use zeron_proto::{ChatConnectivity, ChatSyncState as S};
@@ -12276,6 +12485,54 @@ mod tests {
 mod exit_regressions {
     use super::*;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn new_shell_only_shows_boot_splash_while_connecting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let boot = EngineBootConfig {
+            remote: None,
+            data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        for (connection, expected) in [
+            (ConnectionStatus::Connecting, SplashPhase::Visible),
+            (ConnectionStatus::Ready, SplashPhase::Gone),
+            (
+                ConnectionStatus::Failed("offline".into()),
+                SplashPhase::Gone,
+            ),
+        ] {
+            let window = cx.add_window(|_, cx| {
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.connection = connection;
+                    state
+                });
+                Shell::new(state, boot.clone(), cx)
+            });
+            window
+                .update(cx, |shell, _, _| assert_eq!(shell.splash, expected))
+                .unwrap();
+        }
+    }
 
     #[gpui::test]
     fn appshot_destinations_retain_last_session_and_use_new_canvas_defaults(
@@ -13480,6 +13737,39 @@ mod right_tab_mouse_regressions {
 
         shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+        });
+    }
+
+    /// The user-visible contract: dragging a surface tab onto another slot
+    /// reorders the strip. The drop could not land on a chip because of the
+    /// BlockMouse carve-out; receiving the drop on the chip itself fixes it.
+    #[cfg(not(target_os = "windows"))]
+    #[gpui::test]
+    fn surface_tab_drag_reorders_the_strip(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let from = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        let to = cx.debug_bounds("right-surface-tab-1").unwrap().center();
+
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // First move crosses the threshold and promotes the press into a
+        // drag (bubble phase). The DragMoveEvent dispatch that computes the
+        // drop slot only fires on the NEXT move (capture phase, after the
+        // drag is already active) - a real pointer always produces both.
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(cx.has_active_drag(), "surface tab drag never started");
+        });
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+
+        shell.read_with(cx, |shell, cx| {
+            let key = shell.panel_key(cx);
+            let tabs = shell.right_tabs.get(&key).expect("panel has surface tabs");
+            assert_eq!(
+                tabs,
+                &vec![RightSurface::Subagent(2), RightSurface::Subagent(1)],
+                "tab drag did not reorder the strip"
+            );
         });
     }
 }

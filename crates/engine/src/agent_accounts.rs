@@ -1422,9 +1422,14 @@ impl AgentAccounts {
             .unwrap_or_else(|| CURSOR_DEFAULT_BACKEND.to_string())
             .trim_end_matches('/')
             .to_string();
-        let session: serde_json::Value = self
-            .inner
-            .http
+        // `backendUrl` comes from saved credentials (a self-hosted Cursor
+        // backend could be a private address); keep api keys off a machine
+        // proxy when it resolves to a direct destination.
+        let http = crate::http_error::client_builder_for(&backend)
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let session: serde_json::Value = http
             .post(format!("{backend}/auth/exchange_user_api_key"))
             .bearer_auth(api_key)
             .json(&serde_json::json!({}))
@@ -1437,9 +1442,7 @@ impl AgentAccounts {
             .await
             .ok()?;
         let access_token = str_field(&session, "accessToken")?;
-        let body: serde_json::Value = self
-            .inner
-            .http
+        let body: serde_json::Value = http
             .post(format!("{backend}/{CURSOR_CURRENT_PERIOD_USAGE}"))
             .bearer_auth(&access_token)
             .header("Connect-Protocol-Version", "1")
