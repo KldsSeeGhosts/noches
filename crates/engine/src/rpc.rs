@@ -379,7 +379,7 @@ fn resolve_open_terminal_cwd(
     explicit: Option<String>,
     chat_cwd: Option<String>,
     space_cwd: Option<String>,
-) -> String {
+) -> Result<String, &'static str> {
     let raw = meaningful_cwd(explicit)
         .or_else(|| meaningful_cwd(chat_cwd))
         .or_else(|| meaningful_cwd(space_cwd))
@@ -2631,7 +2631,8 @@ impl RpcService for EngineRpc {
                         .flatten()
                         .map(|space| space.path)
                 });
-                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd);
+                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -2972,35 +2973,39 @@ mod tests {
 
     #[test]
     fn open_terminal_cwd_prefers_explicit_then_chat_then_space_then_home() {
-        let home = crate::repos::home_dir().to_string_lossy().into_owned();
+        let home = crate::repos::session_home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             resolve_open_terminal_cwd(
                 Some("/proj".into()),
                 Some("/chat".into()),
                 Some("/space".into())
-            ),
+            )
+            .unwrap(),
             "/proj"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())),
+            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())).unwrap(),
             "/chat"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())),
+            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())).unwrap(),
             "/space",
             "tilde is a fallback, not an override of the selected project"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(None, None, Some("/space".into())),
+            resolve_open_terminal_cwd(None, None, Some("/space".into())).unwrap(),
             "/space"
         );
-        assert_eq!(resolve_open_terminal_cwd(None, None, None), home);
+        assert_eq!(resolve_open_terminal_cwd(None, None, None).unwrap(), home);
         assert_eq!(
-            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None),
+            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None).unwrap(),
             "/chat"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None),
+            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None).unwrap(),
             "/chat"
         );
         assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));
