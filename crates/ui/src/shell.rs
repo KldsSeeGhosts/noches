@@ -11,9 +11,9 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
-mod updates;
 #[cfg(all(unix, not(feature = "webkit-browser")))]
 mod browser_agent;
+mod updates;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,7 +32,7 @@ use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 use zeron_workspace::Direction;
 
-use crate::changes::{Changes, ChangesEvent};
+use crate::changes::{Changes, ChangesEvent, DiscardWorkingTreeRequest};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
@@ -43,8 +43,8 @@ use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
-use crate::settings::devices::DevicesPage;
 use crate::settings::connections::ConnectionsPage;
+use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -543,8 +543,11 @@ pub fn apply_keymap(
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
+    /// Default: generic ways into Settings land here when nothing is
+    /// remembered (or the remembered section is not reopenable).
+    #[default]
     Connections,
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
@@ -592,6 +595,88 @@ impl SettingsSection {
             SettingsSection::Updates => "Updates",
         }
     }
+
+    /// Where a generic "open Settings" lands for a remembered section: a
+    /// section this build does not show (Appshots off-desktop) falls back to
+    /// the first nav entry.
+    pub(crate) fn reopenable(self) -> Self {
+        if self.visible_in_nav() {
+            self
+        } else {
+            Self::Connections
+        }
+    }
+
+    /// Whether the settings sidebar lists this section on this build.
+    fn visible_in_nav(self) -> bool {
+        self != Self::Appshots || crate::appshots::is_desktop()
+    }
+
+    /// Stable name shared by `ui-settings.json` and `ZERON_OPEN_ROUTE`.
+    fn slug(self) -> &'static str {
+        match self {
+            SettingsSection::Connections => "connections",
+            SettingsSection::Devices => "devices",
+            SettingsSection::Harnesses => "harnesses",
+            SettingsSection::Agents => "accounts",
+            SettingsSection::Appearance => "appearance",
+            SettingsSection::Files => "files",
+            SettingsSection::Notifications => "notifications",
+            SettingsSection::Shortcuts => "shortcuts",
+            SettingsSection::Appshots => "appshots",
+            SettingsSection::Archived => "archived",
+            SettingsSection::Updates => "updates",
+        }
+    }
+
+    /// Inverse of [`Self::slug`], plus names earlier builds used.
+    fn from_slug(slug: &str) -> Option<Self> {
+        Some(match slug {
+            "connections" => SettingsSection::Connections,
+            // `general` was the upstream landing page's name; Noches' first
+            // nav entry is Connections.
+            "general" | "conversations" => SettingsSection::Connections,
+            "devices" => SettingsSection::Devices,
+            "harnesses" | "providers" => SettingsSection::Harnesses,
+            "accounts" | "agents" => SettingsSection::Agents,
+            "appearance" => SettingsSection::Appearance,
+            "files" => SettingsSection::Files,
+            "notifications" => SettingsSection::Notifications,
+            "shortcuts" => SettingsSection::Shortcuts,
+            "appshots" => SettingsSection::Appshots,
+            "archived" => SettingsSection::Archived,
+            "updates" => SettingsSection::Updates,
+            _ => return None,
+        })
+    }
+}
+
+/// Persisted as [`crate::settings::UiSettings::settings_section`].
+impl serde::Serialize for SettingsSection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.slug())
+    }
+}
+
+/// Lenient: an unknown or malformed value reads as the default section
+/// instead of failing - and so defaulting - the whole settings file.
+impl<'de> serde::Deserialize<'de> for SettingsSection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value.as_str().and_then(Self::from_slug).unwrap_or_default())
+    }
+}
+
+/// The section a `ZERON_OPEN_ROUTE` value opens: bare `settings` reopens the
+/// remembered section, `settings/<slug>` names one (and so becomes the
+/// remembered one). `None` for anything else, including unknown slugs.
+fn settings_open_route(route: &str, remembered: SettingsSection) -> Option<SettingsSection> {
+    if route == "settings" {
+        return Some(remembered.reopenable());
+    }
+    route
+        .strip_prefix("settings/")
+        .and_then(SettingsSection::from_slug)
 }
 
 /// What the main outlet shows.
@@ -879,11 +964,11 @@ fn sidebar_footer_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .child(
-            icon(glyph)
-                .size(px(15.0))
-                .text_color(motion::hover_blend(&motion_key, theme.text_muted, theme.text)),
-        )
+        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend(
+            &motion_key,
+            theme.text_muted,
+            theme.text,
+        )))
 }
 
 /// Plain one-line tooltip for sidebar icon buttons.
@@ -1343,6 +1428,17 @@ enum AccountMenuAction {
     SignOut,
 }
 
+#[derive(Debug, Clone)]
+enum DiscardWorkingTreeFlow {
+    Confirm(DiscardWorkingTreeRequest),
+    /// Definite failure - the host answered with an error.
+    Failed(SharedString),
+    /// The reply never arrived (deadline or dropped link). The host lets a
+    /// started discard finish after the caller goes away, so the working
+    /// tree may already be clean - say so instead of claiming failure.
+    Unknown(SharedString),
+}
+
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1748,6 +1844,10 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Global confirmation/error dialog for the Changes-pane trash action. The
+    /// RPC task is retained separately so rerenders do not cancel it.
+    discard_working_tree: Option<DiscardWorkingTreeFlow>,
+    discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -2062,12 +2162,15 @@ impl Shell {
         // Host IDs are untrusted pairing data: encode bytes rather than joining
         // a raw ID as a filesystem path. Local and remote projectless layouts
         // must never overwrite each other.
-        let layout_dir = boot.remote.as_ref().map_or_else(|| data_dir.clone(), |host| {
-            use sha2::Digest;
-            let key = format!("{:x}", sha2::Sha256::digest(host.device_id.as_bytes()));
-            data_dir.join("remote-layouts").join(key)
-        });
-        let settings = settings::current(cx);
+        let layout_dir = boot.remote.as_ref().map_or_else(
+            || data_dir.clone(),
+            |host| {
+                use sha2::Digest;
+                let key = format!("{:x}", sha2::Sha256::digest(host.device_id.as_bytes()));
+                data_dir.join("remote-layouts").join(key)
+            },
+        );
+        let mut settings = settings::current(cx);
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
@@ -2077,18 +2180,25 @@ impl Shell {
         apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
-        // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
+        // synthetic input can't reach them on headless compositors. Bare
+        // `settings` reopens the remembered section; a named one is remembered
+        // like any other link to a section.
+        let open_route = std::env::var("ZERON_OPEN_ROUTE").ok();
+        let route = match open_route.as_deref() {
+            Some(route) if route == "settings" || route.starts_with("settings/") => {
+                match settings_open_route(route, settings.settings_section) {
+                    Some(section) => {
+                        if settings.settings_section != section {
+                            settings.settings_section = section;
+                            settings::update(settings::SavePolicy::Debounced, cx, |s| {
+                                s.settings_section = section;
+                            });
+                        }
+                        Route::Settings(section)
+                    }
+                    None => Route::Chat,
+                }
             }
-            Some("settings/agents") => Route::Settings(SettingsSection::Agents),
-            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -2125,10 +2235,19 @@ impl Shell {
         });
         let shell = cx.entity();
         let update_poll = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(20)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(20))
+                .await;
             loop {
-                if this.update(cx, |shell, cx| shell.check_for_updates(false, cx)).is_err() { break; }
-                cx.background_executor().timer(Duration::from_secs(6 * 60 * 60)).await;
+                if this
+                    .update(cx, |shell, cx| shell.check_for_updates(false, cx))
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
             }
         });
         let sidebar_pane = cx.new(|cx| SidebarPane {
@@ -2149,7 +2268,9 @@ impl Shell {
             sidebar_session_pointer: None,
             sidebar_drag_suppressed_click: false,
             sidebar_drop_outlet: Default::default(),
-            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&layout_dir),
+            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(
+                &layout_dir,
+            ),
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
@@ -2223,6 +2344,8 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            discard_working_tree: None,
+            discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -2664,7 +2787,9 @@ impl Shell {
             self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
-        // snap, no tween — the panels belong to the destination chat).
+        // snap, no tween - the panels belong to the destination chat). The
+        // new-chat canvas is the exception: it always lands with the terminal
+        // hidden.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if !selected.is_empty() {
             self.last_appshot_chat = Some(selected.clone());
@@ -2698,7 +2823,24 @@ impl Shell {
             self.right_takeover_content_tween = None;
             self.main_takeover_tween = None;
             self.terminal_tween = None;
-            let panels = self.panels.get(&self.panel_key(cx));
+            let key = self.panel_key(cx);
+            // Entering the new-chat canvas always lands with the terminal
+            // hidden (user request) - a previously opened canvas drawer must
+            // not pop open on a fresh canvas. The source chat's flag stays in
+            // the map, so returning restores it.
+            let panels = if self.active_chat.is_empty() {
+                self.panels.update(&key, |panels| {
+                    panels.terminal_open = false;
+                });
+                self.panels.get(&key)
+            } else {
+                self.panels.get(&key)
+            };
+            self.state.update(cx, |state, _| {
+                state
+                    .terminal_panels
+                    .insert(key.clone(), panels.terminal_open);
+            });
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -2752,16 +2894,11 @@ impl Shell {
     /// the pane after switching into a non-git space.
     /// The per-session panel key. The new-chat canvas (no selection) keys per
     /// SPACE — one shared "" key made a canvas toggle read as global state
-    /// (user report).
+    /// (user report) - and the project-less canvas further keys per picked
+    /// device (see [`AppState::panel_session_key`]).
     fn panel_key(&self, cx: &App) -> String {
         if self.active_chat.is_empty() {
-            let space = self
-                .state
-                .read(cx)
-                .selected_space
-                .clone()
-                .unwrap_or_default();
-            format!("space-canvas:{space}")
+            self.state.read(cx).panel_session_key()
         } else {
             self.active_chat.clone()
         }
@@ -3256,7 +3393,11 @@ impl Shell {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
                     // A background page cannot open a tab in the wrong session.
-                    if this.right_tabs.get(&owner).is_some_and(|tabs| tabs.contains(&RightSurface::Browser(id))) {
+                    if this
+                        .right_tabs
+                        .get(&owner)
+                        .is_some_and(|tabs| tabs.contains(&RightSurface::Browser(id)))
+                    {
                         this.add_browser_for_session(owner.clone(), url.clone(), window, cx);
                     }
                 }
@@ -3547,6 +3688,13 @@ impl Shell {
                     }
                     ChangesEvent::OpenFile(path) => {
                         this.add_file_surface(path.clone(), window, cx);
+                    }
+                    ChangesEvent::DiscardWorkingTree(request) => {
+                        if this.discard_working_tree_task.is_none() {
+                            this.discard_working_tree =
+                                Some(DiscardWorkingTreeFlow::Confirm(request.clone()));
+                            cx.notify();
+                        }
                     }
                 },
             );
@@ -4066,6 +4214,9 @@ impl Shell {
         let from = self.terminal_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
+        self.state.update(cx, |state, _| {
+            state.terminal_panels.insert(key.clone(), open);
+        });
         self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
@@ -4344,9 +4495,58 @@ impl Shell {
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
+        self.remember_settings_section(section, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Generic entry points (Cmd+, / Ctrl+,, the palette's "Open settings")
+    /// reopen the section last viewed. Links that name a section go through
+    /// [`Self::open_settings`] instead.
+    fn open_last_settings(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(self.settings.settings_section.reopenable(), cx);
+    }
+
+    /// Every section shown is the one to reopen. Written through the shell's
+    /// own settings copy: [`Self::schedule_save`] replaces the whole file
+    /// from it, so a write that bypassed it would be undone by the next save.
+    fn remember_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings.settings_section != section {
+            self.settings.settings_section = section;
+            self.schedule_save(cx);
+        }
+    }
+
+    /// Escape bubbling out of the settings pages. Focused controls - open
+    /// dropdowns, a dialog's own input - consume it before it gets here. What
+    /// remains open without holding focus closes first: the sync prompt, then
+    /// the routed page's dialog or login flow. Returns whether one did; only
+    /// then does Settings stay open.
+    fn dismiss_settings_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sync_flow.has_visible_overlay() {
+            return true;
+        }
+        // The footer account menu is already covered by the caller's modal
+        // block (user_menu), which closes nothing but swallows the key.
+        let Route::Settings(section) = self.route else {
+            return false;
+        };
+        match section {
+            SettingsSection::Devices => self
+                .devices_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Agents => self
+                .accounts_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            _ => false,
+        }
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4385,6 +4585,7 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+                self.remember_settings_section(section, cx);
             }
         }
         self.close_user_menu(cx);
@@ -4405,9 +4606,14 @@ impl Shell {
                 if self.connections_page.is_none() {
                     let state = self.state.clone();
                     let boot = self.boot.clone();
-                    self.connections_page = Some(cx.new(|cx| ConnectionsPage::new(state, boot, cx)));
+                    self.connections_page =
+                        Some(cx.new(|cx| ConnectionsPage::new(state, boot, cx)));
                 }
-                self.connections_page.as_ref().unwrap().clone().into_any_element()
+                self.connections_page
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .into_any_element()
             }
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
@@ -4824,8 +5030,70 @@ impl Shell {
         cx.notify();
     }
 
+    fn confirm_discard_working_tree(&mut self, cx: &mut Context<Self>) {
+        if self.discard_working_tree_task.is_some() {
+            return;
+        }
+        let Some(DiscardWorkingTreeFlow::Confirm(request)) = self.discard_working_tree.clone()
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.discard_working_tree = Some(DiscardWorkingTreeFlow::Failed(
+                "Engine is not connected.".into(),
+            ));
+            cx.notify();
+            return;
+        };
+
+        let mut params = serde_json::Map::new();
+        params.insert("chatId".into(), serde_json::Value::String(request.chat_id));
+        params.insert(
+            "checkoutId".into(),
+            serde_json::Value::String(request.checkout_id),
+        );
+        params.insert(
+            "expectedChecksum".into(),
+            serde_json::Value::String(request.expected_checksum),
+        );
+        if let Some(target) = request.target_device_id {
+            params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+        }
+
+        // Dismiss the confirmation immediately. The task remains retained so
+        // repeat clicks cannot issue a second destructive request.
+        self.discard_working_tree = None;
+        self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::DISCARD_WORKING_TREE,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.discard_working_tree_task = None;
+                shell.discard_working_tree = match result {
+                    Ok(_) => None,
+                    // Transport errors mean the reply never arrived; the host
+                    // finishes a started discard without the caller, so the
+                    // outcome is unknown - never report it as a failure.
+                    Err(
+                        error @ (zeron_rpc::RpcError::Transport(_) | zeron_rpc::RpcError::Closed),
+                    ) => Some(DiscardWorkingTreeFlow::Unknown(format!("{error}").into())),
+                    Err(error) => Some(DiscardWorkingTreeFlow::Failed(format!("{error}").into())),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         self.close_user_menu(cx);
         if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
             return;
@@ -4980,7 +5248,9 @@ impl Shell {
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -5233,7 +5503,9 @@ impl Shell {
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
-        if self.boot.remote.is_some() { return; }
+        if self.boot.remote.is_some() {
+            return;
+        }
         let scope = self.state.read(cx).workspace_scope;
         if scope == Some(WorkspaceScope::Development) {
             return;
@@ -6913,20 +7185,24 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let menu_identity: SharedString = if let Some(remote) = &self.boot.remote { format!("Work runs on {}", remote.name).into() } else { match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart".into()
-                } else {
-                    "Stored on this device".into()
+        let menu_identity: SharedString = if let Some(remote) = &self.boot.remote {
+            format!("Work runs on {}", remote.name).into()
+        } else {
+            match workspace_scope {
+                Some(WorkspaceScope::Local) => {
+                    if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+                        "Sync ready after restart".into()
+                    } else {
+                        "Stored on this device".into()
+                    }
                 }
+                Some(WorkspaceScope::Development) => "Authentication disabled".into(),
+                Some(WorkspaceScope::Synced) | None => user
+                    .as_ref()
+                    .map(|u| SharedString::from(u.email.clone()))
+                    .unwrap_or_else(|| SharedString::from("Not signed in")),
             }
-            Some(WorkspaceScope::Development) => "Authentication disabled".into(),
-            Some(WorkspaceScope::Synced) | None => user
-                .as_ref()
-                .map(|u| SharedString::from(u.email.clone()))
-                .unwrap_or_else(|| SharedString::from("Not signed in")),
-        } };
+        };
         let user_menu = self.render_user_menu(
             local_device_name,
             // The dot already says "online"; words only for remote states
@@ -6935,7 +7211,9 @@ impl Shell {
                 .remote
                 .is_some()
                 .then(|| self.state.read(cx).remote_connection.clone())
-                .filter(|status| !matches!(status, Some(zeron_rpc::remote::ConnectionState::Connected)))
+                .filter(|status| {
+                    !matches!(status, Some(zeron_rpc::remote::ConnectionState::Connected))
+                })
                 .map(|status| {
                     SharedString::from(crate::settings::connections::status_label(status.as_ref()))
                 }),
@@ -7126,16 +7404,18 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
-                                div()
-                                    .size(px(7.0))
-                                    .rounded_full()
-                            .bg(match self.state.read(cx).remote_connection.as_ref() {
-                                Some(zeron_rpc::remote::ConnectionState::Unauthorized) => theme.danger,
-                                Some(zeron_rpc::remote::ConnectionState::Connecting | zeron_rpc::remote::ConnectionState::Reconnecting) => theme.text_muted,
-                                _ => theme.success,
-                            }),
-                            ),
+                            .child(div().size(px(7.0)).rounded_full().bg(
+                                match self.state.read(cx).remote_connection.as_ref() {
+                                    Some(zeron_rpc::remote::ConnectionState::Unauthorized) => {
+                                        theme.danger
+                                    }
+                                    Some(
+                                        zeron_rpc::remote::ConnectionState::Connecting
+                                        | zeron_rpc::remote::ConnectionState::Reconnecting,
+                                    ) => theme.text_muted,
+                                    _ => theme.success,
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -7702,6 +7982,11 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.discard_working_tree.is_some() {
+            self.discard_working_tree = None;
+            cx.notify();
+            return true;
+        }
         // The folded-breadcrumbs menu floats over the palette; it closes first.
         if self.add_space.is_some() && self.project_crumb_menu.is_open() {
             self.close_project_crumb_menu(cx);
@@ -7732,6 +8017,12 @@ impl Shell {
             return true;
         }
         if self.pane_menu.get().is_some() {
+            return true;
+        }
+        // Settings-internal surfaces: an unfocused dialog (the device rename,
+        // an add-account login, the theme import) or the footer account menu
+        // closes before Settings does underneath it.
+        if matches!(self.route, Route::Settings(_)) && self.dismiss_settings_escape_surface(cx) {
             return true;
         }
         if self.dismiss_voice_panel(cx) {
@@ -8111,6 +8402,91 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(flow) = self.discard_working_tree.clone() {
+            let card = match flow {
+                DiscardWorkingTreeFlow::Confirm(_) => {
+                    popover::dialog_card(&theme)
+                        .child(popover::dialog_title(
+                            &theme,
+                            "Discard working tree changes?",
+                        ))
+                        .child(div().mt(px(6.0)).child(popover::dialog_body(
+                            &theme,
+                            "Discard all uncommitted changes in this working tree? This can’t be undone.",
+                        )))
+                        .child(
+                            div()
+                                .mt(px(16.0))
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    popover::btn_ghost(
+                                        &theme,
+                                        "Cancel",
+                                        "discard-working-tree-cancel",
+                                    )
+                                    .id("discard-working-tree-cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_working_tree = None;
+                                        cx.notify();
+                                    })),
+                                )
+                                .child(
+                                    popover::btn_danger(&theme, "Discard changes")
+                                        .id("discard-working-tree-confirm")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_discard_working_tree(cx)
+                                        })),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                DiscardWorkingTreeFlow::Failed(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("discard-working-tree-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+                DiscardWorkingTreeFlow::Unknown(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(
+                        &theme,
+                        "Discard may have completed",
+                    ))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        format!(
+                            "No reply from the device ({error}). The discard keeps running on the host - refresh the changes list to see the outcome.",
+                        ),
+                    )))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("discard-working-tree-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            };
+            overlays.push(popover::modal(
+                "discard-working-tree-dialog",
+                viewport,
+                card,
+            ));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
@@ -8647,9 +9023,11 @@ impl Shell {
             // view-level ring inside the content area without clipping the
             // whole dropzone.
             .children(self.split_drag_preview().map(|(bounds, kind)| {
-                div().absolute().inset_0().overflow_hidden().child(
-                    crate::pane::render::split_drop_preview(bounds, kind, theme),
-                )
+                div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_hidden()
+                    .child(crate::pane::render::split_drop_preview(bounds, kind, theme))
             }))
             .into_any_element()
     }
@@ -8767,6 +9145,10 @@ impl Shell {
         // toggle_terminal never created one.
         if self.terminal_open(cx) && self.terminal.is_none() {
             let panel = self.terminal_panel(cx);
+            let key = self.panel_key(cx);
+            self.state.update(cx, |state, _| {
+                state.terminal_panels.insert(key, true);
+            });
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
         }
         let Some(panel) = self.terminal.clone() else {
@@ -10894,9 +11276,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &SplitViewDown, _, cx| {
                 this.split_workspace_view(Direction::Down, cx)
             }))
-            .on_action(cx.listener(|this, _: &CloseSplitView, _, cx| {
-                this.close_workspace_view(cx)
-            }));
+            .on_action(
+                cx.listener(|this, _: &CloseSplitView, _, cx| this.close_workspace_view(cx)),
+            );
 
         let render_gate = if restart_required {
             GatePhase::Loading
@@ -14083,7 +14465,13 @@ mod workspace_persistence {
                 shell.on_state_changed(&shell.state.clone(), cx);
                 // First pass: the tree restores, unknown sessions are kept
                 // optimistically (chats could still be syncing elsewhere).
-                assert!(shell.workspace.layout.pane(zeron_workspace::PaneId(3)).is_some());
+                assert!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(zeron_workspace::PaneId(3))
+                        .is_some()
+                );
                 // Next frame: chats are synced, the dead binding clears.
                 shell.on_state_changed(&shell.state.clone(), cx);
                 let pane = shell
@@ -14153,7 +14541,9 @@ mod workspace_persistence {
                     shell.workspace_save_task.is_none(),
                     "mid-gesture saves are forbidden"
                 );
-                assert!(!crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists());
+                assert!(
+                    !crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists()
+                );
                 // The drag commits: end_divider_drag clears the latch and
                 // arms the save (still debounced, so the file only appears
                 // once the flush runs).
@@ -14175,5 +14565,218 @@ mod workspace_persistence {
                 let _ = window;
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod settings_reopen_regressions {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    fn init_settings_test(
+        saved: settings::UiSettings,
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            settings::init(saved, dir, cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+    }
+
+    fn test_shell(dir: &std::path::Path, cx: &mut Context<Shell>) -> Shell {
+        let state = cx.new(|_| AppState::new());
+        Shell::new(
+            state,
+            EngineBootConfig {
+                remote: None,
+                data_dir: dir.into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            },
+            cx,
+        )
+    }
+
+    #[test]
+    fn remembered_sections_reopen_only_where_the_nav_can_show_them() {
+        assert_eq!(
+            SettingsSection::Shortcuts.reopenable(),
+            SettingsSection::Shortcuts
+        );
+        // Appshots is hidden off-desktop, so it cannot be reopened there.
+        assert_eq!(
+            SettingsSection::Appshots.reopenable(),
+            if crate::appshots::is_desktop() {
+                SettingsSection::Appshots
+            } else {
+                SettingsSection::Connections
+            }
+        );
+        for section in SettingsSection::ALL {
+            assert!(section.reopenable().visible_in_nav(), "{section:?}");
+            assert_eq!(SettingsSection::from_slug(section.slug()), Some(section));
+        }
+        // Names earlier builds persisted still decode.
+        assert_eq!(
+            SettingsSection::from_slug("general"),
+            Some(SettingsSection::Connections)
+        );
+        assert_eq!(
+            SettingsSection::from_slug("agents"),
+            Some(SettingsSection::Agents)
+        );
+        assert_eq!(
+            SettingsSection::from_slug("providers"),
+            Some(SettingsSection::Harnesses)
+        );
+    }
+
+    #[test]
+    fn open_route_names_a_section_or_reopens_the_remembered_one() {
+        let remembered = SettingsSection::Notifications;
+        assert_eq!(
+            settings_open_route("settings", remembered),
+            Some(SettingsSection::Notifications)
+        );
+        assert_eq!(
+            settings_open_route("settings", SettingsSection::Appshots),
+            Some(SettingsSection::Appshots.reopenable())
+        );
+        for (route, section) in [
+            ("settings/connections", SettingsSection::Connections),
+            ("settings/general", SettingsSection::Connections),
+            ("settings/devices", SettingsSection::Devices),
+            ("settings/harnesses", SettingsSection::Harnesses),
+            ("settings/accounts", SettingsSection::Agents),
+            ("settings/agents", SettingsSection::Agents),
+            ("settings/appearance", SettingsSection::Appearance),
+            ("settings/files", SettingsSection::Files),
+            ("settings/shortcuts", SettingsSection::Shortcuts),
+            ("settings/appshots", SettingsSection::Appshots),
+            ("settings/archived", SettingsSection::Archived),
+            ("settings/updates", SettingsSection::Updates),
+        ] {
+            assert_eq!(
+                settings_open_route(route, remembered),
+                Some(section),
+                "{route}"
+            );
+        }
+        assert_eq!(settings_open_route("settings/billing", remembered), None);
+        assert_eq!(settings_open_route("new", remembered), None);
+    }
+
+    #[gpui::test]
+    fn settings_reopen_where_they_were_left(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // Nothing remembered yet: the default section.
+                assert_eq!(shell.route, Route::Chat);
+                shell.open_last_settings(cx);
+                assert_eq!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Connections.reopenable())
+                );
+                // Switching sections inside Settings is remembered.
+                shell.open_settings(SettingsSection::Shortcuts, cx);
+                assert_eq!(shell.settings.settings_section, SettingsSection::Shortcuts);
+                assert_eq!(
+                    settings::current(cx).settings_section,
+                    SettingsSection::Shortcuts
+                );
+                shell.close_settings(cx);
+                // Cmd+, / the palette reopen it.
+                shell.open_last_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Shortcuts));
+                shell.close_settings(cx);
+
+                // A link naming a section wins, and becomes the one remembered.
+                shell.open_settings(SettingsSection::Appearance, cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Appearance));
+                shell.close_settings(cx);
+                shell.open_last_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Appearance));
+                shell.close_settings(cx);
+                settings::flush(cx);
+            })
+            .unwrap();
+        // It survives a restart.
+        assert_eq!(
+            settings::UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Appearance
+        );
+    }
+
+    #[gpui::test]
+    fn unknown_or_hidden_remembered_sections_reopen_default(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings::UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "settingsSection": "billing"}"#,
+        )
+        .unwrap();
+        let saved = settings::UiSettings::load(dir.path());
+        assert_eq!(saved.sidebar_width, 300.0);
+        init_settings_test(saved, dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.open_last_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Connections));
+                shell.close_settings(cx);
+                // A remembered section this build hides falls back as well.
+                shell.settings.settings_section = SettingsSection::Appshots;
+                shell.open_last_settings(cx);
+                assert_eq!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Appshots.reopenable())
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_closes_what_is_open_inside_settings_before_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            // No engine in tests: render the workspace, not the boot gate.
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.open_settings(SettingsSection::Devices, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // A dialog that does not hold focus (the rename input was never
+        // clicked) still closes before Settings does.
+        let devices = shell.read_with(cx, |shell, _| shell.devices_page.clone().unwrap());
+        devices.update(cx, |page, cx| {
+            page.open_rename("device-1".into(), "Studio".into(), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        assert!(!devices.update(cx, |page, cx| page.dismiss_on_escape(cx)));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
     }
 }

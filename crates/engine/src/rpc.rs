@@ -24,7 +24,7 @@
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
+//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows, cwd?}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
@@ -73,7 +73,7 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
-use crate::repos::{Repos, home_dir};
+use crate::repos::Repos;
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -262,6 +262,14 @@ struct DeleteWorktreeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DiscardWorkingTreeParams {
+    chat_id: String,
+    checkout_id: String,
+    expected_checksum: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListProjectActionsParams {
     space_id: String,
 }
@@ -335,6 +343,48 @@ struct OpenTerminalParams {
     chat_id: String,
     cols: u16,
     rows: u16,
+    /// Explicit working directory (new-chat canvas: the selected project
+    /// folder, or `~`). When omitted, the chat row's cwd is used, then the
+    /// space named by a `space-canvas:{spaceId}` chat id.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Matches the UI canvas panel key (`AppState::panel_session_key`).
+const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
+
+/// A cwd the user (or a project-less chat) meant as "host home", not a folder.
+fn meaningful_cwd(cwd: Option<String>) -> Option<String> {
+    cwd.filter(|cwd| {
+        let trimmed = cwd.trim();
+        !trimmed.is_empty() && trimmed != "~"
+    })
+}
+
+/// Space id encoded in a new-chat canvas terminal key, if any.
+/// The project-less form `space-canvas:@{device}` names a device, not a
+/// space - it never resolves to a folder.
+fn canvas_space_id(chat_id: &str) -> Option<&str> {
+    chat_id
+        .strip_prefix(CANVAS_TERMINAL_PREFIX)
+        .filter(|id| !id.is_empty() && !id.starts_with('@'))
+}
+
+/// Resolve the PTY cwd: a real explicit path wins, then the chat row, then
+/// the project folder named by `space-canvas:{spaceId}`, then `~`.
+/// The portable `~` marker is a fallback, not an override - otherwise a
+/// canvas OpenTerminal that still says `~` (spaces watch not landed in the
+/// UI) would ignore the selected project encoded in `chatId`.
+fn resolve_open_terminal_cwd(
+    explicit: Option<String>,
+    chat_cwd: Option<String>,
+    space_cwd: Option<String>,
+) -> Result<String, &'static str> {
+    let raw = meaningful_cwd(explicit)
+        .or_else(|| meaningful_cwd(chat_cwd))
+        .or_else(|| meaningful_cwd(space_cwd))
+        .unwrap_or_else(|| "~".to_string());
+    crate::repos::expand_home(&raw)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,7 +1162,11 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
             Duration::from_secs(15 * 60)
         }
-        methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Destructive and multi-step filesystem work: the host lets a started
+        // discard run to completion even after the caller is gone, so a short
+        // relay deadline would surface a still-running discard as a definite
+        // failure. Give it room instead.
+        methods::CREATE_WORKTREE | methods::DISCARD_WORKING_TREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1181,6 +1235,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
+            | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
@@ -1982,8 +2037,12 @@ impl RpcService for EngineRpc {
                             let base = crate::diff_sync::merge_base(root, base_ref)
                                 .await
                                 .map_err(|e| RpcError::Failed(e.to_string()))?;
-                            crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
-                                .await
+                            Box::pin(crate::diff_sync::capture_diff_against(
+                                &self.repos,
+                                root,
+                                Some(&base),
+                            ))
+                            .await
                         }
                         // One commit's own changes (History → per-commit tab):
                         // parent (or the empty tree) vs the commit itself.
@@ -2007,7 +2066,7 @@ impl RpcService for EngineRpc {
                             crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree)
                                 .await
                         }
-                        _ => crate::diff_sync::capture_diff(&self.repos, root).await,
+                        _ => Box::pin(crate::diff_sync::capture_diff(&self.repos, root)).await,
                     }
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                     RpcReply::value(&zeron_proto::CheckoutDiff {
@@ -2022,6 +2081,86 @@ impl RpcService for EngineRpc {
                         checksum: snapshot.checksum,
                         updated_at: chrono::Utc::now(),
                     })
+                })
+                .await
+            }
+            methods::DISCARD_WORKING_TREE => {
+                // This destructive branch performs several nested filesystem
+                // futures. Box it so unrelated RPC calls do not inherit that
+                // state in the already-large dispatcher stack frame.
+                Box::pin(async move {
+                    let p: DiscardWorkingTreeParams = parse_params(params)?;
+                    let chat = self
+                        .workspace
+                        .chat(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                    if chat.device_id != self.doc_host.device_id() {
+                        return Err(RpcError::Failed("chat is not hosted by this device".into()));
+                    }
+                    let cwd = chat
+                        .cwd
+                        .as_deref()
+                        .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if identity.id != p.checkout_id {
+                        return Err(RpcError::Failed(
+                            "chat checkout changed since the confirmation was opened".into(),
+                        ));
+                    }
+
+                    // Refuse the mutation when any local chat on this exact
+                    // checkout has a live run. We never interrupt an agent as a
+                    // side effect of discarding files.
+                    let chats = self.workspace.watch_chats().borrow().clone();
+                    for candidate in chats {
+                        if candidate.device_id != self.doc_host.device_id() {
+                            continue;
+                        }
+                        let same_checkout =
+                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
+                                true
+                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                                self.repos
+                                    .checkout_identity(std::path::Path::new(candidate_cwd))
+                                    .await
+                                    .is_ok_and(|candidate_identity| {
+                                        candidate_identity.id == identity.id
+                                    })
+                            } else {
+                                false
+                            };
+                        if same_checkout
+                            && self
+                                .sessions
+                                .session_status(&candidate.id)
+                                .is_some_and(|session| {
+                                    matches!(
+                                        session.status,
+                                        zeron_proto::SessionStatus::Working
+                                            | zeron_proto::SessionStatus::AwaitingInput
+                                    )
+                                })
+                        {
+                            return Err(RpcError::Failed(
+                                "an agent is active in this working tree".into(),
+                            ));
+                        }
+                    }
+
+                    let snapshot = self
+                        .diff_sync
+                        .discard_working_tree(&identity.id, &p.expected_checksum)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    RpcReply::value(&serde_json::json!({
+                        "ok": true,
+                        "checksum": snapshot.checksum,
+                    }))
                 })
                 .await
             }
@@ -2626,16 +2765,24 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
+                // Prefer an explicit real path (new-chat canvas has no row
+                // yet). `space-canvas:{spaceId}` names the selected project
+                // so a missing/tilde cwd still lands in that folder.
+                let chat_cwd = self
                     .workspace
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .map(|cwd| crate::sessions::expand_home(&cwd))
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                    .and_then(|chat| chat.cwd);
+                let space_cwd = canvas_space_id(&p.chat_id).and_then(|space_id| {
+                    self.workspace
+                        .space(space_id)
+                        .ok()
+                        .flatten()
+                        .map(|space| space.path)
+                });
+                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -2939,6 +3086,7 @@ mod tests {
         assert!(forwardable(methods::RESOLVE_GIT_AVATARS));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(forwardable(methods::DISCARD_WORKING_TREE));
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
@@ -2965,6 +3113,12 @@ mod tests {
             forward_deadline(methods::CREATE_WORKTREE),
             Duration::from_secs(120)
         );
+        // A started discard finishes on the host after the caller is gone;
+        // a short deadline would misreport a still-running discard as failed.
+        assert_eq!(
+            forward_deadline(methods::DISCARD_WORKING_TREE),
+            Duration::from_secs(120)
+        );
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),
             Duration::from_secs(15 * 60)
@@ -2977,6 +3131,50 @@ mod tests {
             forward_deadline(methods::QUEUE_COMMAND),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn open_terminal_cwd_prefers_explicit_then_chat_then_space_then_home() {
+        let home = crate::repos::session_home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_open_terminal_cwd(
+                Some("/proj".into()),
+                Some("/chat".into()),
+                Some("/space".into())
+            )
+            .unwrap(),
+            "/proj"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())).unwrap(),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())).unwrap(),
+            "/space",
+            "tilde is a fallback, not an override of the selected project"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, None, Some("/space".into())).unwrap(),
+            "/space"
+        );
+        assert_eq!(resolve_open_terminal_cwd(None, None, None).unwrap(), home);
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None).unwrap(),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None).unwrap(),
+            "/chat"
+        );
+        assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));
+        assert_eq!(canvas_space_id("space-canvas:"), None);
+        // The project-less device form never resolves to a space folder.
+        assert_eq!(canvas_space_id("space-canvas:@remote"), None);
+        assert_eq!(canvas_space_id("chat-1"), None);
     }
 
     #[test]

@@ -248,3 +248,54 @@ fn drop_on_solo_surface_reveals_its_workspace_destination(cx: &mut TestAppContex
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn new_session_canvas_clears_the_observer_visible_terminal_flag(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_selected_project(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+
+            // Canvas A: user opens the drawer, then leaves for chat-a.
+            shell.open_new_session(cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let key_a = shell.panel_key(cx);
+            assert!(key_a.starts_with(crate::state::CANVAS_PANEL_PREFIX));
+            shell.panels.toggle_terminal(&key_a);
+            shell.state.update(cx, |state, _| {
+                state.terminal_panels.insert(key_a.clone(), true);
+            });
+            shell.state.update(cx, |state, cx| {
+                state.select_chat(Some("chat-a".into()), cx);
+            });
+            shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(shell.active_chat, "chat-a");
+
+            // Canvas B (another project's new session), then back to A: the
+            // observer-visible flag must already be false when the key flips
+            // back, or the panel restores a drawer the canvas just closed.
+            shell.state.update(cx, |state, _| {
+                state
+                    .spaces
+                    .push(serde_json::from_value(space("c")).unwrap());
+            });
+            shell.settings.space_filter = Some("c".into());
+            shell.open_new_session(cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let key_b = shell.panel_key(cx);
+            assert_ne!(key_a, key_b);
+            shell.settings.space_filter = Some("b".into());
+            shell.open_new_session(cx);
+            assert_eq!(shell.panel_key(cx), key_a);
+            assert_eq!(
+                shell.state.read(cx).terminal_panels.get(&key_a),
+                Some(&false),
+                "canvas A's observer-visible flag is cleared, not just the shell map"
+            );
+            assert!(!shell.panels.get(&key_a).terminal_open);
+        })
+        .unwrap();
+}
