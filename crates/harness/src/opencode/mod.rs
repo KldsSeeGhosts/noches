@@ -68,7 +68,7 @@ const HEALTH_POLL: Duration = Duration::from_millis(150);
 /// Bound on ordinary (non-SSE) HTTP calls: everything is loopback and the
 /// only slow route is a cold /provider catalog. The synchronous per-turn
 /// command endpoint deliberately bypasses this (its response can take the
-/// whole turn and is ignored anyway).
+/// whole turn; failures are delivered to the session loop).
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bus reconnect: the server is our own child on loopback, so a dropped
@@ -2022,6 +2022,32 @@ struct TurnSpec<'a> {
     attachments: &'a [String],
 }
 
+/// 2.0.4 renamed the command body's `command` key to `name` (1.x keeps
+/// `command` + `arguments`; older 2.x still wants `command` + `text`).
+/// Attachments ride the prompt body's `files` shape. An unversioned 2.x
+/// build (health answered no `version`) postdates the rename, so an
+/// unknown version resolves to `name` - the same call 32ff2e2a made for
+/// the permission reply key.
+fn command_body_v2(
+    version: Option<&ServerVersion>,
+    name: &str,
+    text: &str,
+    attachments: &[String],
+) -> Value {
+    let named = version
+        .and_then(|v| v.number)
+        .is_none_or(|v| v >= (2, 0, 4));
+    if named {
+        let mut body = json!({ "name": name, "text": text });
+        if !attachments.is_empty() {
+            body["files"] = prompt_body_v2(text, attachments)["files"].clone();
+        }
+        body
+    } else {
+        json!({ "command": name, "text": text })
+    }
+}
+
 /// Send a turn: a leading `/command` known to the agent routes through the
 /// command endpoint (the desktop parity — the server does NOT parse slash
 /// text out of an ordinary prompt); everything else is a prompt.
@@ -2051,7 +2077,8 @@ async fn post_prompt(
         let name = split.next().unwrap_or_default();
         let arguments = split.next().unwrap_or_default().trim().to_owned();
         if !name.is_empty() && commands.iter().any(|c| c.name == name) {
-            // 1.x names the args `arguments`; 2.x `text`.
+            // 1.x names the args `arguments`; 2.x `text` - and 2.0.4
+            // renames the command key itself to `name`.
             let (path, cmd_body) = match protocol {
                 Protocol::V1 => (
                     format!("/session/{session_id}/command"),
@@ -2059,7 +2086,7 @@ async fn post_prompt(
                 ),
                 Protocol::V2 => (
                     format!("/api/session/{session_id}/command"),
-                    json!({ "command": name, "text": arguments }),
+                    command_body_v2(server.version.get(), name, &arguments, attachments),
                 ),
             };
             let server_base = server.base.clone();
@@ -2079,7 +2106,7 @@ async fn post_prompt(
                     version: tokio::sync::OnceCell::new(),
                 };
                 // The command endpoint blocks for the whole turn; the bus
-                // carries the real events — but a REJECTED command emits no
+                // carries the real events - but a REJECTED command emits no
                 // turn frames, so surface HTTP failures to the loop instead
                 // of leaving it to the stall watchdog. Do not cut the
                 // request off mid-turn with CALL_TIMEOUT.

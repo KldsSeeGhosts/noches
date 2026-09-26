@@ -43,8 +43,10 @@ impl TurnWire {
 
     /// `version` is the 2.x health answer; `overrides` tunes the fixture:
     /// `holdPrompt` stalls the prompt POST, `delayPromptMs` answers it only
-    /// after that many milliseconds, and `busyPolls` answers that many
-    /// status polls busy before going idle.
+    /// after that many milliseconds, `busyPolls` answers that many status
+    /// polls busy before going idle, and `commandFailure` fails the command
+    /// POST with a 400. `commandNames` seeds the known slash-command list;
+    /// `request` merges extra fields into the run request.
     async fn start_config(
         queued: bool,
         v2: bool,
@@ -63,6 +65,16 @@ impl TurnWire {
         let recorded = posts.clone();
         let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
         let delay_prompt_ms = overrides["delayPromptMs"].as_u64().unwrap_or(0);
+        let command_failure = overrides["commandFailure"].as_bool().unwrap_or(false);
+        let command_names: Vec<String> = overrides["commandNames"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
         let busy_polls = overrides["busyPolls"].as_u64().unwrap_or(0) as usize;
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_polls = polls.clone();
@@ -104,6 +116,12 @@ impl TurnWire {
                         while let Some(event) = events.recv().await {
                             if socket.write_all(format!("data: {event}\n\n").as_bytes()).await.is_err() { break; }
                         }
+                        return;
+                    }
+                    if is_post && command_failure && path.ends_with("/command") {
+                        let body = "{\"error\":\"bad command\"}";
+                        socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        let _ = request_tx.send(path);
                         return;
                     }
                     if hold_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
@@ -180,13 +198,29 @@ impl TurnWire {
                 interrupt: interrupt.clone(),
                             computer_use_socket: None,
 },
-            request: serde_json::from_value(
-                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"}),
-            )
+            request: serde_json::from_value({
+                let mut request = json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
+                if let Some(fields) = overrides["request"].as_object() {
+                    request
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(fields.clone());
+                }
+                request
+            })
             .unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),
-            known_commands: Some(vec![]),
+            known_commands: Some(
+                command_names
+                    .iter()
+                    .map(|name| SlashCommand {
+                        name: name.clone(),
+                        description: String::new(),
+                        input_hint: None,
+                    })
+                    .collect(),
+            ),
         }));
         Self {
             bus,
@@ -1583,4 +1617,75 @@ async fn idle_poll_does_not_settle_while_prompt_post_is_pending() {
     assert_eq!(wire.done().await.0, DoneStatus::Completed);
     // The first poll raced the pending POST; settlement needed a later one.
     assert!(wire.polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn v2_command_bodies_follow_server_version() {
+    // 1.x and pre-2.0.4 2.x keep the `command` key; 2.0.4+ and unversioned
+    // 2.x builds (health stopped reporting a version after the rename) send
+    // `name`.
+    assert_eq!(
+        command_body_v2(Some(&ServerVersion::parse("1.18.31")), "test", "args", &[]),
+        json!({"command":"test","text":"args"})
+    );
+    assert_eq!(
+        command_body_v2(Some(&ServerVersion::parse("2.0.3")), "test", "args", &[]),
+        json!({"command":"test","text":"args"})
+    );
+    for raw in ["2.0.4", "v2.0.11", "3.0.0", "unknown"] {
+        let parsed = ServerVersion::parse(raw);
+        assert_eq!(
+            command_body_v2(Some(&parsed), "test", "args", &[]),
+            json!({"name":"test","text":"args"}),
+            "{raw}"
+        );
+        let attachments = vec!["/workspace/image.png".to_owned()];
+        assert_eq!(
+            command_body_v2(Some(&parsed), "test", "args", &attachments)["files"],
+            prompt_body_v2("args", &attachments)["files"],
+            "{raw}"
+        );
+    }
+    // No health answer at all is still treated as post-rename on V2.
+    assert_eq!(
+        command_body_v2(None, "test", "args", &[]),
+        json!({"name":"test","text":"args"})
+    );
+}
+
+#[tokio::test]
+async fn rejected_command_post_settles_the_turn_errored() {
+    for (v2, version, key) in [
+        (false, "1.18.31", "command"),
+        (true, "2.0.3", "command"),
+        (true, "2.0.11", "name"),
+    ] {
+        let mut wire = TurnWire::start_config(
+            false,
+            v2,
+            true,
+            None,
+            version,
+            json!({"request": {"prompt": "/test args"}, "commandNames": ["test"], "commandFailure": true}),
+        )
+        .await;
+        if v2 {
+            // V2 sets the session model before prompting.
+            wire.request("/api/model").await;
+        }
+        wire.request("/command").await;
+        let (status, _) = wire.done().await;
+        assert_eq!(status, DoneStatus::Errored, "v2={v2} version={version}");
+        let posts = wire.posts.lock().unwrap();
+        let (_, body) = posts
+            .iter()
+            .find(|(path, _)| path.ends_with("/command"))
+            .expect("command POST recorded");
+        assert_eq!(body[key], "test", "v2={v2} version={version}");
+        assert_eq!(
+            body[if v2 { "text" } else { "arguments" }],
+            "args",
+            "v2={v2} version={version}"
+        );
+    }
 }
