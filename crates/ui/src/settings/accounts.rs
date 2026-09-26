@@ -692,6 +692,16 @@ impl AccountsPage {
         cx.notify();
     }
 
+    /// Escape that reached Settings unclaimed cancels an open login first,
+    /// so it never closes Settings under the dialog. Returns whether it did.
+    pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.login.is_none() {
+            return false;
+        }
+        self.cancel_login(cx);
+        true
+    }
+
     // ---- render pieces ----
 
     /// One usage window (zeron settings.agents.tsx `UsageMeter`): label ·
