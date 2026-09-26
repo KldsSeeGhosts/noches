@@ -1069,7 +1069,7 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
 
 async fn read_git_source(root: &Path, revision: &str, path: &Path) -> Result<Capture, EngineError> {
     let spec = format!("{revision}:{}", path.to_string_lossy());
-    capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await
+    Box::pin(capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES)).await
 }
 
 /// Read an untracked file for patch synthesis: a symlink's content is its
@@ -1157,14 +1157,14 @@ pub(crate) async fn read_diff_file_text_at(
     let old = if file.status == "added" {
         None
     } else {
-        Some(read_git_source(root, base, old_path).await?)
+        Some(Box::pin(read_git_source(root, base, old_path)).await?)
     };
     let new = if file.status == "deleted" {
         None
     } else if let Some(target) = target {
-        Some(read_git_source(root, target, new_path).await?)
+        Some(Box::pin(read_git_source(root, target, new_path)).await?)
     } else {
-        Some(read_worktree_source(root, new_path).await?)
+        Some(Box::pin(read_worktree_source(root, new_path)).await?)
     };
     let truncated = old.as_ref().is_some_and(|source| source.truncated)
         || new.as_ref().is_some_and(|source| source.truncated);
@@ -1201,7 +1201,7 @@ pub(crate) async fn read_diff_file_text_at(
 /// against Git's canonical empty tree.
 pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
     let parent_spec = format!("{sha}^");
-    let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
+    let parent = Box::pin(capture_git(root, &["rev-parse", "--verify", &parent_spec], 256))
         .await
         .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
         .unwrap_or_default();
@@ -1213,7 +1213,7 @@ pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
 }
 
 pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+    let head = Box::pin(capture_git(root, &["rev-parse", "--verify", "HEAD"], 256))
         .await
         .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
         .unwrap_or_default();
@@ -1233,7 +1233,7 @@ pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
 /// discard confirmation: every path `git clean` would remove is pinned by
 /// content, not just by name.
 pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
-    capture_diff_against(repos, root, None).await
+    Box::pin(capture_diff_against(repos, root, None)).await
 }
 
 /// [`capture_diff`] with the diff base overridable: `None` keeps the
@@ -1246,7 +1246,7 @@ pub async fn capture_diff_against(
     root: &Path,
     base_override: Option<&str>,
 ) -> Result<DiffSnapshot, EngineError> {
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+    let head = Box::pin(capture_git(root, &["rev-parse", "--verify", "HEAD"], 256))
         .await
         .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
         .unwrap_or_default();
@@ -1255,24 +1255,23 @@ pub async fn capture_diff_against(
         None if head.is_empty() => EMPTY_TREE_SHA,
         None => &head,
     };
-    let branch = repos
-        .current_branch(root)
+    let branch = Box::pin(repos.current_branch(root))
         .await
         .unwrap_or_else(|_| "HEAD".into());
 
-    let names = capture_git(
+    let names = Box::pin(capture_git(
         root,
         &["diff", "--name-status", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let nums = capture_git(
+    let nums = Box::pin(capture_git(
         root,
         &["diff", "--numstat", "-z", "--find-renames", base, "--"],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let tracked = capture_git(
+    let tracked = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1284,11 +1283,11 @@ pub async fn capture_diff_against(
             "--",
         ],
         MAX_PATCH_BYTES,
-    )
+    ))
     .await?;
     // Untracked listing via porcelain status; `--no-optional-locks` keeps this
     // read-only (a status-triggered index refresh would re-kick our own watcher).
-    let status = capture_git(
+    let status = Box::pin(capture_git(
         root,
         &[
             "--no-optional-locks",
@@ -1301,7 +1300,7 @@ pub async fn capture_diff_against(
             "--untracked-files=all",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
 
     let mut files = parse_name_status(&names.stdout);
@@ -1550,7 +1549,7 @@ async fn run_git_for_paths(
     paths: &[Vec<u8>],
 ) -> Result<(), EngineError> {
     for batch in path_batches(paths, MAX_PATH_ARGUMENT_BYTES) {
-        run_git_for_path_batch(root, fixed_args, batch).await?;
+        Box::pin(run_git_for_path_batch(root, fixed_args, batch)).await?;
     }
     Ok(())
 }
@@ -1601,7 +1600,7 @@ pub async fn discard_working_tree(
     root: &Path,
     expected_checksum: &str,
 ) -> Result<DiffSnapshot, EngineError> {
-    let snapshot = capture_diff(repos, root).await?;
+    let snapshot = Box::pin(capture_diff(repos, root)).await?;
     let head = snapshot.head_sha.as_deref().ok_or_else(|| {
         EngineError::Other("cannot discard changes before the first commit".into())
     })?;
@@ -1616,7 +1615,7 @@ pub async fn discard_working_tree(
         ));
     }
 
-    let status = capture_git(
+    let status = Box::pin(capture_git(
         root,
         &[
             "--no-optional-locks",
@@ -1626,7 +1625,7 @@ pub async fn discard_working_tree(
             "--untracked-files=all",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
     if status.truncated {
         return Err(EngineError::Other(
@@ -1660,9 +1659,9 @@ pub async fn discard_working_tree(
         OsString::from("--staged"),
         OsString::from("--worktree"),
     ];
-    run_git_for_paths(root, &restore_args, &tracked).await?;
+    Box::pin(run_git_for_paths(root, &restore_args, &tracked)).await?;
     let clean_args = [OsString::from("clean"), OsString::from("-fd")];
-    run_git_for_paths(root, &clean_args, &untracked).await?;
+    Box::pin(run_git_for_paths(root, &clean_args, &untracked)).await?;
     // `--untracked-files=all` gives exact files, so `git clean` can leave
     // their now-empty parent directories behind. Remove only empty ancestors;
     // ignored files or any concurrent writer make `remove_dir` stop safely.
@@ -1677,7 +1676,7 @@ pub async fn discard_working_tree(
         }
     }
 
-    let final_snapshot = capture_diff(repos, root).await?;
+    let final_snapshot = Box::pin(capture_diff(repos, root)).await?;
     if !final_snapshot.files.is_empty() || !final_snapshot.patch.trim().is_empty() {
         return Err(EngineError::Other(
             "some changes could not be discarded safely".into(),
@@ -1695,12 +1694,11 @@ pub async fn capture_commit_diff(
     root: &Path,
     sha: &str,
 ) -> Result<DiffSnapshot, EngineError> {
-    let base = commit_diff_base(root, sha).await;
-    let branch = repos
-        .current_branch(root)
+    let base = Box::pin(commit_diff_base(root, sha)).await;
+    let branch = Box::pin(repos.current_branch(root))
         .await
         .unwrap_or_else(|_| "HEAD".into());
-    let names = capture_git(
+    let names = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1712,9 +1710,9 @@ pub async fn capture_commit_diff(
             "--",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let nums = capture_git(
+    let nums = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1726,9 +1724,9 @@ pub async fn capture_commit_diff(
             "--",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let tracked = capture_git(
+    let tracked = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1741,7 +1739,7 @@ pub async fn capture_commit_diff(
             "--",
         ],
         MAX_PATCH_BYTES,
-    )
+    ))
     .await?;
     let mut files = parse_name_status(&names.stdout);
     apply_numstat(&mut files, &nums.stdout);
@@ -1781,7 +1779,7 @@ pub async fn capture_commit_diff(
 /// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
 /// Errors when the ref is unknown or the histories are unrelated.
 pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {
-    let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
+    let capture = Box::pin(capture_git(root, &["merge-base", base_ref, "HEAD"], 256)).await?;
     let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     if sha.is_empty() {
         return Err(EngineError::Other(format!("no merge base with {base_ref}")));
@@ -1813,7 +1811,7 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
         cmd.stdin(std::process::Stdio::null());
         cmd.output()
     };
-    let added = run(&["add", "-A", "--ignore-errors", "."])
+    let added = Box::pin(run(&["add", "-A", "--ignore-errors", "."]))
         .await
         .map_err(|e| EngineError::Other(format!("git add failed: {e}")))?;
     if !added.status.success() {
@@ -1823,7 +1821,7 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
             String::from_utf8_lossy(&added.stderr).trim()
         )));
     }
-    let written = run(&["write-tree"])
+    let written = Box::pin(run(&["write-tree"]))
         .await
         .map_err(|e| EngineError::Other(format!("git write-tree failed: {e}")));
     let _ = tokio::fs::remove_file(&index).await;
@@ -1847,17 +1845,16 @@ pub async fn capture_turn_diff(
     root: &Path,
     turn_tree: &str,
 ) -> Result<DiffSnapshot, EngineError> {
-    let current = snapshot_tree(root).await?;
-    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+    let current = Box::pin(snapshot_tree(root)).await?;
+    let head = Box::pin(capture_git(root, &["rev-parse", "--verify", "HEAD"], 256))
         .await
         .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
         .unwrap_or_default();
-    let branch = repos
-        .current_branch(root)
+    let branch = Box::pin(repos.current_branch(root))
         .await
         .unwrap_or_else(|_| "HEAD".into());
 
-    let names = capture_git(
+    let names = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1869,9 +1866,9 @@ pub async fn capture_turn_diff(
             "--",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let nums = capture_git(
+    let nums = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1883,9 +1880,9 @@ pub async fn capture_turn_diff(
             "--",
         ],
         2 * 1024 * 1024,
-    )
+    ))
     .await?;
-    let tracked = capture_git(
+    let tracked = Box::pin(capture_git(
         root,
         &[
             "diff",
@@ -1898,7 +1895,7 @@ pub async fn capture_turn_diff(
             "--",
         ],
         MAX_PATCH_BYTES,
-    )
+    ))
     .await?;
 
     let mut files = parse_name_status(&names.stdout);

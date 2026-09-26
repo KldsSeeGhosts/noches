@@ -855,7 +855,7 @@ impl EngineRpc {
                 serde_json::json!(self.doc_host.device_id()),
             );
         }
-        let reply = self.forward(target, method, params).await;
+        let reply = Box::pin(self.forward(target, method, params)).await;
         let Some(previews) = &self.previews else {
             return reply;
         };
@@ -875,16 +875,20 @@ impl EngineRpc {
                         port,
                         Some(start.url.as_str()),
                     ) {
-                        previews
-                            .open_login_tunnel(&start.login_id, target, port, LOGIN_TUNNEL_TTL)
-                            .await
+                        Box::pin(previews.open_login_tunnel(
+                            &start.login_id,
+                            target,
+                            port,
+                            LOGIN_TUNNEL_TTL,
+                        ))
+                        .await
                     } else {
                         Err(anyhow::anyhow!(
                             "The other device reported an unexpected sign-in port."
                         ))
                     }
                 {
-                    self.cancel_remote_login(target, &start.login_id).await;
+                    Box::pin(self.cancel_remote_login(target, &start.login_id)).await;
                     return Err(RpcError::Failed(error.to_string()));
                 }
                 reply
@@ -901,16 +905,20 @@ impl EngineRpc {
                                 port,
                                 poll.url.as_deref(),
                             ) {
-                                previews
-                                    .open_login_tunnel(&login_id, target, port, LOGIN_TUNNEL_TTL)
-                                    .await
+                                Box::pin(previews.open_login_tunnel(
+                                    &login_id,
+                                    target,
+                                    port,
+                                    LOGIN_TUNNEL_TTL,
+                                ))
+                                .await
                             } else {
                                 Err(anyhow::anyhow!(
                                     "The other device reported an unexpected sign-in port."
                                 ))
                             }
                         {
-                            self.cancel_remote_login(target, &login_id).await;
+                            Box::pin(self.cancel_remote_login(target, &login_id)).await;
                             return RpcReply::value(&AgentLoginPoll {
                                 status: AgentLoginStatus::Error,
                                 message: Some(error.to_string()),
@@ -938,9 +946,7 @@ impl EngineRpc {
 
     async fn cancel_remote_login(&self, target: &str, login_id: &str) {
         let params = serde_json::json!({ "loginId": login_id, "targetDeviceId": target });
-        if let Err(error) = self
-            .forward(target, methods::CANCEL_AGENT_LOGIN, params)
-            .await
+        if let Err(error) = Box::pin(self.forward(target, methods::CANCEL_AGENT_LOGIN, params)).await
         {
             tracing::debug!(%error, "cancelling the remote login failed (best-effort)");
         }
@@ -1529,14 +1535,12 @@ impl RpcService for EngineRpc {
                     | methods::COMPLETE_AGENT_LOGIN
                     | methods::CANCEL_AGENT_LOGIN
             ) {
-                return self.forward_agent_login(&target, method, params).await;
+                return Box::pin(self.forward_agent_login(&target, method, params)).await;
             }
-            return self.forward(&target, method, params).await;
+            return Box::pin(self.forward(&target, method, params)).await;
         }
         if AuthRpc::handles(method) {
-            return AuthRpc::new(self.auth()?.clone())
-                .handle(method, params)
-                .await;
+            return Box::pin(AuthRpc::new(self.auth()?.clone()).handle(method, params)).await;
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
@@ -2022,11 +2026,10 @@ impl RpcService for EngineRpc {
                         commit_sha: Option<String>,
                     }
                     let p: P = parse_params(params)?;
-                    let identity = self
-                        .repos
-                        .checkout_identity(std::path::Path::new(&p.cwd))
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let identity =
+                        Box::pin(self.repos.checkout_identity(std::path::Path::new(&p.cwd)))
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
                     let root = identity.root.as_path();
                     let snapshot = match p.mode.as_str() {
                         "branch" => {
@@ -2034,7 +2037,7 @@ impl RpcService for EngineRpc {
                                 .base_ref
                                 .as_deref()
                                 .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                            let base = crate::diff_sync::merge_base(root, base_ref)
+                            let base = Box::pin(crate::diff_sync::merge_base(root, base_ref))
                                 .await
                                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                             Box::pin(crate::diff_sync::capture_diff_against(
@@ -2051,7 +2054,12 @@ impl RpcService for EngineRpc {
                                 .commit_sha
                                 .as_deref()
                                 .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
-                            crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
+                            Box::pin(crate::diff_sync::capture_commit_diff(
+                                &self.repos,
+                                root,
+                                sha,
+                            ))
+                            .await
                         }
                         "turn" => {
                             let chat_id = p
@@ -2063,8 +2071,12 @@ impl RpcService for EngineRpc {
                                 .turn_snapshot(chat_id)
                                 .filter(|s| s.root == identity.root)
                                 .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                            crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree)
-                                .await
+                            Box::pin(crate::diff_sync::capture_turn_diff(
+                                &self.repos,
+                                root,
+                                &snapshot.tree,
+                            ))
+                            .await
                         }
                         _ => Box::pin(crate::diff_sync::capture_diff(&self.repos, root)).await,
                     }
@@ -2102,11 +2114,11 @@ impl RpcService for EngineRpc {
                         .cwd
                         .as_deref()
                         .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
-                    let identity = self
-                        .repos
-                        .checkout_identity(std::path::Path::new(cwd))
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let identity = Box::pin(
+                        self.repos.checkout_identity(std::path::Path::new(cwd)),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                     if identity.id != p.checkout_id {
                         return Err(RpcError::Failed(
                             "chat checkout changed since the confirmation was opened".into(),
@@ -2125,12 +2137,14 @@ impl RpcService for EngineRpc {
                             if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
                                 true
                             } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
-                                self.repos
-                                    .checkout_identity(std::path::Path::new(candidate_cwd))
-                                    .await
-                                    .is_ok_and(|candidate_identity| {
-                                        candidate_identity.id == identity.id
-                                    })
+                                Box::pin(
+                                    self.repos
+                                        .checkout_identity(std::path::Path::new(candidate_cwd)),
+                                )
+                                .await
+                                .is_ok_and(|candidate_identity| {
+                                    candidate_identity.id == identity.id
+                                })
                             } else {
                                 false
                             };
@@ -2152,11 +2166,12 @@ impl RpcService for EngineRpc {
                         }
                     }
 
-                    let snapshot = self
-                        .diff_sync
-                        .discard_working_tree(&identity.id, &p.expected_checksum)
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let snapshot = Box::pin(
+                        self.diff_sync
+                            .discard_working_tree(&identity.id, &p.expected_checksum),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                     RpcReply::value(&serde_json::json!({
                         "ok": true,
                         "checksum": snapshot.checksum,
