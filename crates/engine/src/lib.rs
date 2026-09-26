@@ -298,7 +298,8 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
-        let agent_accounts = AgentAccounts::new(agent_accounts_config);
+        let agent_accounts =
+            AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),

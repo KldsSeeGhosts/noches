@@ -127,6 +127,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod process;
+pub mod redact;
 mod scratch;
 pub mod shell_env;
 #[cfg(windows)]

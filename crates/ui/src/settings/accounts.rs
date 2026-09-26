@@ -102,6 +102,39 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
 /// ("Mon") within a week, else month + day ("Sep 14") — a weekday is noise
 /// when the window is a Codex free-tier MONTHLY reset weeks out. The caller
 /// prefixes "resets ". Pure given `now`.
+///
+/// Whether a login URL may be opened. Remote logins relay their URL from
+/// another device (or from a CLI's output there), so only web sign-in pages
+/// and loopback callbacks pass - never `file://` or custom schemes. Pure.
+pub fn is_openable_login_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => true,
+        "http" => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let host = match authority.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(""),
+                None => authority.split(':').next().unwrap_or(""),
+            };
+            matches!(host, "localhost" | "127.0.0.1" | "::1")
+        }
+        _ => false,
+    }
+}
+
+fn open_login_url(url: &str, cx: &mut gpui::App) {
+    if is_openable_login_url(url) {
+        cx.open_url(url);
+    } else {
+        tracing::warn!("refused to open a non-web sign-in URL");
+    }
+}
+
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
     let at = resets_at?;
@@ -116,12 +149,162 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
+/// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`). Every
+/// agent Noches registers that keeps a login of its own is here; what each
+/// supports is documented engine-side (`agent_accounts` module docs).
+pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Antigravity, "Antigravity", "Antigravity"),
+    (HarnessId::Grok, "Grok", "grok login"),
+    (HarnessId::Devin, "Devin", "devin auth login"),
+    (HarnessId::Opencode, "OpenCode", "opencode auth login"),
+    (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Hermes, "Hermes", "hermes auth add"),
 ];
+
+/// Whether `harness` has an Accounts section (and sign-in flow). Pure.
+pub fn signs_in(harness: HarnessId) -> bool {
+    PROVIDERS
+        .iter()
+        .any(|(provider, _, _)| *provider == harness)
+}
+
+pub(crate) fn provider_name(harness: HarnessId) -> &'static str {
+    PROVIDERS
+        .iter()
+        .find(|(provider, _, _)| *provider == harness)
+        .map_or("this provider", |(_, name, _)| name)
+}
+
+/// Whether the provider reports plan usage. One that doesn't shows no meters
+/// and no "usage unavailable" note - there is nothing missing. Pure.
+pub fn reports_usage(harness: HarnessId) -> bool {
+    harness != HarnessId::Antigravity
+}
+
+/// Providers whose agent holds exactly ONE login (Antigravity): once it is
+/// connected there is nothing to add - signing in again only re-confirms it.
+pub fn keeps_one_login(harness: HarnessId) -> bool {
+    harness == HarnessId::Antigravity
+}
+
+/// Whether zeron switches this agent's logins. Hermes rotates through its
+/// own credential pool (listed, never reordered); Antigravity keeps one.
+pub fn switches_accounts(harness: HarnessId) -> bool {
+    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity)
+}
+
+/// A standing note under a provider's Accounts label, for an agent whose
+/// accounts work differently. Hermes owns its credential pool: zeron lists
+/// it and adds to it through Hermes' own CLI, but never switches or removes
+/// its entries. Pure.
+pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
+    match harness {
+        HarnessId::Hermes => Some(
+            "Hermes manages its own credential pool and rotates through it. Accounts added \
+             here go through `hermes auth add`; remove one with `hermes auth remove`.",
+        ),
+        _ => None,
+    }
+}
+
+/// One way to add an account: agents that keep a login PER model provider
+/// (OpenCode, Pi, Hermes) sign in to a named provider; the rest have one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginOption {
+    /// The engine's `provider` param (`None` = the agent's only login).
+    pub provider: Option<&'static str>,
+    /// Who the user signs in to.
+    pub label: &'static str,
+}
+
+/// The sign-ins zeron offers for `harness`, in button order. Pure.
+pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
+    let option = |provider, label| LoginOption {
+        provider: Some(provider),
+        label,
+    };
+    match harness {
+        HarnessId::Opencode => vec![
+            option("openai", "ChatGPT"),
+            option("github-copilot", "GitHub Copilot"),
+        ],
+        HarnessId::Pi => vec![option("openai-codex", "ChatGPT")],
+        HarnessId::Hermes => vec![
+            option("openai-codex", "ChatGPT"),
+            option("nous", "Nous Portal"),
+        ],
+        _ => vec![LoginOption {
+            provider: None,
+            label: provider_name(harness),
+        }],
+    }
+}
+
+/// The list's last row: connect the first account, or add another. Pure.
+pub fn add_account_label(harness: HarnessId, empty: bool) -> String {
+    if empty {
+        format!("Connect a {} account", provider_name(harness))
+    } else {
+        "Add account".to_string()
+    }
+}
+
+/// [`add_account_label`] for one [`LoginOption`]: a per-provider sign-in
+/// names its provider ("Connect ChatGPT", "Add GitHub Copilot account"). Pure.
+pub fn add_option_label(harness: HarnessId, option: LoginOption, empty: bool) -> String {
+    match option.provider {
+        None => add_account_label(harness, empty),
+        Some(_) if empty => format!("Connect {}", option.label),
+        Some(_) => format!("Add {} account", option.label),
+    }
+}
+
+/// What the sign-in dialog says while the browser finishes - one sentence
+/// per provider, same shape. Pure.
+fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
+    match (harness, provider) {
+        (HarnessId::ClaudeCode, _) => {
+            "Finish signing in to Claude in your browser. The new login is saved next to \
+             your current one - nothing changes until you switch."
+        }
+        (HarnessId::Codex, _) => {
+            "Finish signing in to ChatGPT in your browser. The new login is saved next to \
+             your current one - nothing changes until you switch."
+        }
+        (HarnessId::Cursor, _) => {
+            "Finish signing in to Cursor in your browser. This mints a zeron-named API key \
+             you can revoke any time from Cursor's dashboard."
+        }
+        (HarnessId::Antigravity, _) => {
+            "Finish signing in to Google in your browser. Antigravity keeps one login on \
+             this device; if it is already signed in, this just confirms it."
+        }
+        (HarnessId::Grok, _) => {
+            "Finish signing in to Grok in your browser - approve the code shown below. The \
+             new login is saved next to your current one - nothing changes until you switch."
+        }
+        (HarnessId::Devin, _) => {
+            "Finish signing in to Devin in your browser. The new login is saved next to your \
+             current one - nothing changes until you switch."
+        }
+        (HarnessId::Opencode, Some("github-copilot")) => {
+            "Finish signing in to GitHub in your browser - enter the code shown below. The \
+             new login is saved next to your current one - nothing changes until you switch."
+        }
+        (HarnessId::Opencode | HarnessId::Pi, _) => {
+            "Finish signing in to ChatGPT in your browser. The agent gets its own login, saved \
+             next to any current one - nothing changes until you switch."
+        }
+        (HarnessId::Hermes, _) => {
+            "Finish signing in in your browser - enter the code shown below. Hermes adds the \
+             login to its own credential pool and rotates through it itself."
+        }
+        _ => "Finish signing in in your browser.",
+    }
+}
 
 /// Accounts of one provider, in the engine's order (slot creation). No
 /// active-first re-sort: switching accounts must not move the switched-to
@@ -138,16 +321,110 @@ pub fn provider_accounts(
         .collect()
 }
 
+/// Compact usage-column geometry for the mini meters (label · bar · percent).
+const USAGE_LABEL_WIDTH: f32 = 52.0;
+const USAGE_BAR_WIDTH: f32 = 88.0;
+const USAGE_PERCENT_WIDTH: f32 = 34.0;
+
+/// One mini meter line of the usage column: label, a short bar, percent. The
+/// reset moment rides the row's tooltip instead of taking a column.
+pub(crate) fn render_usage_meter(
+    window: &zeron_proto::AgentUsageWindow,
+    theme: &Theme,
+) -> AnyElement {
+    let fraction = window.used_fraction.clamp(0.0, 1.0);
+    let level = usage_level(fraction);
+    let fill = usage_color(level, theme).opacity(match level {
+        UsageLevel::Normal => 0.8,
+        _ => 0.9,
+    });
+    div()
+        .h(px(16.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .text_size(crate::typography::ui_rems(11.5))
+        .child(
+            div()
+                .w(px(USAGE_LABEL_WIDTH))
+                .flex_none()
+                .truncate()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(window.label.clone())),
+        )
+        .child(
+            div()
+                .w(px(USAGE_BAR_WIDTH))
+                .flex_none()
+                .h(px(4.0))
+                .rounded_full()
+                .overflow_hidden()
+                .bg(theme.wash(0.08))
+                .when(fraction > 0.0, |el| {
+                    el.child(
+                        div()
+                            .h_full()
+                            // A 1.5% floor keeps tiny non-zero usage
+                            // visible (zeron `max(used, 1.5)%`).
+                            .w(gpui::relative(fraction.max(0.015)))
+                            .rounded_full()
+                            .bg(fill),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .w(px(USAGE_PERCENT_WIDTH))
+                .flex_none()
+                .text_right()
+                .text_color(match level {
+                    UsageLevel::Normal => theme.text_muted,
+                    _ => usage_color(level, theme),
+                })
+                .child(SharedString::from(format!(
+                    "{}%",
+                    (fraction * 100.0).round() as u32
+                ))),
+        )
+        .into_any_element()
+}
+
+/// The optimistic half of a switch: `account` becomes the live login of its
+/// group - its agent, or for agents that keep a login per model provider,
+/// that provider - and every other group keeps its own. Pure.
+pub fn mark_switched(snapshot: &mut AgentAccountsSnapshot, account: &AgentAccount) {
+    for row in snapshot.accounts.iter_mut() {
+        if row.harness == account.harness && row.provider == account.provider {
+            row.active = row.id == account.id;
+        }
+    }
+}
+
+/// The last accounts list per target device (`None` = this device), shared
+/// by every accounts view so a re-opened Settings paints instantly and
+/// revalidates in place instead of flashing a skeleton.
+#[derive(Default)]
+pub(crate) struct AccountsSnapshotCache(
+    pub(crate) std::collections::HashMap<Option<String>, AgentAccountsSnapshot>,
+);
+
+impl gpui::Global for AccountsSnapshotCache {}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
 
 enum LoginFlow {
     /// StartAgentLogin in flight.
-    Starting { harness: HarnessId },
+    Starting {
+        harness: HarnessId,
+        provider: Option<&'static str>,
+    },
     /// Claude-style: open the URL, paste the code back.
     PasteCode {
         harness: HarnessId,
+        provider: Option<&'static str>,
         start: AgentLoginStart,
         submitting: bool,
         error: Option<SharedString>,
@@ -155,6 +432,7 @@ enum LoginFlow {
     /// Codex-style: open the URL, poll until the browser flow lands.
     Browser {
         harness: HarnessId,
+        provider: Option<&'static str>,
         start: AgentLoginStart,
         message: Option<SharedString>,
         error: Option<SharedString>,
@@ -162,17 +440,34 @@ enum LoginFlow {
 }
 
 impl LoginFlow {
-    /// Dialog title (zeron: "Add Claude account" / "Add Codex account").
-    fn title(&self) -> &'static str {
-        let harness = match self {
-            LoginFlow::Starting { harness }
+    fn harness(&self) -> HarnessId {
+        match self {
+            LoginFlow::Starting { harness, .. }
             | LoginFlow::PasteCode { harness, .. }
             | LoginFlow::Browser { harness, .. } => *harness,
-        };
-        match harness {
-            HarnessId::Codex => "Add Codex account",
-            HarnessId::Cursor => "Connect Cursor",
-            _ => "Add Claude account",
+        }
+    }
+
+    fn provider(&self) -> Option<&'static str> {
+        match self {
+            LoginFlow::Starting { provider, .. }
+            | LoginFlow::PasteCode { provider, .. }
+            | LoginFlow::Browser { provider, .. } => *provider,
+        }
+    }
+
+    /// Dialog title - a per-provider sign-in names its provider ("Sign in to
+    /// ChatGPT for OpenCode"); a single-login agent names itself.
+    fn title(&self) -> String {
+        let option = login_options(self.harness())
+            .into_iter()
+            .find(|option| option.provider == self.provider());
+        match option {
+            Some(LoginOption {
+                provider: Some(_),
+                label,
+            }) => format!("Sign in to {label} for {}", provider_name(self.harness())),
+            _ => format!("Sign in to {}", provider_name(self.harness())),
         }
     }
 }
@@ -436,12 +731,24 @@ impl AccountsPage {
         trigger.into_any_element()
     }
 
+    /// Stale-while-revalidate: paint the last snapshot (this session's cache
+    /// shared with the composer footer ring), then re-list in place. The
+    /// skeleton only shows on a genuinely first load.
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
         };
-        self.snapshot = Loadable::Loading;
+        let key = self.target_device.clone();
+        if !matches!(self.snapshot, Loadable::Ready(_)) {
+            self.snapshot = match cx
+                .try_global::<AccountsSnapshotCache>()
+                .and_then(|cache| cache.0.get(&key))
+            {
+                Some(cached) => Loadable::Ready(cached.clone()),
+                None => Loadable::Loading,
+            };
+        }
         let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -451,7 +758,12 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
+                        Ok(snapshot) => {
+                            cx.default_global::<AccountsSnapshotCache>()
+                                .0
+                                .insert(key, snapshot.clone());
+                            Loadable::Ready(snapshot)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -473,6 +785,17 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        // Optimistic: a Switch flips the live marker within the account's own
+        // provider group at once; a Forget drops the row. The engine's reply
+        // re-lists and reconciles; a refusal reloads.
+        let previous = self.snapshot.ready().cloned();
+        if let Loadable::Ready(snapshot) = &mut self.snapshot {
+            if method == methods::ACTIVATE_AGENT_ACCOUNT {
+                mark_switched(snapshot, account);
+            } else {
+                snapshot.accounts.retain(|row| row.id != account.id);
+            }
+        }
         self.busy_account = Some(account.id.clone());
         self.error = None;
         // Tolerant param shape: both `id` and `accountId` plus the harness.
@@ -487,7 +810,12 @@ impl AccountsPage {
                 page.busy_account = None;
                 match result {
                     Ok(_) => page.load(force_usage_for(LoadTrigger::PostAction), cx),
-                    Err(err) => page.error = Some(format!("{err}").into()),
+                    Err(err) => {
+                        if let Some(previous) = previous {
+                            page.snapshot = Loadable::Ready(previous);
+                        }
+                        page.error = Some(format!("{err}").into());
+                    }
                 }
                 cx.notify();
             })
@@ -498,13 +826,24 @@ impl AccountsPage {
 
     // ---- add-account flows ----
 
-    fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+    /// Start a sign-in. `provider` is `Some` for agents that keep a login PER
+    /// model provider (OpenCode, Pi, Hermes); `None` for single-login agents.
+    fn start_login(
+        &mut self,
+        harness: HarnessId,
+        provider: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.login = Some(LoginFlow::Starting { harness });
+        self.login = Some(LoginFlow::Starting { harness, provider });
         self.error = None;
-        let params = self.params(serde_json::json!({ "harness": harness }));
+        let mut params = serde_json::json!({ "harness": harness });
+        if let (Some(provider), Some(object)) = (provider, params.as_object_mut()) {
+            object.insert("provider".into(), serde_json::json!(provider));
+        }
+        let params = self.params(params);
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -516,13 +855,14 @@ impl AccountsPage {
                         .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
-                        cx.open_url(&start.url);
+                        open_login_url(&start.url, cx);
                         match start.mode {
                             AgentLoginMode::PasteCode => {
                                 page.code_input
                                     .update(cx, |input, cx| input.set_text("", cx));
                                 page.login = Some(LoginFlow::PasteCode {
                                     harness,
+                                    provider,
                                     start,
                                     submitting: false,
                                     error: None,
@@ -531,6 +871,7 @@ impl AccountsPage {
                             AgentLoginMode::Browser => {
                                 page.login = Some(LoginFlow::Browser {
                                     harness,
+                                    provider,
                                     start,
                                     message: None,
                                     error: None,
@@ -807,10 +1148,12 @@ impl AccountsPage {
                 el.child(widgets::badge(theme, plan))
             });
 
-        // Actions only on INACTIVE accounts (zeron `{!account.active && …}`):
-        // an icon-only Forget (trash, hover → foreground) then Switch, which
-        // reads "Switching…" while the activate round-trips.
-        let actions: Option<gpui::Div> = (!account.active).then(|| {
+        // Actions only on INACTIVE accounts (zeron `{!account.active && …}`),
+        // and only on accounts zeron may touch at all: an icon-only Forget
+        // (trash, hover → foreground) then Switch, which reads "Switching…"
+        // while the activate round-trips. A read-only agent (Hermes' pool) and
+        // an unreadable live login are `switchable` == false - neither shown.
+        let actions: Option<gpui::Div> = (!account.active && account.switchable).then(|| {
             div()
                 .flex()
                 .flex_row()
@@ -1039,23 +1382,13 @@ impl AccountsPage {
             }
             LoginFlow::Browser {
                 harness,
+                provider,
                 start,
                 message,
                 error,
             } => {
                 let has_error = error.is_some();
-                let body = match harness {
-                    HarnessId::Cursor => {
-                        "Finish signing in to Cursor in your browser. This mints a \
-                         zeron-named API key you can revoke any time from Cursor's \
-                         dashboard — it is separate from `cursor-agent login`."
-                    }
-                    _ => {
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch."
-                    }
-                };
+                let body = login_copy(*harness, *provider);
                 div()
                     .flex()
                     .flex_col()
@@ -1115,7 +1448,7 @@ impl AccountsPage {
             }
         };
         let card = popover::dialog_card(&theme)
-            .child(popover::dialog_title(&theme, title))
+            .child(popover::dialog_title(&theme, &title))
             .child(body)
             .into_any_element();
         Some(popover::modal("add-account-dialog", viewport, card))
@@ -1367,6 +1700,13 @@ impl Render for AccountsPage {
                                  with \u{201C}{cli}\u{201D} or add an account."
                             ),
                         };
+                        // Agents that keep a login PER provider (OpenCode, Pi,
+                        // Hermes) offer one sign-in per provider; the rest have a
+                        // single "Add account". A single-login agent already
+                        // connected hides the button (it would only re-confirm).
+                        let empty = accounts.is_empty();
+                        let options = login_options(harness);
+                        let show_add = !(keeps_one_login(harness) && !empty);
                         let card = if rows.is_empty() {
                             card.child(
                                 div()
@@ -1399,21 +1739,42 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Add account")),
-                                    ),
+                                    .children(if show_add {
+                                        options
+                                            .into_iter()
+                                            .map(|option| -> AnyElement {
+                                                let add_label =
+                                                    add_option_label(harness, option, empty);
+                                                let provider = option.provider;
+                                                widgets::ghost_action(&theme)
+                                                    .id(add_id.clone())
+                                                    .hover(|s| widgets::ghost_hover(&theme, s))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.start_login(harness, provider, cx);
+                                                    }))
+                                                    .child(
+                                                        crate::icons::icon(
+                                                            crate::icons::ADD_CIRCLE,
+                                                        )
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                    )
+                                                    .child(SharedString::from(add_label))
+                                                    .into_any_element()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        Vec::new()
+                                    }),
                             )
+                            .children(provider_note(harness).into_iter().map(|note| {
+                                div()
+                                    .mt(px(6.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(note))
+                                    .into_any_element()
+                            }))
                             .children(
                                 warnings
                                     .into_iter()
@@ -1475,9 +1836,9 @@ impl Render for AccountsPage {
                             )
                             .child(widgets::page_subtitle(
                                 &theme,
-                                "The Claude Code, Codex, and Cursor logins on this device. Zeron \
-                                 detects the live session, keeps each account backed up, and can \
-                                 swap between them.",
+                                "The agent logins on this device. Noches detects the live \
+                                 session, keeps each account backed up, and can swap between \
+                                 them.",
                             ))
                             .when_some(self.error.clone(), |el, message| {
                                 el.child(
@@ -1595,11 +1956,14 @@ mod tests {
             plan_label: None,
             active,
             usage_windows: vec![],
+            usage_fetched_at: None,
+            usage_error: None,
             display_name: None,
             organization: None,
             auth_kind: None,
             switchable: true,
             saved_at: None,
+            provider: None,
         };
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
