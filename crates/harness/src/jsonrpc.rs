@@ -12,7 +12,7 @@
 //!   the TS harness's swallowed-EPIPE behavior.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -47,6 +47,7 @@ pub(crate) struct RpcClient {
     next_id: Arc<AtomicI64>,
     pending: Pending,
     writer: mpsc::UnboundedSender<String>,
+    closed: Arc<AtomicBool>,
 }
 
 impl RpcClient {
@@ -57,22 +58,43 @@ impl RpcClient {
         tokio::spawn(write_loop(stdin, writer_rx));
         let pending: Pending = Arc::default();
         let (incoming_tx, incoming_rx) = mpsc::channel(256);
-        tokio::spawn(read_loop(stdout, Arc::clone(&pending), incoming_tx));
+        let closed = Arc::new(AtomicBool::new(false));
+        tokio::spawn(read_loop(
+            stdout,
+            Arc::clone(&pending),
+            incoming_tx,
+            closed.clone(),
+        ));
         (
             Self {
                 next_id: Arc::new(AtomicI64::new(0)),
                 pending,
                 writer: writer_tx,
+                closed,
             },
             incoming_rx,
         )
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Send a request and await its response (resolved by the reader task).
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending lock").insert(id, tx);
+        {
+            let mut pending = self.pending.lock().expect("pending lock");
+            // Check under the same lock as EOF cleanup: a request racing the
+            // reader exit must either be rejected here or cleared by it.
+            if self.is_closed() {
+                return Err(HarnessError::Protocol(format!(
+                    "{method}: app-server exited before responding"
+                )));
+            }
+            pending.insert(id, tx);
+        }
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
@@ -171,7 +193,12 @@ fn response_error(error: &Value) -> String {
 /// Parse stdout lines: responses resolve the pending map, everything else is
 /// forwarded in order. Non-JSON noise is skipped; on EOF all pending requests
 /// fail (their senders drop) and one final [`Incoming::Eof`] is delivered.
-async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incoming>) {
+async fn read_loop(
+    stdout: ChildStdout,
+    pending: Pending,
+    tx: mpsc::Sender<Incoming>,
+    closed: Arc<AtomicBool>,
+) {
     let mut lines = BufReader::new(stdout).lines();
     // A read error ends the loop like EOF: either way the child's stdout is
     // unusable, pending requests must fail, and the session loop must know.
@@ -239,6 +266,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
         }
     }
     // EOF/read error: fail every awaiting request, then signal the loop.
+    closed.store(true, Ordering::Release);
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
 }
@@ -246,6 +274,26 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requests_after_eof_fail_without_entering_pending_map() {
+        let (writer, mut receiver) = mpsc::unbounded_channel();
+        let client = RpcClient {
+            next_id: Arc::new(AtomicI64::new(0)),
+            pending: Arc::default(),
+            writer,
+            closed: Arc::new(AtomicBool::new(true)),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            client.request("session/prompt", json!({})),
+        )
+        .await
+        .expect("a request after EOF cannot wait for another EOF");
+        assert!(result.unwrap_err().to_string().contains("exited"));
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn rpc_error_preserves_string_and_structured_details() {

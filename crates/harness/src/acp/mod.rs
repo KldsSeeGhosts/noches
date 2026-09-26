@@ -53,7 +53,10 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::process::{Child, Command, Stdio};
+use crate::process::{Command, Stdio};
+use crate::scratch::ScratchDir;
+use child::Child;
+mod child;
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
@@ -61,6 +64,16 @@ use subagent_devin::DevinTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pi's discovery budget: `pi-acp` cold-starts the agent (plus extensions)
+/// before the session probe can answer.
+const PI_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The widest initialize → session/new discovery budget across the ACP
+/// agents (Pi's 60s cold start). Callers bounding a `models()` round trip -
+/// the model picker's ListModels deadline, the engine's forward deadline -
+/// derive from this plus their own transport margin, so a widened harness
+/// budget can never be abandoned mid-probe by an outer timeout.
+pub const MAX_MODEL_DISCOVERY_TIMEOUT: Duration = PI_MODEL_DISCOVERY_TIMEOUT;
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -859,6 +872,10 @@ pub struct AcpHarness {
     /// opens must see account changes and newly available models.
     models_cache: tokio::sync::Mutex<Option<(Instant, Vec<Model>)>>,
     devin_models: devin_models::Catalog,
+    /// Test seam: a pre-existing context-usage file path, bypassing the
+    /// real-Pi launch-dir provisioning in `prepare_pi_cua`.
+    #[doc(hidden)]
+    pub pi_usage_file_override: Option<PathBuf>,
 }
 
 impl AcpHarness {
@@ -877,6 +894,7 @@ impl AcpHarness {
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::Mutex::new(None),
             devin_models: devin_models::Catalog::default(),
+            pi_usage_file_override: None,
         }
     }
 
@@ -898,7 +916,7 @@ impl AcpHarness {
     /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
     /// pi's RPC mode.
     pub fn pi() -> Self {
-        Self::with_spec(pi_spec())
+        Self::with_spec(pi_spec()).with_model_discovery_timeout(PI_MODEL_DISCOVERY_TIMEOUT)
     }
 
     /// google antigravity over its acp server (`agy_acp_server`).
@@ -910,11 +928,12 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (mut child, _stderr) = self.spawn_agent(home.as_deref(), false, &[], &[]).await?;
+        let (_scratch, mut child, _stderr) =
+            self.spawn_agent(home.as_deref(), false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
-                shutdown_child(&mut child, self.kill_grace).await;
+                child.shutdown(self.kill_grace).await;
                 return Err(HarnessError::Protocol("agent child has no stdio".into()));
             }
         };
@@ -925,7 +944,7 @@ impl AcpHarness {
             request_draining(&client, &mut incoming, "logout", json!({})).await
         };
         let result = tokio::time::timeout(SIGN_OUT_TIMEOUT, flow).await;
-        shutdown_child(&mut child, self.kill_grace).await;
+        child.shutdown(self.kill_grace).await;
         match result {
             Ok(outcome) => outcome.map(|_| ()),
             Err(_) => Err(HarnessError::Protocol(format!(
@@ -978,6 +997,10 @@ impl AcpHarness {
         }
         if let Some(browser) = browser {
             cmd.env("BROWSER", browser);
+        }
+        let scratch = self.adapter_scratch()?;
+        if let Some(dir) = &scratch {
+            dir.apply(&mut cmd);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1364,17 +1387,24 @@ impl AcpHarness {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
+    fn adapter_scratch(&self) -> Result<Option<ScratchDir>, HarnessError> {
+        Ok(matches!(self.resolve_launch()?, Launch::Archive { .. })
+            .then(|| ScratchDir::new(self.spec.executable))
+            .transpose()?)
+    }
+
     async fn spawn_agent(
         &self,
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
         extra_env: &[(&str, String)],
-    ) -> Result<(Child, crate::StderrTail), HarnessError> {
+    ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
+        child::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -1396,17 +1426,22 @@ impl AcpHarness {
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
+        let scratch = self.adapter_scratch()?;
+        if let Some(dir) = &scratch {
+            dir.apply(&mut cmd);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
             } else {
                 HarnessError::Io(e)
             }
         })?;
+        let mut child = Child::new(child);
         let stderr_tail = crate::StderrTail::default();
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
@@ -1416,9 +1451,10 @@ impl AcpHarness {
                     tracing::debug!(target: "zeron_harness::acp", "stderr: {line}");
                     tail.push(&line);
                 }
+                tail.close();
             });
         }
-        Ok((child, stderr_tail))
+        Ok((scratch, child, stderr_tail))
     }
 
     /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
@@ -1427,11 +1463,11 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], &[]).await?;
+        let (_scratch, mut child, _stderr) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
-                shutdown_child(&mut child, self.kill_grace).await;
+                child.shutdown(self.kill_grace).await;
                 return Err(HarnessError::Protocol("agent child has no stdio".into()));
             }
         };
@@ -1478,7 +1514,7 @@ impl AcpHarness {
             Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
-        shutdown_child(&mut child, self.kill_grace).await;
+        child.shutdown(self.kill_grace).await;
         match result {
             Ok(inner) => inner,
             Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
@@ -1491,11 +1527,11 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
+        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
-                shutdown_child(&mut child, self.kill_grace).await;
+                child.shutdown(self.kill_grace).await;
                 return Err(HarnessError::Protocol("agent child has no stdio".into()));
             }
         };
@@ -1525,7 +1561,7 @@ impl AcpHarness {
             Ok::<Vec<Model>, HarnessError>(models)
         };
         let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
-        shutdown_child(&mut child, self.kill_grace).await;
+        child.shutdown(self.kill_grace).await;
         match result {
             Ok(inner) => inner,
             Err(_) => {
@@ -1903,9 +1939,9 @@ impl Harness for AcpHarness {
             if self.spec.id == HarnessId::Pi && self.executable.is_none() {
                 Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
             } else {
-                (Vec::new(), None, None)
+                (Vec::new(), None, self.pi_usage_file_override.clone())
             };
-        let (mut child, stderr_tail) = self
+        let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
             .await?;
         let stdin = child
@@ -1920,6 +1956,7 @@ impl Harness for AcpHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
+            scratch,
             client,
             incoming,
             event_tx,
@@ -1964,6 +2001,7 @@ type PiLaunch = (
 
 struct Session {
     child: Child,
+    scratch: Option<ScratchDir>,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -2431,6 +2469,10 @@ fn stop_outcome(
     match res {
         Ok(resp) => match resp.get("stopReason").and_then(Value::as_str) {
             Some("cancelled") => (DoneStatus::Interrupted, None),
+            Some("error") => (
+                DoneStatus::Errored,
+                Some("The agent failed to complete the turn.".to_owned()),
+            ),
             Some("refusal") => (
                 DoneStatus::Errored,
                 Some("The agent refused to continue.".to_owned()),
@@ -2885,6 +2927,8 @@ fn steering_call_future(
 /// turn, the steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        // Locals drop in reverse binding order: reap the child before cleanup.
+        scratch: _scratch,
         mut child,
         client,
         mut incoming,
@@ -2938,6 +2982,9 @@ async fn run_session(session: Session) {
                         target: "zeron_harness::acp",
                         "session/load failed (starting fresh): {e}"
                     );
+                    let _ = send(&event_tx, AgentEvent::Error {
+                        message: format!("{agent_name} could not restore session {resume}; starting a new session without the previous context: {e}"),
+                    }).await;
                     let new = new_session(
                         &client,
                         &mut incoming,
@@ -3123,7 +3170,7 @@ async fn run_session(session: Session) {
                             session_id: None,
                         }))
                         .await;
-                    shutdown_child(&mut child, kill_grace).await;
+                    child.shutdown(kill_grace).await;
                     return;
                 }
             }
@@ -3137,7 +3184,7 @@ async fn run_session(session: Session) {
                     session_id: None,
                 }))
                 .await;
-            shutdown_child(&mut child, kill_grace).await;
+            child.shutdown(kill_grace).await;
             return;
         }
     };
@@ -3156,7 +3203,7 @@ async fn run_session(session: Session) {
     )
     .await
     {
-        shutdown_child(&mut child, kill_grace).await;
+        child.shutdown(kill_grace).await;
         return;
     }
     if !init_commands.is_empty()
@@ -3168,7 +3215,7 @@ async fn run_session(session: Session) {
         )
         .await
     {
-        shutdown_child(&mut child, kill_grace).await;
+        child.shutdown(kill_grace).await;
         return;
     }
 
@@ -3236,7 +3283,9 @@ async fn run_session(session: Session) {
     let mut interrupt_sent = false;
     let mut done_current = false;
     let mut done_after_interrupt = false;
-    let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    let mut escalation_target = None;
+    let mut escalation_deadline = None;
+    let mut escalation_signal = Signal::Term;
     // Starved-turn recovery (2026-08-12 stuck-Working incident): a
     // `session/prompt` sent while the agent runs a SELF-CONTINUED turn (a
     // background-task re-invocation no prompt started) starves —
@@ -3270,10 +3319,26 @@ async fn run_session(session: Session) {
     const CANCEL_FLUSH: Duration = Duration::from_secs(2);
     let mut cancel_flush_deadline: Option<tokio::time::Instant> = None;
 
+    let mut child_exit = None;
+    let mut exit_drain_deadline = None;
     'main: loop {
         tokio::select! {
+            status = child.wait(), if child_exit.is_none() => {
+                escalation_deadline = None;
+                child_exit = Some(status.ok());
+                child.request_group_shutdown();
+                // Descendants can hold stdout open after an adapter crash.
+                // Drain already-written frames, but never wait on them forever.
+                exit_drain_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(200));
+            },
+            _ = tokio::time::sleep_until(exit_drain_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if exit_drain_deadline.is_some() => break 'main,
+
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
+                if res.is_err() && client.is_closed() {
+                    break 'main;
+                }
                 starve_deadline = None;
                 prompt_stall_deadline = None;
                 if let Some(id) = current_prompt_id.take() {
@@ -3394,6 +3459,16 @@ async fn run_session(session: Session) {
                     break 'main;
                 }
                 let (status, error) = stop_outcome(&res, interrupted);
+                // The context ring is torn down at Done, so the extension's
+                // final snapshot must land first; a cancelled turn skips it
+                // (the write races teardown and is not meaningful).
+                if !interrupted
+                    && let Some(path) = pi_usage_file.as_deref()
+                    && let Some(ev) = pi_usage::read_event(path)
+                    && !send(&event_tx, ev).await
+                {
+                    break 'main;
+                }
                 done_current = true;
                 if interrupted {
                     done_after_interrupt = true;
@@ -3573,6 +3648,12 @@ async fn run_session(session: Session) {
                         .await;
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
+                        }
+                        if !interrupted
+                            && let Some(path) = pi_usage_file.as_deref()
+                            && let Some(ev) = pi_usage::read_event(path)
+                        {
+                            let _ = send(&event_tx, ev).await;
                         }
                         let (status, error) = stop_outcome(&res, interrupted);
                         done_current = true;
@@ -3960,12 +4041,8 @@ async fn run_session(session: Session) {
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
                     if let Some(pid) = crate::process::signal_target(&child) {
-                        escalation = Some(tokio::spawn(async move {
-                            tokio::time::sleep(interrupt_grace).await;
-                            send_signal(&pid, Signal::Term);
-                            tokio::time::sleep(kill_grace).await;
-                            send_signal(&pid, Signal::Kill);
-                        }));
+                        escalation_target = Some(pid);
+                        escalation_deadline = Some(tokio::time::Instant::now() + interrupt_grace);
                     }
                 } else {
                     // Idle between turns: nothing to cancel — the terminal
@@ -4011,6 +4088,25 @@ async fn run_session(session: Session) {
                 break 'main;
             },
 
+            // Keep escalation in the owner task: it cannot outlive child.wait()
+            // or signal a pid after the child has been reaped.
+            _ = tokio::time::sleep_until(escalation_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if escalation_deadline.is_some() => {
+                // Once signal escalation starts, a late prompt response no longer
+                // owns this turn (including any usage attached to that response).
+                turn = None;
+                if let Some(target) = &escalation_target {
+                    send_signal(target, escalation_signal);
+                }
+                escalation_deadline = match escalation_signal {
+                    Signal::Term => {
+                        escalation_signal = Signal::Kill;
+                        Some(tokio::time::Instant::now() + kill_grace)
+                    }
+                    Signal::Kill => None,
+                };
+            },
+
             _ = event_tx.closed() => break 'main,
         }
     }
@@ -4028,6 +4124,23 @@ async fn run_session(session: Session) {
         }
     }
 
+    // The extension's last write can race the poll's final tick; a direct
+    // read lands the settled number. The turn-settle path already emitted
+    // it before its Done; this covers exits that reach bookkeeping without
+    // one (a crash mid-turn). Skip on cancellation - the ring is torn down
+    // with the turn and a post-Done snapshot is dead weight.
+    if !interrupted
+        && !done_current
+        && let Some(watcher) = &usage_watcher
+    {
+        watcher.abort();
+        if let Some(path) = pi_usage_file.as_deref()
+            && let Some(ev) = pi_usage::read_event(path)
+        {
+            let _ = send(&event_tx, ev).await;
+        }
+    }
+
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
@@ -4042,7 +4155,15 @@ async fn run_session(session: Session) {
                 .await;
         } else if !interrupted && !done_current {
             // A child killed mid-turn must not read as a silent success.
-            let status = child.try_wait().ok().flatten();
+            let status = match child_exit {
+                Some(status) => status,
+                None => tokio::time::timeout(Duration::from_millis(200), child.wait())
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+            };
+            child.request_group_shutdown();
+            stderr_tail.wait_closed().await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -4054,23 +4175,13 @@ async fn run_session(session: Session) {
         }
     }
 
-    // Escalation dies BEFORE the child is reaped: after `shutdown_child`
-    // waits the pid, a still-armed SIGTERM/SIGKILL timer would fire at a
-    // freed (reusable) pid.
-    if let Some(handle) = escalation {
-        handle.abort();
-    }
+    // Escalation now lives in the owner task's select, so it cannot outlive
+    // the reaped child; there is no detached handle left to abort. (May
+    // already be aborted above; aborting twice is a no-op.)
     if let Some(watcher) = usage_watcher {
         watcher.abort();
     }
-    // The extension's last write can race the poll's final tick; a direct
-    // read lands the settled number before the stream ends.
-    if let Some(path) = pi_usage_file.as_deref()
-        && let Some(ev) = pi_usage::read_event(path)
-    {
-        let _ = send(&event_tx, ev).await;
-    }
-    shutdown_child(&mut child, kill_grace).await;
+    child.shutdown(kill_grace).await;
 }
 
 #[cfg(test)]
@@ -4176,6 +4287,14 @@ mod tests {
             script,
             "#!/bin/sh\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' -e '/tmp/noches-private/noches-context-usage.ts' \"$@\"\n"
         );
+    }
+
+    #[test]
+    fn pi_discovery_allows_cold_extension_startup() {
+        let pi = AcpHarness::pi();
+        assert_eq!(pi.model_discovery_timeout, Duration::from_secs(60));
+        assert_eq!(pi.handshake_timeout, Duration::from_secs(120));
+        assert!(pi.spec.prompt_stall.is_none());
     }
 
     fn all_antigravity_auth_methods() -> Value {
@@ -5107,4 +5226,13 @@ mod tests {
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn explicit_program_launches_do_not_get_archive_scratch_roots() {
+    let harness = AcpHarness::antigravity().with_executable(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh"),
+    );
+    assert!(harness.adapter_scratch().unwrap().is_none());
 }

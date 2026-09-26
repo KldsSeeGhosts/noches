@@ -127,6 +127,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod process;
+mod scratch;
 pub mod shell_env;
 #[cfg(windows)]
 pub mod windows_process;
@@ -176,9 +177,21 @@ fn compose_path<'a>(
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
 /// the proper background-crash message old zeron showed (user requirement).
 #[derive(Clone, Default)]
-pub(crate) struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+pub(crate) struct StderrTail(
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
 
 impl StderrTail {
+    pub(crate) fn close(&self) {
+        self.1.notify_one();
+    }
+
+    pub(crate) async fn wait_closed(&self) {
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(200), self.1.notified()).await;
+    }
+
     const KEEP_LINES: usize = 6;
     const KEEP_BYTES: usize = 700;
 
@@ -207,7 +220,11 @@ impl StderrTail {
             return None;
         }
         let mut joined = tail.iter().cloned().collect::<Vec<_>>().join("\n");
-        joined.truncate(Self::KEEP_BYTES * 2);
+        let mut start = joined.len().saturating_sub(Self::KEEP_BYTES * 2);
+        while !joined.is_char_boundary(start) {
+            start += 1;
+        }
+        joined.drain(..start);
         Some(joined)
     }
 }
@@ -326,14 +343,24 @@ pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::
     }
     #[cfg(not(windows))]
     {
+        let target = process::signal_target(child);
         if matches!(child.try_wait(), Ok(Some(_))) {
+            if let Some(group) = target.filter(|pid| *pid < 0) {
+                send_signal(&group, Signal::Kill);
+            }
             return;
         }
-        if let Some(pid) = child.id() {
+        if let Some(pid) = target {
             send_signal(&pid, Signal::Term);
             if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+                if pid < 0 {
+                    send_signal(&pid, Signal::Kill);
+                }
                 return;
             }
+        }
+        if let Some(pid) = target {
+            send_signal(&pid, Signal::Kill);
         }
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -347,14 +374,15 @@ pub(crate) enum Signal {
 }
 
 #[cfg(unix)]
-pub(crate) fn send_signal(pid: &u32, signal: Signal) {
+pub(crate) fn send_signal(pid: &i32, signal: Signal) {
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
+    // SAFETY: kill(2) targets an owned child or its private process group.
+    // Negative targets include descendants after the group leader exits.
     unsafe {
-        libc::kill(*pid as libc::pid_t, sig);
+        libc::kill(*pid, sig);
     }
 }
 
@@ -374,4 +402,18 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    #[test]
+    fn stderr_tail_truncates_at_utf8_boundaries() {
+        let tail = super::StderrTail::default();
+        tail.push(&"界".repeat(700));
+        tail.push(&"界".repeat(700));
+        tail.push("last stderr line");
+        let snapshot = tail.snapshot().unwrap();
+        assert!(snapshot.len() <= 1400);
+        assert!(snapshot.ends_with("last stderr line"));
+    }
 }

@@ -1336,3 +1336,304 @@ async fn registers_browser_mcp_in_session_new() {
         "{events:?}"
     );
 }
+
+fn pi_fixture() -> AcpHarness {
+    AcpHarness::pi()
+        .with_executable(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi-acp.sh"),
+        )
+        .with_graces(Duration::from_millis(100), Duration::from_millis(150))
+}
+
+#[tokio::test]
+async fn pi_crash_reports_status_and_stderr_once() {
+    for (prompt, status, tail) in [
+        ("crash", "exit code 23", "last stderr context"),
+        ("signal-crash", "signal 9", "signal context"),
+        (
+            "inherited-pipe-crash",
+            "exit code 25",
+            "inherited pipe context",
+        ),
+    ] {
+        let (controls, _steer, _) = controls();
+        let events = run_to_end(&pi_fixture(), request(prompt), controls).await;
+        let done = dones(&events);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, DoneStatus::Errored);
+        let error = done[0].1.as_deref().unwrap();
+        assert!(error.contains(status) && error.contains(tail), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn pi_idle_crash_then_load_preserves_session() {
+    let (ctl, _steer, _) = controls();
+    let events = run_to_end(&pi_fixture(), request("idle-crash"), ctl).await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    let session = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Done { session_id, .. } => session_id.clone(),
+            _ => None,
+        })
+        .unwrap();
+    let (ctl, steer, _) = controls();
+    drop(steer);
+    let mut req = request("resumed");
+    req.resume = Some(session);
+    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "reply:resumed".into()
+    }));
+}
+
+#[tokio::test]
+async fn pi_failed_load_announces_lost_context() {
+    let (ctl, steer, _) = controls();
+    drop(steer);
+    let mut req = request("fresh");
+    req.resume = Some("missing".into());
+    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { message } if message.contains("without the previous context"))));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn pi_frames_and_model_effort_round_trip() {
+    let (ctl, steer, _) = controls();
+    drop(steer);
+    let mut req = request("frames");
+    req.model = Some("mock/model".into());
+    req.reasoning = Some(ReasoningLevel::Max);
+    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.len() == 1024 * 1024 + 17))
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert_eq!(pi_fixture().models().await.unwrap()[0].id, "mock/model");
+}
+
+#[tokio::test]
+async fn pi_error_stop_reason_is_failed() {
+    let (ctl, steer, _) = controls();
+    drop(steer);
+    let events = run_to_end(&pi_fixture(), request("error"), ctl).await;
+    assert_eq!(dones(&events)[0].0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn pi_interrupt_error_and_duplicate_terminal_settle_once() {
+    let (ctl, _steer, token) = controls();
+    let mut stream = pi_fixture()
+        .run(request("interrupt-error"), ctl)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if matches!(&event, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
+}
+
+#[tokio::test]
+async fn pi_interrupt_kills_tool_process_group() {
+    let (ctl, _steer, token) = controls();
+    let mut stream = pi_fixture().run(request("tree"), ctl).await.unwrap();
+    let mut tree_pids = Vec::new();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if let AgentEvent::TextDelta { text } = &event
+                && let Some(pid) = text.strip_prefix("tree:")
+            {
+                tree_pids.push(pid.parse::<i32>().unwrap());
+                token.cancel();
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
+    assert_eq!(tree_pids.len(), 2);
+    for pid in tree_pids {
+        // A zombie awaiting the host reaper is dead; no tool may remain running.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        assert!(
+            stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z"),
+            "{stat}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pi_rejected_model_config_keeps_default_and_runs_prompt() {
+    let (ctl, steer, _) = controls();
+    drop(steer);
+    let mut req = request("config-rejected");
+    req.model = Some("mock/reject".into());
+    let events = run_to_end(&pi_fixture(), req, ctl).await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn pi_dropping_stream_terminates_tool_tree() {
+    let (ctl, _steer, _) = controls();
+    let mut stream = pi_fixture().run(request("tree"), ctl).await.unwrap();
+    let mut pids = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pids.len() < 2 {
+            if let AgentEvent::TextDelta { text } = stream.next().await.unwrap().unwrap()
+                && let Some(pid) = text.strip_prefix("tree:")
+            {
+                pids.push(pid.parse::<i32>().unwrap());
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pids.iter().all(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("consumer shutdown must terminate the tool tree");
+}
+
+#[tokio::test]
+async fn cancel_watchdog_ignores_late_settlement_for_all_acp_specs() {
+    for adapter in [
+        AcpHarness::grok(),
+        AcpHarness::pi(),
+        AcpHarness::antigravity(),
+    ] {
+        let adapter = adapter
+            .with_executable(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-robust-acp.py"),
+            )
+            .with_graces(Duration::from_millis(50), Duration::from_millis(50));
+        for scenario in ["wedge", "late-settle"] {
+            let (ctl, _steer, token) = controls();
+            let mut req = request(scenario);
+            req.model = None;
+            req.cwd = std::env::temp_dir().display().to_string();
+            let mut stream = adapter.run(req, ctl).await.unwrap();
+            let mut events = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    let event = event.unwrap();
+                    if matches!(&event, AgentEvent::TextDelta { text } if text == "ready") {
+                        token.cancel();
+                    }
+                    assert!(
+                        !matches!(event, AgentEvent::Usage { .. }),
+                        "late usage in {scenario}"
+                    );
+                    events.push(event);
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                dones(&events),
+                vec![(DoneStatus::Interrupted, None)],
+                "{scenario}"
+            );
+        }
+    }
+}
+
+/// The Pi context-usage snapshot must land BEFORE the terminal Done on a
+/// normal turn, and must not be emitted at all after a cancellation (the
+/// ring is torn down with the turn).
+#[tokio::test]
+async fn pi_usage_snapshot_precedes_done_and_is_dropped_on_cancel() {
+    use zeron_proto::ContextUsage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let usage_file = dir.path().join("context-usage.json");
+    std::fs::write(&usage_file, r#"{"tokens": 1234, "contextWindow": 200000}"#).unwrap();
+
+    // Normal completion: snapshot arrives before Done.
+    let mut harness = pi_fixture();
+    harness.pi_usage_file_override = Some(usage_file.clone());
+    let (ctl, steer, _token) = controls();
+    drop(steer);
+    let events = run_to_end(&harness, request("fresh"), ctl).await;
+    let snapshot_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ContextUsageSnapshot { .. }));
+    let done_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }));
+    assert!(
+        snapshot_idx.is_some(),
+        "expected a ContextUsageSnapshot before Done: {events:?}"
+    );
+    assert!(
+        snapshot_idx < done_idx,
+        "snapshot must precede the terminal Done: {events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)],);
+
+    // Cancellation: no snapshot after the interrupted Done.
+    std::fs::write(&usage_file, r#"{"tokens": 9999, "contextWindow": 200000}"#).unwrap();
+    let mut harness = pi_fixture();
+    harness.pi_usage_file_override = Some(usage_file);
+    let (ctl, _steer, token) = controls();
+    let mut stream = harness.run(request("interrupt-error"), ctl).await.unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if matches!(&event, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
+    let done_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(
+        !events[done_idx..].iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextUsageSnapshot {
+                usage: ContextUsage {
+                    tokens: Some(9999),
+                    ..
+                }
+            }
+        )),
+        "cancel must not emit the post-Done snapshot: {events:?}"
+    );
+}
