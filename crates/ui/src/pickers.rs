@@ -32,9 +32,13 @@ use zeron_rpc::methods;
 const MAX_REF_ROWS: usize = 300;
 /// Catalog calls resolve to Ready or Error, never an eternal Loading: past
 /// these bounds the chip shows "Models unavailable" and the picker's Retry.
-/// Models get longer because a plugin-heavy OpenCode cold start is slow.
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
-const MODELS_TIMEOUT: Duration = Duration::from_secs(45);
+/// The model list must outlast the harnesses' widest discovery budget
+/// (Pi's 60s cold start) plus relay/transport overhead; a shorter deadline
+/// abandons an in-flight probe and reports "Models unavailable" while the
+/// harness is still legitimately working.
+const MODELS_TIMEOUT: Duration =
+    zeron_harness::acp::MAX_MODEL_DISCOVERY_TIMEOUT.saturating_add(Duration::from_secs(15));
 
 /// A triangle from the last point in the active trigger to the near edge
 /// of its submenu. Mirroring the edge handles menus placed on either side.
