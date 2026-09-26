@@ -1313,13 +1313,16 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
-    let client = reqwest::Client::new();
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };
         let Some(edge) = inner.config.edge.clone() else {
             return;
         };
+        // The edge URL can point at a local or tailnet edge; a machine-wide
+        // proxy must never carry its bearer token, so direct destinations
+        // (loopback/private/tailnet) bypass it.
+        let client = crate::http_error::client_for(&edge.url);
         let self_id = inner.config.device_id.clone();
         let now = now_ms();
         let stale: Vec<String> = {
@@ -1453,16 +1456,51 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
 /// fresh token+device the provider already mints per attempt. No second
 /// auth path to maintain, and the `?beat=1` keeps presence alive for a
 /// device that can only reach the edge over HTTPS.
+/// HTTPS client cache shared by a transport's fetch/push futures: built once
+/// per resolved origin so connection pooling and TLS sessions survive across
+/// pull/push (which hit different leaf paths on the same edge), and rebuilt
+/// when the provider's URL changes origin - including a direct-destination
+/// flip, so a loopback or tailnet edge still bypasses the machine proxy.
+struct ClientCache {
+    cached: Mutex<Option<(String, reqwest::Client)>>,
+    /// Test hook applied to every built client (e.g. a failing DNS resolver);
+    /// production requests ride the same cache the hook customizes.
+    customize_builder:
+        Option<Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>>,
+}
+
+impl ClientCache {
+    fn client_for(&self, url: &reqwest::Url) -> reqwest::Client {
+        let origin = url.origin().ascii_serialization();
+        let mut cached = lock(&self.cached);
+        if let Some((key, client)) = cached.as_ref()
+            && *key == origin
+        {
+            return client.clone();
+        }
+        let builder = match &self.customize_builder {
+            Some(f) => f(crate::http_error::client_builder_for(url.as_str())),
+            None => crate::http_error::client_builder_for(url.as_str()),
+        };
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+        *cached = Some((origin, client.clone()));
+        client
+    }
+}
+
 struct WsDerivedRegistryTransport {
     url: Arc<dyn zeron_sync::UrlProvider>,
-    client: reqwest::Client,
+    clients: Arc<ClientCache>,
 }
 
 impl WsDerivedRegistryTransport {
     fn new(url: Arc<dyn zeron_sync::UrlProvider>) -> Self {
         Self {
             url,
-            client: reqwest::Client::new(),
+            clients: Arc::new(ClientCache {
+                cached: Mutex::new(None),
+                customize_builder: None,
+            }),
         }
     }
 
@@ -1509,9 +1547,10 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         since: u64,
     ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
         let provider = self.url.clone();
-        let client = self.client.clone();
+        let clients = self.clients.clone();
         Box::pin(async move {
             let (mut u, token) = Self::leaf_url(&provider, "rows").await?;
+            let client = clients.client_for(&u);
             u.query_pairs_mut()
                 .append_pair("since", &since.to_string())
                 .append_pair("beat", "1");
@@ -1540,9 +1579,10 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         body: String,
     ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
         let provider = self.url.clone();
-        let client = self.client.clone();
+        let clients = self.clients.clone();
         Box::pin(async move {
             let (u, token) = Self::leaf_url(&provider, "push").await?;
+            let client = clients.client_for(&u);
             let mut req = client
                 .post(u)
                 .header("content-type", "application/json")
@@ -1578,11 +1618,17 @@ mod tests {
         use zeron_sync::RegistryTransport;
 
         let dns = Arc::new(FailingDns::default());
+        let dns_hook = dns.clone();
         let transport = WsDerivedRegistryTransport {
             url: Arc::new(zeron_sync::StaticUrl(
                 "wss://edge.invalid/registry/org/ws?token=token-secret".into(),
             )),
-            client: dns.client(),
+            clients: Arc::new(ClientCache {
+                cached: Mutex::new(None),
+                customize_builder: Some(Arc::new(move |builder| {
+                    builder.dns_resolver(dns_hook.clone())
+                })),
+            }),
         };
         let pull = transport.fetch(0).await.unwrap_err();
         let push = transport.push("{}".into()).await.unwrap_err();
@@ -1591,6 +1637,36 @@ mod tests {
             assert!(message.contains("injected DNS lookup failure"), "{message}");
             assert!(!message.contains("token-secret"), "{message}");
         }
+    }
+
+    #[test]
+    fn client_cache_rebuilds_only_on_url_change() {
+        use super::*;
+
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = builds.clone();
+        let cache = ClientCache {
+            cached: Mutex::new(None),
+            customize_builder: Some(Arc::new(move |builder| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                builder
+            })),
+        };
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        // Pull and push hit different leaf paths on the same edge origin and
+        // must share one pooled client.
+        cache.client_for(&url("https://edge.example.com/registry/org/rows"));
+        cache.client_for(&url("https://edge.example.com/registry/org/push"));
+        cache.client_for(&url("https://edge.example.com/registry/org/rows"));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // An origin change rebuilds, including a flip onto a direct
+        // (no-proxy) destination.
+        cache.client_for(&url("http://localhost:8787/registry/org/rows"));
+        cache.client_for(&url("http://localhost:8787/registry/org/push"));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // And back off loopback rebuilds again.
+        cache.client_for(&url("https://edge.example.com/registry/org/rows"));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

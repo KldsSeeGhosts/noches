@@ -52,8 +52,12 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
                         Ok(0) | Err(_) => return,
                         Ok(n) => used += n,
                     }
-                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") { break; }
-                    if used == request.len() { return; }
+                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if used == request.len() {
+                        return;
+                    }
                 }
                 // Local port-discovery tools probe new listeners with HEAD /.
                 // That is not an Edge protocol request from this runtime.
@@ -428,9 +432,14 @@ async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
         runtime.core().links().is_some(),
         "peer routing must recover without restarting the app"
     );
-    assert!(
+    // The release checker only exists on builds with a published update
+    // channel (Noches dev/stable). A local source build has no checker to
+    // keep alive; when the build does have one, an offline boot must not
+    // retire it either.
+    assert_eq!(
         runtime.core().updater().is_some(),
-        "the Edge updater supervisor must survive an offline boot"
+        zeron_update::identity::distributed(),
+        "release checker presence must match the build's update channel"
     );
     runtime.shutdown().await;
 }

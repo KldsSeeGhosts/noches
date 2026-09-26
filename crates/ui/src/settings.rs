@@ -686,6 +686,10 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// The Settings section last viewed. Cmd+, / Ctrl+,, and the palette
+    /// reopen it; links naming a section replace it. Files without it, or
+    /// with a name this build does not know, open on the default section.
+    pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -774,6 +778,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
@@ -1533,6 +1538,53 @@ mod tests {
     }
 
     #[test]
+    fn settings_section_round_trips_and_old_or_unknown_values_read_as_default() {
+        use crate::shell::SettingsSection;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = UiSettings {
+            settings_section: SettingsSection::Appearance,
+            ..Default::default()
+        };
+        settings.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(text.contains(r#""settingsSection": "appearance""#), "{text}");
+        assert_eq!(
+            UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Appearance
+        );
+        for section in SettingsSection::ALL {
+            let encoded = serde_json::to_string(&UiSettings {
+                settings_section: section,
+                ..Default::default()
+            })
+            .unwrap();
+            let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.settings_section, section);
+        }
+
+        // A file written before the field existed.
+        let legacy: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(legacy.settings_section, SettingsSection::Connections);
+        assert_eq!(legacy.sidebar_width, 300.0);
+        // Unknown names and malformed values read as the default without
+        // defaulting the rest of the file.
+        for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(r#"{{"sidebarWidth": 300, "settingsSection": {raw}}}"#),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(
+                loaded.settings_section,
+                SettingsSection::Connections,
+                "{raw}"
+            );
+            assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
+        }
+    }
+
+    #[test]
     fn window_geometry_restores_display_identity_with_overlapping_local_coordinates() {
         let primary = WindowGeometry {
             display_uuid: Some(uuid::Uuid::from_u128(1)),
@@ -1994,6 +2046,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appshots_enabled: false,
             appshot_sound_enabled: true,

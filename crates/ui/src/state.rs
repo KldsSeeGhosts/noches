@@ -721,6 +721,13 @@ pub struct UploadProgress {
     total: u64,
 }
 
+pub(crate) const CANVAS_PANEL_PREFIX: &str = "space-canvas:";
+
+/// Per-space key for new-session-canvas chrome (terminal tabs, panel flags).
+pub fn canvas_panel_key(space_id: Option<&str>) -> String {
+    format!("{CANVAS_PANEL_PREFIX}{}", space_id.unwrap_or(""))
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -858,6 +865,12 @@ pub struct AppState {
     /// One queue watch task per fixed pane chat (single-flight per key;
     /// dropping the task cancels the engine-side watch).
     pane_queue_tasks: HashMap<String, Task<()>>,
+    /// Per-session terminal-drawer open flags, keyed by panel session key
+    /// (chat id or canvas key). Written by the shell on every toggle so the
+    /// terminal panel can gate tab creation on the DESTINATION key's flag
+    /// after a canvas-to-canvas key change - its own `open` flag is a
+    /// projection of this map, and the map is the only copy visible here.
+    pub terminal_panels: HashMap<String, bool>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -965,6 +978,7 @@ impl AppState {
             subagent_active_obs: std::cell::RefCell::new(std::collections::HashSet::new()),
             pane_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
+            terminal_panels: HashMap::new(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -978,6 +992,97 @@ impl AppState {
     /// first send survives the chat being minted.
     pub fn composer_key(&self) -> String {
         self.selected_chat.clone().unwrap_or_default()
+    }
+
+    /// Per-session chrome key (terminal tabs, panel open flags). Real chats
+    /// use the chat id; the new-session canvas is per-space so two projects
+    /// don't share one drawer.
+    pub fn panel_session_key(&self) -> String {
+        match self.selected_chat.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                let space_id = self.selected_space.as_deref().unwrap_or("");
+                match self.canvas_device_key(space_id) {
+                    Some(device) => format!("{CANVAS_PANEL_PREFIX}@{device}"),
+                    None => canvas_panel_key(self.selected_space.as_deref()),
+                }
+            }
+        }
+    }
+
+    /// The device identity a canvas panel key routes terminal RPCs to.
+    /// Project canvases already key on the space (which is pinned to one
+    /// host), but the project-less canvas key `space-canvas:` never changes
+    /// while `selected_device` does - retargeting the pick must switch the
+    /// session key or the drawer keeps driving the old device's PTY.
+    fn canvas_device_key(&self, space_id: &str) -> Option<String> {
+        if !space_id.is_empty() {
+            return None;
+        }
+        Some(
+            self.selected_device
+                .clone()
+                .or_else(|| self.local_device_id.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Optional `OpenTerminal` cwd. Existing chats leave this unset so the
+    /// engine reads the chat row. The canvas has no row yet - pass the
+    /// selected project's folder. When the project id is known but the
+    /// WatchSpaces row has not landed, leave cwd unset: `chatId` is
+    /// `space-canvas:{spaceId}` and the engine resolves the folder. Only
+    /// a deliberate project-less canvas sends `~`.
+    pub fn terminal_open_cwd(&self) -> Option<String> {
+        self.terminal_open_cwd_for(&self.panel_session_key())
+    }
+
+    /// [`Self::terminal_open_cwd`] for a specific panel key (the tab being
+    /// opened, which matches the selected session).
+    pub fn terminal_open_cwd_for(&self, session_key: &str) -> Option<String> {
+        let Some(space_id) = session_key.strip_prefix(CANVAS_PANEL_PREFIX) else {
+            return None;
+        };
+        // `space-canvas:@device` carries the project-less pick inline.
+        let space_id = space_id.strip_prefix('@').map_or(space_id, |_| "");
+        if space_id.is_empty() || self.no_project {
+            return Some("~".to_string());
+        }
+        self.spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.path.clone())
+            .filter(|path| !path.trim().is_empty())
+    }
+
+    /// Device to address terminal RPCs at, when it isn't this engine.
+    /// Canvas keys (`space-canvas:{space}`) resolve through the space row;
+    /// the project-less key (`space-canvas:@device`) carries the pick that
+    /// opened it so tabs keep addressing their own device even after the
+    /// canvas retargets.
+    pub fn terminal_target_device(&self, session_key: &str) -> Option<String> {
+        let device = if let Some(space_id) = session_key.strip_prefix(CANVAS_PANEL_PREFIX) {
+            if let Some(device) = space_id.strip_prefix('@') {
+                device.to_string()
+            } else if space_id.is_empty() {
+                self.selected_device
+                    .clone()
+                    .or_else(|| self.local_device_id.clone())?
+            } else {
+                self.spaces
+                    .iter()
+                    .find(|space| space.id == space_id)?
+                    .device_id
+                    .clone()
+            }
+        } else {
+            self.chats
+                .iter()
+                .find(|chat| chat.id == session_key)?
+                .device_id
+                .clone()
+        };
+        (self.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
     pub fn review_comments(&self, key: &str) -> &[ReviewComment] {
@@ -1187,8 +1292,10 @@ impl AppState {
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
     /// reach its executor promptly? Locally-hosted chats are never degraded
     /// (a queued command executes on this device even fully offline). Remote
-    /// chats degrade when the OS says offline, when the chat's own edge room
-    /// is down, or when the host device has gone presence-dark.
+    /// chats degrade when the OS is offline, when registry recovery is needed
+    /// to restore their delivery path, when an active room stays down, or when
+    /// the host device has gone presence-dark. A Local sync state is normal
+    /// dormancy while the global connection and remote host are healthy.
     pub fn chat_delivery_degraded(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         use zeron_proto::ConnectivityState as S;
         if self.connectivity.state == S::Disabled {
@@ -1197,24 +1304,29 @@ impl AppState {
         let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
             // Unknown chat (a just-minted canvas send): only the global
             // state can speak.
-            return self.connectivity.state == S::Offline;
+            return self.connectivity.state != S::Connected;
         };
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline {
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, now) {
             return true;
         }
-        let room_down = match self
+        let net = self
             .connectivity
             .chats
             .iter()
-            .find(|c| c.chat_id == chat_id)
-        {
+            .find(|c| c.chat_id == chat_id);
+        if self.connectivity.state == S::Reconnecting {
+            // The registry can be down while this chat's room or HTTP fallback
+            // still delivers. A dormant or unknown chat has no such proof.
+            return !net.is_some_and(|net| net.delivery_live);
+        }
+        match net {
+            Some(net) if net.sync_state == zeron_proto::ChatSyncState::Local => false,
             Some(net) => !net.connected,
-            None => self.connectivity.state != S::Connected,
-        };
-        room_down || !self.device_online(&chat.device_id, now)
+            None => false,
+        }
     }
 
     /// A send is queued: in flight AND its delivery path is degraded — the
@@ -2401,6 +2513,9 @@ impl AppState {
         follow_space: bool,
         cx: &mut Context<Self>,
     ) {
+        if let Some(id) = &chat_id {
+            self.focus_chat_sync(id, cx);
+        }
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
@@ -2670,6 +2785,33 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    /// Navigation signal is separate from watch lifetime: resubscribing,
+    /// receiving agent output and MCP reads cannot refresh focus priority.
+    pub(crate) fn focus_chat_sync(&self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        let chat_id = chat_id.to_owned();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = handle
+                .client()
+                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .await
+            {
+                tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn focus_subagent_sync(&self, doc_id: &str, cx: &mut Context<Self>) {
+        // Frozen transcripts are static blobs: navigation must not open their
+        // old room just to report focus.
+        if self.sub_watch_tasks.contains_key(doc_id) {
+            self.focus_chat_sync(doc_id, cx);
+        }
     }
 }
 
@@ -2981,6 +3123,8 @@ fn spawn_transcript_watch(
     handle: EngineHandle,
     chat_id: String,
 ) -> Task<()> {
+    // The scoped subscription cancels even a silent server stream on drop;
+    // otherwise a deselected chat would retain its protected sync slot.
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
@@ -4727,6 +4871,117 @@ mod tests {
     }
 
     #[test]
+    fn canvas_terminal_uses_the_selected_project_folder() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.apply_spaces(vec![
+            space("s1", "local", "/Users/me/proj", 1),
+            space("remote-space", "remote", "/remote/proj", 2),
+        ]);
+        state.selected_chat = None;
+        state.no_project = false;
+        state.selected_space = Some("s1".into());
+
+        assert_eq!(state.panel_session_key(), "space-canvas:s1");
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("/Users/me/proj"));
+        assert_eq!(
+            state.terminal_open_cwd_for("space-canvas:s1").as_deref(),
+            Some("/Users/me/proj")
+        );
+        // Project id is known, row not in the list yet - do not send `~`.
+        state.spaces.clear();
+        assert_eq!(state.terminal_open_cwd(), None);
+        state.apply_spaces(vec![
+            space("s1", "local", "/Users/me/proj", 1),
+            space("remote-space", "remote", "/remote/proj", 2),
+        ]);
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("/Users/me/proj"));
+        assert_eq!(
+            state.terminal_target_device(&state.panel_session_key()),
+            None,
+            "local project stays on this engine"
+        );
+
+        state.selected_space = Some("remote-space".into());
+        assert_eq!(
+            state
+                .terminal_target_device("space-canvas:remote-space")
+                .as_deref(),
+            Some("remote")
+        );
+
+        state.no_project = true;
+        state.selected_space = None;
+        state.selected_device = Some("remote".into());
+        assert_eq!(state.panel_session_key(), "space-canvas:@remote");
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("~"));
+        assert_eq!(
+            state
+                .terminal_target_device("space-canvas:@remote")
+                .as_deref(),
+            Some("remote")
+        );
+
+        let mut row = chat("chat-1", 0, None);
+        row.device_id = "remote".into();
+        state.chats = vec![row];
+        state.selected_chat = Some("chat-1".into());
+        assert_eq!(state.panel_session_key(), "chat-1");
+        assert_eq!(state.terminal_open_cwd(), None);
+        assert_eq!(
+            state.terminal_target_device("chat-1").as_deref(),
+            Some("remote")
+        );
+    }
+
+    /// The project-less canvas carries its device pick IN the session key:
+    /// retargeting the pick A->B->A must mint distinct keys per device (the
+    /// terminal drawer would otherwise keep streaming A's PTY under B's
+    /// canvas) and round-trip back to A's tabs.
+    #[test]
+    fn projectless_canvas_panel_key_follows_the_device_pick() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.apply_spaces(vec![space("s1", "local", "/Users/me/proj", 1)]);
+        state.selected_chat = None;
+        state.no_project = true;
+        state.selected_space = None;
+        state.selected_device = Some("dev-a".into());
+
+        let key_a = state.panel_session_key();
+        assert_eq!(key_a, "space-canvas:@dev-a");
+        assert_eq!(
+            state.terminal_target_device(&key_a).as_deref(),
+            Some("dev-a")
+        );
+
+        // A -> B: a new key, routed at B.
+        state.selected_device = Some("dev-b".into());
+        let key_b = state.panel_session_key();
+        assert_eq!(key_b, "space-canvas:@dev-b");
+        assert_ne!(key_a, key_b);
+        assert_eq!(
+            state.terminal_target_device(&key_b).as_deref(),
+            Some("dev-b")
+        );
+        // A tab recorded under A's key still addresses A after the switch.
+        assert_eq!(
+            state.terminal_target_device(&key_a).as_deref(),
+            Some("dev-a")
+        );
+
+        // B -> A: the original key returns, so A's tabs reattach untouched.
+        state.selected_device = Some("dev-a".into());
+        assert_eq!(state.panel_session_key(), key_a);
+
+        // The local pick never carries a remote target.
+        state.selected_device = Some("local".into());
+        let key_local = state.panel_session_key();
+        assert_eq!(key_local, "space-canvas:@local");
+        assert_eq!(state.terminal_target_device(&key_local), None);
+    }
+
+    #[test]
     fn projectless_preference_survives_restart_and_space_refreshes() {
         let dir = tempfile::tempdir().unwrap();
         let defaults = crate::settings::composer::ComposerDefaults {
@@ -5344,8 +5599,10 @@ mod tests {
         }];
         s.connectivity.state = ConnectivityState::Connected;
         s.connectivity.chats = vec![ChatConnectivity {
+            sync_state: zeron_proto::ChatSyncState::Unknown,
             chat_id: "c-remote".into(),
             connected: true,
+            delivery_live: false,
             pending_pushes: 0,
         }];
 
@@ -5353,12 +5610,55 @@ mod tests {
         assert!(!s.chat_delivery_degraded("c-remote", now));
         assert!(!s.chat_delivery_degraded("c-local", now));
 
-        // The chat's own room down → degraded even while globally Connected.
+        // Idle chats can remain without a socket for longer than the engine's
+        // grace. A stale down sample during focus must not flash a warning.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
         s.connectivity.chats[0].connected = false;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+
+        // A requested reconnect stays quiet inside its fresh grace window.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = true;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+
+        // A requested or active room down past grace degrades even while
+        // globally Connected.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = false;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
         assert!(s.chat_delivery_degraded("c-remote", now));
         s.connectivity.chats[0].connected = true;
 
+        // Global registry failure and host presence loss still warn for a
+        // dormant chat.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
+        s.connectivity.state = ConnectivityState::Reconnecting;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+
+        // A live chat room can deliver while the registry reconnects. The
+        // graced `connected` bit alone is not proof, but delivery_live is.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Synced;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].delivery_live = true;
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.begin_pending_send("c-remote", "m-live", now);
+        assert!(!s.send_queued("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        s.connectivity.chats[0].connected = false; // HTTP delivery can outlive the socket.
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        s.connectivity.chats[0].delivery_live = false;
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        s.connectivity.chats[0].connected = true;
+        s.connectivity.state = ConnectivityState::Connected;
+
         // Host gone presence-dark → degraded (a send would queue at best).
+        s.connectivity.chats[0].delivery_live = true;
         s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
         assert!(s.chat_delivery_degraded("c-remote", now));
         s.devices[0].last_seen_at = Some(now);
@@ -5368,6 +5668,7 @@ mod tests {
         s.connectivity.state = ConnectivityState::Offline;
         assert!(s.chat_delivery_degraded("c-remote", now));
         assert!(!s.chat_delivery_degraded("c-local", now));
+        s.connectivity.chats[0].delivery_live = false;
 
         // Local profile (Disabled): nothing degrades.
         s.connectivity.state = ConnectivityState::Disabled;

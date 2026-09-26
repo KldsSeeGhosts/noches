@@ -1,6 +1,6 @@
 //! Authenticated signaling supplies SDP/DTLS fingerprints. Preview bytes only
 //! use the resulting reliable, ordered DataChannel; there is no edge byte relay.
-use crate::mux::{Connector, Mux, Stream, Transport};
+use crate::mux::{Connector, Mux, PeerScoped, Stream, Transport};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -104,7 +104,12 @@ impl Peers {
     async fn send(&self, to: &str, signal: Signal) -> anyhow::Result<()> {
         tokio::select! { _ = self.0.stop.cancelled() => anyhow::bail!("preview networking stopped"), result = self.0.output.send(OutgoingSignal { to: to.into(), signal }) => { result?; Ok(()) } }
     }
-    async fn create(&self, session: String, initiator: bool) -> anyhow::Result<Arc<Peer>> {
+    async fn create(
+        &self,
+        device: &str,
+        session: String,
+        initiator: bool,
+    ) -> anyhow::Result<Arc<Peer>> {
         tracing::debug!(initiator, "creating preview peer");
         let (ready, receiver) = watch::channel(None);
         let (gathered, gathering) = watch::channel(false);
@@ -113,7 +118,9 @@ impl Peers {
             ready,
             gathered,
             channel_claimed: AtomicBool::new(false),
-            connector: self.0.connector.clone(),
+            // Streams this peer opens are attributed to its authenticated
+            // device (sign-in callbacks only serve the device that asked).
+            connector: Arc::new(PeerScoped::new(device, self.0.connector.clone())),
             initiator,
             stop: stop.clone(),
             changed: self.0.changed.clone(),
@@ -194,7 +201,7 @@ impl Peers {
             peers.len() < 16 || peers.contains_key(device),
             "too many preview peers"
         );
-        let peer = self.create(session, true).await?;
+        let peer = self.create(device, session, true).await?;
         if let Some(old) = peers.insert(device.into(), peer.clone()) {
             old.close().await;
         }
@@ -241,7 +248,7 @@ impl Peers {
                     peers.len() < 16 || peers.contains_key(device),
                     "too many preview peers"
                 );
-                let peer = self.create(signal.session, false).await?;
+                let peer = self.create(device, signal.session, false).await?;
                 if let Some(old) = peers.insert(device.into(), peer.clone()) {
                     old.close().await;
                 }
@@ -476,6 +483,7 @@ impl Transport for ChannelTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mux::BoxIo;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     struct Echo;
     #[async_trait::async_trait]
@@ -588,6 +596,81 @@ mod tests {
         forward_a.abort();
         forward_b.abort();
         result.expect("re-pairing test stalled");
+    }
+    /// A connector that records which authenticated peer (if any) each open
+    /// is attributed to, then echoes.
+    struct Attributing {
+        seen: Mutex<Vec<Option<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Connector for Attributing {
+        async fn connect(&self, service: &str) -> anyhow::Result<BoxIo> {
+            self.connect_from(None, service).await
+        }
+        async fn connect_from(&self, peer: Option<&str>, service: &str) -> anyhow::Result<BoxIo> {
+            self.seen
+                .lock()
+                .await
+                .push(peer.map(str::to_owned));
+            anyhow::ensure!(service == "service", "unknown service");
+            let (client, server) = tokio::io::duplex(65536);
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(server);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+            Ok(Box::new(client))
+        }
+    }
+    #[tokio::test]
+    async fn streams_a_peer_opens_are_attributed_to_that_device() {
+        let stop = CancellationToken::new();
+        let a_seen = Arc::new(Attributing {
+            seen: Mutex::new(Vec::new()),
+        });
+        let b_seen = Arc::new(Attributing {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (mut a, mut a_out) = Peers::new("a".into(), a_seen.clone(), stop.clone());
+        let (mut b, mut b_out) = Peers::new("b".into(), b_seen.clone(), stop.clone());
+        a.set_ice_servers(Vec::new()).unwrap();
+        b.set_ice_servers(Vec::new()).unwrap();
+        let peer_b = b.clone();
+        let forward_a = tokio::spawn(async move {
+            while let Some(message) = a_out.recv().await {
+                let _ = peer_b.signal("a", message.signal).await;
+            }
+        });
+        let peer_a = a.clone();
+        let forward_b = tokio::spawn(async move {
+            while let Some(message) = b_out.recv().await {
+                let _ = peer_a.signal("b", message.signal).await;
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            echo_round(&b, "a").await;
+            echo_round(&a, "b").await;
+        })
+        .await;
+        stop.cancel();
+        a.clear().await;
+        b.clear().await;
+        forward_a.abort();
+        forward_b.abort();
+        result.expect("pairing stalled");
+        // Every stream b opened on a arrived stamped "b" (and vice versa) -
+        // never anonymously, which sign-in callback routes would refuse.
+        let a_seen = a_seen.seen.lock().await;
+        assert!(!a_seen.is_empty());
+        assert!(
+            a_seen.iter().all(|peer| peer.as_deref() == Some("b")),
+            "a saw unattributed opens: {a_seen:?}"
+        );
+        let b_seen = b_seen.seen.lock().await;
+        assert!(!b_seen.is_empty());
+        assert!(
+            b_seen.iter().all(|peer| peer.as_deref() == Some("a")),
+            "b saw unattributed opens: {b_seen:?}"
+        );
     }
     #[tokio::test]
     async fn actual_webrtc_pair_streams_in_both_directions() {

@@ -28,7 +28,7 @@ BUILD_FLAGS=()
 if [[ "$PROFILE" == release ]]; then BUILD_FLAGS=(--release); fi
 BIN="./target/$PROFILE/zeron"
 echo "▸ building $PROFILE demo (first run takes a few minutes)…"
-cargo build -p zeron "${BUILD_FLAGS[@]}" -q
+cargo build -p zeron ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} -q
 
 echo "▸ starting engine daemon on :$IPC"
 env ZERON_DATA_DIR="$DAEMON_DIR" ZERON_IPC_PORT=$IPC ZERON_HARNESS=mock \

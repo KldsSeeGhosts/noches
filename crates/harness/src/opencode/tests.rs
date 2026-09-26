@@ -8,6 +8,7 @@ struct TurnWire {
     requests: mpsc::UnboundedReceiver<String>,
     events: mpsc::Receiver<Result<AgentEvent, HarnessError>>,
     interrupt: tokio_util::sync::CancellationToken,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
     run: tokio::task::JoinHandle<()>,
 }
@@ -37,6 +38,23 @@ impl TurnWire {
         auto_approve: bool,
         answer: Option<bool>,
     ) -> Self {
+        Self::start_config(queued, v2, auto_approve, answer, "2.0.3", json!({})).await
+    }
+
+    /// `version` is the 2.x health answer; `overrides` tunes the fixture:
+    /// `holdPrompt` stalls the prompt POST, `delayPromptMs` answers it only
+    /// after that many milliseconds, `busyPolls` answers that many status
+    /// polls busy before going idle, and `commandFailure` fails the command
+    /// POST with a 400. `commandNames` seeds the known slash-command list;
+    /// `request` merges extra fields into the run request.
+    async fn start_config(
+        queued: bool,
+        v2: bool,
+        auto_approve: bool,
+        answer: Option<bool>,
+        version: &'static str,
+        overrides: Value,
+    ) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -45,6 +63,21 @@ impl TurnWire {
         let (request_tx, requests) = mpsc::unbounded_channel();
         let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = posts.clone();
+        let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
+        let delay_prompt_ms = overrides["delayPromptMs"].as_u64().unwrap_or(0);
+        let command_failure = overrides["commandFailure"].as_bool().unwrap_or(false);
+        let command_names: Vec<String> = overrides["commandNames"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let busy_polls = overrides["busyPolls"].as_u64().unwrap_or(0) as usize;
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_polls = polls.clone();
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -52,6 +85,7 @@ impl TurnWire {
                 let bus_rx = bus_rx.clone();
                 let request_tx = request_tx.clone();
                 let recorded = recorded.clone();
+                let polls = server_polls.clone();
                 connections.spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -84,9 +118,30 @@ impl TurnWire {
                         }
                         return;
                     }
+                    if is_post && command_failure && path.ends_with("/command") {
+                        let body = "{\"error\":\"bad command\"}";
+                        socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        let _ = request_tx.send(path);
+                        return;
+                    }
+                    if hold_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
+                        let _ = request_tx.send(path);
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    if delay_prompt_ms > 0 && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
+                        tokio::time::sleep(Duration::from_millis(delay_prompt_ms)).await;
+                    }
+                    if path == "/session/status" || path == "/api/session/active" {
+                        let count = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = if count < busy_polls { r#"{"fixture":{"type":"busy"}}"# } else { r#"{"fixture":{"type":"idle"}}"# };
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        return;
+                    }
+                    let health = json!({"healthy":true,"version":version}).to_string();
                     let body = if v2 {
                         match path.as_str() {
-                            "/api/health" => r#"{"healthy":true,"version":"2.0.3"}"#,
+                            "/api/health" => health.as_str(),
                             "/api/session" => r#"{"data":{"id":"fixture"}}"#,
                             "/api/command" => r#"{"data":[]}"#,
                             // Non-empty: the catalog-sync retry loop must not stall tests.
@@ -143,13 +198,29 @@ impl TurnWire {
                 interrupt: interrupt.clone(),
                             computer_use_socket: None,
 },
-            request: serde_json::from_value(
-                json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"}),
-            )
+            request: serde_json::from_value({
+                let mut request = json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
+                if let Some(fields) = overrides["request"].as_object() {
+                    request
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(fields.clone());
+                }
+                request
+            })
             .unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),
-            known_commands: Some(vec![]),
+            known_commands: Some(
+                command_names
+                    .iter()
+                    .map(|name| SlashCommand {
+                        name: name.clone(),
+                        description: String::new(),
+                        input_hint: None,
+                    })
+                    .collect(),
+            ),
         }));
         Self {
             bus,
@@ -157,6 +228,7 @@ impl TurnWire {
             requests,
             events,
             interrupt,
+            polls,
             server,
             run,
         }
@@ -414,6 +486,70 @@ async fn v2_execution_failure_and_interrupt_settle_the_turn() {
         json!({"sessionID": "fixture", "reason": "user"}),
     );
     assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
+}
+
+async fn read_http_request_headers(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(socket.read_u8().await.unwrap());
+        assert!(headers.len() <= 8192, "unexpectedly large request headers");
+    }
+}
+
+/// The loopback `opencode serve` gets our Basic-auth password on every call,
+/// so a system/env proxy must never see that traffic.
+#[test]
+fn http_client_never_proxies_the_loopback_server() {
+    const NAME: &str = "opencode::tests::http_client_never_proxies_the_loopback_server";
+    const CHILD: &str = "ZERON_OPENCODE_PROXY_PROBE";
+    if std::env::var_os(CHILD).is_none() {
+        // reqwest reads the proxy from the environment, and mutating it here
+        // would race sibling tests, so run the body in a child process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("REQUEST_METHOD")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child probe failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/global/health", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_request_headers(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        // Control: a default client does route loopback through the dead
+        // proxy, so this test cannot pass vacuously.
+        assert!(reqwest::Client::new().get(&url).send().await.is_err());
+        let response = http_client()
+            .get(&url)
+            .send()
+            .await
+            .expect("opencode client must reach loopback directly");
+        assert!(response.status().is_success());
+    });
 }
 
 #[tokio::test]
@@ -1215,31 +1351,39 @@ async fn permissions_stay_session_scoped_and_never_persist_grants() {
 
 #[tokio::test]
 async fn permissions_without_auto_approve_require_an_explicit_answer() {
-    for accept in [false, true] {
-        let mut wire = TurnWire::start_policy(false, true, false, Some(accept)).await;
-        wire.request("/api/model").await;
-        wire.request("/prompt").await;
-        wire.v2(
-            "permission.asked",
-            json!({"id":"approval", "sessionID":"fixture"}),
-        );
-        let body = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some((_, body)) = wire
-                    .posts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(p, _)| p.contains("permission"))
-                {
-                    break body.clone();
+    for version in ["2.0.0", "2.0.3", "2.0.4", "2.0.11"] {
+        for accept in [false, true] {
+            let mut wire =
+                TurnWire::start_config(false, true, false, Some(accept), version, json!({})).await;
+            wire.request("/api/model").await;
+            wire.request("/prompt").await;
+            wire.v2(
+                "permission.asked",
+                json!({"id":"approval", "sessionID":"fixture"}),
+            );
+            let body = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some((_, body)) = wire
+                        .posts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(p, _)| p.contains("permission"))
+                    {
+                        break body.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(body["reply"], if accept { "once" } else { "reject" });
+            })
+            .await
+            .unwrap();
+            let key = if version == "2.0.0" || version == "2.0.3" {
+                "reply"
+            } else {
+                "decision"
+            };
+            assert_eq!(body, json!({key: if accept { "once" } else { "reject" }}));
+        }
     }
 }
 
@@ -1424,4 +1568,188 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
     let (status, text) = wire.done().await;
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "Recovered");
+}
+
+#[tokio::test]
+async fn stalled_prompt_post_does_not_block_bus_completion() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "2.0.3",
+        json!({"holdPrompt": true}),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stalled_prompt_post_has_a_bounded_timeout() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "2.0.3",
+        json!({"holdPrompt": true}),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn ambiguous_idle_polls_status_with_backoff_until_idle() {
+    let mut wire =
+        TurnWire::start_config(false, false, true, None, "2.0.3", json!({"busyPolls": 2})).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.idle();
+    let start = tokio::time::Instant::now();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(start.elapsed() >= Duration::from_millis(650));
+}
+
+#[tokio::test]
+async fn abort_ignores_late_bus_text_and_usage() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.interrupt.cancel();
+    wire.request("/abort").await;
+    wire.bus.send(json!({"type":"message.updated", "properties":{"info":{"id":"late", "sessionID":"fixture", "role":"assistant", "tokens":{"input":999,"output":999}}}})).unwrap();
+    wire.bus.send(json!({"type":"message.part.updated", "properties":{"part":{"id":"text", "messageID":"late", "sessionID":"fixture", "type":"text", "text":"LATE"}}})).unwrap();
+    wire.idle();
+    let mut dones = 0;
+    while let Some(event) = wire.events.recv().await {
+        match event.unwrap() {
+            AgentEvent::TextDelta { .. } | AgentEvent::Usage { .. } => {
+                panic!("late content after abort")
+            }
+            AgentEvent::Done { status, .. } => {
+                assert_eq!(status, DoneStatus::Interrupted);
+                dones += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(dones, 1);
+}
+
+#[tokio::test]
+async fn idle_without_busy_resolves_through_status_poll() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert_eq!(wire.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn idle_poll_does_not_settle_while_prompt_post_is_pending() {
+    // A stale/absent status answer while the prompt POST is still in flight
+    // describes the pre-prompt state; the run must not report Done (the
+    // server may execute the prompt afterwards).
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "2.0.3",
+        json!({"delayPromptMs": 350}),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.idle();
+    // The 100ms status poll lands while the POST is still held: it must be
+    // re-armed rather than trusted, or the run ends before the turn starts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    // The first poll raced the pending POST; settlement needed a later one.
+    assert!(wire.polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn v2_command_bodies_follow_server_version() {
+    // 1.x and pre-2.0.4 2.x keep the `command` key; 2.0.4+ and unversioned
+    // 2.x builds (health stopped reporting a version after the rename) send
+    // `name`.
+    assert_eq!(
+        command_body_v2(Some(&ServerVersion::parse("1.18.31")), "test", "args", &[]),
+        json!({"command":"test","text":"args"})
+    );
+    assert_eq!(
+        command_body_v2(Some(&ServerVersion::parse("2.0.3")), "test", "args", &[]),
+        json!({"command":"test","text":"args"})
+    );
+    for raw in ["2.0.4", "v2.0.11", "3.0.0", "unknown"] {
+        let parsed = ServerVersion::parse(raw);
+        assert_eq!(
+            command_body_v2(Some(&parsed), "test", "args", &[]),
+            json!({"name":"test","text":"args"}),
+            "{raw}"
+        );
+        let attachments = vec!["/workspace/image.png".to_owned()];
+        assert_eq!(
+            command_body_v2(Some(&parsed), "test", "args", &attachments)["files"],
+            prompt_body_v2("args", &attachments)["files"],
+            "{raw}"
+        );
+    }
+    // No health answer at all is still treated as post-rename on V2.
+    assert_eq!(
+        command_body_v2(None, "test", "args", &[]),
+        json!({"name":"test","text":"args"})
+    );
+}
+
+#[tokio::test]
+async fn rejected_command_post_settles_the_turn_errored() {
+    for (v2, version, key) in [
+        (false, "1.18.31", "command"),
+        (true, "2.0.3", "command"),
+        (true, "2.0.11", "name"),
+    ] {
+        let mut wire = TurnWire::start_config(
+            false,
+            v2,
+            true,
+            None,
+            version,
+            json!({"request": {"prompt": "/test args"}, "commandNames": ["test"], "commandFailure": true}),
+        )
+        .await;
+        if v2 {
+            // V2 sets the session model before prompting.
+            wire.request("/api/model").await;
+        }
+        wire.request("/command").await;
+        let (status, _) = wire.done().await;
+        assert_eq!(status, DoneStatus::Errored, "v2={v2} version={version}");
+        let posts = wire.posts.lock().unwrap();
+        let (_, body) = posts
+            .iter()
+            .find(|(path, _)| path.ends_with("/command"))
+            .expect("command POST recorded");
+        assert_eq!(body[key], "test", "v2={v2} version={version}");
+        assert_eq!(
+            body[if v2 { "text" } else { "arguments" }],
+            "args",
+            "v2={v2} version={version}"
+        );
+    }
 }

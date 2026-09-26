@@ -50,11 +50,11 @@ pub const TEXTAREA_PAD_V: f32 = 20.0;
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
 /// 260)` (zeron composer.tsx line 235). The 76px floor applies even when
-/// empty — it's what makes the always-expanded new-chat composer tall.
+/// empty - it's what makes the always-expanded new-chat composer tall.
 pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
-/// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 — the tallest
-/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) — zeron
+/// Expanded actions row: `pt-1` (4) + h-8 picker chips (32 - the tallest
+/// children; composer/styles.tsx pickerChip) + `pb-2.5` (10) - zeron
 /// composer-actions.tsx line 60.
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
@@ -82,6 +82,14 @@ const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
 // Accommodate the PR badge without overflowing the
 // row's equal 8px top/bottom gutters.
 const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+/// One footer ring chip: 16px ring + label + padding, plus the cluster gap.
+const RING_CHIP_WIDTH: f32 = 56.0;
+
+/// Footer width the model handoff reserves for the ring cluster: one chip
+/// per visible ring (context occupancy, account usage), none when empty.
+fn ring_cluster_width(context: bool, account: bool) -> f32 {
+    RING_CHIP_WIDTH * (context as u8 + account as u8) as f32
+}
 
 /// Route chrome dissolves around the middle of the shared-element move. The
 /// two ramps never overlap, which avoids duplicate picker ids/popovers while
@@ -107,7 +115,7 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
-/// capacity — expanding and collapsing share no boundary, so a width right at
+/// capacity - expanding and collapsing share no boundary, so a width right at
 /// the flip threshold can't oscillate between the two layouts.
 pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
 /// During an interactive resize, collapsing back to the compact mode waits
@@ -117,7 +125,7 @@ pub const RESIZE_SETTLE_MS: u64 = 150;
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
 /// input capacity (a layout-stable width: measured while compact, tracked by
-/// container-width deltas while expanded — never the post-flip measured width,
+/// container-width deltas while expanded - never the post-flip measured width,
 /// which differs per mode and would feed back into the decision):
 /// - a newline always expands;
 /// - while `resizing`, an expanded composer stays expanded until sizes settle;
@@ -152,7 +160,7 @@ fn composer_width_changed(previous: Option<f32>, current: f32) -> bool {
 pub const CARET_BLINK_MS: u64 = 500;
 
 /// Caret blink phase for a time since the last keystroke/caret move: solid
-/// through the first half-period (typing bursts never blink — each keystroke
+/// through the first half-period (typing bursts never blink - each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
@@ -316,11 +324,11 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
 /// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`]); the blank-
 /// thread handoff swaps in the coordinated 420ms route-transition spec. Both use the
-/// manual-drive pattern from shell.rs `WidthTween` — never `with_animation`,
+/// manual-drive pattern from shell.rs `WidthTween` - never `with_animation`,
 /// whose element-id keying replays tweens on remount, round-6 §1–3.
 ///
 /// The morph animates the pill's COMMITTED height: the flip commits its final
-/// layout immediately (the input entity never remounts — the caret survives,
+/// layout immediately (the input entity never remounts - the caret survives,
 /// exactly as before) while the pill clips toward the live target. The pill's
 /// bottom edge is stationary on screen, so the controls stay pinned to it
 /// (constant screen-y; see the anchoring helpers below) and only the text
@@ -330,7 +338,7 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// morph is ever created.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlipMorph {
-    /// Rendered height when the flip committed — the animation's start point.
+    /// Rendered height when the flip committed - the animation's start point.
     pub from: f32,
     /// Commit time in ms on the caller's monotonic clock.
     pub start_ms: f32,
@@ -362,7 +370,7 @@ impl FlipMorph {
         ((now_ms - self.start_ms) / total).clamp(0.0, 1.0)
     }
 
-    /// Eased progress 0..1 — also drives the inner geometry handoff.
+    /// Eased progress 0..1 - also drives the inner geometry handoff.
     pub fn progress(&self, now_ms: f32) -> f32 {
         self.spec.progress(self.raw(now_ms))
     }
@@ -372,7 +380,7 @@ impl FlipMorph {
     }
 
     /// Committed-height evaluation: eased lerp from the flip-time height to
-    /// the LIVE target (auto-grow may move the target mid-morph — the morph
+    /// the LIVE target (auto-grow may move the target mid-morph - the morph
     /// tracks it instead of finishing on a stale height).
     pub fn height(&self, target: f32, now_ms: f32) -> f32 {
         motion::lerp(self.from, target, self.progress(now_ms))
@@ -427,7 +435,7 @@ pub fn morph_cluster_inset(expanded: bool, progress: f32) -> f32 {
 }
 
 /// Expanded text top padding across the morph: starts at the compact resting
-/// inset (12 ≈ `py-3`) and eases to `pt-4` (16) — the first line glides with
+/// inset (12 ≈ `py-3`) and eases to `pt-4` (16) - the first line glides with
 /// the rising top edge instead of jumping at the commit.
 pub fn morph_text_pad(progress: f32) -> f32 {
     motion::lerp(12.0, 16.0, progress)
@@ -436,7 +444,7 @@ pub fn morph_text_pad(progress: f32) -> f32 {
 /// Collapse-morph text glide: the committed compact row is bottom-anchored
 /// (text resting top = 36px above the pill's outer bottom: 49 − 1 hairline −
 /// 12 centering inset), while at the commit instant the text sat 17px below
-/// the expanded pill's top (1 hairline + 16 `pt-4`) — i.e. `from − 17` above
+/// the expanded pill's top (1 hairline + 16 `pt-4`) - i.e. `from − 17` above
 /// the bottom. The decaying relative offset walks it down smoothly.
 pub fn collapse_text_glide(from: f32, progress: f32) -> f32 {
     (from - 53.0).max(0.0) * (1.0 - progress)
@@ -450,7 +458,7 @@ pub fn morph_cluster_dy(progress: f32) -> f32 {
 }
 
 /// Session/route changes SNAP the composer (same rule as the header inset
-/// tween, round 6: route swaps remount in the original — zero motion). The
+/// tween, round 6: route swaps remount in the original - zero motion). The
 /// nav-driven flip doesn't commit on the first render after a switch (the
 /// draft swap has to be laid out and re-measured first), so a plain reset at
 /// the nav instant leaks: `last_rendered_height` is repopulated before the
@@ -460,13 +468,13 @@ pub fn morph_cluster_dy(progress: f32) -> f32 {
 pub const ROUTE_SNAP_MS: u64 = 250;
 
 /// Advance the flip morph across one render pass. While the committed mode
-/// holds, the morph is kept (a finished one clears) — same-mode renders can
+/// holds, the morph is kept (a finished one clears) - same-mode renders can
 /// NEVER restart the animation. A committed mode change starts one morph from
 /// the last rendered height, which mid-flight is the CURRENT animated height,
 /// so a reverse flip hands off seamlessly instead of popping to an endpoint.
 /// Reduced motion (or a first paint with no measured height yet) snaps, and
 /// `route_snap` (a session/route change within [`ROUTE_SNAP_MS`]) both blocks
-/// arming AND kills anything in flight — navigation never animates the pill.
+/// arming AND kills anything in flight - navigation never animates the pill.
 pub fn flip_morph_step(
     morph: Option<FlipMorph>,
     mode_changed: bool,
@@ -506,7 +514,7 @@ pub enum SendButtonMode {
 
 /// What the composer holds that a send could carry. A staged image or diff
 /// comment counts: both synthesize their own prompt body, so either alone is
-/// a legal send — and during a live run has to read as Queue, not Stop.
+/// a legal send - and during a live run has to read as Queue, not Stop.
 pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
@@ -613,7 +621,7 @@ fn wizard_escape_goes_back(key: &str, input_focused: bool, input_empty: bool) ->
 }
 
 /// Find the unresolved input request the panel should serve, if any: an
-/// unresolved input part on the LAST assistant entry — regardless of the
+/// unresolved input part on the LAST assistant entry - regardless of the
 /// entry's run status. The question stays answerable until the user actually
 /// answers it (user requirement): a run that died under its question (engine
 /// restart reaping it) leaves an aborted entry whose answer the engine
@@ -622,7 +630,7 @@ fn wizard_escape_goes_back(key: &str, input_focused: bool, input_empty: bool) ->
 /// not last-entry: a steer prompt sent while the agent waits appends a USER
 /// entry after the streaming assistant entry, and a last-entry-only read made
 /// the QuestionPanel vanish exactly when the user typed (earlier forensics;
-/// matches the original composer.tsx, which reads the live-assistant fold —
+/// matches the original composer.tsx, which reads the live-assistant fold -
 /// rebuilt from replay even after the run died).
 pub fn pending_input_request(
     transcript: &[SessionMessageEntry],
@@ -645,7 +653,7 @@ pub fn pending_input_request(
 }
 
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
-/// another device) — the wizard latch's release condition.
+/// another device) - the wizard latch's release condition.
 pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
     transcript.iter().any(|entry| {
         entry.parts.iter().any(|part| {
@@ -669,9 +677,9 @@ pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &s
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardStep {
     Stay,
-    /// Single-select landed — advance after [`AUTO_ADVANCE_MS`].
+    /// Single-select landed - advance after [`AUTO_ADVANCE_MS`].
     AutoAdvance,
-    /// All pages answered — submit these answers.
+    /// All pages answered - submit these answers.
     Done(Vec<UserInputAnswer>),
 }
 
@@ -858,11 +866,11 @@ actions!(
 /// bursts the user actually typed rather than one character at a time.
 const UNDO_COALESCE: Duration = Duration::from_millis(700);
 
-/// Cap on retained undo steps — a long-lived composer must not grow forever.
+/// Cap on retained undo steps - a long-lived composer must not grow forever.
 const UNDO_LIMIT: usize = 200;
 
 /// The literal `@` a chip displays before its file name. Projected as TEXT so
-/// it shapes, wraps, and hit-tests with the label — the earlier SVG icons
+/// it shapes, wraps, and hit-tests with the label - the earlier SVG icons
 /// painted into a reserved whitespace slot never sat right at text size
 /// (user report). Chips read as inline code: `@name` in the mono font over
 /// the code wash.
@@ -1169,10 +1177,10 @@ impl TextProjection {
         for (link, label) in links.into_iter().zip(labels) {
             projection.display.push_str(&raw[raw_at..link.range.start]);
             let display_start = projection.display.len();
-            // The chip is plain projected text — `@` plus the label between
+            // The chip is plain projected text - `@` plus the label between
             // non-breaking side bearings; the rounded code wash beneath it is
             // painted by `ComposerTextElement::paint`. Every character here
-            // must exist in Geist (no exotic whitespace — U+2003/U+202F shape
+            // must exist in Geist (no exotic whitespace - U+2003/U+202F shape
             // at fallback width and collapsed the chip once already).
             projection.display.push_str(MENTION_SIDE_PAD);
             projection.display.push(MENTION_PREFIX);
@@ -1304,7 +1312,7 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
 
 /// One chip in a *sent* message: its byte range over the projected display
 /// string (`@label` between side bearings). The transcript renders these
-/// read-only — no editing state, no tooltip machinery.
+/// read-only - no editing state, no tooltip machinery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMentionSpan {
     pub range: Range<usize>,
@@ -1315,7 +1323,7 @@ pub struct SentMentionSpan {
 
 /// Project a sent message's raw Markdown for transcript display: mention links
 /// collapse to the same chip labels the composer shows, everything else passes
-/// through untouched. `None` when the text has no valid mention — the
+/// through untouched. `None` when the text has no valid mention - the
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
@@ -1342,7 +1350,7 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
     Some((projection.display, spans))
 }
 
-/// Direction of the last edit — a run only merges with edits of its own kind.
+/// Direction of the last edit - a run only merges with edits of its own kind.
 #[derive(Clone, Copy, PartialEq)]
 enum EditKind {
     Insert,
@@ -1436,7 +1444,7 @@ fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("shift-home", SelectHome, ctx),
         KeyBinding::new("shift-end", SelectEnd, ctx),
-        // macOS line/document motion — a laptop keyboard has no home/end keys,
+        // macOS line/document motion - a laptop keyboard has no home/end keys,
         // so Cmd+arrow is the only way users reach either edge.
         KeyBinding::new("cmd-left", Home, ctx),
         KeyBinding::new("cmd-right", End, ctx),
@@ -1536,7 +1544,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     };
     // Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
     // keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
-    // so anything bound here can never reach a palette's `on_key_down` —
+    // so anything bound here can never reach a palette's `on_key_down` -
     // navigation keys (up/down/left/right/enter) are deliberately unbound and
     // bubble to the palette frame instead.
     let palette = Some(PALETTE_SEARCH_CONTEXT);
@@ -1609,7 +1617,7 @@ pub enum ComposerInputEvent {
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
-    /// Images pasted from the clipboard (screenshots / copied image data) —
+    /// Images pasted from the clipboard (screenshots / copied image data) -
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
     PastedImages(Vec<gpui::Image>),
     /// File paths pasted from the clipboard (a file manager "Copy").
@@ -1681,13 +1689,13 @@ pub struct ComposerInput {
     projection: TextProjection,
     /// Inline completion preview: painted in faint ink after the text while
     /// the caret sits at the end (palette tab-completion). Owned by the
-    /// wrapper — it recomputes and re-sets this on every render pass, so the
+    /// wrapper - it recomputes and re-sets this on every render pass, so the
     /// input never has to know what the completion means.
     ghost: Option<SharedString>,
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
-    /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
+    /// Bumped once per `layout_text` pass - the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
     layout_epoch: u64,
@@ -1700,7 +1708,7 @@ pub struct ComposerInput {
     // -- undo history --
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
-    /// Kind, trailing offset, and time of the last edit — the merge test that
+    /// Kind, trailing offset, and time of the last edit - the merge test that
     /// decides whether the next edit extends the current undo step.
     last_edit: Option<(EditKind, usize, Instant)>,
     /// The wrapper owns mention state; this only redirects bound keys while a
@@ -1724,7 +1732,7 @@ impl ComposerInput {
         Self::with_context(placeholder, GENERIC_COMPOSER_CONTEXT, cx)
     }
 
-    /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
+    /// An input in a custom KEY context - palettes use `"PaletteSearch"`,
     /// whose keymap binds only text-editing keys so navigation keys bubble to
     /// the surrounding frame (see `init`).
     pub fn with_context(
@@ -1818,7 +1826,7 @@ impl ComposerInput {
         self
     }
 
-    /// Reset the caret blink phase (solid again) — called on every edit and
+    /// Reset the caret blink phase (solid again) - called on every edit and
     /// caret move, matching textarea behavior.
     fn reset_blink(&mut self) {
         self.blink_anchor = Instant::now();
@@ -1947,7 +1955,7 @@ impl ComposerInput {
 
     /// Replace a completed plain-text token (slash commands) as one
     /// non-coalescing undo step. Unlike [`Self::replace_mention`], the
-    /// replacement is ordinary text — no link, no chip projection.
+    /// replacement is ordinary text - no link, no chip projection.
     pub fn replace_plain_token(
         &mut self,
         range: Range<usize>,
@@ -1984,7 +1992,7 @@ impl ComposerInput {
     }
 
     /// Set (or clear) the inline completion preview. Only paints while the
-    /// caret sits at the end of a non-empty draft — see the prepaint gate.
+    /// caret sits at the end of a non-empty draft - see the prepaint gate.
     pub fn set_ghost(&mut self, ghost: Option<SharedString>, cx: &mut Context<Self>) {
         if self.ghost == ghost {
             return;
@@ -1997,7 +2005,7 @@ impl ComposerInput {
         self.content.contains('\n')
     }
 
-    /// Unwrapped width of the widest line — feeds the compact/expanded flip.
+    /// Unwrapped width of the widest line - feeds the compact/expanded flip.
     pub fn measured_text_width(&self) -> f32 {
         self.max_line_width
     }
@@ -2030,7 +2038,7 @@ impl ComposerInput {
         self.scroll_left = 0.0;
         self.follow_cursor = true;
         // Programmatic replacement (draft load, clear-on-submit) is a new
-        // document, not an edit — undo must not reach back past it.
+        // document, not an edit - undo must not reach back past it.
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.last_edit = None;
@@ -2504,7 +2512,7 @@ impl ComposerInput {
     }
 
     /// Opt/Cmd + Delete family. With a live selection these delete the
-    /// selection only (platform behavior) — the extend runs off the cursor.
+    /// selection only (platform behavior) - the extend runs off the cursor.
     fn delete_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             if self.cursor_offset() == offset {
@@ -2561,7 +2569,7 @@ impl ComposerInput {
                 self.content[self.selected_range.clone()].to_string(),
             ));
         } else if let Some(text) = crate::markdown::selection::selected_text() {
-            // The composer keeps focus while the user reads the transcript —
+            // The composer keeps focus while the user reads the transcript -
             // Cmd+C with no input selection copies the markdown selection.
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -2583,7 +2591,7 @@ impl ComposerInput {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        // Image data (or copied files) beats text — the original composer's
+        // Image data (or copied files) beats text - the original composer's
         // onPaste prevents the default text insert when `clipboardData.files`
         // is non-empty and stages the images instead.
         let mut images: Vec<gpui::Image> = Vec::new();
@@ -3400,7 +3408,7 @@ struct ComposerTextPrepaint {
     mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
     /// Completion preview: window-space origin of the end-of-text caret plus
-    /// the suffix to paint there (shaped at paint time — it never joins the
+    /// the suffix to paint there (shaped at paint time - it never joins the
     /// content's own layout, so hit-testing and the caret ignore it).
     ghost: Option<(Point<Pixels>, SharedString)>,
 }
@@ -3655,7 +3663,7 @@ impl gpui::Element for ComposerTextElement {
             }
         });
 
-        // WrappedLine isn't Clone — temporarily take the shaped lines out of the
+        // WrappedLine isn't Clone - temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
         let (lines, line_height, scroll, scroll_left) = self.input.update(cx, |input, _| {
             (
@@ -3717,7 +3725,7 @@ impl gpui::Element for ComposerTextElement {
                 }
                 // Caret only when this input is actually focused in an active
                 // window (Electron hides it on window deactivation too), and only
-                // in the "on" blink phase — solid while typing, ~500ms blink idle.
+                // in the "on" blink phase - solid while typing, ~500ms blink idle.
                 if self
                     .input
                     .update(cx, |input, cx| input.caret_shown(window, cx))
@@ -3858,7 +3866,7 @@ pub enum ComposerEvent {
     /// by the newly-created session. Emitting this before `select_chat` keeps
     /// the first destination frame on the same timeline as the source frame.
     NewThreadTransitionStarted,
-    /// A prompt was sent optimistically — give the transcript its exact row
+    /// A prompt was sent optimistically - give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
     Sent { chat_id: String, message_id: String },
@@ -3951,7 +3959,7 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
 
 /// Slash-command completion state: like [`FileMentionState`] but the
 /// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// locally per keystroke - no RPC, debounce, or skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
@@ -3994,7 +4002,7 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            "The session's device runs an older zeron - update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
@@ -4005,7 +4013,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to list commands".into()
+            "The session's device runs an older zeron - update it to list commands".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => {
@@ -4021,7 +4029,7 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 ///
 /// Only pane-local, user-authored content is carried: the live input text,
 /// the per-chat-key draft/attachment/appshot maps, and the draft a queue
-/// edit displaced. Deliberately EXCLUDED — global or host-coupled, never the
+/// edit displaced. Deliberately EXCLUDED - global or host-coupled, never the
 /// pane's property: the model/harness picker choices (agent identity is
 /// global), in-flight send/interrupt/mention/slash tasks, popup + lightbox
 /// chrome, layout/flip measurements, failure banners, and the queue-edit
@@ -4029,7 +4037,7 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 /// host-issued lease cannot be resurrected on a new entity, so a switch that
 /// catches an edit mid-flight salvages the DISPLACED draft (text +
 /// attachments + appshots, the user's own words) as the pane's plain unsent
-/// draft and lets the leased row's text go — the row stays in the queue
+/// draft and lets the leased row's text go - the row stays in the queue
 /// panel, where the edit can be re-initiated.
 #[derive(Clone, Default)]
 pub(crate) struct ComposerDraftState {
@@ -4055,6 +4063,8 @@ pub struct Composer {
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
+    /// The footer's ring cluster: plan-usage ring beside the context ring.
+    account_usage: Entity<crate::account_usage::AccountUsage>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -4071,7 +4081,7 @@ pub struct Composer {
     /// gets focus back on close.
     preview_focus: FocusHandle,
     /// Focus grab deferred to the next render (open sites don't all have a
-    /// `Window` — the `ZERON_ATTACH_PREVIEW` boot knob opens in `new`).
+    /// `Window` - the `ZERON_ATTACH_PREVIEW` boot knob opens in `new`).
     preview_focus_pending: bool,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
@@ -4082,12 +4092,12 @@ pub struct Composer {
     /// Advertised commands per harness (one `ListCommands` per harness per
     /// composer lifetime; the engine caches discovery on its side too).
     slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
-    /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
+    /// Slash-popup row scroll - the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
     /// File-mention popup row scroll (same treatment).
     mention_scroll: gpui::ScrollHandle,
-    /// Shared scrollbar hover/drag state for both popups' floating rails —
+    /// Shared scrollbar hover/drag state for both popups' floating rails -
     /// they never show at once (mutually exclusive by token shape).
     popup_bar: crate::popover::MenuScrollbarState,
     pub(crate) current_key: String,
@@ -4099,7 +4109,7 @@ pub struct Composer {
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
-    /// under their own chat — a blanket clear-on-switch erased the one
+    /// under their own chat - a blanket clear-on-switch erased the one
     /// visible trace of a failed send (2026-08-19).
     failure_key: Option<String>,
     wizard: Option<Wizard>,
@@ -4137,7 +4147,7 @@ pub struct Composer {
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
-    /// DROPPED an in-flight send future mid-upload — no banner, no cleanup,
+    /// DROPPED an in-flight send future mid-upload - no banner, no cleanup,
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
@@ -4147,7 +4157,7 @@ pub struct Composer {
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
-    /// Current layout mode (persisted across frames — never derived fresh).
+    /// Current layout mode (persisted across frames - never derived fresh).
     expanded_mode: bool,
     /// `layout_epoch` of the measurement that caused the last flip: the flip is
     /// re-evaluated only after the input has been laid out in the new mode, so
@@ -4155,7 +4165,7 @@ pub struct Composer {
     flip_epoch: u64,
     /// Compact-mode input capacity, learned while compact (layout-stable).
     compact_capacity: f32,
-    /// Input width first measured after expanding — container-width deltas
+    /// Input width first measured after expanding - container-width deltas
     /// while expanded shift `compact_capacity` by the same amount.
     expanded_anchor: f32,
     /// Last input width seen in the current mode (resize detection).
@@ -4175,9 +4185,9 @@ pub struct Composer {
     pub(crate) subagent_seen: std::collections::HashSet<String>,
     settle_task: Option<Task<()>>,
     /// In-flight compact↔expanded morph (one per committed flip; manual
-    /// drive — see [`FlipMorph`]).
+    /// drive - see [`FlipMorph`]).
     flip_morph: Option<FlipMorph>,
-    /// Pill height actually rendered last frame — a committed flip morphs
+    /// Pill height actually rendered last frame - a committed flip morphs
     /// from here, so mid-flight reversals hand off without a jump.
     last_rendered_height: f32,
     model_handoff_position: f32,
@@ -4344,7 +4354,7 @@ impl Composer {
             }
         };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state — a pickers-side notify (refs
+        // by the composer from picker state - a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
         let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
         let picker_focus = cx.subscribe(
@@ -4396,12 +4406,14 @@ impl Composer {
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
         let current_key = target.key(state.read(cx));
+        let account_usage = cx.new(|cx| crate::account_usage::AccountUsage::new(state.clone(), cx));
         let mut composer = Self {
             state,
             target,
             input,
             queue_edit_draft: None,
             pickers,
+            account_usage,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             appshots: HashMap::new(),
@@ -4478,7 +4490,7 @@ impl Composer {
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
-        // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
+        // a rig) - `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
         // `ZERON_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
         if let Ok(spec) = std::env::var("ZERON_ATTACH") {
             let staged: Vec<StagedAttachment> = spec
@@ -4530,7 +4542,7 @@ impl Composer {
         cx.notify();
     }
 
-    /// Bind a pane-fixed composer (and its pickers) to a chat — `send` calls
+    /// Bind a pane-fixed composer (and its pickers) to a chat - `send` calls
     /// this with the just-minted id before the selection observer can run.
     /// The input text is untouched; `ChatTarget::bind` is a no-op for the
     /// global Selected composer.
@@ -4580,7 +4592,7 @@ impl Composer {
     /// project switch tears this pane's surface down.
     pub(crate) fn snapshot_draft_state(&self, cx: &App) -> ComposerDraftState {
         // While a queue edit holds the input, the text belongs to the HOST's
-        // leased queued row — the user's own words are the displaced draft.
+        // leased queued row - the user's own words are the displaced draft.
         // Salvage those (extending the key's staged attachments/appshots) on
         // top of every other key's parked state, and let the lease go.
         if let Some((displaced, displaced_attachments, displaced_appshots)) =
@@ -4617,7 +4629,7 @@ impl Composer {
     /// Rehydrate a parked draft state into a fresh pane composer. The
     /// receiving maps start empty, so the merge is a pure move; the live
     /// text lands in the input only when the keys match and the input is
-    /// still empty (never clobbering newer typing) — otherwise it is
+    /// still empty (never clobbering newer typing) - otherwise it is
     /// displaced like any other per-key draft.
     pub(crate) fn restore_draft_state(
         &mut self,
@@ -4897,7 +4909,7 @@ impl Composer {
         cx.notify();
     }
 
-    /// Drop a deleted chat's per-chat composer state — staged attachments hold
+    /// Drop a deleted chat's per-chat composer state - staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
@@ -4987,13 +4999,13 @@ impl Composer {
                                     // honors the image's intrinsic aspect
                                     // ratio over a percent height (gpui
                                     // f8d8a90 repoint), so size_full let a
-                                    // tall photo grow past the frame — the
+                                    // tall photo grow past the frame - the
                                     // rectangular overflow clip then squared
                                     // the bottom corners (2026-08-19 report).
                                     // 56−2 = frame minus its 1px borders.
                                     .w(px(STRIP_THUMB - 2.0))
                                     .h(px(STRIP_THUMB - 2.0))
-                                    // Own radii — the frame's rounding only
+                                    // Own radii - the frame's rounding only
                                     // clips rectangularly (7 = 8 - border).
                                     .rounded(px(7.0))
                                     .object_fit(ObjectFit::Cover),
@@ -5020,7 +5032,7 @@ impl Composer {
                             .group_hover(group, |s| s.opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 // The button overhangs the thumbnail, whose
-                                // hitbox is right underneath — don't let the
+                                // hitbox is right underneath - don't let the
                                 // same click also open the preview.
                                 cx.stop_propagation();
                                 this.remove_attachment(&remove_id, cx);
@@ -5354,7 +5366,7 @@ impl Composer {
         self.mention.request = self.mention.request.wrapping_add(1);
         self.mention_task = None;
         // Refining an open menu keeps the stale rows visible until the new
-        // response lands — clearing here made the popup bounce through the
+        // response lands - clearing here made the popup bounce through the
         // skeleton (and a different height) on every keystroke.
         let refining = self.mention.token.is_some() && token.is_some();
         self.mention.token = token.clone();
@@ -5832,7 +5844,7 @@ impl Composer {
             .and_then(|h| self.slash_cache.get(&h))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        // Full pill width at the mention card's height budget — both composer
+        // Full pill width at the mention card's height budget - both composer
         // completions share the same surface shape.
         let mut card = crate::popover::popover_card(theme)
             .w_full()
@@ -5961,7 +5973,7 @@ impl Composer {
         ))
     }
 
-    /// The popup whose rows a scrollbar drag is moving — the tokens are
+    /// The popup whose rows a scrollbar drag is moving - the tokens are
     /// mutually exclusive, so at most one exists.
     fn active_popup_scroll(&self) -> Option<gpui::ScrollHandle> {
         if self.slash.token.is_some() {
@@ -5994,8 +6006,8 @@ impl Composer {
                     Indicator::Working | Indicator::AwaitingInput
                 )
             });
-            // `target_queue` is this composer's own projection — selected or
-            // pane-fixed — so removal markers verify against its rows without
+            // `target_queue` is this composer's own projection - selected or
+            // pane-fixed - so removal markers verify against its rows without
             // involving the selection.
             let queue = Self::target_queue(&self.target, state);
             self.queue_removing
@@ -6008,7 +6020,7 @@ impl Composer {
         let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
             // The edited row verifies against this composer's own queue
-            // projection — a pane composer checks its chat's rows even while
+            // projection - a pane composer checks its chat's rows even while
             // another chat is selected.
             (
                 self.target.key(s),
@@ -6052,7 +6064,7 @@ impl Composer {
             self.clear_queue_edit(cx);
         }
 
-        // Draft swap on chat navigation — the input entity itself survives.
+        // Draft swap on chat navigation - the input entity itself survives.
         if key != self.current_key {
             let new_thread_launch =
                 self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
@@ -6077,7 +6089,7 @@ impl Composer {
             self.reset_mention(None, cx);
             // Route changes snap (round 5/6): a mode difference between the
             // old and new session's composer must not glide across
-            // navigation. Killing the in-flight morph here isn't enough —
+            // navigation. Killing the in-flight morph here isn't enough -
             // the nav-driven flip only commits AFTER the swapped draft has
             // been re-measured, one or two renders later, so the whole
             // window snaps (see ROUTE_SNAP_MS).
@@ -6130,13 +6142,13 @@ impl Composer {
             _ => {
                 if let Some(wizard) = self.wizard.as_ref() {
                     // LATCH (original composer.tsx `inputLatch`): a transient
-                    // fold/sync blip — or a steer appended behind the
-                    // streaming entry — must not unmount the panel and lose
+                    // fold/sync blip - or a steer appended behind the
+                    // streaming entry - must not unmount the panel and lose
                     // the user's picks. Release only on explicit resolution
                     // (here or on another device) or when a NON-EMPTY
                     // transcript shows the question superseded (a newer
                     // assistant entry took over). Never on run death: the
-                    // question stays answerable until answered — the engine
+                    // question stays answerable until answered - the engine
                     // delivers a dead run's answer as a resumed turn.
                     let transcript = self.target.transcript(self.state.read(cx)).to_vec();
                     let released = input_request_resolved(&transcript, &wizard.request_id)
@@ -6181,7 +6193,7 @@ impl Composer {
             return false;
         }
         // New-chat canvas: needs a runnable agent. The
-        // no-agents check only fires once the catalog is loaded — offline
+        // no-agents check only fires once the catalog is loaded - offline
         // and still-loading states must not block (the harness resolves from
         // the remembered default and the engine reports real failures).
         self.pickers.read(cx).no_agents_available()
@@ -6222,7 +6234,7 @@ impl Composer {
             // Enter never stops a run: Stop mode implies an empty composer,
             // so a stray extra Enter right after sending landed an interrupt
             // on the just-dispatched prompt and the agent ate it silently
-            // (issue #406). Stop stays on the button — and on Esc when
+            // (issue #406). Stop stays on the button - and on Esc when
             // escape_stops_active_agent is enabled.
             SendButtonMode::Stop => {}
             _ if no_content => {}
@@ -6251,7 +6263,7 @@ impl Composer {
         }
     }
 
-    /// Queue a Run doc command with an optimistic echo — or, with the agent
+    /// Queue a Run doc command with an optimistic echo - or, with the agent
     /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
@@ -6259,7 +6271,7 @@ impl Composer {
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
-            self.failure_key = None; // global — meaningful on every chat
+            self.failure_key = None; // global - meaningful on every chat
             cx.notify();
             return;
         };
@@ -6270,17 +6282,17 @@ impl Composer {
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
         // Where the new session runs (Current checkout / reuse an existing
-        // worktree / fresh worktree off the picked base) — resolved NOW so
+        // worktree / fresh worktree off the picked base) - resolved NOW so
         // the async block needs no picker access.
         let plan = self.pickers.read(cx).checkout_plan();
-        // Fully-resolved model/reasoning/options — concrete values (chat config
+        // Fully-resolved model/reasoning/options - concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
         let existing_cwd = self
             .target
             .chat(self.state.read(cx))
             .and_then(|c| c.cwd.clone());
-        // The PROJECT fixes the new chat's device + base folder — sessions are
+        // The PROJECT fixes the new chat's device + base folder - sessions are
         // minted onto the project's device, not necessarily this one. With no
         // project ("Don't work in a project") the composer's device pick is
         // the host and the session runs from `~` there.
@@ -6370,11 +6382,11 @@ impl Composer {
 
         // Queued-attachment flow (durable-by-design): stage the bytes on the
         // LOCAL engine, queue the command immediately with `pending://` refs,
-        // and let the engine push the bytes to a remote host afterwards —
+        // and let the engine push the bytes to a remote host afterwards -
         // staging must never gate the queue (2026-08-19 incident: a send
         // died with a zombie peer link because the upload sat in front of
         // QueueCommand). Requires every engine involved to understand the
-        // ref scheme — the local engine (an IPC daemon may be older than
+        // ref scheme - the local engine (an IPC daemon may be older than
         // this UI) and, for remotely-hosted chats, the host; anything older
         // keeps the legacy blocking upload.
         let host_is_remote = host_device_id
@@ -6405,7 +6417,7 @@ impl Composer {
             .collect();
         // The echo carries attachment refs from the first frame, so photos
         // render while the send is still pending. Queued flow: the refs are
-        // the real `pending://` identities (stable — no post-upload refresh).
+        // the real `pending://` identities (stable - no post-upload refresh).
         // Legacy flow: synthetic `pending/…` paths that the post-upload
         // refresh replaces with the host's absolute paths. Either way the
         // staged bytes are seeded into the transcript cache under every
@@ -6432,7 +6444,7 @@ impl Composer {
             &echo_paths,
         );
         // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
-        // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
+        // persisted ref to `{its uploads dir}/{id8}-{name}` - an absolute
         // path the sender can't predict, but whose id8 it minted. The alias
         // keeps the thumbnail on the already-local bytes through that
         // rewrite instead of blanking into a reload skeleton.
@@ -6480,7 +6492,7 @@ impl Composer {
             continuation_of: None,
         };
         // A pane-fixed composer locks onto the chat it just minted BEFORE the
-        // event and the selection observer run — by the time `select_chat`
+        // event and the selection observer run - by the time `select_chat`
         // notifies, its key must already be the new chat's (no draft swap).
         if is_new && matches!(self.target, ChatTarget::Fixed(None)) {
             self.bind_chat(chat_id.clone(), cx);
@@ -6489,7 +6501,7 @@ impl Composer {
         if is_new {
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
-        // A queued message is not in the transcript yet — the queue panel is
+        // A queued message is not in the transcript yet - the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
         self.state.update(cx, |s, cx| {
             if is_new {
@@ -6497,7 +6509,7 @@ impl Composer {
             }
             if should_publish_optimistic_echo(queue) {
                 s.push_echo(&chat_id, echo);
-                // Working overlay until the host executes the queued command —
+                // Working overlay until the host executes the queued command -
                 // without it a remote send flashed Completed (and could ring
                 // the done-chime) in the queue→drain→sync gap.
                 s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
@@ -6525,7 +6537,7 @@ impl Composer {
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<Option<String>, String> = async {
-                // Attachments stage FIRST — before the chat row or anything
+                // Attachments stage FIRST - before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
                 // uploadId), and ordering it first makes a new-chat send
                 // atomic: a staging failure aborts with NOTHING created,
@@ -6533,7 +6545,7 @@ impl Composer {
                 // "failed to stage → empty transcript" report).
                 //
                 // Queued flow: commit the bytes to the LOCAL engine's uploads
-                // dir (fast, offline-safe) — the queued command carries the
+                // dir (fast, offline-safe) - the queued command carries the
                 // `pending://` refs and the engine delivers the bytes to a
                 // remote host afterwards, retrying until they land. Legacy
                 // flow (old engines): stage on the host device up front,
@@ -6577,7 +6589,7 @@ impl Composer {
                             "fileName": att.name,
                         }));
                     }
-                    // The echo refs ARE the persisted refs — no refresh pass.
+                    // The echo refs ARE the persisted refs - no refresh pass.
                     attachment_paths = echo_paths.clone();
                     content = echo_text.clone();
                 } else if !staged.is_empty() {
@@ -6608,7 +6620,7 @@ impl Composer {
                             Err(err) => {
                                 tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
                                 return Err(
-                                    "Couldn't upload the attachment — the device may be offline."
+                                    "Couldn't upload the attachment - the device may be offline."
                                         .to_string(),
                                 );
                             }
@@ -6665,12 +6677,12 @@ impl Composer {
                 // Resolve the working directory: existing chats keep theirs;
                 // new chats run per the checkout plan (t3code env-mode): the
                 // space's folder as-is, an EXISTING worktree of the picked ref
-                // (a plain cwd override — multiple sessions share one
+                // (a plain cwd override - multiple sessions share one
                 // worktree), or a fresh isolated worktree created off the
                 // picked base ref (CreateWorktree on send, targeted at the
                 // space's device; the RPC relay-forwards).
                 let mut cwd = if is_new {
-                    // Project-less sessions run from the host's home dir —
+                    // Project-less sessions run from the host's home dir -
                     // "~" is expanded on the host when the run spawns.
                     space_path.clone().or_else(|| Some("~".to_string()))
                 } else {
@@ -6701,18 +6713,18 @@ impl Composer {
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
                             // Footer shows the base until the host stamps the
                             // actual zeron/<name> branch post-creation. cwd
-                            // stays the repo folder — an old host that doesn't
+                            // stays the repo folder - an old host that doesn't
                             // know the spec degrades to the main checkout
                             // instead of failing the run.
                             chat_branch = base.clone();
                             if let Some(repo_path) = &space_path {
                                 // A remote repo's branch list loads over the
-                                // relay — on a bad link it may never arrive
+                                // relay - on a bad link it may never arrive
                                 // and the picker has no base. That must NOT
                                 // silently drop the isolation the user picked
                                 // (2026-08-19: "New worktree" ran in the main
-                                // checkout): default to HEAD, which git — any
-                                // host version — resolves as the repo's
+                                // checkout): default to HEAD, which git - any
+                                // host version - resolves as the repo's
                                 // current checkout state.
                                 let base =
                                     base.clone().unwrap_or_else(|| "HEAD".to_string());
@@ -6840,7 +6852,7 @@ impl Composer {
                     params["transfers"] = serde_json::Value::Array(transfers);
                 }
                 // Deadline-bounded: QueueCommand is a local write (in-process
-                // or IPC), but a deferred engine handle can park forever —
+                // or IPC), but a deferred engine handle can park forever -
                 // the send task must never grind silently (2026-08-19).
                 attachments::call_with_timeout(
                     &engine,
@@ -6858,7 +6870,7 @@ impl Composer {
                 // A failed new-chat send must not strand a just-minted empty
                 // chat in the sidebar (v0.2.12 "empty transcript" report).
                 // Staging now runs before CreateChat, so usually nothing was
-                // created — but a post-mutate failure (QueueCommand) still
+                // created - but a post-mutate failure (QueueCommand) still
                 // leaves a row. Best-effort delete; a no-op if the chat was
                 // never materialized.
                 let _ = attachments::call_with_timeout(
@@ -6885,7 +6897,7 @@ impl Composer {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the stash. A failed NEW
                     // chat restores to the CANVAS (key "") and navigates back
-                    // there — the minted chat is gone (deleted above), so
+                    // there - the minted chat is gone (deleted above), so
                     // nothing may restore under its key.
                     let restore_key = if is_new {
                         String::new()
@@ -6912,7 +6924,7 @@ impl Composer {
                     });
                     if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
-                        // while the send was in flight survive the hand-back —
+                        // while the send was in flight survive the hand-back -
                         // draining the minted chat's slot too when the restore
                         // target is the canvas.
                         let mut merged = ordinary_staged.clone();
@@ -7057,14 +7069,14 @@ impl Composer {
             Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
             Err(_) => return,
         };
-        // `action_task`, NOT `send_task` — see `interrupt`.
+        // `action_task`, NOT `send_task` - see `interrupt`.
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Answer failed: {err}").into());
                     composer.failure_key = Some(failure_chat);
-                    // The answer never left this device — put the panel back.
+                    // The answer never left this device - put the panel back.
                     composer.answered_requests.remove(&request_id);
                     cx.notify();
                 })
@@ -7075,7 +7087,7 @@ impl Composer {
             // but the host may still REJECT it (e.g. the run's resolver is
             // gone). If the very same request is still the live pending input
             // once the host has had ample time to execute and the resolved
-            // flag to sync back, the answer demonstrably didn't take —
+            // flag to sync back, the answer demonstrably didn't take -
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
@@ -7099,7 +7111,7 @@ impl Composer {
         let input_empty = self.input.read(cx).is_empty();
         let key = event.keystroke.key.as_str();
         // A BARE digit picks an option. With a modifier held the keystroke
-        // belongs to an app shortcut — ⌘1..⌘9 jump to a sidebar row — and the
+        // belongs to an app shortcut - ⌘1..⌘9 jump to a sidebar row - and the
         // panel must not also consume it as a selection.
         if let Ok(digit) = key.parse::<usize>()
             && (1..=9).contains(&digit)
@@ -7147,7 +7159,7 @@ impl Composer {
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
-            // (typed answers win — zeron question-panel.tsx `isSel`).
+            // (typed answers win - zeron question-panel.tsx `isSel`).
             let picked = wizard.is_picked(ix) && typed_empty;
             div()
                 .id(("wizard-option", ix))
@@ -7340,7 +7352,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Zeron composer-actions.tsx: a size-7 filled circle — up-arrow to
+        // Zeron composer-actions.tsx: a size-7 filled circle - up-arrow to
         // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
             SendButtonMode::Stop => div()
@@ -7389,7 +7401,7 @@ impl Composer {
 
 /// The completion popups' floating rails run through
 /// [`crate::popover::rail`]: the shared `popup_bar` state plus whichever
-/// popup's rows are mounted — see [`Composer::active_popup_scroll`].
+/// popup's rows are mounted - see [`Composer::active_popup_scroll`].
 impl crate::popover::ScrollRailHost for Composer {
     fn rail_bar(&mut self) -> &mut crate::popover::MenuScrollbarState {
         &mut self.popup_bar
@@ -7400,8 +7412,8 @@ impl crate::popover::ScrollRailHost for Composer {
     }
 }
 
-/// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
-/// the focused terminal panel is hidden — route here).
+/// Focus lands on the prompt input (window-level focus fallbacks - e.g. after
+/// the focused terminal panel is hidden - route here).
 impl Focusable for Composer {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
@@ -7458,7 +7470,7 @@ impl Render for Composer {
         };
         let now = Instant::now();
         // Only measurements taken *after* the last flip may drive the next one
-        // (at most one flip per layout pass — a flip invalidates the widths).
+        // (at most one flip per layout pass - a flip invalidates the widths).
         let measured_since_flip = epoch > self.flip_epoch && last_width > 0.0;
         if measured_since_flip {
             // A same-mode width change is an interactive window/pane resize:
@@ -7529,7 +7541,7 @@ impl Render for Composer {
             self.last_seen_width = 0.0;
         }
         // New chats render expanded regardless of `expanded_mode` (see below),
-        // so a mode flip there changes nothing visible — never morph it.
+        // so a mode flip there changes nothing visible - never morph it.
         let new_chat = self.target.chat_id(self.state.read(cx)).is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
@@ -7585,7 +7597,7 @@ impl Render for Composer {
             let offline = state.connectivity.state == S::Offline;
             degraded.then(|| {
                 let text: SharedString = if offline {
-                    "Offline — messages will send when you're back online.".into()
+                    "Offline - messages will send when you're back online.".into()
                 } else {
                     "Messages will send once the connection recovers.".into()
                 };
@@ -7634,7 +7646,7 @@ impl Render for Composer {
             })
             .when_some(queue_notice, |el, (notice, offline)| {
                 // Not a warning box (v0.2.12 feedback: the amber Notice read
-                // as an error and flashed on every blip — pre-grace). One
+                // as an error and flashed on every blip - pre-grace). One
                 // quiet caption line, amber dot only for hard offline; it
                 // clears itself the moment the path heals.
                 let dot = if offline {
@@ -7665,7 +7677,7 @@ impl Render for Composer {
         }
 
         // What is waiting to be sent, stacked directly above the box it was
-        // typed in — the queue is a property of this composer, not a panel
+        // typed in - the queue is a property of this composer, not a panel
         // somewhere else.
         let show_queue_latest_shortcut = self.queue_shortcut_revealed
             && self.editing_queued.is_none()
@@ -7884,7 +7896,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
-        // Attach button — opens the native image picker (the original's hidden
+        // Attach button - opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
         // this button and the model picker.
@@ -7982,13 +7994,31 @@ impl Render for Composer {
             .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
                 f32::from(bounds.size.width)
             });
-        let usage = crate::context_usage::usage_for_target(self.state.read(cx), &self.target);
-        let has_context_ring = crate::context_usage::has_window(usage);
-        let context_ring = has_context_ring.then(|| {
-            crate::context_usage::render(usage, self.state.clone(), self.target.clone(), &theme)
-                .into_any_element()
+        // The footer's ring cluster (account usage + context) tracks the
+        // session's harness and device; it renders itself when there is
+        // anything to show. The device is THIS composer's target - never the
+        // globally selected chat, which a split pane may not be showing.
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let ring_target = {
+            let state = self.state.read(cx);
+            let device = self
+                .target
+                .chat(state)
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.effective_device_id());
+            device.filter(|device| state.local_device_id.as_ref() != Some(device))
+        };
+        self.account_usage.update(cx, |usage, cx| {
+            usage.track(harness, ring_target, self.target.clone(), cx)
         });
-        let context_ring_width = if has_context_ring { 30.0 } else { 0.0 };
+        // The ring cluster takes footer width per visible ring (context
+        // occupancy, account usage) - labeled chips run wider than a bare
+        // ring. Empty cluster reserves nothing.
+        let usage = crate::context_usage::usage_for_target(self.state.read(cx), &self.target);
+        let context_ring = crate::context_usage::has_window(usage);
+        let account_ring = self.account_usage.read(cx).has_account_ring(cx);
+        let show_rings = context_ring || account_ring;
+        let context_ring_width = ring_cluster_width(context_ring, account_ring);
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
@@ -8024,7 +8054,7 @@ impl Render for Composer {
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
             // (12px bottom + 2px top, 32px chips → 46px) ABSOLUTE at the pill's
-            // stationary bottom — constant screen-y through the morph, with
+            // stationary bottom - constant screen-y through the morph, with
             // the 4.5px compact↔expanded centering delta gliding out. The
             // text viewport follows the animated height so it cannot paint
             // over the controls. Its width stays fixed (no tween rewraps);
@@ -8083,7 +8113,10 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .gap(px(6.0))
-                                .children(context_ring)
+                                .children(
+                                    show_rings
+                                        .then(|| self.account_usage.clone().into_any_element()),
+                                )
                                 .child(send_button),
                         ),
                 )
@@ -8152,7 +8185,10 @@ impl Render for Composer {
                                 .gap(px(6.0))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .children(context_ring)
+                                .children(
+                                    show_rings
+                                        .then(|| self.account_usage.clone().into_any_element()),
+                                )
                                 .child(send_button),
                         ),
                 )
@@ -8172,7 +8208,7 @@ impl Render for Composer {
         let has_new_thread_git_selectors = Self::target_space(&self.target, self.state.read(cx))
             .is_some_and(|space| space.git_detected);
         // The file dropzone lives in the shell (the whole conversation column,
-        // not just the pill — shell.rs `chat-dropzone`); drops land back here
+        // not just the pill - shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
@@ -8193,7 +8229,7 @@ impl Render for Composer {
                 .absolute()
                 .inset_0()
             })
-            // Both completion popups span the full pill width above it —
+            // Both completion popups span the full pill width above it -
             // the file-mention and slash tokens are mutually exclusive.
             .children(self.render_file_mention_popup(&theme, cx))
             .children(self.render_slash_popup(&theme, cx));
@@ -8384,7 +8420,9 @@ mod tests {
                                 .absolute()
                                 .inset_0()
                                 .opacity(0.0)
-                                .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0)),
+                                .drag_over::<gpui::ExternalPaths>(|style, _, _, _| {
+                                    style.opacity(1.0)
+                                }),
                         )
                 }
             }
@@ -8788,14 +8826,14 @@ mod tests {
         });
     }
 
-    /// Issue #406: Enter submits — it must never stop a run. Stop mode only
+    /// Issue #406: Enter submits - it must never stop a run. Stop mode only
     /// exists on a live run with an EMPTY composer, so a habitual
     /// double-Enter after sending interrupted the just-dispatched prompt
     /// and the agent ate it silently. Keyboard stop is the Esc setting's
     /// job; Enter on an empty composer is a no-op.
     #[gpui::test]
     fn enter_on_empty_composer_during_a_live_run_never_interrupts(cx: &mut gpui::TestAppContext) {
-        // RpcClient::new spawns its reader on tokio — give the test a reactor.
+        // RpcClient::new spawns its reader on tokio - give the test a reactor.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
         // The client's write end: any RPC Enter dispatches lands here.
@@ -8807,7 +8845,7 @@ mod tests {
                 zeron_rpc::RpcClient::new(out, inbound),
             ));
             state.selected_chat = Some("c".into());
-            // A send in flight reads as Working — the double-Enter window.
+            // A send in flight reads as Working - the double-Enter window.
             state.begin_pending_send("c", "m1", chrono::Utc::now());
         });
         let composer = cx.new(|cx| Composer::new(state, cx));
@@ -9250,7 +9288,7 @@ mod tests {
         let cap = 300.0;
         // Text just over capacity expands…
         assert!(composer_flip(false, cap + 1.0, cap, false, false));
-        // …and the SAME width, now expanded, does NOT collapse back — the
+        // …and the SAME width, now expanded, does NOT collapse back - the
         // collapse threshold sits COLLAPSE_HYSTERESIS below the expand one.
         assert!(composer_flip(true, cap + 1.0, cap, false, false));
         // Anywhere inside the band the two modes are both stable (no width in
@@ -9301,7 +9339,7 @@ mod tests {
         assert_eq!(COMPOSER_MIN_HEIGHT, 124.0);
         assert_eq!(COMPOSER_MAX_HEIGHT, 308.0);
         // One line sits at the floor: the textarea BOX (content + `pt-4 pb-1`)
-        // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` — this is
+        // clamps UP to 76 exactly like `Math.max(scrollHeight, 76)` - this is
         // what makes the always-expanded new-chat composer 124px tall.
         assert_eq!(
             composer_total_height(input_content_height(1)),
@@ -9732,7 +9770,7 @@ mod tests {
         let mid = m.height(124.0, 90.0);
         assert!(mid > 49.0 && mid < 124.0);
         // A reverse flip mid-flight commits a new morph FROM the animated
-        // height — continuous at the handoff, no pop to an endpoint.
+        // height - continuous at the handoff, no pop to an endpoint.
         let rev = flip_morph_step(Some(m), true, mid, 90.0, false, false).unwrap();
         assert_eq!(rev.from, mid);
         assert_eq!(rev.height(49.0, 90.0), mid);
@@ -9748,7 +9786,7 @@ mod tests {
 
     #[test]
     fn route_change_never_arms_the_morph() {
-        // A flip committed inside the route-snap window must NOT animate —
+        // A flip committed inside the route-snap window must NOT animate -
         // switching sessions (chat↔chat or chat↔new-session) snaps the
         // composer straight to the target mode, like the header (round 6).
         assert_eq!(flip_morph_step(None, true, 49.0, 0.0, false, true), None);
@@ -9814,7 +9852,7 @@ mod tests {
             assert!(v >= prev && v <= 8.0 + CLUSTER_X_DELTA);
             prev = v;
         }
-        // Internal group spacing is shared between modes — only this wrapper
+        // Internal group spacing is shared between modes - only this wrapper
         // inset may differ across the flip.
     }
 
@@ -10064,8 +10102,8 @@ mod tests {
         );
         // DEAD entry with an unresolved input STILL gets the panel: the
         // question stays answerable until answered (the engine delivers the
-        // answer as a resumed turn), so a run reaped under its question —
-        // engine restart — must not orphan it (user report).
+        // answer as a resumed turn), so a run reaped under its question -
+        // engine restart - must not orphan it (user report).
         let t = vec![entry(
             Some(MessageStatus::Aborted),
             vec![input_part.clone()],
@@ -10106,7 +10144,7 @@ mod tests {
         assert!(pending_input_request(&[]).is_none());
 
         // Regression (user forensics): a steer prompt appends a USER entry
-        // AFTER the streaming assistant entry — the question must still be
+        // AFTER the streaming assistant entry - the question must still be
         // found (a last-entry-only read vanished the panel exactly when the
         // user typed, bricking the answer flow).
         let user_echo = SessionMessageEntry {
@@ -10172,6 +10210,95 @@ mod tests {
             assert_eq!(composer.current_key, "");
             assert!(composer.target.chat_id(composer.state.read(cx)).is_none());
         });
+    }
+
+    /// A split pane's ring cluster serves its OWN chat's device: a pane bound
+    /// to a chat on another machine loads/switches accounts there, while the
+    /// global selection sits on a local chat.
+    #[gpui::test]
+    fn a_pane_ring_tracks_its_own_chats_device(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let state = handle.read_with(cx, |composer, _| composer.state.clone()).unwrap();
+        let chat_on = |id: &str, device: &str| zeron_proto::Chat {
+            id: id.into(),
+            device_id: device.into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("local".into());
+            state.apply_chats(vec![
+                chat_on("local-chat", "local"),
+                chat_on("remote-chat", "remote-device"),
+            ]);
+            state.selected_chat = Some("local-chat".into());
+        });
+        // This pane's composer is fixed to the remote chat; the selection
+        // (and the Selected composer's ring) stays on the local one.
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.set_target(ChatTarget::Fixed(Some("remote-chat".into())), cx);
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        handle
+            .read_with(cx, |composer, cx| {
+                assert_eq!(
+                    composer.account_usage.read(cx).target_device(),
+                    Some("remote-device"),
+                    "a pane's account ring must load its own chat's device"
+                );
+            })
+            .unwrap();
+        // A new-chat canvas follows the pane's effective device, never the
+        // selection's: selected_device stays local, canvas picks remote.
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.set_target(ChatTarget::Fixed(None), cx);
+                composer.state.update(cx, |state, _| {
+                    state.selected_device = Some("remote-device".into());
+                });
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        handle
+            .read_with(cx, |composer, cx| {
+                assert_eq!(
+                    composer.account_usage.read(cx).target_device(),
+                    Some("remote-device"),
+                    "a canvas's account ring must follow its device pick"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The footer reserves per-ring width, so both labeled chips fit in the
+    /// model chip's handoff instead of sharing one ring's slot.
+    #[test]
+    fn each_visible_ring_reserves_its_own_width() {
+        assert_eq!(ring_cluster_width(false, false), 0.0);
+        assert_eq!(ring_cluster_width(true, false), 56.0);
+        assert_eq!(ring_cluster_width(false, true), 56.0);
+        assert_eq!(ring_cluster_width(true, true), 112.0);
     }
 }
 

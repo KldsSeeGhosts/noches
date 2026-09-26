@@ -1,10 +1,7 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
 use crate::state::{AppState, ChatTarget};
 use crate::theme::Theme;
-use gpui::{
-    Context, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
-    prelude::*, px,
-};
+use gpui::{PathBuilder, SharedString, canvas, div, point, prelude::*, px};
 use zeron_proto::ContextUsage;
 
 /// The replicated usage frame belongs to the selected chat. Neither an
@@ -16,20 +13,48 @@ pub(crate) fn usage_for_target(state: &AppState, target: &ChatTarget) -> Option<
         .flatten()
 }
 
-pub(crate) fn render(
+/// The context ring's trigger chip; the footer's ring cluster
+/// ([`crate::account_usage`]) opens [`card`] from it on click. `open` holds
+/// the hover wash while its popover is up.
+pub(crate) fn chip(
     usage: Option<ContextUsage>,
-    state: gpui::Entity<crate::state::AppState>,
-    target: ChatTarget,
+    open: bool,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let fraction = usage.and_then(ContextUsage::fraction);
     let color = fill_color(fraction, theme);
+    let label = fraction
+        .map(|f| format!("{:.0}%", f * 100.0))
+        .unwrap_or_else(|| " - ".into());
+    ring_chip(
+        "context-usage",
+        fraction.unwrap_or(0.0) as f32,
+        color,
+        color,
+        label,
+        open,
+        theme,
+    )
+}
+
+/// One footer ring indicator: ring + percent, identical geometry for every
+/// ring so they sit side by side as equals. `arc` colours the ring's fill,
+/// `text` the label; `open` holds the hover wash while its popover is up.
+pub(crate) fn ring_chip(
+    id: &'static str,
+    fraction: f32,
+    arc: gpui::Hsla,
+    text: gpui::Hsla,
+    label: String,
+    open: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
     let track = theme.text_faint.opacity(0.25);
     let ring = canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let center = bounds.center();
-            let mut arc = |fraction: f32, color| {
+            let mut arc_path = |fraction: f32, color| {
                 if fraction <= 0.0 {
                     return;
                 }
@@ -52,39 +77,32 @@ pub(crate) fn render(
                     window.paint_path(path, color);
                 }
             };
-            arc(1.0, track);
-            arc(fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32, color);
+            arc_path(1.0, track);
+            arc_path(fraction.clamp(0.0, 1.0), arc);
         },
     )
     .size(px(16.0));
-    let label = fraction
-        .map(|f| format!("Context window: {:.0}% used", f * 100.0))
-        .unwrap_or_else(|| "Context window: usage not reported".into());
     div()
-        .id("context-usage")
+        .id(id)
         .flex_none()
         .flex()
         .items_center()
-        .justify_center()
-        .size(px(24.0))
+        .gap(px(5.0))
+        .h(px(24.0))
+        .px(px(6.0))
         .rounded(px(6.0))
-        .aria_label(SharedString::from(label))
+        .text_size(px(11.0))
+        .text_color(text)
+        .cursor_pointer()
+        .when(open, |s| s.bg(crate::theme::ink(0.05)))
         .hover(|s| s.bg(crate::theme::ink(0.05)))
         .child(ring)
-        .tooltip(move |_, cx| {
-            cx.new(|cx| UsageCard {
-                _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
-                state: state.clone(),
-                target: target.clone(),
-            })
-            .into()
-        })
+        .child(SharedString::from(label))
 }
 
-struct UsageCard {
-    state: gpui::Entity<crate::state::AppState>,
-    target: ChatTarget,
-    _subscription: gpui::Subscription,
+/// The context popover card's content, opened from [`chip`].
+pub(crate) fn card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
+    render_card(usage, theme)
 }
 
 /// Ring + bar fill share one hue rule: danger at >=90%, warning at >=75%,
@@ -153,97 +171,95 @@ fn detail_lines(usage: Option<ContextUsage>) -> Vec<String> {
     }
 }
 
-impl Render for UsageCard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = &Theme::of(cx).for_popup();
-        let usage = usage_for_target(self.state.read(cx), &self.target);
-        let fraction = usage.and_then(ContextUsage::fraction);
-        let fill = fill_color(fraction, theme);
-        let percent = fraction.map(|f| format!("{:.0}%", f * 100.0));
+/// The card's body for a snapshot `usage` - shared by the click popover
+/// ([`card`]) and, before the rings moved to popovers, the hover tooltip.
+fn render_card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
+    let fraction = usage.and_then(ContextUsage::fraction);
+    let fill = fill_color(fraction, theme);
+    let percent = fraction.map(|f| format!("{:.0}%", f * 100.0));
 
-        let mut card = crate::popover::popover_card(theme)
-            .p(px(12.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(16.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("Context window"),
-                    )
-                    .children(percent.map(|p| {
-                        div()
-                            .font_family(theme.font_mono.clone())
-                            .text_size(px(11.0))
-                            .text_color(fill)
-                            .child(p)
-                    })),
-            )
-            .child(
-                div()
-                    .h(px(4.0))
-                    .w_full()
-                    .rounded(px(2.0))
-                    .bg(theme.text_faint.opacity(0.25))
-                    .child(div().h_full().rounded(px(2.0)).bg(fill).w(gpui::relative(
-                        fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
-                    ))),
-            )
-            .children(detail_lines(usage).into_iter().map(|line| {
-                div()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    // the lines break only at their own boundaries: a tooltip
-                    // sizes from unwrapped text, so soft wrapping clipped it
-                    .whitespace_nowrap()
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(line))
-            }));
-        let compact_percent = usage.and_then(|u| {
-            let window = u.window.filter(|w| *w > 0)?;
-            Some(u.compact_at? as f64 / window as f64 * 100.0)
-        });
-        if let Some(compaction) = compact_percent {
-            card = card.child(
-                div()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    .whitespace_nowrap()
-                    .text_color(theme.text_faint)
-                    .child(format!("Auto-compacts at ~{compaction:.0}%")),
-            );
-        }
-        if let Some(session) = usage.and_then(|u| u.session) {
-            card = card.child(
-                div()
-                    .pt(px(4.0))
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    .whitespace_nowrap()
-                    .text_color(theme.text_faint)
-                    .child(format!(
-                        "Session: {} in · {} out · {} cache",
-                        with_separators(session.input),
-                        with_separators(session.output),
-                        with_separators(session.cache_read),
-                    )),
-            );
-        }
-        crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
+    let mut card = crate::popover::popover_card(theme)
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child("Context window"),
+                )
+                .children(percent.map(|p| {
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.0))
+                        .text_color(fill)
+                        .child(p)
+                })),
+        )
+        .child(
+            div()
+                .h(px(4.0))
+                .w_full()
+                .rounded(px(2.0))
+                .bg(theme.text_faint.opacity(0.25))
+                .child(div().h_full().rounded(px(2.0)).bg(fill).w(gpui::relative(
+                    fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+                ))),
+        )
+        .children(detail_lines(usage).into_iter().map(|line| {
+            div()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                // the lines break only at their own boundaries: a tooltip
+                // sizes from unwrapped text, so soft wrapping clipped it
+                .whitespace_nowrap()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(line))
+        }));
+    let compact_percent = usage.and_then(|u| {
+        let window = u.window.filter(|w| *w > 0)?;
+        Some(u.compact_at? as f64 / window as f64 * 100.0)
+    });
+    if let Some(compaction) = compact_percent {
+        card = card.child(
+            div()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .whitespace_nowrap()
+                .text_color(theme.text_faint)
+                .child(format!("Auto-compacts at ~{compaction:.0}%")),
+        );
     }
+    if let Some(session) = usage.and_then(|u| u.session) {
+        card = card.child(
+            div()
+                .pt(px(4.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .whitespace_nowrap()
+                .text_color(theme.text_faint)
+                .child(format!(
+                    "Session: {} in · {} out · {} cache",
+                    with_separators(session.input),
+                    with_separators(session.output),
+                    with_separators(session.cache_read),
+                )),
+        );
+    }
+    card
 }
 
 #[cfg(test)]
