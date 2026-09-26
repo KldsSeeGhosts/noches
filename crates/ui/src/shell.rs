@@ -77,6 +77,20 @@ mod voice_actions;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
+/// `connected` already includes the engine's degradation grace. A brief
+/// focus-triggered dial needs no sidebar status; queued changes or a sustained
+/// outage still deserve one.
+fn chat_sync_pill_caption(chat: &zeron_proto::ChatConnectivity) -> Option<&'static str> {
+    use zeron_proto::ChatSyncState as S;
+    let sustained_or_queued = !chat.connected || chat.pending_pushes > 0;
+    match chat.sync_state {
+        S::Waiting if sustained_or_queued => Some("Sync queued - changes are saved"),
+        S::Connecting if sustained_or_queued => Some("Syncing…"),
+        S::Offline if !chat.connected => Some("Offline - changes are saved"),
+        _ => None,
+    }
+}
+
 actions!(
     shell,
     [
@@ -2967,6 +2981,13 @@ impl Shell {
     }
 
     fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        if let RightSurface::Subagent(id) = surface
+            && let Some(tab) = self.subagent_tabs.get(&id)
+        {
+            let doc_id = tab.doc_id.clone();
+            self.state
+                .update(cx, |state, cx| state.focus_subagent_sync(&doc_id, cx));
+        }
         if self.resolved_right_active(cx) != surface {
             self.suspend_file_images(cx);
         }
@@ -6626,19 +6647,45 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The global connection line. `None` while healthy (`Connected`) or on
-    /// local profiles (`Disabled`) — and the engine's degrade grace means it
-    /// only exists during REAL outages, never join/wake blips. No surface,
+    /// Global connection health, with selected-chat queue and storage status.
+    /// Persistence failures take precedence even when the network is offline.
+    /// `None` while healthy (`Connected`) or on local profiles (`Disabled`) -
+    /// and the engine's degrade grace means it only exists during REAL
+    /// outages, never join/wake blips. No surface,
     /// no border (v0.2.12 feedback): a bare spinner + faint caption while
     /// reconnecting; an amber dot only when the OS says offline. The
     /// transport error belongs in logs, not the sidebar.
     fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
+        let selected = self.state.read(cx).selected_chat.as_deref();
+        let chat = conn.chats.iter()
+            .find(|c| Some(c.chat_id.as_str()) == selected);
+        let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
-            S::Disabled | S::Connected => return None,
+            _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
+                "Changes could not be saved".into(),
+                // A storage failure is a failed state, not a transient warn:
+                // the danger hue matches the sidebar's errored sessions.
+                div()
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(SessionState::Failed.color(theme).unwrap_or(theme.danger))
+                    .into_any_element(),
+            ),
+            S::Disabled => return None,
+            S::Connected => {
+                let caption = chat_sync_pill_caption(chat?)?;
+                (
+                    caption.into(),
+                    loaders::mini_mono_spinner(
+                        "chat-sync-spinner", 2.0, theme.text_muted,
+                        self.sidebar_pane.entity_id(), cx,
+                    ).into_any_element(),
+                )
+            }
             S::Offline => (
-                "Offline — sends are saved".into(),
+                "Offline - sends are saved".into(),
                 div()
                     .size(px(5.0))
                     .rounded_full()
@@ -11069,6 +11116,42 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_sync_status_waits_for_grace_or_queued_changes() {
+        use zeron_proto::{ChatConnectivity, ChatSyncState as S};
+
+        let mut chat = ChatConnectivity {
+            chat_id: "remote".into(),
+            sync_state: S::Local,
+            connected: false,
+            delivery_live: false,
+            pending_pushes: 0,
+        };
+        assert_eq!(chat_sync_pill_caption(&chat), None);
+
+        for state in [S::Waiting, S::Connecting, S::Offline] {
+            chat.sync_state = state;
+            chat.connected = true;
+            assert_eq!(chat_sync_pill_caption(&chat), None, "transient {state:?}");
+        }
+
+        chat.sync_state = S::Waiting;
+        chat.connected = false;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued - changes are saved"));
+        chat.sync_state = S::Connecting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+        chat.sync_state = S::Offline;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline - changes are saved"));
+
+        // Real pending pushes remain visible even with a live room.
+        chat.connected = true;
+        chat.pending_pushes = 1;
+        chat.sync_state = S::Waiting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued - changes are saved"));
+        chat.sync_state = S::Connecting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
 
     #[test]
     fn sidebar_drag_nudges_each_edge_once_until_rearmed() {
