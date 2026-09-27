@@ -65,57 +65,6 @@ struct HostAgentModel: Decodable, Identifiable {
     let reasoningLevels: [String]
 }
 
-struct HostPart: Codable, Identifiable, Equatable {
-    var id: String
-    var kind: String
-    var text: String?
-    var message: String?
-    var call: JSONValue?
-    var isError: Bool?
-    var requestId: String?
-    var questions: [UserInputQuestion]?
-    var resolved: Bool?
-}
-
-struct HostMessage: Codable, Identifiable, Equatable {
-    var id: String
-    var role: String
-    var status: String?
-    var parts: [HostPart]
-}
-
-struct HostTranscriptFrame: Decodable {
-    struct Upsert: Decodable { let after: String?; let entry: HostMessage }
-    struct Append: Decodable { let entry: String; let part: String; let text: String; let len: Int }
-    var reset: [HostMessage]?
-    var upsert: [Upsert]?
-    var append: [Append]?
-    var remove: [String]?
-    var count: Int?
-
-    func applying(to source: [HostMessage]) throws -> [HostMessage] {
-        if let reset { return reset }
-        var rows = source
-        rows.removeAll { (remove ?? []).contains($0.id) }
-        for change in upsert ?? [] {
-            rows.removeAll { $0.id == change.entry.id }
-            if let anchor = change.after {
-                guard let index = rows.firstIndex(where: { $0.id == anchor }) else { throw RelayError.rpc("Transcript needs a refresh.") }
-                rows.insert(change.entry, at: index + 1)
-            } else { rows.insert(change.entry, at: 0) }
-        }
-        for change in append ?? [] {
-            guard let row = rows.firstIndex(where: { $0.id == change.entry }),
-                  let part = rows[row].parts.firstIndex(where: { $0.id == change.part }) else { throw RelayError.rpc("Transcript needs a refresh.") }
-            let text = (rows[row].parts[part].text ?? "") + change.text
-            guard text.utf8.count == change.len else { throw RelayError.rpc("Transcript needs a refresh.") }
-            rows[row].parts[part].text = text
-        }
-        guard count == rows.count else { throw RelayError.rpc("Transcript needs a refresh.") }
-        return rows
-    }
-}
-
 @MainActor @Observable
 final class CompanionModel {
     var profiles: [ConnectionProfile] = []

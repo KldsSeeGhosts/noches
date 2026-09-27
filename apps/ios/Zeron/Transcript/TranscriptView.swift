@@ -504,6 +504,9 @@ struct ToolChipRow: View {
     @State private var expanded = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private var isThought: Bool { tool.call.isThought }
+    private var detailText: String { expanded ? tool.call.expandedDetail : tool.call.chipDetail }
+
     var body: some View {
         Button {
             withAnimation(reduceMotion ? nil : Motion.resize) { expanded.toggle() }
@@ -514,7 +517,7 @@ struct ToolChipRow: View {
                     Rectangle().fill(Theme.borderStrong).frame(width: 1, height: 5)
                     Image(systemName: tool.call.chipSymbol)
                         .font(.system(size: 14))
-                        .foregroundStyle(tool.isError ? Theme.danger : Theme.textMuted)
+                        .foregroundStyle(iconTint)
                         .frame(width: 26, height: 18)
                     Rectangle().fill(continues ? Theme.borderStrong : .clear)
                         .frame(width: 1)
@@ -524,20 +527,55 @@ struct ToolChipRow: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(tool.call.chipLabel)
                             .font(Theme.sans(14, weight: .medium))
-                            .foregroundStyle(tool.isError ? Theme.danger : Theme.textMuted)
+                            .foregroundStyle(Theme.textMuted)
+                        if isThought {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                                .foregroundStyle(Theme.textFaint)
+                        }
+                        Spacer(minLength: 0)
                         if tool.isError {
-                            Text("Failed").font(Theme.sans(12)).foregroundStyle(Theme.danger)
-                        } else if !tool.resolved {
+                            Text("failed")
+                                .font(Theme.mono(12))
+                                .foregroundStyle(Theme.danger.opacity(0.9))
+                        } else if !tool.resolved && !tool.call.isSubagentSpawn {
                             Text("Running").font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
                         }
                     }
-                    if !tool.call.chipDetail.isEmpty {
-                        Text(expanded ? tool.call.expandedDetail : tool.call.chipDetail)
+                    if isThought {
+                        if expanded, let text = tool.call.string("text"), !text.isEmpty {
+                            Text(text)
+                                .font(Theme.sans(15))
+                                .foregroundStyle(Theme.textMuted)
+                                .lineSpacing(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.leading)
+                        }
+                    } else if !detailText.isEmpty {
+                        Text(detailText)
                             .font(Theme.mono(13))
-                            .foregroundStyle(Theme.text.opacity(0.85))
+                            .foregroundStyle(Theme.textFaint)
                             .lineLimit(expanded ? nil : 2)
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let phase = tool.subagentPhase {
+                        HStack(spacing: 6) {
+                            SubagentStatusGlyph(phase: phase)
+                            Text(phase.label)
+                                .font(Theme.sans(12))
+                                .foregroundStyle(phase.tint)
+                            if let model = tool.call.subagentModel {
+                                Text(model).font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
+                            }
+                        }
+                    }
+                    if let tail = tool.subagentTail {
+                        Text(tail)
+                            .font(Theme.sans(12))
+                            .foregroundStyle(Theme.textMuted)
+                            .lineLimit(1)
                     }
                 }
                 .padding(.vertical, 10)
@@ -555,6 +593,37 @@ struct ToolChipRow: View {
                 UIPasteboard.general.string = tool.call.expandedDetail
             }
         }
+    }
+
+    /// The family hue, or danger once the call failed.
+    private var iconTint: Color {
+        if tool.isError { return Theme.danger }
+        return ToolFamily.of(tool.call, isThought: isThought).color ?? Theme.textMuted
+    }
+}
+
+/// Desktop status glyphs on SessionState hues: sky Running, emerald check
+/// Done (neutral once seen), danger triangle Failed, neutral dot Started.
+struct SubagentStatusGlyph: View {
+    let phase: SubagentPhase
+    var seen = false
+
+    var body: some View {
+        Group {
+            switch phase {
+            case .running: Circle().fill(Theme.statusWorking).frame(width: 7, height: 7)
+            case .started: Circle().fill(Theme.textFaint).frame(width: 4, height: 4)
+            case .done:
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(seen ? Theme.textFaint : Theme.statusCompleted)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.danger)
+            }
+        }
+        .frame(width: 12, height: 12)
     }
 }
 
