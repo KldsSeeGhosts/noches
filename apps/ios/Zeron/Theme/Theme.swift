@@ -36,9 +36,9 @@ enum Theme {
     static var dangerSoft: Color { AppearanceSettings.shared.color("dangerMuted") }
     static var warning: Color { AppearanceSettings.shared.color("warning") }
 
-    // ---- paint: status dots (shell/spaces.rs status_dot_color) ----
-    static var statusWorking: Color { AppearanceSettings.shared.accentColor("activity") }
-    static var statusCompleted: Color { AppearanceSettings.shared.color("success") }
+    // ---- paint: status dots (status_palette.rs SessionState hues) ----
+    static var statusWorking: Color { SessionState.working.color ?? Theme.textMuted }
+    static var statusCompleted: Color { SessionState.completed.color ?? Theme.textMuted }
     /// Claude brand orange — kept even on the mono surface.
     static let claudeBrand = Color(red: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0)
 
