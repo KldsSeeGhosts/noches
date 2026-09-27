@@ -45,7 +45,7 @@ final class CompanionDashboardTests: XCTestCase {
         XCTAssertFalse(model.online)
     }
     func testTranscriptAdapterPreservesToolResolutionAndApprovalIdentity() throws {
-        let json = #"{"id":"message","role":"assistant","status":"streaming","parts":[{"id":"tool","kind":"tool","call":{"kind":"exec","command":"swift test"},"isError":false},{"id":"question","kind":"input","requestId":"approval-17","questions":[{"id":"q","header":"Approve","question":"Run tests?","options":["Allow"]}],"resolved":false}]}"#
+        let json = #"{"id":"message","role":"assistant","status":"streaming","parts":[{"id":"tool","kind":"tool","call":{"kind":"exec","command":"swift test"},"isError":false,"resolved":true},{"id":"question","kind":"input","requestId":"approval-17","questions":[{"id":"q","header":"Approve","question":"Run tests?","options":["Allow"]}],"resolved":false}]}"#
         let message = try JSONDecoder().decode(HostMessage.self, from: Data(json.utf8))
         let entry = message.renderedEntry
         XCTAssertEqual(entry.status, .streaming)
