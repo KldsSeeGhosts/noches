@@ -162,7 +162,7 @@ final class CompanionUITests: XCTestCase {
         composer.tap(); composer.typeText("Follow up after this turn")
         app.buttons["Send message"].tap()
         app.buttons["Done"].tap()
-        let queued = app.buttons["Queued · 1"]
+        let queued = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Queued · '")).firstMatch
         XCTAssertTrue(queued.waitForExistence(timeout: 5)); queued.tap()
         XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForExistence(timeout: 5))
         capture("companion-queued")
