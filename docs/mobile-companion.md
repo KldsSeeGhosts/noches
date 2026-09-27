@@ -119,11 +119,23 @@ ping every 8 seconds and a close after 24 seconds without a frame. A dropped
 link retries every 4 seconds while foregrounded; backgrounding closes it and
 the app reconnects on return.
 
-The home screen groups sessions by project and puts sessions needing input
-first, followed by errors, working sessions, completed sessions, and idle
-sessions. Search matches titles, previews, branches, paths, and project names.
-The bottom filter switches between All, Needs you, Working, and Archived.
-Select a project or switch computers above the list.
+The home screen follows the desktop control plane (see
+[docs/design/mobile.md](design/mobile.md)). Sessions are grouped into **Needs
+you** (awaiting input or failed), **Running**, and **Recent**. Cards show:
+
+- the project badge, which is the repository favicon read over
+  `ReadWorkspaceFile` or `ReadWorkspaceImage`, or a colored monogram;
+- the status, with elapsed time while the session is working;
+- the title;
+- the branch;
+- the harness mark.
+
+Status follows desktop `display_status`. Working and awaiting-input rows older
+than 45 seconds count as stale. A finished session that you have not opened is
+Completed (emerald) until any device opens it; opening it on the phone sends
+`Mutate {op: "markChatSeen"}`. Search matches titles, previews, branches,
+paths, and project names. The bottom filter switches between All, Needs you,
+Running, and Archived.
 
 Sessions are scoped to the selected computer:
 
@@ -146,7 +158,9 @@ Sessions are scoped to the selected computer:
 - approvals: `respondInput` with the question panel's `{questionId, labels}`
   answers.
 
-Transcript: `WatchDocMessages` frames apply incrementally as reset, upsert,
+Transcript: tool rows use the desktop labels and tool-family tints. Thinking
+shows as a collapsed row, and generated images load through
+`ReadAttachmentChunk` and open full screen. `WatchDocMessages` frames apply incrementally as reset, upsert,
 append, or remove changes, with byte-length and row-count checks. Text parts
 use the same native table, incremental markdown parser, folding user bubbles,
 and expandable tool groups as the cloud app. Scrolling away from the latest
@@ -168,16 +182,19 @@ Not implemented today:
 - the host engine and the gateway must already be running, so the phone cannot
   wake a sleeping host, start a stopped service, or reach a machine that is off
   the tailnet;
-- no attachments and no generated-image rendering: the composer has no picker,
-  and `image` parts show "View generated image on your computer";
-- no terminal or PR actions/badges;
-- queue rows cannot be edited, reordered, or removed from the phone;
+- no terminal, project actions, or PR badges;
+- queue rows cannot be reordered from the phone;
 - no space creation.
+
+Simulator rigs can pair and open a session from launch arguments in Debug
+builds: `-companion-pair <code>` and `-companion-open <chatId>`.
+`scripts/companion-rig.sh` runs a seeded mock-harness engine behind a
+loopback `noches-connect` and prints a code for these arguments.
 
 ## Theme and appearance
 
 The companion uses the desktop's Geist and Geist Mono fonts, pixel mark,
-bot avatars, agent marks, and theme color roles. The native list keeps project
+project badges, agent marks, and theme color roles. The native list keeps project
 labels and session metadata compact; search, filtering, and new-session
 controls sit at the bottom of the screen. Chat uses a glass composer and the
 shared native transcript renderer.
@@ -229,7 +246,8 @@ and all state on the host.
 | Scope | Every signed-in device | The paired computers only |
 | Phone state | Loro mirrors of workspace and session docs | None; live RPC views |
 | Offline host | Commands stay durable in the session doc and a reconnecting host drains them | Nothing is sent; the connection reports the error |
-| Attachments, queue edits, PR badges | Supported | Not implemented |
+| Attachments, queue edits | Supported | Supported |
+| PR badges | Supported | Not implemented |
 | Theme | Bundled desktop catalog | Same catalog |
 
 ## Build, run, and test
@@ -378,9 +396,16 @@ lives only in the temp directory.
 - `apps/ios/Zeron/Companion/CompanionView.swift`: navigation, pairing,
   new-session sheet, session view, and composer.
 - `apps/ios/Zeron/Companion/CompanionHome.swift`: project list, session rows,
-  search/filtering, avatars, and session actions.
-- `apps/ios/Zeron/Companion/CompanionTranscript.swift`: host message adapter
-  and shared native transcript integration.
+  search/filtering, project badges, and session actions.
+- `apps/ios/Zeron/Companion/CompanionSession.swift`, `CompanionComposer.swift`,
+  `CompanionTrays.swift`: session header, composer, and agent/queue trays.
+- `apps/ios/Zeron/Companion/CompanionNewSession.swift`: new-session sheet.
+- `apps/ios/Zeron/Companion/CompanionModel+*.swift`: state derivation, seen
+  markers, config, queue, uploads, and project icons.
+- `apps/ios/Zeron/Companion/CompanionTranscript.swift`, `CompanionSubagents.swift`,
+  `CompanionImages.swift`: host message adapter, subagents, and images.
+- `apps/ios/Zeron/Theme/ControlPlaneStyle.swift`, `Views/ControlPlaneViews.swift`:
+  status, tool-family, and monogram palettes and the shared glyphs.
 - `apps/ios/Zeron/Companion/CompanionWorkspace.swift`: read-only files and diff.
 - `apps/ios/Zeron/Companion/CompanionScanner.swift`: camera QR scanning.
 - `scripts/pairing-qr.swift`: private local QR rendering on macOS.
