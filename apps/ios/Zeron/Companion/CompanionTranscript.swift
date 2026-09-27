@@ -59,10 +59,32 @@ struct HostTranscriptFrame: Decodable {
     /// Host-owned context snapshot (`transcript_delta.rs` TranscriptUpdate).
     /// It may ride a frame with no row changes at all.
     var contextUsage: ContextUsage?
+    /// True when the frame carried `contextUsage` at all. The host sends the
+    /// key on every frame it emits, so a null clears the snapshot; an older
+    /// host omits the key, which leaves the last snapshot alone
+    /// (`TranscriptUpdate`'s `#[serde(default)]`).
+    var carriesContextUsage = false
+
+    private enum CodingKeys: String, CodingKey {
+        case reset, upsert, append, remove, count, contextUsage
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        reset = try values.decodeIfPresent([HostMessage].self, forKey: .reset)
+        upsert = try values.decodeIfPresent([Upsert].self, forKey: .upsert)
+        append = try values.decodeIfPresent([Append].self, forKey: .append)
+        remove = try values.decodeIfPresent([String].self, forKey: .remove)
+        count = try values.decodeIfPresent(Int.self, forKey: .count)
+        carriesContextUsage = values.contains(.contextUsage)
+        contextUsage = try values.decodeIfPresent(ContextUsage.self, forKey: .contextUsage)
+    }
 
     struct Update {
         var messages: [HostMessage]
         var contextUsage: ContextUsage?
+        /// True when the frame carried the `contextUsage` key at all.
+        var carriesContextUsage: Bool
     }
 
     func applying(to source: [HostMessage]) throws -> [HostMessage] {
@@ -72,7 +94,7 @@ struct HostTranscriptFrame: Decodable {
     /// Apply the row changes and carry the frame's context snapshot out.
     /// `count` is a desync tripwire only when the host sent it.
     func apply(to source: [HostMessage]) throws -> Update {
-        if let reset { return Update(messages: reset, contextUsage: contextUsage) }
+        if let reset { return Update(messages: reset, contextUsage: contextUsage, carriesContextUsage: carriesContextUsage) }
         var rows = source
         rows.removeAll { (remove ?? []).contains($0.id) }
         for change in upsert ?? [] {
@@ -90,7 +112,7 @@ struct HostTranscriptFrame: Decodable {
             rows[row].parts[part].text = text
         }
         if let count, count != rows.count { throw RelayError.rpc("Transcript needs a refresh.") }
-        return Update(messages: rows, contextUsage: contextUsage)
+        return Update(messages: rows, contextUsage: contextUsage, carriesContextUsage: carriesContextUsage)
     }
 }
 

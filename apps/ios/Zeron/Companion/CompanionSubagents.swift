@@ -78,7 +78,7 @@ struct CompanionSubagentView: View {
     @State private var scroll = ScrollState()
     @State private var failed = false
 
-    private var usingFrozen: Bool { subagent.docRef == nil || failed }
+    private var usingFrozen: Bool { subagent.docRef == nil || (failed && !subagent.phase.active) }
 
     private var frozen: [HostMessage] {
         let text = subagent.tail ?? (subagent.phase == .failed
@@ -88,18 +88,30 @@ struct CompanionSubagentView: View {
                             parts: [HostPart(id: "frozen", kind: "text", text: text)])]
     }
 
+    /// A live agent whose doc opened empty borrows the tail only until its
+    /// first row arrives; a settled one freezes on it.
+    private var rows: [HostMessage] {
+        if usingFrozen { return frozen }
+        if messages.isEmpty, subagent.phase.active, subagent.tail != nil { return frozen }
+        return messages
+    }
+
+    private var waitingForRows: Bool {
+        !usingFrozen && messages.isEmpty && !(subagent.phase.active && subagent.tail != nil)
+    }
+
     var body: some View {
         ZStack {
-            CompanionTranscript(messages: usingFrozen ? frozen : messages,
+            CompanionTranscript(messages: rows,
                                 scroll: scroll, online: model.online, busy: false, submittedID: nil) { _, _ in }
-            if !usingFrozen && messages.isEmpty {
+            if waitingForRows {
                 ProgressView().tint(Theme.textFaint)
             }
         }
         .background(Theme.bg)
         .navigationTitle(subagent.title)
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: subagent.docRef) {
+        .task(id: "\(subagent.docRef ?? "")-\(model.generation)-\(model.online)") {
             guard let ref = subagent.docRef else { return }
             let connection = model.connection
             do {
@@ -107,13 +119,13 @@ struct CompanionSubagentView: View {
                     guard !Task.isCancelled, model.connection === connection else { return }
                     let frame = try CompanionModel.decode(HostTranscriptFrame.self, value)
                     messages = try frame.applying(to: messages)
-                    // A doc that opened with no entries still has the spawn's
-                    // result to show; never leave the screen empty.
-                    if messages.isEmpty, subagent.tail != nil { failed = true; return }
+                    // A settled doc that opened with no entries still has the
+                    // spawn's result to show; a live one keeps watching.
+                    if messages.isEmpty, !subagent.phase.active, subagent.tail != nil { failed = true; return }
                 }
             } catch {
                 guard !Task.isCancelled else { return }
-                failed = true
+                if !subagent.phase.active { failed = true }
             }
         }
     }

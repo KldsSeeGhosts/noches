@@ -147,8 +147,12 @@ private struct TrayAgentPill: View {
     let agent: CompanionSubagent
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            AgentPill(phase: agent.phase, title: agent.title, elapsed: elapsed(now: context.date))
+        if agent.phase == .running, agent.startedAt != nil {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                AgentPill(phase: agent.phase, title: agent.title, elapsed: elapsed(now: context.date))
+            }
+        } else {
+            AgentPill(phase: agent.phase, title: agent.title, elapsed: nil)
         }
     }
 
@@ -283,16 +287,20 @@ struct CompanionQueueTray: View {
 
 // MARK: - Queue edit sheet
 
-/// Retypes one queued message through the host's edit lease. Conflicts and
-/// failures stay in the sheet so the draft is never lost silently.
+/// Retypes one queued message through the host's edit lease. The lease is
+/// taken when the sheet opens and populated from the host's current text;
+/// it is released if the sheet closes without saving. Conflicts and failures
+/// stay in the sheet so the draft is never lost silently.
 struct CompanionQueueEditSheet: View {
     let model: CompanionModel
     let chat: HostChat
     let item: HostQueueItem
     @Environment(\.dismiss) private var dismiss
+    @State private var lease: CompanionQueuedEditLease?
     @State private var text = ""
     @State private var error: String?
-    @State private var busy = false
+    @State private var busy = true
+    @State private var committed = false
 
     var body: some View {
         NavigationStack {
@@ -326,17 +334,46 @@ struct CompanionQueueEditSheet: View {
         }
         .tint(Theme.text)
         .presentationDetents([.medium, .large])
-        .onAppear { text = MessageQueue.visibleText(item.text, attachments: item.attachments ?? []) }
+        .task { await begin() }
+        .onDisappear {
+            // Swipe-away or Cancel closes the row to other devices; a save
+            // that succeeded already committed the lease.
+            guard !committed, let lease else { return }
+            Task { await model.cancelQueuedEdit(lease) }
+        }
+    }
+
+    /// Acquire the lease and open the editor on the host's current text, not
+    /// the possibly stale queue snapshot.
+    private func begin() async {
+        guard lease == nil else { return }
+        do {
+            let started = try await model.beginQueuedEdit(chat, item)
+            // Dismissal can win the race with the host's ACK; release the
+            // lease instead of leaving the row gated for other devices.
+            guard !Task.isCancelled else {
+                await model.cancelQueuedEdit(started)
+                return
+            }
+            lease = started
+            text = MessageQueue.visibleText(started.text, attachments: item.attachments ?? [])
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+        busy = false
     }
 
     private func save() {
+        guard let lease else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = MessageQueue.editedText(trimmed, hasAttachments: item.attachmentCount > 0) ?? trimmed
         busy = true
         error = nil
         Task {
             do {
-                try await model.editQueued(chat, item, text: body)
+                try await model.commitQueuedEdit(lease, text: body)
+                committed = true
                 dismiss()
             } catch {
                 self.error = error.localizedDescription

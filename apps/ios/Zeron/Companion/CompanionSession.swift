@@ -63,6 +63,7 @@ struct CompanionSessionView: View {
         .task(id: "badge-\(currentChat.spaceId ?? "")-\(model.generation)") { await loadBadge() }
         .task { try? await model.markSeen(currentChat) }
         .onChange(of: messages) { _, _ in scheduleSeen() }
+        .onChange(of: state) { _, _ in scheduleSeen() }
         .onDisappear { seen?.cancel() }
     }
 
@@ -217,8 +218,9 @@ struct CompanionSessionView: View {
         }
     }
 
-    /// Opening the session marks it seen; later messages do too once the turn
-    /// has settled, debounced so a streaming turn does not write per frame.
+    /// Opening the session marks it seen; later messages and the transition
+    /// to a settled state do too, debounced so a streaming turn does not
+    /// write per frame.
     private func scheduleSeen() {
         seen?.cancel()
         seen = Task {
@@ -241,6 +243,9 @@ struct CompanionSessionView: View {
     private func watchTranscript() async {
         guard model.online else { return }
         loaded = false
+        // A new watch's first frame owns the snapshot; a stale ring from the
+        // previous connection must not outlive it.
+        contextUsage = nil
         let connection = model.connection
         while !Task.isCancelled && model.online {
             do {
@@ -249,7 +254,9 @@ struct CompanionSessionView: View {
                     let frame = try CompanionModel.decode(HostTranscriptFrame.self, value)
                     let update = try frame.apply(to: messages)
                     messages = update.messages
-                    contextUsage = update.contextUsage ?? contextUsage
+                    // The host sends `contextUsage` on every emitted frame;
+                    // null clears it, absent (older host) leaves it alone.
+                    if update.carriesContextUsage { contextUsage = update.contextUsage }
                     loaded = true
                 }
                 return

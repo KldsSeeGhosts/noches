@@ -18,16 +18,21 @@ struct CompanionAttachmentChunk: Decodable {
 @MainActor
 final class CompanionImageLoader {
     typealias Fetch = @MainActor (_ path: String, _ offset: UInt64) async -> CompanionAttachmentChunk?
+    /// The host owning the connection, resolved per key so a path served by
+    /// two computers never cross-hits the decoded-image cache.
+    typealias HostIdentity = @MainActor () -> String?
 
     /// 24 MiB, the desktop's `MAX_ATTACHMENT_BYTES` / generated-image cap.
     static let maxImageBytes = 24 * 1024 * 1024
     private static let maxReadChunks = 1_000
 
     private let fetch: Fetch
+    private let hostIdentity: HostIdentity
     private let cache = NSCache<NSString, UIImage>()
 
-    init(fetch: @escaping Fetch) {
+    init(fetch: @escaping Fetch, hostIdentity: @escaping HostIdentity = { nil }) {
         self.fetch = fetch
+        self.hostIdentity = hostIdentity
         // Same 64 MiB decoded-image budget as the cloud attachment cache.
         cache.totalCostLimit = 64 * 1024 * 1024
         cache.countLimit = 24
@@ -36,11 +41,11 @@ final class CompanionImageLoader {
     /// The companion session's connection, resolved lazily so reconnects are
     /// picked up per read.
     convenience init(model: CompanionModel) {
-        self.init { [weak model] path, offset in
+        self.init(fetch: { [weak model] path, offset in
             guard let model, model.online else { return nil }
             return try? await CompanionModel.decode(CompanionAttachmentChunk.self,
                 model.connection.call("ReadAttachmentChunk", ["path": path, "offset": offset]))
-        }
+        }, hostIdentity: { [weak model] in model?.selected?.deviceId })
     }
 
     func cached(path: String, mimeType: String?) -> UIImage? {
@@ -73,7 +78,7 @@ final class CompanionImageLoader {
     }
 
     private func key(path: String, mimeType: String?) -> String {
-        "\(mimeType ?? "")|\(path)"
+        "\(hostIdentity() ?? "")|\(mimeType ?? "")|\(path)"
     }
 }
 

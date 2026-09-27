@@ -12,12 +12,11 @@ struct HostAttachment: Hashable {
 extension HostAttachment {
     /// How attachments ride the prompt (`attachments.rs` `with_attachments`):
     /// plain local paths appended to the text, which is what persists in the
-    /// doc. The refs trailer is what the transcript parser strips.
+    /// doc. The refs trailer is what the transcript parser strips. Delegate to
+    /// the app's canonical port so the header is byte-identical to the
+    /// engine/desktop trailer.
     static func composed(_ text: String, paths: [String]) -> String {
-        guard !paths.isEmpty else { return text }
-        let body = text.isEmpty ? "See the attached image(s)." : text
-        let refs = paths.map { "- \($0)" }.joined(separator: "\n")
-        return "\(body)\n\nAttached images (local files - open them to view):\n\(refs)"
+        withAttachments(text: text, paths: paths)
     }
 }
 

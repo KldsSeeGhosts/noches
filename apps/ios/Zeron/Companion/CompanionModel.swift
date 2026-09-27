@@ -280,12 +280,18 @@ final class CompanionModel {
     func send(_ text: String, chat: HostChat, attachments: [HostAttachment] = [], messageID: String = UUID().uuidString.lowercased()) async throws {
         guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
         let paths = attachments.map(\.path)
-        let body = HostAttachment.composed(text, paths: paths)
         let state = state(chat)
         if state == .working || state == .awaitingInput {
+            // A queue row keeps the user's plain editable text; the host
+            // rebuilds the attachment trailer at dispatch
+            // (`doc_host.rs` `queued_message_prompt`). Image-only rows still
+            // need a body (`queue.rs` rejects blank text).
+            let body = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !paths.isEmpty
+                ? attachmentOnlyText : text
             _ = try await connection.call("QueueMessage", ["chatId": chat.id, "text": body,
                 "attachments": paths, "holdForTurnEnd": true])
         } else {
+            let body = HostAttachment.composed(text, paths: paths)
             var request: [String: Any] = ["prompt": body, "cwd": chat.cwd ?? "~",
                 "sandbox": chat.config?.sandbox ?? "workspace-write", "autoApprove": false]
             if !paths.isEmpty { request["attachments"] = paths }
