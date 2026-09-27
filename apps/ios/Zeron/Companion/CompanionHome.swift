@@ -365,35 +365,19 @@ struct CompanionProjectBadge: View {
 
 // MARK: - Session actions
 
-/// Legacy: remove once the session screen migrates.
-struct CompanionAvatar: View {
-    let status: String
-    let seed: String
-    private var asset: String {
-        let avatars = ["bot-orbit", "bot-visor", "bot-dome", "bot-box", "bot-ears", "bot-halo", "bot-sprout", "bot-bolt", "bot-basic"]
-        let hash = seed.utf8.reduce(UInt8(0)) { ($0 &* 31) &+ $1 }
-        return avatars[Int(hash) % avatars.count]
-    }
-    var body: some View {
-        Image(asset).resizable().scaledToFit().frame(width: 32, height: 34)
-            .frame(width: 36, height: 36)
-            .overlay(alignment: .bottomTrailing) {
-                Circle().fill(companionStatusColor(status)).frame(width: 7, height: 7)
-                    .overlay(Circle().stroke(Theme.bg, lineWidth: 2)).offset(x: 1, y: 1)
-            }.accessibilityHidden(true)
-    }
-}
 
 struct CompanionSessionMenu: View {
     let model: CompanionModel
     let chat: HostChat
     var archived: () -> Void = {}
+    var files: (() -> Void)? = nil
     @State private var renaming = false
     @State private var title = ""
     @State private var error: String?
     @State private var busy = false
     var body: some View {
         Menu {
+            if let files { Button("Browse files", systemImage: "folder", action: files); Divider() }
             Button("Rename session", systemImage: "pencil") { title = chat.displayTitle; renaming = true }
             Button(chat.archived ? "Restore session" : "Archive session", systemImage: chat.archived ? "tray.and.arrow.up" : "archivebox") {
                 perform { try await model.archive(chat, archived: !chat.archived); archived() }

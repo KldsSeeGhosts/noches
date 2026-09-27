@@ -217,9 +217,18 @@ struct CompanionComposer: View {
 
     private var contextButton: some View {
         Button { showContext = true } label: {
-            ContextRing(usage: usage)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
+            HStack(spacing: 5) {
+                ContextRing(usage: usage, size: 16)
+                if let fraction = usage?.fraction {
+                    Text("\(Int((fraction * 100).rounded()))%")
+                        .font(Theme.mono(12))
+                        .foregroundStyle(fraction >= 0.75 ? ContextFill(fraction: fraction).color : Theme.textFaint)
+                        .monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Context window")

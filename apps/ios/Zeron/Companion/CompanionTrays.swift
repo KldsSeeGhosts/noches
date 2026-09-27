@@ -110,17 +110,15 @@ struct CompanionAgentsTray: View {
 
     var body: some View {
         TraySurface {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
+            HStack(spacing: 10) {
+                HStack(spacing: 5) {
                     Text("Agents")
                         .font(Theme.sans(12, weight: .medium))
-                        .foregroundStyle(Theme.textFaint)
                     Text("\(done)/\(agents.count)")
                         .font(Theme.mono(12))
-                        .foregroundStyle(Theme.textFaint)
-                    Spacer(minLength: 0)
                 }
-                .frame(height: 40)
+                .foregroundStyle(Theme.textFaint)
+                .fixedSize()
                 .padding(.leading, 4)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -134,9 +132,13 @@ struct CompanionAgentsTray: View {
                             .accessibilityLabel("\(agent.title), \(agent.phase.rawValue)")
                         }
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 6)
                 }
+                .scrollClipDisabled()
+                .mask(LinearGradient(stops: [.init(color: .black, location: 0.9), .init(color: .clear, location: 1)],
+                                     startPoint: .leading, endPoint: .trailing))
             }
+            .padding(.top, 2)
         }
     }
 }
@@ -204,8 +206,7 @@ struct CompanionQueueTray: View {
                     .rotationEffect(.degrees(expanded ? 0 : -90))
             }
             .padding(.horizontal, 4)
-            .frame(minHeight: 32)
-            .padding(.vertical, 6)
+            .frame(minHeight: 40)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -237,7 +238,7 @@ struct CompanionQueueTray: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
-                    .frame(width: 44, height: 44)
+                    .frame(width: 44, height: 36)
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("Queued message actions")

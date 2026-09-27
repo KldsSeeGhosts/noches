@@ -45,6 +45,7 @@ final class CompanionUITests: XCTestCase {
         capture("companion-connected-dark")
         let session = app.staticTexts["Build the mobile companion"]
         XCTAssertTrue(session.waitForExistence(timeout: 5)); openSession(app)
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Session actions for'")).firstMatch.tap()
         app.buttons["Browse files"].tap()
         XCTAssertTrue(app.staticTexts["Sources"].waitForExistence(timeout: 5))
         app.staticTexts["Sources"].tap()

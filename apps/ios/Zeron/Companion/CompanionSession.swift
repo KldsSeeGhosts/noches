@@ -68,7 +68,7 @@ struct CompanionSessionView: View {
 
     // MARK: Header
 
-    /// One glass group for Changes, Files, and More. Splitting them into three
+    /// One glass group for Changes and More (Files lives in More). Splitting them into three
     /// toolbar items costs ~60pt each on iOS 26, which crushes the two-line
     /// title; the compact slots buy the title back without shrinking any hit
     /// target below 44pt (the visual glyph stays 16pt).
@@ -80,13 +80,7 @@ struct CompanionSessionView: View {
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("Review changes")
-            Button { inspector = .files } label: {
-                Image(systemName: "folder")
-                    .frame(width: 38, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Browse files")
-            CompanionSessionMenu(model: model, chat: currentChat, archived: { dismiss() })
+            CompanionSessionMenu(model: model, chat: currentChat, archived: { dismiss() }, files: { inspector = .files })
                 .frame(width: 38, height: 44)
         }
         .frame(height: 44)

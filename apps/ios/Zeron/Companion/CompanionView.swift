@@ -56,7 +56,21 @@ struct CompanionView: View {
             await model.maintainConnection()
         }
         .onAppear {
-            if ProcessInfo.processInfo.arguments.contains("-companion-settings") { settings = true }
+            let arguments = ProcessInfo.processInfo.arguments
+            if arguments.contains("-companion-settings") { settings = true }
+            #if DEBUG
+            // Simulator rigs (scripts/companion-rig.sh): pair from a launch argument.
+            if let index = arguments.firstIndex(of: "-companion-pair"), arguments.indices.contains(index + 1) {
+                try? model.pair(arguments[index + 1])
+            }
+            #endif
+        }
+        .onChange(of: model.chats.count) { _, _ in
+            #if DEBUG
+            let arguments = ProcessInfo.processInfo.arguments
+            if path.isEmpty, let index = arguments.firstIndex(of: "-companion-open"), arguments.indices.contains(index + 1),
+               let chat = model.chats.first(where: { $0.id == arguments[index + 1] }) { path.append(chat) }
+            #endif
         }
         .onChange(of: model.selectedID) { _, _ in path = [] }
     }
@@ -166,24 +180,3 @@ struct NewSessionRequest: Identifiable {
     let project: String
 }
 
-// Legacy: remove once the session screen migrates.
-func companionStatusColor(_ status: String) -> Color {
-    switch status {
-    case "working": Theme.statusWorking
-    case "awaitingInput": Theme.warning
-    case "errored": Theme.danger
-    case "completed": Theme.statusCompleted
-    default: Theme.textFaint
-    }
-}
-
-// Legacy: remove once the session screen migrates.
-func statusLabel(_ status: String) -> String {
-    switch status {
-    case "working": return "Working"
-    case "awaitingInput": return "Needs your input"
-    case "errored": return "Needs attention"
-    case "completed": return "Done"
-    default: return "Ready"
-    }
-}
