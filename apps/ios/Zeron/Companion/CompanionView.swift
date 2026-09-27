@@ -7,6 +7,8 @@ struct CompanionView: View {
     @State private var model = CompanionModel()
     @State private var pairing = false
     @State private var settings = false
+    /// Presented once the settings sheet finishes dismissing; swapping sheets in one tap races.
+    @State private var afterSettings: (() -> Void)?
     @State private var newSession: NewSessionRequest?
     @State private var cloud = false
     @State private var path: [HostChat] = []
@@ -46,7 +48,7 @@ struct CompanionView: View {
                 NewHostSessionSheet(model: model, initialProject: request.project) { path.append($0) }
             }
             .sheet(isPresented: $cloud) { SignInView() }
-            .sheet(isPresented: $settings) { settingsSheet }
+            .sheet(isPresented: $settings, onDismiss: { afterSettings?(); afterSettings = nil }) { settingsSheet }
         }
         .tint(Theme.text)
         .environment(\.companionImageLoader, images)
@@ -107,7 +109,7 @@ struct CompanionView: View {
                             }
                         }
                     }
-                    Button { settings = false; pairing = true } label: {
+                    Button { afterSettings = { pairing = true }; settings = false } label: {
                         Label("Pair a computer", systemImage: "plus")
                             .font(Theme.sans(15)).foregroundStyle(Theme.text)
                             .frame(minHeight: 44)
@@ -117,7 +119,7 @@ struct CompanionView: View {
                     NavigationLink("Appearance") { AppearanceSettingsView() }
                 }
                 Section {
-                    Button { settings = false; cloud = true } label: {
+                    Button { afterSettings = { cloud = true }; settings = false } label: {
                         Label("Connect a cloud account", systemImage: "cloud")
                             .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
                     }
