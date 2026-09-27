@@ -37,7 +37,7 @@ final class CompanionUITests: XCTestCase {
         let profile: [String: String] = ["id":"mobile-fixture", "name":"Studio fixture", "endpoint":"ws://127.0.0.1:28777", "token":String(repeating:"a",count:64), "deviceId":"fixture-mac"]
         let data = try JSONSerialization.data(withJSONObject: profile)
         let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-        field.tap(); field.typeText(code)
+        focus(field); field.typeText(code)
         app.buttons["Connect to computer"].tap()
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Needs you"].waitForExistence(timeout: 5))
@@ -94,7 +94,7 @@ final class CompanionUITests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: profile)
             let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             let field = app.secureTextFields["connection-code"]
-            field.tap(); field.typeText(code)
+            focus(field); field.typeText(code)
             app.buttons["Connect to computer"].tap()
         }
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
@@ -161,7 +161,7 @@ final class CompanionUITests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: profile)
             let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             let field = app.secureTextFields["connection-code"]
-            field.tap(); field.typeText(code)
+            focus(field); field.typeText(code)
             app.buttons["Connect to computer"].tap()
         }
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
@@ -210,6 +210,17 @@ final class CompanionUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["Light theme"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.staticTexts["Dark theme"].exists)
             capture("appearance-\(theme)")
+        }
+    }
+
+    /// Sheets can still be animating in when their field first exists; retry
+    /// until the tap actually lands keyboard focus.
+    private func focus(_ field: XCUIElement) {
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        for _ in 0..<5 {
+            if field.isHittable { field.tap() }
+            if (field.value(forKey: "hasKeyboardFocus") as? Bool) == true { return }
+            Thread.sleep(forTimeInterval: 0.3)
         }
     }
 }
