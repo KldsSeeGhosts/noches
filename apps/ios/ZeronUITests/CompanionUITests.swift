@@ -140,8 +140,16 @@ final class CompanionUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-appearance.mode", "dark", "-appearance.dark", "zeron-dark"]
         app.launch()
+        // Pair with this test's fixture host whether the app is empty or holds
+        // a profile from another host, so the assertions can never read the
+        // wrong fixture's /commands list.
         if app.buttons["pair-computer"].waitForExistence(timeout: 2) {
             app.buttons["pair-computer"].tap()
+        } else {
+            app.buttons["Appearance and computers"].tap()
+            app.buttons["Pair a computer"].tap()
+        }
+        do {
             let profile: [String: String] = ["id":"mobile-fixture", "name":"Studio fixture", "endpoint":"ws://127.0.0.1:28777", "token":String(repeating:"a",count:64), "deviceId":"fixture-mac"]
             let data = try JSONSerialization.data(withJSONObject: profile)
             let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
@@ -163,7 +171,13 @@ final class CompanionUITests: XCTestCase {
         app.buttons["Send message"].tap()
         app.buttons["Done"].tap()
         let queued = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Queued · '")).firstMatch
-        XCTAssertTrue(queued.waitForExistence(timeout: 5)); queued.tap()
+        XCTAssertTrue(queued.waitForExistence(timeout: 5))
+        // The queue tray starts expanded; its header collapses and restores it.
+        XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForExistence(timeout: 5))
+        queued.tap()
+        XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForNonExistence(timeout: 5))
+        capture("companion-queued-collapsed")
+        queued.tap()
         XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForExistence(timeout: 5))
         capture("companion-queued")
         app.buttons["Stop session"].tap()
