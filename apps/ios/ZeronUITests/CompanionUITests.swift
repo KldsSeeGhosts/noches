@@ -40,6 +40,8 @@ final class CompanionUITests: XCTestCase {
         field.tap(); field.typeText(code)
         app.buttons["Connect to computer"].tap()
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Needs you"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Running"].exists)
         capture("companion-connected-dark")
         let session = app.staticTexts["Build the mobile companion"]
         XCTAssertTrue(session.waitForExistence(timeout: 5)); openSession(app)
@@ -66,10 +68,14 @@ final class CompanionUITests: XCTestCase {
         capture("companion-transcript-dark")
         app.navigationBars.buttons.firstMatch.tap()
         app.buttons["New session"].tap()
-        XCTAssertTrue(app.buttons["Create session"].waitForExistence(timeout: 5))
-        app.buttons["Create session"].tap()
+        XCTAssertTrue(app.buttons["Start session"].waitForExistence(timeout: 5))
+        let editor = app.descendants(matching: .any)["first-message"].firstMatch
+        if editor.exists { editor.tap(); editor.typeText("Kick off the mobile work.") }
+        if !app.buttons["Start session"].isHittable { app.swipeUp() }
+        app.buttons["Start session"].tap()
         XCTAssertTrue(app.navigationBars["New mobile session"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.descendants(matching: .any)["companion-composer"].firstMatch.exists)
+        XCTAssertTrue(app.staticTexts["Received on the fixture host. No real agent was started."].waitForExistence(timeout: 8))
         capture("companion-new-session")
     }
 

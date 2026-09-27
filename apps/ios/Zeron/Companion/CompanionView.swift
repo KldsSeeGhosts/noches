@@ -7,17 +7,16 @@ struct CompanionView: View {
     @State private var model = CompanionModel()
     @State private var pairing = false
     @State private var settings = false
-    @State private var newSession = false
+    @State private var newSession: NewSessionRequest?
     @State private var cloud = false
     @State private var path: [HostChat] = []
-    @State private var initialProject = ""
     @State private var images: CompanionImageLoader?
 
     var body: some View {
         NavigationStack(path: $path) {
             Group {
                 if model.selected != nil {
-                    CompanionDashboard(model: model, newSession: { initialProject = $0; newSession = true }, pair: { pairing = true }, opened: { path.append($0) })
+                    CompanionDashboard(model: model, newSession: { newSession = NewSessionRequest(project: $0) }, pair: { pairing = true }, opened: { path.append($0) })
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 28) { heading; welcome }
@@ -43,43 +42,11 @@ struct CompanionView: View {
                 CompanionSessionView(model: model, chat: chat)
             }
             .sheet(isPresented: $pairing) { PairComputerSheet(model: model) }
-            .sheet(isPresented: $newSession) {
-                NewHostSessionSheet(model: model, initialProject: initialProject) { path.append($0) }
+            .sheet(item: $newSession) { request in
+                NewHostSessionSheet(model: model, initialProject: request.project) { path.append($0) }
             }
             .sheet(isPresented: $cloud) { SignInView() }
-            .sheet(isPresented: $settings) {
-                NavigationStack {
-                    List {
-                        NavigationLink("Appearance") { AppearanceSettingsView() }
-                        Section("Computers") {
-                            ForEach(model.profiles) { host in
-                                Button { model.select(host.id); settings = false } label: {
-                                    HStack {
-                                        Label(host.name, systemImage: "desktopcomputer")
-                                        Spacer()
-                                        if model.selectedID == host.id { Image(systemName: "checkmark") }
-                                    }
-                                }
-                                .swipeActions {
-                                    Button("Forget", role: .destructive) {
-                                        do { try model.forget(host) } catch { model.error = error.localizedDescription }
-                                    }
-                                }
-                            }
-                            Button("Pair a computer") { settings = false; pairing = true }
-                        }
-                        Section {
-                            Button("Connect a cloud account") { settings = false; cloud = true }
-                            Button("Explore demo sessions") { settings = false; app.enterDemoMode() }
-                        }
-                        Text("Forgetting a computer removes its key from this phone. Revoke the key on the host to disable it everywhere.")
-                            .font(Theme.sans(13)).foregroundStyle(Theme.textMuted)
-                    }
-                    .scrollContentBackground(.hidden).background(Theme.bg)
-                    .navigationTitle("Settings")
-                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { settings = false } } }
-                }
-            }
+            .sheet(isPresented: $settings) { settingsSheet }
         }
         .tint(Theme.text)
         .environment(\.companionImageLoader, images)
@@ -93,6 +60,69 @@ struct CompanionView: View {
         }
         .onChange(of: model.selectedID) { _, _ in path = [] }
     }
+
+    // MARK: - Settings
+
+    private var settingsSheet: some View {
+        NavigationStack {
+            List {
+                Section("Computers") {
+                    ForEach(model.profiles) { host in
+                        Button { model.select(host.id); settings = false } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "desktopcomputer")
+                                    .font(.system(size: 15)).foregroundStyle(Theme.textMuted)
+                                    .frame(width: 22)
+                                Text(host.name).font(Theme.sans(15)).foregroundStyle(Theme.text).lineLimit(1)
+                                Spacer(minLength: 8)
+                                if model.selectedID == host.id {
+                                    Circle()
+                                        .fill(model.online ? Theme.statusCompleted : Theme.warning)
+                                        .frame(width: 6, height: 6)
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(Theme.textMuted)
+                                }
+                            }
+                            .frame(minHeight: 44)
+                        }
+                        .buttonStyle(.plain)
+                        .swipeActions {
+                            Button("Forget", role: .destructive) {
+                                do { try model.forget(host) } catch { model.error = error.localizedDescription }
+                            }
+                        }
+                    }
+                    Button { settings = false; pairing = true } label: {
+                        Label("Pair a computer", systemImage: "plus")
+                            .font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            .frame(minHeight: 44)
+                    }
+                }
+                Section {
+                    NavigationLink("Appearance") { AppearanceSettingsView() }
+                }
+                Section {
+                    Button { settings = false; cloud = true } label: {
+                        Label("Connect a cloud account", systemImage: "cloud")
+                            .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+                    }
+                    Button { settings = false; app.enterDemoMode() } label: {
+                        Label("Explore demo sessions", systemImage: "sparkles")
+                            .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+                    }
+                } footer: {
+                    Text("Forgetting a computer removes its key from this phone. Revoke the key on the host to disable it everywhere.")
+                }
+            }
+            .scrollContentBackground(.hidden).background(Theme.bg)
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { settings = false } } }
+        }
+    }
+
+    // MARK: - Signed out
 
     private var heading: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -127,9 +157,27 @@ struct CompanionView: View {
         }
         .foregroundStyle(Theme.text).padding(24).modifier(CompanionPanel())
     }
-
 }
 
+/// The compose action's request: carrying the filtered project in an item
+/// avoids the stale-state race of setting a project and a boolean together.
+struct NewSessionRequest: Identifiable {
+    let id = UUID()
+    let project: String
+}
+
+// Legacy: remove once the session screen migrates.
+func companionStatusColor(_ status: String) -> Color {
+    switch status {
+    case "working": Theme.statusWorking
+    case "awaitingInput": Theme.warning
+    case "errored": Theme.danger
+    case "completed": Theme.statusCompleted
+    default: Theme.textFaint
+    }
+}
+
+// Legacy: remove once the session screen migrates.
 func statusLabel(_ status: String) -> String {
     switch status {
     case "working": return "Working"
