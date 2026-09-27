@@ -85,6 +85,15 @@ final class CompanionDashboardTests: XCTestCase {
         XCTAssertEqual(model.visibleChats(scope: .attention).map(\.id), ["attention", "failed"])
         XCTAssertEqual(model.visibleChats(scope: .working).map(\.id), ["working"])
     }
+    func testProjectIdentityFallsBackToHome() {
+        let model = model()
+        let project = model.chats.first { $0.id == "working" }!
+        XCTAssertEqual(model.projectName(for: project), "Noches")
+        XCTAssertEqual(model.monogramSeed(for: project), "/code/noches")
+        let home = model.chats.first { $0.id == "idle" }!
+        XCTAssertEqual(model.projectName(for: home), "Home")
+        XCTAssertEqual(model.monogramSeed(for: home), "home")
+    }
     func testHostDateParsesChronoPrecision() {
         let base = Date(timeIntervalSince1970: 1_790_078_400)
         XCTAssertEqual(HostDate.parse("2026-09-22T12:00:00Z"), base)
