@@ -11,6 +11,7 @@ struct CompanionView: View {
     @State private var cloud = false
     @State private var path: [HostChat] = []
     @State private var initialProject = ""
+    @State private var images: CompanionImageLoader?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -81,6 +82,8 @@ struct CompanionView: View {
             }
         }
         .tint(Theme.text)
+        .environment(\.companionImageLoader, images)
+        .onAppear { if images == nil { images = CompanionImageLoader(model: model) } }
         .task(id: "\(model.selectedID ?? "")-\(model.connectionRevision)-\(scenePhase == .active)") {
             guard scenePhase == .active else { model.connection.close(); model.online = false; return }
             await model.maintainConnection()
