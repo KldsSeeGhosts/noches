@@ -3,10 +3,14 @@
 //! delivery in each direction; requests are never blindly rerun after host loss.
 mod client;
 mod config;
+mod host;
 mod server;
 
 pub use client::{ConnectionState, RemoteClient, connect};
 pub use config::{ConnectionProfile, Connections, Credentials, private_write, validate_endpoint};
+pub use host::{
+    GATEWAY_PORT, pair_client, revoke_client, select_tailnet, tailnet_ipv4, write_code,
+};
 pub use server::{ServerOptions, serve};
 
 use serde::{Deserialize, Serialize};

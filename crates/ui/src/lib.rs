@@ -49,6 +49,7 @@ pub mod popover;
 pub mod project_actions;
 pub mod queue;
 pub mod rail;
+pub mod remote_access;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -224,6 +225,9 @@ pub fn run_app(config: UiConfig) {
         })
         .detach();
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
+        // Remote access is a host-side service, so only a local window starts
+        // it. Idempotent across windows and silent when no phone is paired.
+        remote_access::autostart(&config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
         // doc snapshots before the process exits (remote engines outlive us).

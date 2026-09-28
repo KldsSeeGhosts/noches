@@ -27,7 +27,9 @@ listener with `lsof -nP -iTCP:PORT -sTCP:LISTEN` on macOS or
 `ss -ltnp | grep PORT` on Linux.
 
 Then join the host to the tailnet. `tailscale ip -4` prints the address the
-phone will dial, a `100.x.y.z` address. Create the pair code and serve:
+phone will dial, a `100.x.y.z` address. On a desktop host, skip the rest of this
+section and use Settings > Connections ([Pairing from the app](#pairing-from-the-app)).
+Otherwise create the pair code and serve:
 
 ```sh
 cargo build -p zeron-rpc --bin noches-connect
@@ -64,6 +66,40 @@ working if a different engine takes over that address. Management commands:
 `revoke` removes one client's key, and that client's sessions close within five
 seconds. `probe` prints the host name, the identity check, the workspace scope,
 and watch row counts for a code file.
+
+## Pairing from the app
+
+Settings > Connections in a local desktop window carries a **Pair a phone**
+section, so the CLI is not required for a normal pairing. It mints the same
+`noches-connect:` code, shows it as a QR (error-correction level M, black on
+white with a 4-module quiet zone) next to the endpoint, and offers **Copy code**
+for a phone that cannot scan. The code lives in that page's memory only: it is
+never logged and never written to disk, and **Done** clears it. The short
+instruction on the page is "On your phone, open Noches, tap Pair a computer, and
+scan this code. The phone must be on the same tailnet."
+
+The button does everything `pair` plus `serve` did:
+
+- reads this computer's Tailscale address from its interfaces; if Tailscale is
+  not connected the page says so and stops, since there is no address to pair
+  against;
+- names the client from the macOS `ComputerName` (elsewhere the hostname without
+  `.local`), and pins the engine's `deviceId` through `EngineInfo` on
+  `ws://127.0.0.1:{ipc port}`;
+- appends the client to `{data_dir}/remote-access.json`, mode 0600 through the
+  same atomic `private_write` the CLI uses, and
+- starts the gateway in-process on `{tailnet ip}:27657`, serving that same
+  upstream.
+
+The gateway is one per process, shared by every window, and starts automatically
+on launch when `remote-access.json` already has a client and the computer is on
+the tailnet. If another `noches-connect serve` already owns port 27657 the page
+says exactly that instead of failing silently. **Paired devices** lists each
+client with its short id and endpoint; **Revoke** removes one, and the gateway
+stops when the last client is revoked.
+
+The CLI below stays the right tool for a headless host, a systemd service, or
+scripting, and it keeps its own `access.json` so the two stores never collide.
 
 ## Pairing the phone
 
@@ -388,3 +424,7 @@ lives only in the temp directory.
   accent state, custom-family import.
 - `crates/rpc/src/bin/noches-connect.rs`: gateway `serve`, `pair`, `revoke`,
   `import`, and `probe`.
+- `crates/rpc/src/remote/host.rs`: host-side pairing, revocation, and tailnet
+  address discovery, shared by the CLI and the desktop page.
+- `crates/ui/src/remote_access.rs`: the in-app gateway, its status, and the QR
+  rendering; `crates/ui/src/settings/connections.rs` is the page around it.

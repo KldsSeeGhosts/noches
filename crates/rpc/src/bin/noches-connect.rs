@@ -44,32 +44,15 @@ async fn main() -> anyhow::Result<()> {
         }
         "pair" => {
             let path = PathBuf::from(required(&opts, "--credentials")?);
-            let upstream = required(&opts, "--upstream")?;
-            let engine = zeron_rpc::connect_ws(&upstream).await?;
-            let info = tokio::time::timeout(
-                Duration::from_secs(8),
-                engine.call(methods::ENGINE_INFO, serde_json::json!({})),
+            let profile = remote::pair_client(
+                &required(&opts, "--upstream")?,
+                &path,
+                &required(&opts, "--name")?,
+                &required(&opts, "--endpoint")?,
             )
-            .await??;
-            let profile = ConnectionProfile {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: required(&opts, "--name")?,
-                endpoint: required(&opts, "--endpoint")?,
-                token: format!(
-                    "{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                ),
-                device_id: info["deviceId"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing engine identity"))?
-                    .into(),
-            };
+            .await?;
             let code = profile.code()?;
-            let mut credentials = Credentials::load(&path)?;
-            credentials.clients.push(profile.clone());
-            credentials.save(&path)?;
-            remote::private_write(&PathBuf::from(required(&opts, "--out")?), code.as_bytes())?;
+            remote::write_code(&PathBuf::from(required(&opts, "--out")?), &code)?;
             println!(
                 "Paired client {}. Connection code saved to the requested private file.",
                 profile.id
@@ -77,12 +60,7 @@ async fn main() -> anyhow::Result<()> {
         }
         "revoke" => {
             let path = PathBuf::from(required(&opts, "--credentials")?);
-            let id = required(&opts, "--id")?;
-            let mut credentials = Credentials::load(&path)?;
-            let before = credentials.clients.len();
-            credentials.clients.retain(|c| c.id != id);
-            anyhow::ensure!(credentials.clients.len() < before, "Client not found");
-            credentials.save(&path)?;
+            remote::revoke_client(&path, &required(&opts, "--id")?)?;
             println!("Client revoked. Active sessions will close within five seconds.");
         }
         "import" => {

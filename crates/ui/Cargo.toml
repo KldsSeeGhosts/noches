@@ -87,6 +87,10 @@ tracing.workspace = true
 sha2.workspace = true
 roxmltree = "0.21.1"
 png = "0.18"
+# Pairing QR codes for Settings > Connections. The crate's `image` feature is
+# off: we own the PNG encoding (the workspace `image` crate) and only need the
+# module matrix plus EC level.
+qrcode = { version = "0.14", default-features = false }
 thiserror.workspace = true
 rust-embed = "=8.7.2"
 

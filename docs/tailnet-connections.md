@@ -97,7 +97,9 @@ Credentials (`access.json`) and saved desktop connections (`connections.json`) g
 
 ## Gateway CLI
 
-`noches-connect` is the whole host-side interface.
+`noches-connect` is the host-side interface for a headless host, a service, or
+scripting. A local desktop window does the same work from Settings > Connections
+(see below) and keeps its clients in a separate file.
 
 ### serve
 
@@ -194,6 +196,8 @@ Selections, panels, and subscriptions belong to the window, and its layout file 
 ### Connections page
 
 Settings > Connections (`crates/ui/src/settings/connections.rs`) lists saved computers with a live status: Connected, Connecting, Reconnecting, Access revoked, or Saved computer. Each row has Remove and Open computer. Below the list are Open local window and Paste connection code, which reads the clipboard, validates the code, and saves it to `connections.json`. The sidebar footer shows the same status next to the host name when the window is remote.
+
+A local window also hosts. The **Pair a phone** section below Paste connection code runs the same gateway in-process (`crates/ui/src/remote_access.rs`) instead of the CLI: it mints a code through `remote::pair_client`, renders the QR, starts `remote::serve` on the computer's Tailscale address and port 27657, and lists paired devices with a Revoke action. Its credentials file is `{data_dir}/remote-access.json`, separate from the CLI's `access.json`. The gateway starts again on launch when that file already has a client, and reports plainly when another `noches-connect serve` owns the port. See `docs/mobile-companion.md` for the flow.
 
 ### Sidebar Remote button
 
