@@ -37,12 +37,15 @@ final class CompanionUITests: XCTestCase {
         let profile: [String: String] = ["id":"mobile-fixture", "name":"Studio fixture", "endpoint":"ws://127.0.0.1:28777", "token":String(repeating:"a",count:64), "deviceId":"fixture-mac"]
         let data = try JSONSerialization.data(withJSONObject: profile)
         let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-        field.tap(); field.typeText(code)
+        focus(field); field.typeText(code)
         app.buttons["Connect to computer"].tap()
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["Needs you"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Running"].exists)
         capture("companion-connected-dark")
         let session = app.staticTexts["Build the mobile companion"]
         XCTAssertTrue(session.waitForExistence(timeout: 5)); openSession(app)
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Session actions for'")).firstMatch.tap()
         app.buttons["Browse files"].tap()
         XCTAssertTrue(app.staticTexts["Sources"].waitForExistence(timeout: 5))
         app.staticTexts["Sources"].tap()
@@ -66,10 +69,14 @@ final class CompanionUITests: XCTestCase {
         capture("companion-transcript-dark")
         app.navigationBars.buttons.firstMatch.tap()
         app.buttons["New session"].tap()
-        XCTAssertTrue(app.buttons["Create session"].waitForExistence(timeout: 5))
-        app.buttons["Create session"].tap()
+        XCTAssertTrue(app.buttons["Start session"].waitForExistence(timeout: 5))
+        let editor = app.descendants(matching: .any)["first-message"].firstMatch
+        if editor.exists { editor.tap(); editor.typeText("Kick off the mobile work.") }
+        if !app.buttons["Start session"].isHittable { app.swipeUp() }
+        app.buttons["Start session"].tap()
         XCTAssertTrue(app.navigationBars["New mobile session"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.descendants(matching: .any)["companion-composer"].firstMatch.exists)
+        XCTAssertTrue(app.staticTexts["Received on the fixture host. No real agent was started."].waitForExistence(timeout: 8))
         capture("companion-new-session")
     }
 
@@ -87,7 +94,7 @@ final class CompanionUITests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: profile)
             let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             let field = app.secureTextFields["connection-code"]
-            field.tap(); field.typeText(code)
+            focus(field); field.typeText(code)
             app.buttons["Connect to computer"].tap()
         }
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
@@ -140,13 +147,21 @@ final class CompanionUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-appearance.mode", "dark", "-appearance.dark", "zeron-dark"]
         app.launch()
+        // Pair with this test's fixture host whether the app is empty or holds
+        // a profile from another host, so the assertions can never read the
+        // wrong fixture's /commands list.
         if app.buttons["pair-computer"].waitForExistence(timeout: 2) {
             app.buttons["pair-computer"].tap()
+        } else {
+            app.buttons["Appearance and computers"].tap()
+            app.buttons["Pair a computer"].tap()
+        }
+        do {
             let profile: [String: String] = ["id":"mobile-fixture", "name":"Studio fixture", "endpoint":"ws://127.0.0.1:28777", "token":String(repeating:"a",count:64), "deviceId":"fixture-mac"]
             let data = try JSONSerialization.data(withJSONObject: profile)
             let code = "noches-connect:" + data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             let field = app.secureTextFields["connection-code"]
-            field.tap(); field.typeText(code)
+            focus(field); field.typeText(code)
             app.buttons["Connect to computer"].tap()
         }
         XCTAssertTrue(app.staticTexts["Connected"].waitForExistence(timeout: 15))
@@ -162,8 +177,14 @@ final class CompanionUITests: XCTestCase {
         composer.tap(); composer.typeText("Follow up after this turn")
         app.buttons["Send message"].tap()
         app.buttons["Done"].tap()
-        let queued = app.buttons["Queued · 1"]
-        XCTAssertTrue(queued.waitForExistence(timeout: 5)); queued.tap()
+        let queued = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Queued · '")).firstMatch
+        XCTAssertTrue(queued.waitForExistence(timeout: 5))
+        // The queue tray starts expanded; its header collapses and restores it.
+        XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForExistence(timeout: 5))
+        queued.tap()
+        XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForNonExistence(timeout: 5))
+        capture("companion-queued-collapsed")
+        queued.tap()
         XCTAssertTrue(app.staticTexts["Follow up after this turn"].waitForExistence(timeout: 5))
         capture("companion-queued")
         app.buttons["Stop session"].tap()
@@ -189,6 +210,17 @@ final class CompanionUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["Light theme"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.staticTexts["Dark theme"].exists)
             capture("appearance-\(theme)")
+        }
+    }
+
+    /// Sheets can still be animating in when their field first exists; retry
+    /// until the tap actually lands keyboard focus.
+    private func focus(_ field: XCUIElement) {
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        for _ in 0..<5 {
+            if field.isHittable { field.tap() }
+            if (field.value(forKey: "hasKeyboardFocus") as? Bool) == true { return }
+            Thread.sleep(forTimeInterval: 0.3)
         }
     }
 }

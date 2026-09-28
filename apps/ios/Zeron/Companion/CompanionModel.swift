@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 
 struct HostChat: Decodable, Identifiable, Hashable {
     var id: String
@@ -8,10 +9,12 @@ struct HostChat: Decodable, Identifiable, Hashable {
     var archived: Bool
     var cwd: String?
     var branch: String?
+    var checkoutId: String?
     var spaceId: String?
     var config: ChatConfig?
     var lastMessagePreview: String?
     var lastMessageAt: String?
+    var lastSeenAt: String?
     var createdAt: String
     var displayTitle: String { title.flatMap { $0.isEmpty ? nil : $0 } ?? "New session" }
 }
@@ -27,6 +30,8 @@ struct HostSpace: Decodable, Identifiable {
 struct HostSession: Decodable {
     let chatId: String
     let status: String
+    var startedAt: String?
+    var updatedAt: String?
 }
 
 struct HostHarness: Decodable, Identifiable {
@@ -35,63 +40,29 @@ struct HostHarness: Decodable, Identifiable {
     var label: String { name }
     let installed: Bool?
     let enabled: Bool?
+    let supportsSteering: Bool?
+    let steeringMode: String?
+    let reasoningLevels: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, installed, enabled, supportsSteering, steeringMode, reasoningLevels
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        installed = try values.decodeIfPresent(Bool.self, forKey: .installed)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled)
+        supportsSteering = try values.decodeIfPresent(Bool.self, forKey: .supportsSteering)
+        steeringMode = try values.decodeIfPresent(String.self, forKey: .steeringMode)
+        reasoningLevels = try values.decodeIfPresent([String].self, forKey: .reasoningLevels) ?? []
+    }
 }
 
 struct HostAgentModel: Decodable, Identifiable {
     let id: String
     let label: String
     let reasoningLevels: [String]
-}
-
-struct HostPart: Codable, Identifiable, Equatable {
-    var id: String
-    var kind: String
-    var text: String?
-    var message: String?
-    var call: JSONValue?
-    var isError: Bool?
-    var requestId: String?
-    var questions: [UserInputQuestion]?
-    var resolved: Bool?
-}
-
-struct HostMessage: Codable, Identifiable, Equatable {
-    var id: String
-    var role: String
-    var status: String?
-    var parts: [HostPart]
-}
-
-struct HostTranscriptFrame: Decodable {
-    struct Upsert: Decodable { let after: String?; let entry: HostMessage }
-    struct Append: Decodable { let entry: String; let part: String; let text: String; let len: Int }
-    var reset: [HostMessage]?
-    var upsert: [Upsert]?
-    var append: [Append]?
-    var remove: [String]?
-    var count: Int?
-
-    func applying(to source: [HostMessage]) throws -> [HostMessage] {
-        if let reset { return reset }
-        var rows = source
-        rows.removeAll { (remove ?? []).contains($0.id) }
-        for change in upsert ?? [] {
-            rows.removeAll { $0.id == change.entry.id }
-            if let anchor = change.after {
-                guard let index = rows.firstIndex(where: { $0.id == anchor }) else { throw RelayError.rpc("Transcript needs a refresh.") }
-                rows.insert(change.entry, at: index + 1)
-            } else { rows.insert(change.entry, at: 0) }
-        }
-        for change in append ?? [] {
-            guard let row = rows.firstIndex(where: { $0.id == change.entry }),
-                  let part = rows[row].parts.firstIndex(where: { $0.id == change.part }) else { throw RelayError.rpc("Transcript needs a refresh.") }
-            let text = (rows[row].parts[part].text ?? "") + change.text
-            guard text.utf8.count == change.len else { throw RelayError.rpc("Transcript needs a refresh.") }
-            rows[row].parts[part].text = text
-        }
-        guard count == rows.count else { throw RelayError.rpc("Transcript needs a refresh.") }
-        return rows
-    }
 }
 
 @MainActor @Observable
@@ -109,33 +80,38 @@ final class CompanionModel {
     var connectionRevision = 0
     var drafts: [String: String] = [:]
     var connection = DirectConnection()
+    var projectIcons: [String: (image: UIImage?, at: Date)] = [:]
+    var projectIconTasks: [String: Task<UIImage?, Never>] = [:]
     var selected: ConnectionProfile? { profiles.first { $0.id == selectedID } }
     var localChats: [HostChat] {
-        chats.filter { !$0.archived && $0.deviceId == selected?.deviceId }
-            .sorted { ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt) }
+        chats.filter { !$0.archived && $0.deviceId == selected?.deviceId }.sorted(by: Self.recency)
     }
     var archivedChats: [HostChat] {
-        chats.filter { $0.archived && $0.deviceId == selected?.deviceId }
-            .sorted { ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt) }
+        chats.filter { $0.archived && $0.deviceId == selected?.deviceId }.sorted(by: Self.recency)
+    }
+    /// Activity order, id tiebreak so the sort is total (view.rs `sort_chats`).
+    static func recency(_ a: HostChat, _ b: HostChat) -> Bool {
+        if a.activityDate != b.activityDate { return a.activityDate > b.activityDate }
+        if a.created != b.created { return a.created > b.created }
+        return a.id < b.id
     }
     func visibleChats(project: String = "", query: String = "", scope: CompanionScope = .all) -> [HostChat] {
         let source = scope == .archived ? archivedChats : localChats
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return source.filter { chat in
             (project.isEmpty || chat.spaceId == project)
-                && (scope != .attention || ["awaitingInput", "errored"].contains(status(chat.id)))
-                && (scope != .working || status(chat.id) == "working")
+                && (scope != .attention || state(chat).needsYou)
+                && (scope != .working || state(chat).running)
                 && (search.isEmpty || [chat.displayTitle, chat.lastMessagePreview ?? "", chat.branch ?? "",
                     chat.cwd ?? "", localSpaces.first { $0.id == chat.spaceId }?.displayName ?? ""]
                     .contains { $0.localizedCaseInsensitiveContains(search) })
         }.sorted {
-            let a = Self.attentionRank(status($0.id)), b = Self.attentionRank(status($1.id))
-            if scope != .archived && a != b { return a < b }
-            return ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt)
+            if scope != .archived {
+                let a = state($0).attentionRank, b = state($1).attentionRank
+                if a != b { return a < b }
+            }
+            return Self.recency($0, $1)
         }
-    }
-    private static func attentionRank(_ status: String) -> Int {
-        switch status { case "awaitingInput": 0; case "errored": 1; case "working": 2; case "completed": 3; default: 4 }
     }
     func draftKey(for chat: HostChat) -> String { "\(chat.deviceId)/\(chat.id)" }
 
@@ -209,7 +185,7 @@ final class CompanionModel {
                     group.addTask { @MainActor in
                         let catalog = try await connection.call("ListHarnesses")
                         guard !Task.isCancelled, self.connection === connection else { return }
-                        self.harnesses = try Self.decode([HostHarness].self, catalog).filter { $0.enabled ?? ($0.installed ?? true) }
+                        self.harnesses = try Self.decode([HostHarness].self, catalog).filter(\.isOffered)
                         arrived("agents")
                     }
                     group.addTask { @MainActor in
@@ -250,6 +226,8 @@ final class CompanionModel {
         }
     }
 
+    /// Raw host status string. Legacy rows still read this; new code uses
+    /// `state(_:)`, which applies the staleness gate and the unseen marker.
     func status(_ chatID: String) -> String { sessions.first { $0.chatId == chatID }?.status ?? "idle" }
 
     func create(spaceID: String?, harness: String, model: String? = nil, reasoning: String? = nil) async throws -> HostChat {
@@ -290,7 +268,7 @@ final class CompanionModel {
         try await mutate(chat, values: ["op": "setChatArchived", "archived": archived])
     }
 
-    private func mutate(_ chat: HostChat, values: [String: Any]) async throws {
+    func mutate(_ chat: HostChat, values: [String: Any]) async throws {
         guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
         var params = values
         params["chatId"] = chat.id
@@ -299,13 +277,24 @@ final class CompanionModel {
         _ = try await connection.call("Mutate", params)
     }
 
-    func send(_ text: String, chat: HostChat, messageID: String = UUID().uuidString.lowercased()) async throws {
+    func send(_ text: String, chat: HostChat, attachments: [HostAttachment] = [], messageID: String = UUID().uuidString.lowercased()) async throws {
         guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
-        if status(chat.id) == "working" || status(chat.id) == "awaitingInput" {
-            _ = try await connection.call("QueueMessage", ["chatId": chat.id, "text": text, "holdForTurnEnd": true])
+        let paths = attachments.map(\.path)
+        let state = state(chat)
+        if state == .working || state == .awaitingInput {
+            // A queue row keeps the user's plain editable text; the host
+            // rebuilds the attachment trailer at dispatch
+            // (`doc_host.rs` `queued_message_prompt`). Image-only rows still
+            // need a body (`queue.rs` rejects blank text).
+            let body = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !paths.isEmpty
+                ? attachmentOnlyText : text
+            _ = try await connection.call("QueueMessage", ["chatId": chat.id, "text": body,
+                "attachments": paths, "holdForTurnEnd": true])
         } else {
-            var request: [String: Any] = ["prompt": text, "cwd": chat.cwd ?? "~",
+            let body = HostAttachment.composed(text, paths: paths)
+            var request: [String: Any] = ["prompt": body, "cwd": chat.cwd ?? "~",
                 "sandbox": chat.config?.sandbox ?? "workspace-write", "autoApprove": false]
+            if !paths.isEmpty { request["attachments"] = paths }
             if let config = chat.config {
                 request["harness"] = config.harness
                 request["model"] = config.model
