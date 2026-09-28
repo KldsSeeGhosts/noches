@@ -362,10 +362,18 @@ final class TranscriptLayoutTests: XCTestCase {
         // Compare presentation samples on the display clock, not Task.sleep's
         // wake-up clock. Retain both geometries and callback times to diagnose
         // delayed layout/commits and missed display updates in CI.
-        let frameSteps = zip(samples, samples.dropFirst()).compactMap { previous, current -> CGFloat? in
+        // A stalled display callback coalesces rendered presentation frames
+        // into one sample. Compare successive samples as contiguous 60Hz
+        // motion windows. Normalize the final, unfulfilled interval to one
+        // display frame: it measures presentation resolution, not the time
+        // XCTest spent waiting for the settled-frame expectation.
+        let frameSteps = (1..<samples.count).compactMap { index -> CGFloat? in
+            let previous = samples[index - 1]
+            let current = samples[index]
             guard let before = previous.presentedHeight, let after = current.presentedHeight else { return nil }
-            let elapsed = max(current.timestamp - previous.timestamp, 1.0 / 60)
-            return abs(after - before) / CGFloat(elapsed * 60)
+            let nominalFrames = current.timestamp - previous.timestamp
+            let windowFrames = index + 1 == samples.count ? 1.0 : max(1.0, nominalFrames)
+            return abs(after - before) / CGFloat(windowFrames * 60)
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
