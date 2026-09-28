@@ -23,11 +23,6 @@ on:
 permissions:
   contents: read
 
-# Serialize published channels; obsolete PR builds can be cancelled safely.
-concurrency:
-  group: noches-release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   prepare:
     if: github.repository_owner == 'KldsSeeGhosts' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
@@ -55,16 +50,8 @@ jobs:
           - runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      # Self-hosted runners reuse the workspace, so target/ and the cargo
-      # registry persist on disk and no Actions cache is needed.
       - uses: actions/checkout@v4
-        with:
-          clean: false
-      - name: Clean stale untracked files (keep target/)
-        if: runner.environment != 'github-hosted'
-        run: git clean -ffdx -e target/
       - name: System dependencies
-        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -75,10 +62,9 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-        if: runner.environment == 'github-hosted'
         with:
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
       - name: Updater tests
         run: cargo test --locked -p zeron-update
       - name: Linux input-seat tests
@@ -101,7 +87,7 @@ jobs:
   macos:
     if: github.event_name != 'pull_request'
     needs: prepare
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: macos-15
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -109,14 +95,12 @@ jobs:
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
-      # Self-hosted runner reuses the workspace: target/ and the cargo
-      # registry persist on disk, so no Actions cache is used.
       - uses: actions/checkout@v4
-        with:
-          clean: false
-      - name: Clean stale untracked files (keep target/)
-        run: git clean -ffdx -e target/
       - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
       - name: Updater tests
         run: cargo test --locked -p zeron-update
       - name: Chromium build dependencies
@@ -170,6 +154,10 @@ jobs:
   publish:
     if: github.event_name != 'pull_request'
     needs: [prepare, linux, macos]
+    # Builds may run concurrently, but only one job may advance a channel feed.
+    concurrency:
+      group: noches-release-publish-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write

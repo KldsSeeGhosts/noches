@@ -89,10 +89,12 @@ jobs:
           latest_build="$(jq -r '[.data[].attributes.version | select(test("^[0-9]+$")) | tonumber] | max // 0' "$builds")"
           build_number="$((latest_build + 1))"
 
-          echo "AC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
-          echo "AC_TOKEN_PATH=$token_path" >> "$GITHUB_ENV"
-          echo "ASC_APP_ID=$app_id" >> "$GITHUB_ENV"
-          echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          {
+            echo "AC_KEY_PATH=$key_path"
+            echo "AC_TOKEN_PATH=$token_path"
+            echo "ASC_APP_ID=$app_id"
+            echo "BUILD_NUMBER=$build_number"
+          } >> "$GITHUB_ENV"
           echo "Preparing $AUDIENCE TestFlight build $build_number from $GITHUB_SHA."
 
       - name: Xcode version
@@ -161,7 +163,7 @@ jobs:
 
           token="$(cat "$AC_TOKEN_PATH")"
           builds="$RUNNER_TEMP/processing-builds.json"
-          for attempt in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             curl --globoff --fail-with-body --silent --show-error \
               -H "Authorization: Bearer $token" \
               -H 'Content-Type: application/json' \
