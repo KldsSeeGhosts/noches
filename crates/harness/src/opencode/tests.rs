@@ -1602,10 +1602,21 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
     .await;
     wire.request("/prompt_async").await;
     wire.status("busy");
-    tokio::task::yield_now().await;
     tokio::time::pause();
-    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
-    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+    // Receiving the POST only proves the fixture server saw the request;
+    // under parallel test load reqwest may not have armed its timeout yet.
+    // Advance after letting the client poll, and repeat if that race wins.
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+        tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+        while let Ok(event) = wire.events.try_recv() {
+            if let AgentEvent::Done { status, .. } = event.unwrap() {
+                assert_eq!(status, DoneStatus::Errored);
+                return;
+            }
+        }
+    }
+    panic!("stalled prompt did not time out after three client timeout windows");
 }
 
 #[tokio::test]
