@@ -257,7 +257,7 @@ jobs:
       - name: Check out pinned GPUI for native frame-source tests
         shell: bash
         run: |
-          # Avoid tomllib (3.11+); Apple Python on the self-hosted Mac is 3.9.
+          # Avoid tomllib (3.11+) so the runner's Python version does not matter.
           rev=$(python3 -c 'import re,sys; t=open("Cargo.toml").read(); m=re.search(r"(?m)^gpui\s*=\s*\{[^}]*\brev\s*=\s*\"([0-9a-f]+)\"", t); sys.exit("could not parse gpui rev from Cargo.toml") if not m else print(m.group(1))')
           git init frame-source-tests
           git -C frame-source-tests remote add origin https://github.com/zeronsh/zui
