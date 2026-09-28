@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [dev, main]
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/release.yml'
       - 'scripts/*release*'
       - 'scripts/package-*.sh'
@@ -49,7 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: [self-hosted, Linux, X64, arch]
+          - runner: ubuntu-24.04
           - runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
