@@ -2499,6 +2499,20 @@ impl SubagentObserver {
     }
 }
 
+/// Consume only the exact pi-acp startup inventory advertised by session/new.
+/// Ordinary agent text (including a response that happens to mention Pi) stays.
+fn consume_pi_startup_info(method: &str, update: &Value, pending: &mut Option<String>) -> bool {
+    let matches = method == "session/update"
+        && update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk")
+        && pending.as_deref().is_some_and(|startup| {
+            update.pointer("/content/text").and_then(Value::as_str) == Some(startup)
+        });
+    if matches {
+        pending.take();
+    }
+    matches
+}
+
 /// The events of one notification, session-filtered. `session/update` maps
 /// per [`map_update`]; `_x.ai/session_notification` is grok's extension
 /// channel — same `{sessionId, update}` envelope, but its updates (the
@@ -2511,11 +2525,19 @@ fn session_update_events(
     session_id: &str,
     subagents: &mut SubagentObserver,
     shapes: &mut normalize::ToolShapes,
+    pi_startup_info: &mut Option<String>,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
     let update = params.get("update").unwrap_or(&Value::Null);
+    // pi-acp includes its startup inventory in session/new's _meta, then
+    // repeats that exact text as an agent_message_chunk on a timer. It is
+    // adapter chrome, not the model's answer. Match the response's payload
+    // rather than heuristically stripping real assistant text or slash output.
+    if consume_pi_startup_info(method, update, pi_startup_info) {
+        return Vec::new();
+    }
     match method {
         "session/update" => match subagents {
             SubagentObserver::Devin(tracker) => tracker.map(update),
@@ -3211,13 +3233,20 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
+        let pi_startup_info = (harness == HarnessId::Pi)
+            .then(|| options_snapshot.pointer("/_meta/piAcp/startupInfo"))
+            .flatten()
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        Ok::<(String, bool, Vec<SlashCommand>, Option<String>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
+            pi_startup_info,
         ))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext, init_commands, mut pi_startup_info) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -3504,6 +3533,7 @@ async fn run_session(session: Session) {
                                 &session_id,
                                 &mut subagents,
                                 &mut tool_shapes,
+                                &mut pi_startup_info,
                             );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
@@ -3698,6 +3728,7 @@ async fn run_session(session: Session) {
                         &session_id,
                         &mut subagents,
                         &mut tool_shapes,
+                        &mut pi_startup_info,
                     );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
@@ -3820,6 +3851,7 @@ async fn run_session(session: Session) {
                                         &session_id,
                                         &mut subagents,
                                         &mut tool_shapes,
+                                        &mut pi_startup_info,
                                     );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
@@ -4281,6 +4313,39 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_startup_inventory_is_not_assistant_text() {
+        let inventory = "pi v0.87.1\n## Skills\n- /home/agent/SKILL.md\n";
+        let mut pending = Some(inventory.to_owned());
+        let chunk = |text: &str| {
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            })
+        };
+        assert!(!consume_pi_startup_info(
+            "session/update",
+            &chunk("Hey! How can I help?"),
+            &mut pending,
+        ));
+        assert!(!consume_pi_startup_info(
+            "session/update",
+            &chunk("pi v0.87.1"),
+            &mut pending,
+        ));
+        assert!(consume_pi_startup_info(
+            "session/update",
+            &chunk(inventory),
+            &mut pending,
+        ));
+        assert_eq!(pending, None);
+        assert!(!consume_pi_startup_info(
+            "session/update",
+            &chunk(inventory),
+            &mut pending,
+        ));
+    }
 
     #[test]
     fn pi_cua_without_bridge_gets_a_private_per_run_launch_directory() {
