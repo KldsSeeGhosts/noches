@@ -454,40 +454,53 @@ final class TranscriptLayoutTests: XCTestCase {
         await mount(turns: 600, useEditor: true)
         let editor = findNativeEditor(window)!
         let tailKey = key + "|a599#t1.0"
-        for showing in [true, false, true, false] {
-            let startPosition = try XCTUnwrap(TranscriptLayoutProbe.presentedFrame(for: key)).maxY
-            let baseline = startPosition - (try XCTUnwrap(TranscriptLayoutProbe.presentedFrame(for: tailKey))).maxY
-            var samples: [GeometrySample] = []
-            var triggered = false
-            var stableFrames = 0
-            // Sample in the display callback so every observation is a frame the
-            // user actually saw; scheduler wake-ups can land mid-transaction,
-            // after layout but before UIKit attaches the keyboard springs.
-            let completed = await DisplaySampler.observe(
-                showing ? "Keyboard opens and settles" : "Keyboard closes and settles") { [self] link in
-                let sample = geometrySample(link,
-                    position: TranscriptLayoutProbe.presentedFrame(for: key)?.maxY,
-                    modelPosition: nil, tailKey: tailKey)
-                samples.append(sample)
-                if !triggered {
-                    triggered = true
-                    if showing { editor.becomeFirstResponder() } else { editor.resignFirstResponder() }
-                    return false
-                }
-                guard let position = sample.position, let target = sample.modelViewport?.maxY,
-                      abs(target - startPosition) > 1 else { return false }
-                stableFrames = abs(position - target) <= 1 ? stableFrames + 1 : 0
-                return stableFrames == 3
+        let directions = [true, false, true, false]
+        var samplesByLeg = directions.map { _ in [GeometrySample]() }
+        var leg = 0
+        var startPosition: CGFloat?
+        var baseline: CGFloat?
+        var stableFrames = 0
+        // Keep one display link alive across all reversals. Awaiting a separate
+        // waiter between legs can stall the simulator long enough for UIKit to
+        // dismiss the keyboard before the closing leg takes its first sample.
+        let completed = await DisplaySampler.observe("Keyboard opens and closes twice", timeout: 30) { [self] link in
+            let sample = geometrySample(link,
+                position: TranscriptLayoutProbe.presentedFrame(for: key)?.maxY,
+                modelPosition: nil, tailKey: tailKey)
+            samplesByLeg[leg].append(sample)
+            if startPosition == nil {
+                startPosition = sample.position
+                baseline = sample.gap
+                editor.becomeFirstResponder()
+                return false
             }
+            guard let position = sample.position, let target = sample.modelViewport?.maxY,
+                  let origin = startPosition, abs(target - origin) > 1 else { return false }
+            stableFrames = abs(position - target) <= 1 ? stableFrames + 1 : 0
+            guard stableFrames == 3 else { return false }
+            leg += 1
+            if leg == directions.count { return true }
+            // The settled frame is also the start of the next leg. Trigger its
+            // reversal now, before yielding to the XCTest waiter/run loop.
+            samplesByLeg[leg].append(sample)
+            startPosition = position
+            stableFrames = 0
+            if directions[leg] { editor.becomeFirstResponder() } else { editor.resignFirstResponder() }
+            return false
+        }
+        let settledBaseline = try XCTUnwrap(baseline)
+        for (index, showing) in directions.enumerated() {
+            let samples = samplesByLeg[index]
             try attachMotion(showing ? "keyboard-opening-motion" : "keyboard-closing-motion", samples: samples)
             let positions = samples.compactMap(\.position)
             let gaps = samples.compactMap(\.gap)
-            XCTAssertTrue(completed, "Keyboard motion did not settle")
             XCTAssertEqual(gaps.count, samples.count, "Both views must remain realized on every frame")
-            XCTAssertGreaterThan((positions.max() ?? 0) - (positions.min() ?? 0), 150)
-            XCTAssertLessThan(gaps.map { abs($0 - baseline) }.max() ?? .infinity, 4)
-            assertTailVisible()
+            XCTAssertGreaterThan((positions.max() ?? 0) - (positions.min() ?? 0), 150,
+                                 "Keyboard motion missing from leg \(index)")
+            XCTAssertLessThan(gaps.map { abs($0 - settledBaseline) }.max() ?? .infinity, 4)
         }
+        XCTAssertTrue(completed, "Keyboard motion did not settle (leg \(leg))")
+        assertTailVisible()
     }
 
     func testInterruptedKeyboardMotionKeepsTranscriptAttached() async {
