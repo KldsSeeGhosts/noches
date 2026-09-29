@@ -19,13 +19,29 @@ on:
   push:
     branches: [dev, main]
   workflow_dispatch:
+    inputs:
+      migration:
+        description: 'One-time migration phase (dev branch only); normal is ordinary release'
+        type: choice
+        options: [normal, seed, bridge]
+        required: true
+        default: normal
+      channel:
+        description: 'Migration channel (normal uses auto)'
+        type: choice
+        options: [auto, dev, stable]
+        default: auto
+      confirm:
+        description: 'For migration type exactly seed-dev, seed-stable, bridge-dev, or bridge-stable'
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   prepare:
-    if: github.repository_owner == 'KldsSeeGhosts' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    if: github.repository_owner == 'KldsSeeGhosts' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || (inputs.migration == 'normal' && inputs.channel == 'auto' && inputs.confirm == '' || github.ref == 'refs/heads/dev' && inputs.migration != 'normal' && inputs.channel != '' && inputs.confirm == format('{0}-{1}', inputs.migration, inputs.channel)))
     runs-on: ubuntu-24.04
     outputs:
       channel: ${{ steps.identity.outputs.channel }}
@@ -35,6 +51,8 @@ jobs:
       - id: identity
         env:
           NOCHES_SOURCE_BRANCH: ${{ github.base_ref || github.ref_name }}
+          NOCHES_RELEASE_MODE: ${{ inputs.migration || 'normal' }}
+          NOCHES_MIGRATION_CHANNEL: ${{ inputs.migration != 'normal' && inputs.channel || '' }}
         run: python3 scripts/noches-release.py prepare
       - name: Release configuration tests
         run: python3 scripts/test-noches-release.py
@@ -77,6 +95,7 @@ jobs:
           NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
           NOCHES_REPOSITORY: ${{ github.repository }}
           NOCHES_COMMIT: ${{ github.sha }}
+          NOCHES_BRIDGE_EPOCH: ${{ inputs.migration == 'bridge' && '0' || '' }}
         run: bash scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -142,6 +161,7 @@ jobs:
           NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
           NOCHES_REPOSITORY: ${{ github.repository }}
           NOCHES_COMMIT: ${{ github.sha }}
+          NOCHES_BRIDGE_EPOCH: ${{ inputs.migration == 'bridge' && '0' || '' }}
         run: bash scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -156,7 +176,7 @@ jobs:
     needs: [prepare, linux, macos]
     # Builds may run concurrently, but only one job may advance a channel feed.
     concurrency:
-      group: noches-release-publish-${{ github.ref }}
+      group: noches-release-publish-${{ needs.prepare.outputs.channel }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
@@ -165,6 +185,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
       NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
+      NOCHES_RELEASE_MODE: ${{ inputs.migration || 'normal' }}
+      NOCHES_MIGRATION_CONFIRM: ${{ inputs.confirm || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

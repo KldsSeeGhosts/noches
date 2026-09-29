@@ -41,7 +41,7 @@ pub const fn current_version() -> &'static str {
 /// scheme is re-keyed (for example the `0.1.x` series superseding `0.3.x`) so
 /// a later series orders above every older release regardless of SemVer.
 /// Manifests written before the field existed count as epoch 0.
-pub const VERSION_EPOCH: u32 = 1;
+pub const VERSION_EPOCH: u32 = if cfg!(noches_bridge_epoch) { 0 } else { 1 };
 
 /// Background check cadence.
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -303,7 +303,7 @@ fn release_base(_edge_url: &str) -> anyhow::Result<String> {
         return validate_release_override(&url);
     }
     Ok(format!(
-        "https://github.com/{}/releases/download/noches-{}",
+        "https://github.com/{}/releases/download/noches-epoch1-{}",
         identity::repository(),
         identity::channel()
     ))
@@ -1497,6 +1497,20 @@ mod tests {
     }
 
     #[test]
+    fn distributed_feed_uses_permanent_epoch1_tag() {
+        if std::env::var_os("NOCHES_RELEASES_URL").is_none() {
+            assert_eq!(
+                release_base("").unwrap(),
+                format!(
+                    "https://github.com/{}/releases/download/noches-epoch1-{}",
+                    identity::repository(),
+                    identity::channel()
+                )
+            );
+        }
+    }
+
+    #[test]
     fn version_series_epoch_orders_rekeyed_feeds() {
         // The 0.1.x series re-keys below the 0.3.x numbers; the epoch keeps a
         // 0.1.x build from offering old-series feeds and lets new-series feeds
@@ -1506,15 +1520,40 @@ mod tests {
             "files": {}
         }))
         .unwrap();
-        assert!(!legacy.newer_than("0.1.0-dev.1"));
+        assert_eq!(legacy.newer_than("0.1.0-dev.1"), cfg!(noches_bridge_epoch));
         let mut series = legacy.clone();
         series.epoch = 1;
         series.version = "0.1.36-dev.1".into();
         assert!(series.newer_than("0.1.0-dev.1"));
-        assert!(!series.newer_than("0.1.37-dev.1"));
+        assert_eq!(series.newer_than("0.1.37-dev.1"), cfg!(noches_bridge_epoch));
         let mut future = series.clone();
         future.epoch = 2;
         assert!(future.newer_than("0.1.37-dev.1"));
+        assert_eq!(VERSION_EPOCH, if cfg!(noches_bridge_epoch) { 0 } else { 1 });
+    }
+
+    #[test]
+    fn legacy_bridge_then_epoch_one_feed_is_ordered_for_both_clients() {
+        let bridge = Manifest {
+            version: "0.4.42-dev.1".into(),
+            epoch: 1, // Legacy feed advertisement, not the bridge binary's epoch.
+            ..Default::default()
+        };
+        // The shipped 0.3.x updater ignores epoch and compares only SemVer.
+        assert!(version_newer(&bridge.version, "0.3.35-dev.1"));
+        // Already-installed epoch-1 clients that still read the old URL can
+        // take the same hop without comparing against an epoch-0 manifest.
+        if !cfg!(noches_bridge_epoch) {
+            assert!(bridge.newer_than("0.1.41-dev.1"));
+        }
+        let destination = Manifest {
+            version: "0.1.43-dev.1".into(),
+            epoch: 1,
+            ..Default::default()
+        };
+        if cfg!(noches_bridge_epoch) {
+            assert!(destination.newer_than(&bridge.version));
+        }
     }
 
     #[test]
@@ -1543,25 +1582,23 @@ mod tests {
 
     #[test]
     fn install_kind_detection() {
+        let root = identity::app_root(Path::new("/home/u"));
         assert_eq!(
             detect_install_from_for_os(
-                Path::new("/home/u/.zeron/app/0.1.1/zeron"),
+                &root.join("0.1.1/zeron"),
                 Some(Path::new("/home/u")),
                 "linux",
             ),
-            InstallKind::Managed {
-                app_root: PathBuf::from("/home/u/.zeron/app")
-            }
+            InstallKind::Managed { app_root: root }
         );
+        let bundle = PathBuf::from("/Applications").join(identity::bundle_name());
         assert_eq!(
             detect_install_from_for_os(
-                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
+                &bundle.join("Contents/MacOS/zeron"),
                 Some(Path::new("/Users/u")),
                 "macos",
             ),
-            InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Zeron.app")
-            }
+            InstallKind::MacApp { bundle }
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
