@@ -9,7 +9,9 @@ import {createRequire} from 'node:module';
 const root = path.resolve(process.argv[2]);
 const entry = path.join(root, 'dist/esm/index.js');
 let source = fs.readFileSync(entry, 'utf8');
-const marker = '"./src/agent/executor-common.ts"(e,t,n)';
+// Minifier argument names are not part of the SDK contract. Locate the
+// module by its stable name; still fail closed if exports/transport change.
+const marker = '"./src/agent/executor-common.ts"(';
 const start = source.indexOf(marker);
 const end = source.indexOf('"./src/agent/native/vendored-tree-sitter.ts"', start);
 assert(start >= 0 && end > start, 'SDK layout changed: review the auth contract instrumentation');
