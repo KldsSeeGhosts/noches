@@ -14,39 +14,85 @@ struct CompanionView: View {
     @State private var path: [HostChat] = []
     @State private var images: CompanionImageLoader?
 
-    var body: some View {
-        NavigationStack(path: $path) {
-            Group {
-                if model.selected != nil {
-                    CompanionDashboard(model: model, newSession: { newSession = NewSessionRequest(project: $0) }, pair: { pairing = true }, opened: { path.append($0) })
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) { welcome }
-                            .padding(24).frame(maxWidth: 620).frame(maxWidth: .infinity)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var columns = NavigationSplitViewVisibility.all
+
+    /// Regular width (iPad) puts the project/thread list beside the session.
+    private var split: Bool { sizeClass == .regular && model.selected != nil }
+
+    private var dashboard: some View {
+        CompanionDashboard(model: model, newSession: { newSession = NewSessionRequest(project: $0) },
+                           pair: { pairing = true },
+                           opened: { split ? (path = [$0]) : path.append($0) },
+                           selectedChatID: split ? path.last?.id : nil)
+    }
+
+    @ToolbarContentBuilder
+    private var homeToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            NochesWordmark()
+        }.sharedBackgroundVisibility(.hidden)
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { settings = true } label: { Image(systemName: "ellipsis") }
+                .accessibilityLabel("Appearance and computers")
+        }
+    }
+
+    @ViewBuilder
+    private var layout: some View {
+        if split {
+            NavigationSplitView(columnVisibility: $columns) {
+                dashboard
+                    .background(Theme.bg.ignoresSafeArea())
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar { homeToolbar }
+                    .navigationSplitViewColumnWidth(min: 340, ideal: 400, max: 460)
+            } detail: {
+                NavigationStack {
+                    if let chat = path.last {
+                        CompanionSessionView(model: model, chat: chat).id(chat.id)
+                    } else {
+                        VStack(spacing: 12) {
+                            NochesMark(size: 26).opacity(0.5)
+                            Text("Select a session").font(Theme.sans(20, weight: .medium)).tracking(-0.4)
+                            Text("Or start a new one from the list.")
+                                .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity).background(Theme.bg.ignoresSafeArea())
                     }
                 }
             }
-            .background(Theme.bg.ignoresSafeArea())
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    NochesWordmark()
-                }.sharedBackgroundVisibility(.hidden)
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { settings = true } label: { Image(systemName: "ellipsis") }
-                        .accessibilityLabel("Appearance and computers")
+            .navigationSplitViewStyle(.balanced)
+        } else {
+            NavigationStack(path: $path) {
+                Group {
+                    if model.selected != nil {
+                        dashboard
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) { welcome }
+                                .padding(24).frame(maxWidth: 620).frame(maxWidth: .infinity)
+                        }
+                    }
+                }
+                .background(Theme.bg.ignoresSafeArea())
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { homeToolbar }
+                .navigationDestination(for: HostChat.self) { chat in
+                    CompanionSessionView(model: model, chat: chat)
                 }
             }
-            .navigationDestination(for: HostChat.self) { chat in
-                CompanionSessionView(model: model, chat: chat)
-            }
+        }
+    }
+
+    var body: some View {
+        layout
             .sheet(isPresented: $pairing) { PairComputerSheet(model: model) }
             .sheet(item: $newSession) { request in
-                NewHostSessionSheet(model: model, initialProject: request.project) { path.append($0) }
+                NewHostSessionSheet(model: model, initialProject: request.project) { path = split ? [$0] : path + [$0] }
             }
             .sheet(isPresented: $cloud) { SignInView() }
             .sheet(isPresented: $settings, onDismiss: { afterSettings?(); afterSettings = nil }) { settingsSheet }
-        }
         .tint(Theme.text)
         .environment(\.companionImageLoader, images)
         .onAppear { if images == nil { images = CompanionImageLoader(model: model) } }

@@ -1,25 +1,48 @@
 import SwiftUI
 
-/// The phone's control plane: Needs you / Running / Recent sections of T3
-/// thread cards. Colors and sizes follow docs/design/mobile.md; every glyph
-/// and hue comes from the shared control-plane primitives.
+/// The phone's control plane: sessions as T3 thread cards, either sectioned
+/// by state (Needs you / Running / Recent) or grouped under their projects.
+/// Colors and sizes follow docs/design/mobile.md; every glyph and hue comes
+/// from the shared control-plane primitives.
 struct CompanionDashboard: View {
     let model: CompanionModel
     let newSession: (String) -> Void
     let pair: () -> Void
     let opened: (HostChat) -> Void
+    /// The session showing in the iPad detail column, highlighted in the list.
+    var selectedChatID: String? = nil
     @State private var project = ""
     @State private var query = ""
     @State private var scope: CompanionScope = .all
+    @State private var sheet: HomeSheet?
+    /// Runs once the drawer has finished dismissing; swapping sheets in one tap races.
+    @State private var afterSheet: (() -> Void)?
+    @AppStorage("companion.home.grouping") private var groupingRaw = CompanionGrouping.status.rawValue
+    @AppStorage("companion.home.collapsed") private var collapsedRaw = ""
     @FocusState private var searchFocused: Bool
 
+    private enum HomeSheet: Identifiable {
+        case projects, addProject
+        var id: Int { self == .projects ? 0 : 1 }
+    }
+
+    private var grouping: CompanionGrouping { CompanionGrouping(rawValue: groupingRaw) ?? .status }
+    private var collapsed: Set<String> { CompanionCollapsed.ids(collapsedRaw) }
     private var visible: [HostChat] { model.visibleChats(project: project, query: query, scope: scope) }
     private var needsYou: [HostChat] { visible.filter { model.state($0).needsYou } }
     private var running: [HostChat] { visible.filter { model.state($0).running } }
     private var recent: [HostChat] {
         visible.filter { let state = model.state($0); return !state.needsYou && !state.running }
     }
+    /// Empty projects still get a header in the project view, so a fresh
+    /// project has somewhere to start its first thread. Filters hide them.
+    private var groups: [CompanionProjectGroup] {
+        let unfiltered = project.isEmpty && query.isEmpty && scope == .all
+        let all = model.projectGroups(chats: visible, keepEmpty: unfiltered)
+        return project.isEmpty ? all : all.filter { $0.projectID == project }
+    }
     private var projectTitle: String { model.localSpaces.first { $0.id == project }?.displayName ?? "All projects" }
+    private var hasNoProjects: Bool { model.online && model.localSpaces.isEmpty }
 
     var body: some View {
         List {
@@ -31,21 +54,59 @@ struct CompanionDashboard: View {
         }
         .listStyle(.plain).scrollContentBackground(.hidden)
         .scrollDismissesKeyboard(.interactively)
+        .refreshable { await refresh() }
         .background(Theme.bg).foregroundStyle(Theme.text)
         .motionAnimation(Motion.resort, value: visible.map(\.id))
+        .motionAnimation(Motion.collapse, value: collapsedRaw)
+        .motionAnimation(Motion.collapse, value: groupingRaw)
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar }
         .onAppear { searchFocused = false }
         .onChange(of: model.selectedID) { _, _ in project = ""; query = ""; scope = .all }
+        .onChange(of: model.localSpaces.map(\.id)) { _, ids in
+            if !project.isEmpty, model.online, !ids.contains(project) { project = "" }
+        }
+        .sheet(item: $sheet, onDismiss: { afterSheet?(); afterSheet = nil }) { item in
+            switch item {
+            case .projects:
+                CompanionProjectList(model: model, selection: $project) { id in
+                    afterSheet = { newSession(id) }
+                    sheet = nil
+                }
+            case .addProject:
+                CompanionAddProjectSheet(model: model) { space in
+                    collapsedRaw = CompanionCollapsed.ids(collapsedRaw).subtracting([space.id]).sorted().joined(separator: "\n")
+                    sheet = nil
+                }
+            }
+        }
+    }
+
+    /// Sessions, projects and agents arrive over live watches, so refreshing
+    /// an online host just drops cached badge art. An offline host retries now
+    /// instead of waiting out the four-second backoff.
+    private func refresh() async {
+        if model.online {
+            model.projectIcons = [:]
+            model.generation += 1
+            return
+        }
+        guard model.selected != nil else { return }
+        model.connectionRevision += 1
+        for _ in 0..<20 where !model.online {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
     }
 
     // MARK: - Sections
 
     @ViewBuilder
     private var listContent: some View {
-        if visible.isEmpty {
+        if visible.isEmpty && (grouping == .status || groups.isEmpty) {
             emptyState
                 .listRowInsets(EdgeInsets(top: 24, leading: 20, bottom: 24, trailing: 20))
                 .listRowSeparator(.hidden).listRowBackground(Color.clear)
+        } else if grouping == .project {
+            projectGroups
         } else if scope == .archived {
             rows(visible)
         } else {
@@ -78,7 +139,8 @@ struct CompanionDashboard: View {
 
     private func rows(_ chats: [HostChat]) -> some View {
         ForEach(Array(chats.enumerated()), id: \.element.id) { index, chat in
-            CompanionSessionRow(model: model, chat: chat, showsSeparator: index < chats.count - 1) {
+            CompanionSessionRow(model: model, chat: chat, showsSeparator: index < chats.count - 1,
+                                isSelected: chat.id == selectedChatID) {
                 searchFocused = false
                 UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 opened(chat)
@@ -88,12 +150,87 @@ struct CompanionDashboard: View {
         }
     }
 
+    // MARK: - Project groups
+
+    @ViewBuilder
+    private var projectGroups: some View {
+        ForEach(groups) { group in
+            // A search should reveal matches, so it overrides collapsing.
+            let open = !collapsed.contains(group.id) || !query.isEmpty
+            groupHeader(group, open: open)
+            if open {
+                if group.chats.isEmpty {
+                    Text("No sessions yet").font(Theme.sans(13)).foregroundStyle(Theme.textFaint)
+                        .padding(.leading, 20).padding(.vertical, 6)
+                        .listRowInsets(EdgeInsets()).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                } else {
+                    rows(group.chats)
+                }
+            }
+        }
+        if project.isEmpty {
+            Button { sheet = .addProject } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus").font(.system(size: 13, weight: .medium)).frame(width: 20)
+                    Text("Add project").font(Theme.sans(14))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Theme.textMuted).padding(.horizontal, 20).frame(minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(CompanionPressStyle()).disabled(!model.online)
+            .accessibilityIdentifier("add-project-row")
+            .listRowInsets(EdgeInsets()).listRowSeparator(.hidden).listRowBackground(Color.clear)
+        }
+    }
+
+    /// Chevron, badge, name, mono path hint, state dots, count, and a "+" that
+    /// starts a thread in this project. The chevron side toggles collapsing.
+    private func groupHeader(_ group: CompanionProjectGroup, open: Bool) -> some View {
+        HStack(spacing: 0) {
+            Button {
+                collapsedRaw = CompanionCollapsed.toggled(collapsedRaw, id: group.id)
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textFaint).rotationEffect(.degrees(open ? 90 : 0)).frame(width: 12)
+                    CompanionProjectBadge(model: model, space: group.space, name: group.name,
+                                          seed: group.space?.path ?? "home", size: 20)
+                    Text(group.name).font(Theme.sans(15, weight: .medium)).foregroundStyle(Theme.text).lineLimit(1)
+                        .layoutPriority(1)
+                    Text(group.hint).font(Theme.mono(12)).foregroundStyle(Theme.textFaint)
+                        .lineLimit(1).truncationMode(.head)
+                    Spacer(minLength: 8)
+                    CompanionStateDots(needsYou: group.needsYou, running: group.running)
+                    Text("\(group.chats.count)").font(Theme.mono(12)).foregroundStyle(Theme.textFaint)
+                }
+                .padding(.leading, 20).frame(minHeight: 48).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("project-group-\(group.id)")
+            .accessibilityLabel("\(group.name), \(group.chats.count) sessions")
+            .accessibilityValue(open ? "Expanded" : "Collapsed")
+            .accessibilityHint("Shows or hides this project's sessions")
+            Button { searchFocused = false; newSession(group.projectID) } label: {
+                Image(systemName: "plus").font(.system(size: 15, weight: .regular))
+                    .foregroundStyle(Theme.textMuted).frame(width: 48, height: 48).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).disabled(!model.online)
+            .padding(.trailing, 6)
+            .accessibilityLabel("New session in \(group.name)")
+            .accessibilityIdentifier("project-new-\(group.id)")
+        }
+        .padding(.top, 10)
+        .listRowInsets(EdgeInsets()).listRowSeparator(.hidden).listRowBackground(Color.clear)
+        .accessibilityAddTraits(.isHeader)
+    }
+
     // MARK: - Header
 
     /// One quiet line under the wordmark: which computer (with its link
-    /// state) on the left, which project on the right.
+    /// state) on the left, grouping and project on the right.
     private var connectionHeader: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Menu {
                 ForEach(model.profiles) { host in
                     Button { model.select(host.id) } label: {
@@ -105,36 +242,32 @@ struct CompanionDashboard: View {
                 Button("Pair a computer", systemImage: "plus", action: pair)
             } label: {
                 HStack(spacing: 8) {
-                    Circle().fill(model.online ? Theme.statusCompleted : Theme.warning).frame(width: 6, height: 6)
+                    CompanionConnectionDot(online: model.online, message: model.connectionMessage)
                     Text(model.selected?.name ?? "Computer").font(Theme.sans(14, weight: .medium))
                         .foregroundStyle(Theme.text).lineLimit(1)
                     Text(model.connectionMessage).font(Theme.mono(12))
                         .foregroundStyle(model.online ? Theme.textFaint : Theme.warning).lineLimit(1)
+                        .layoutPriority(-1)
                     Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(Theme.textFaint)
                 }
                 .frame(minHeight: 44).contentShape(Rectangle())
             }
+            .accessibilityLabel("\(model.selected?.name ?? "Computer"), \(model.connectionMessage)")
             .accessibilityHint("Switch computer")
-            Spacer(minLength: 8)
+            .accessibilityIdentifier("host-switcher")
+            Spacer(minLength: 4)
             Menu {
-                Button { project = "" } label: {
-                    if project.isEmpty { Label("All projects", systemImage: "checkmark") }
-                    else { Text("All projects") }
-                }
-                ForEach(model.localSpaces) { space in
-                    Button { project = space.id } label: {
-                        HStack(spacing: 8) {
-                            CompanionProjectBadge(model: model, space: space, name: space.displayName,
-                                                  seed: space.path, size: 16)
-                            Text(space.displayName)
-                            if project == space.id {
-                                Spacer(minLength: 16)
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
+                Picker("Group sessions", selection: $groupingRaw) {
+                    ForEach(CompanionGrouping.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
                 }
             } label: {
+                Image(systemName: grouping == .status ? "line.3.horizontal.decrease" : "folder")
+                    .font(.system(size: 15)).foregroundStyle(Theme.textMuted)
+                    .frame(width: 40, height: 44).contentShape(Rectangle())
+            }
+            .accessibilityLabel("Group sessions, \(grouping.title)")
+            .accessibilityIdentifier("grouping-toggle")
+            Button { searchFocused = false; sheet = .projects } label: {
                 HStack(spacing: 7) {
                     if let space = model.localSpaces.first(where: { $0.id == project }) {
                         CompanionProjectBadge(model: model, space: space, name: space.displayName, seed: space.path, size: 16)
@@ -146,7 +279,9 @@ struct CompanionDashboard: View {
                 }
                 .frame(minHeight: 44).contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("Filter by project, \(projectTitle)")
+            .accessibilityIdentifier("project-filter")
         }
     }
 
@@ -200,17 +335,62 @@ struct CompanionDashboard: View {
         }
     }
 
+    @ViewBuilder
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            NochesMark(size: 22).opacity(0.5).padding(.bottom, 6)
-            Text(!query.isEmpty ? "No matching sessions" : scope == .attention ? "Nothing needs you"
-                 : scope == .working ? "No agents working" : scope == .archived ? "No archived sessions" : "Start a session")
-                .font(Theme.sans(20, weight: .medium)).tracking(-0.4)
-            Text(!query.isEmpty ? "Search by title, branch, or project."
-                 : scope == .archived ? "Archived sessions can be restored here."
-                 : "Your sessions stay in sync with your computer.")
-                .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
-        }.padding(.vertical, 40)
+        if hasNoProjects && query.isEmpty && scope == .all {
+            VStack(alignment: .leading, spacing: 10) {
+                NochesMark(size: 22).opacity(0.5).padding(.bottom, 6)
+                Text("No projects yet").font(Theme.sans(20, weight: .medium)).tracking(-0.4)
+                Text("Add a folder from your computer to group its sessions by project.")
+                    .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+                Button { sheet = .addProject } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus").font(.system(size: 14, weight: .medium))
+                        Text("Add a project").font(Theme.sans(16, weight: .medium))
+                    }
+                    .padding(.horizontal, 22).frame(minHeight: 48)
+                    .background(Theme.text, in: Capsule()).foregroundStyle(Theme.bg)
+                }
+                .padding(.top, 10).accessibilityIdentifier("add-project-empty")
+            }.padding(.vertical, 40)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                NochesMark(size: 22).opacity(0.5).padding(.bottom, 6)
+                Text(!query.isEmpty ? "No matching sessions" : scope == .attention ? "Nothing needs you"
+                     : scope == .working ? "No agents working" : scope == .archived ? "No archived sessions" : "Start a session")
+                    .font(Theme.sans(20, weight: .medium)).tracking(-0.4)
+                Text(!query.isEmpty ? "Search by title, branch, or project."
+                     : scope == .archived ? "Archived sessions can be restored here."
+                     : "Your sessions stay in sync with your computer.")
+                    .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+            }.padding(.vertical, 40)
+        }
+    }
+}
+
+/// The computer's link state: emerald when connected, a slow warning pulse
+/// while connecting or reconnecting (steady under Reduce Motion).
+struct CompanionConnectionDot: View {
+    let online: Bool
+    let message: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var dim = false
+
+    private var pulsing: Bool { !online && (message == "Connecting" || message == "Reconnecting" || message == "Loading sessions") }
+
+    var body: some View {
+        Circle().fill(online ? Theme.statusCompleted : Theme.warning).frame(width: 6, height: 6)
+            .opacity(pulsing && !reduceMotion && dim ? 0.35 : 1)
+            .onAppear { update() }
+            .onChange(of: pulsing) { _, _ in update() }
+    }
+
+    private func update() {
+        if pulsing && !reduceMotion {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true }
+        } else {
+            withAnimation(Motion.fadeQuick) { dim = false }
+        }
     }
 }
 
@@ -229,6 +409,7 @@ struct CompanionSessionRow: View {
     let model: CompanionModel
     let chat: HostChat
     var showsSeparator = true
+    var isSelected = false
     let opened: () -> Void
     @State private var rename = false
     @State private var name = ""
@@ -259,6 +440,7 @@ struct CompanionSessionRow: View {
                     Rectangle().fill(Theme.border.opacity(0.6)).frame(height: 0.5).padding(.leading, 12)
                 }
             }
+            .background(isSelected ? Theme.elementHover : Color.clear)
             .contentShape(Rectangle())
         }
         .buttonStyle(CompanionPressStyle())

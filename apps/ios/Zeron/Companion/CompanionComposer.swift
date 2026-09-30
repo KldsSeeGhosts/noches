@@ -26,6 +26,9 @@ struct CompanionComposer: View {
     @State private var saving = false
     @State private var uploading: (done: Int, total: Int)?
     @State private var showContext = false
+    @State private var access: CompanionAccess = .ask
+    @State private var fileMatches: [HostFileMatch] = []
+    @State private var commands: [HostSlashCommand] = []
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
     private var mark: BrandMark { .forHarness(harness) }
@@ -62,6 +65,18 @@ struct CompanionComposer: View {
         guard model.online, !busy else { return false }
         return showsStop || hasContent
     }
+    private var trigger: ComposerTrigger? { ComposerTrigger.active(in: draft) }
+    private var commandSuggestions: [HostSlashCommand] {
+        guard let trigger, trigger.kind == .command else { return [] }
+        return Array(filterSlashCommands(commands, query: trigger.query).prefix(6))
+    }
+    private var hasSuggestions: Bool {
+        guard let trigger else { return false }
+        return trigger.kind == .mention ? !fileMatches.isEmpty : !commandSuggestions.isEmpty
+    }
+    private var sandbox: CompanionSandbox {
+        chat.config?.sandbox.flatMap(CompanionSandbox.init) ?? .workspaceWrite
+    }
     private var showsRing: Bool {
         guard let usage, let window = usage.window else { return false }
         return window > 0
@@ -83,6 +98,15 @@ struct CompanionComposer: View {
         .task(id: "\(harness)-\(model.generation)") {
             guard model.online else { return }
             if let loaded = try? await model.models(for: harness), !loaded.isEmpty { catalog = loaded }
+            commands = (try? await model.slashCommands(for: harness)) ?? []
+        }
+        .task(id: chat.id) { access = model.access(for: chat) }
+        .task(id: trigger?.kind == .mention ? trigger?.query : nil) {
+            guard let trigger, trigger.kind == .mention, model.online else { fileMatches = []; return }
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            let found = (try? await model.searchFiles(chat, query: trigger.query)) ?? []
+            if !Task.isCancelled { fileMatches = Array(found.prefix(6)) }
         }
     }
 
@@ -90,6 +114,7 @@ struct CompanionComposer: View {
 
     private var pill: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if hasSuggestions { suggestionList }
             if !staged.isEmpty { attachmentRow }
             TextField(placeholder, text: $draft, axis: .vertical)
                 .lineLimit(1...8)
@@ -111,6 +136,57 @@ struct CompanionComposer: View {
         .padding(.bottom, 6)
         .background(Theme.wash(0.04), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .nochesGlass(.regular.interactive(), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+    }
+
+    private var suggestionList: some View {
+        VStack(spacing: 0) {
+            if trigger?.kind == .mention {
+                ForEach(fileMatches) { match in
+                    suggestionRow(icon: match.isDir ? "folder" : "doc", title: match.name,
+                                  detail: match.parent.isEmpty ? nil : match.parent) { insert(match.path + (match.isDir ? "/" : "")) }
+                }
+            } else {
+                ForEach(commandSuggestions) { command in
+                    suggestionRow(icon: "slash.circle", title: "/" + command.name,
+                                  detail: command.description.isEmpty ? command.inputHint : command.description) { insert(command.name) }
+                }
+            }
+        }
+        .accessibilityIdentifier("composer-suggestions")
+    }
+
+    private func suggestionRow(icon: String, title: String, detail: String?, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.textFaint)
+                    .frame(width: 18)
+                Text(title)
+                    .font(Theme.mono(13))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                if let detail {
+                    Text(detail)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.textFaint)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 4)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func insert(_ value: String) {
+        guard let trigger else { return }
+        UISelectionFeedbackGenerator().selectionChanged()
+        draft = trigger.inserting(value, into: draft)
+        fileMatches = []
     }
 
     private var attachmentRow: some View {
@@ -149,6 +225,7 @@ struct CompanionComposer: View {
         HStack(spacing: 6) {
             attachButton
             modelChip
+            accessChip
             Spacer(minLength: 4)
             if showsRing {
                 contextButton
@@ -215,6 +292,26 @@ struct CompanionComposer: View {
         .accessibilityLabel("Model: \(modelName)\(currentReasoning.map { ", reasoning \(HarnessCatalog.reasoningLabel($0))" } ?? "")")
     }
 
+    private var accessChip: some View {
+        Menu {
+            Picker("Approvals", selection: Binding(get: { access }, set: { setAccess($0) })) {
+                ForEach(CompanionAccess.allCases, id: \.self) { Label($0.label, systemImage: $0.icon).tag($0) }
+            }
+            Divider()
+            Picker("Sandbox", selection: Binding(get: { sandbox }, set: { setSandbox($0) })) {
+                ForEach(CompanionSandbox.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+        } label: {
+            Image(systemName: access.icon)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(access == .auto ? Theme.text : Theme.textMuted)
+                .frame(minWidth: 32, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .disabled(busy || saving || !model.online)
+        .accessibilityLabel("Access: \(access.label), \(sandbox.label)")
+    }
+
     private var contextButton: some View {
         Button { showContext = true } label: {
             HStack(spacing: 5) {
@@ -278,7 +375,8 @@ struct CompanionComposer: View {
             busy = true
             error = nil
             Task {
-                do { try await stop() } catch { self.error = error.localizedDescription }
+                do { try await stop(); UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+                catch { self.error = error.localizedDescription }
                 busy = false
             }
             return
@@ -297,7 +395,9 @@ struct CompanionComposer: View {
                 try await send(text, attachments, messageID)
                 if draft == raw { draft = "" }
                 staged = []
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
             } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
                 self.error = error.localizedDescription
             }
             uploading = nil
@@ -334,6 +434,21 @@ struct CompanionComposer: View {
                     ? "One image couldn't be attached (unsupported or over 24 MB)."
                     : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
             }
+        }
+    }
+
+    private func setAccess(_ value: CompanionAccess) {
+        access = value
+        model.setAccess(value, for: chat)
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+
+    private func setSandbox(_ value: CompanionSandbox) {
+        saving = true
+        error = nil
+        Task {
+            do { try await model.setSandbox(chat, value) } catch { self.error = error.localizedDescription }
+            saving = false
         }
     }
 

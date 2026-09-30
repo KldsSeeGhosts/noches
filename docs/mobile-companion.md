@@ -205,22 +205,56 @@ requests use the native question panel. A frame that fails verification
 surfaces "Transcript needs a refresh." before the view resubscribes. The host
 writes every entry; the phone never edits the transcript.
 
-The chat toolbar also opens **Files** and **Changes**. Files supports folder
-navigation, paginated listings, and selectable text with line numbers through
-`ListWorkspaceDirectory` and `ReadWorkspaceFile`. Changes reads the current
-checkout's working diff through `GetCheckoutDiff`, with additions/deletions
-and colored patch lines. These views are read-only. Previews stop at 200,000
-characters and label partial results; binary files must be opened on the host.
-The host enforces the workspace file boundaries.
+The session's **Workspace** menu opens Changes, Files, Terminal, and the
+project's actions:
+
+- **Changes** follows `WatchCheckoutDiffs` (seeded by `GetCheckoutDiff`) and
+  lists files with status letters, `+N −M`, branch, and ahead/behind from
+  `ListGitHistory`. A file opens a unified diff with both line gutters, sliced
+  from the fetched patch or, when that patch was truncated, rebuilt from
+  `GetCheckoutFileDiffText`. **Discard all changes** calls `DiscardWorkingTree`
+  with the diff checksum behind a destructive confirmation. The header's
+  `+N −M` opens the same view.
+- **Files** browses with `ListWorkspaceDirectory`, searches with
+  `SearchWorkspaceFiles`, and previews with syntax colors. Complete UTF-8 files
+  with LF or CRLF endings can be edited; Save sends `WriteWorkspaceFile` with
+  the read's checkout id and content hash, and a `conflict` reply is surfaced
+  instead of overwriting. Previews stop at 200,000 characters and binary files
+  must be opened on the host. The host enforces the workspace file boundaries.
+- **Terminal** opens a shell in the session's folder with `OpenTerminal`,
+  streams `SubscribeTerminal`, and writes base64 input with `WriteTerminal`.
+  The view handles `\r`, backspace, erase-line, clear, and 16-color SGR; full
+  screen TUIs are not rendered. A key row offers esc, tab, ctrl-c, ctrl-d, and
+  arrows. Dismissing the sheet detaches; the toolbar close ends the shell.
+- **Run: {action}** entries come from `ListProjectActions` and start through
+  `RunProjectAction`, with output in the Terminal view.
+
+Projects: the new-session sheet and the Projects drawer offer **Add
+project…**, which browses the host with `ListFolders` (Home plus `ListDrives`
+roots, a typed path, and a git badge on repositories) and creates the project
+with `Mutate {op: "createSpace"}` on the paired host's device id. Project
+settings rename (`renameSpace`) or remove (`deleteSpace`, which deletes the
+project's sessions on the host). For a git project, a new session can run on
+the current branch or in a new worktree from `CreateWorktree` based on a
+branch from `ListBranches`; the engine names the `zeron/…` branch.
+
+Home groups sessions **By status** or **By project** (collapsible groups with a
+per-project **+**). On iPad the list is the sidebar of a split view.
+
+Composer: the access chip switches the run's `autoApprove` between Ask and
+Auto-approve (stored per host and chat on the phone) and sets the sandbox
+through `setChatConfig`. `@` suggests files from `SearchFiles`; `/` at the
+start of the draft suggests `ListCommands` entries, sent as prompt text.
+Queued rows can move up, to the top, or down (`MoveQueuedMessage`), and edit
+leases renew every 20 seconds.
 
 Not implemented today:
 
 - the host engine and the gateway must already be running, so the phone cannot
   wake a sleeping host, start a stopped service, or reach a machine that is off
   the tailnet;
-- no terminal, project actions, or PR badges;
-- queue rows cannot be reordered from the phone;
-- no space creation.
+- no PR badges, clone, or new-repository flows;
+- one terminal per session, without full-screen TUI rendering.
 
 Simulator rigs can pair and open a session from launch arguments in Debug
 builds: `-companion-pair <code>` and `-companion-open <chatId>`.
@@ -442,7 +476,11 @@ lives only in the temp directory.
   `CompanionImages.swift`: host message adapter, subagents, and images.
 - `apps/ios/Zeron/Theme/ControlPlaneStyle.swift`, `Views/ControlPlaneViews.swift`:
   status, tool-family, and monogram palettes and the shared glyphs.
-- `apps/ios/Zeron/Companion/CompanionWorkspace.swift`: read-only files and diff.
+- `apps/ios/Zeron/Companion/CompanionWorkspace.swift`: files, search, and edit.
+- `apps/ios/Zeron/Companion/CompanionChanges.swift`, `CompanionChangesDiff.swift`: live diff panel and parser.
+- `apps/ios/Zeron/Companion/CompanionTerminal.swift`: terminal and project actions output.
+- `apps/ios/Zeron/Companion/CompanionFolderBrowser.swift`, `CompanionProjects.swift`, `CompanionProjectList.swift`: host folder browser, add/rename/remove project, projects drawer.
+- `apps/ios/Zeron/Companion/CompanionMentions.swift`: `@` file and `/` command suggestions.
 - `apps/ios/Zeron/Companion/CompanionScanner.swift`: camera QR scanning.
 - `scripts/pairing-qr.swift`: private local QR rendering on macOS.
 - `apps/ios/Zeron/Theme/AppearanceSettings.swift`: catalog, appearance and

@@ -236,6 +236,15 @@ struct CompanionQueueTray: View {
             Menu {
                 Button(actionLabel(item), systemImage: actionIcon(item)) { advance(item) }
                 Button("Edit", systemImage: "pencil") { editing = item }
+                if let index = items.firstIndex(of: item), items.count > 1 {
+                    if index > 0 {
+                        Button("Move up", systemImage: "arrow.up") { move(item, to: index - 1) }
+                        if index > 1 { Button("Move to top", systemImage: "arrow.up.to.line") { move(item, to: 0) } }
+                    }
+                    if index < items.count - 1 {
+                        Button("Move down", systemImage: "arrow.down") { move(item, to: index + 1) }
+                    }
+                }
                 Divider()
                 Button("Remove", systemImage: "trash", role: .destructive) { remove(item) }
             } label: {
@@ -274,6 +283,17 @@ struct CompanionQueueTray: View {
         }
     }
 
+    private func move(_ item: HostQueueItem, to index: Int) {
+        busy = true
+        error = nil
+        UISelectionFeedbackGenerator().selectionChanged()
+        Task {
+            do { try await model.moveQueued(chat, item, to: index) }
+            catch { self.error = error.localizedDescription }
+            busy = false
+        }
+    }
+
     private func remove(_ item: HostQueueItem) {
         busy = true
         error = nil
@@ -301,6 +321,7 @@ struct CompanionQueueEditSheet: View {
     @State private var error: String?
     @State private var busy = true
     @State private var committed = false
+    @State private var renewal: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -338,6 +359,7 @@ struct CompanionQueueEditSheet: View {
         .onDisappear {
             // Swipe-away or Cancel closes the row to other devices; a save
             // that succeeded already committed the lease.
+            renewal?.cancel()
             guard !committed, let lease else { return }
             Task { await model.cancelQueuedEdit(lease) }
         }
@@ -356,6 +378,14 @@ struct CompanionQueueEditSheet: View {
                 return
             }
             lease = started
+            renewal = Task { [model] in
+                // Leases expire on the host; renew while the sheet stays open.
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(20))
+                    if Task.isCancelled { return }
+                    await model.renewQueuedEdit(started)
+                }
+            }
             text = MessageQueue.visibleText(started.text, attachments: item.attachments ?? [])
             error = nil
         } catch {

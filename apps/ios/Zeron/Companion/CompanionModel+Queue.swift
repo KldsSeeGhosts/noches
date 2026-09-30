@@ -104,6 +104,27 @@ extension CompanionModel {
             "leaseId": lease.leaseId, "action": "cancel"])
     }
 
+    /// `MoveQueuedMessage {chatId, id, toIndex}`; `toIndex` is the row's
+    /// final position in the list.
+    func moveQueued(_ chat: HostChat, _ item: HostQueueItem, to index: Int) async throws {
+        guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
+        _ = try await connection.call("MoveQueuedMessage", Self.moveQueuedParams(chatID: chat.id, id: item.id, toIndex: index))
+    }
+
+    /// `RenewQueuedMessageEdit {chatId, id, leaseId}` keeps a long edit alive.
+    func renewQueuedEdit(_ lease: CompanionQueuedEditLease) async {
+        guard online, lease.deviceId == selected?.deviceId else { return }
+        _ = try? await connection.call("RenewQueuedMessageEdit", Self.renewQueuedParams(lease))
+    }
+
+    static func moveQueuedParams(chatID: String, id: String, toIndex: Int) -> [String: Any] {
+        ["chatId": chatID, "id": id, "toIndex": max(0, toIndex)]
+    }
+
+    static func renewQueuedParams(_ lease: CompanionQueuedEditLease) -> [String: Any] {
+        ["chatId": lease.chatId, "id": lease.rowId, "leaseId": lease.leaseId]
+    }
+
     private func queued(_ method: String, _ chat: HostChat, _ item: HostQueueItem) async throws {
         guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
         _ = try await connection.call(method, ["chatId": chat.id, "id": item.id])

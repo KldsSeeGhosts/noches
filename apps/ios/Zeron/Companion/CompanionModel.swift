@@ -293,7 +293,7 @@ final class CompanionModel {
         } else {
             let body = HostAttachment.composed(text, paths: paths)
             var request: [String: Any] = ["prompt": body, "cwd": chat.cwd ?? "~",
-                "sandbox": chat.config?.sandbox ?? "workspace-write", "autoApprove": false]
+                "sandbox": chat.config?.sandbox ?? "workspace-write", "autoApprove": access(for: chat) == .auto]
             if !paths.isEmpty { request["attachments"] = paths }
             if let config = chat.config {
                 request["harness"] = config.harness

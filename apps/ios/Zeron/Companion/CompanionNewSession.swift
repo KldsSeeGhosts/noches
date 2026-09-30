@@ -18,6 +18,11 @@ struct NewHostSessionSheet: View {
     @State private var draft = ""
     @State private var busy = false
     @State private var error: String?
+    @State private var addingProject = false
+    @State private var browsingFolder = false
+    @State private var branches: [String] = []
+    @State private var useWorktree = false
+    @State private var baseBranch = ""
 
     private var offered: [HostHarness] { model.harnesses.filter(\.isOffered) }
     private var levels: [String] {
@@ -76,6 +81,18 @@ struct NewHostSessionSheet: View {
                 }
                 loadingModels = false
             }
+            .task(id: space) {
+                branches = []; useWorktree = false; baseBranch = ""
+                guard let project = model.localSpaces.first(where: { $0.id == space }) else { return }
+                // Non-git folders fail `ListBranches`; the branch section stays hidden.
+                guard let found = try? await model.branches(for: project), !Task.isCancelled else { return }
+                branches = found
+                baseBranch = found.first ?? ""
+            }
+            .sheet(isPresented: $addingProject) {
+                CompanionAddProjectSheet(model: model) { added in space = added.id }
+            }
+            .sheet(isPresented: $browsingFolder) { browseFolderSheet }
             .onChange(of: agentModel) { _, _ in reasoning = defaultLevel(levels) }
             .onChange(of: harness) { _, id in
                 agentModel = ""
@@ -98,10 +115,88 @@ struct NewHostSessionSheet: View {
                     if index > 0 { rowSeparator }
                     projectRow(title: item.displayName, name: item.displayName, seed: item.path, project: item, id: item.id)
                 }
+                rowSeparator
+                actionRow("Add project…", icon: "plus", id: "add-project-row") { addingProject = true }
+                rowSeparator
+                actionRow("Browse folder…", icon: "folder", id: "browse-folder-row") { browsingFolder = true }
             }
             .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
+            if !branches.isEmpty { branchControls }
         }
+    }
+
+    private func actionRow(_ title: String, icon: String, id: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon).font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.textMuted)
+                    .frame(width: 20, height: 20)
+                Text(title).font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 14).frame(minHeight: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(CompanionPressStyle())
+        .disabled(!model.online)
+        .accessibilityIdentifier(id)
+    }
+
+    /// Browse any host folder and add it as a project without a name step.
+    private var browseFolderSheet: some View {
+        NavigationStack {
+            CompanionFolderBrowser(model: model, title: "Browse folder") { path, isRepo in
+                Task {
+                    do {
+                        let added = try await model.addProject(path: path, name: nil, isRepo: isRepo)
+                        space = added.id; browsingFolder = false
+                    } catch { self.error = error.localizedDescription; browsingFolder = false }
+                }
+            }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { browsingFolder = false } } }
+        }
+    }
+
+    /// Git projects: stay on the current branch, or start in a fresh worktree
+    /// (`zeron/<name>` off the chosen base branch).
+    private var branchControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                modeChip("Current branch", on: !useWorktree) { useWorktree = false }
+                modeChip("New worktree", on: useWorktree) { useWorktree = true }
+            }
+            if useWorktree {
+                Menu {
+                    ForEach(branches, id: \.self) { name in
+                        Button { baseBranch = name } label: {
+                            if baseBranch == name { Label(name, systemImage: "checkmark") } else { Text(name) }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        LineIconView(.gitBranch, size: 14, color: Theme.textMuted)
+                        Text("Based on \(baseBranch)").font(Theme.mono(12)).foregroundStyle(Theme.text).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textFaint)
+                    }
+                    .padding(.horizontal, 14).frame(minHeight: 48)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
+                }
+                Text("Creates an isolated checkout on a new branch so this session can't touch your working tree.")
+                    .font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
+            }
+        }
+    }
+
+    private func modeChip(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(Theme.mono(12))
+                .foregroundStyle(on ? Theme.bg : Theme.textMuted)
+                .padding(.horizontal, 12).frame(minHeight: 44)
+                .background(on ? Theme.text : Theme.text.opacity(0.06), in: Capsule())
+                .contentShape(Capsule())
+        }.buttonStyle(.plain)
     }
 
     private func projectRow(title: String, name: String, seed: String, project: HostSpace?, id: String) -> some View {
@@ -219,9 +314,17 @@ struct NewHostSessionSheet: View {
             busy = true; error = nil
             Task {
                 do {
-                    let chat = try await model.create(spaceID: space.isEmpty ? nil : space, harness: harness,
-                                                      model: agentModel.isEmpty ? nil : agentModel,
-                                                      reasoning: reasoning.isEmpty ? nil : reasoning)
+                    let picked = agentModel.isEmpty ? nil : agentModel
+                    let effort = reasoning.isEmpty ? nil : reasoning
+                    let chat: HostChat
+                    if useWorktree, !baseBranch.isEmpty, let project = model.localSpaces.first(where: { $0.id == space }) {
+                        let tree = try await model.createWorktree(for: project, base: baseBranch)
+                        chat = try await model.create(space: project, harness: harness, model: picked, reasoning: effort,
+                                                      branch: tree.branch, cwd: tree.path)
+                    } else {
+                        chat = try await model.create(spaceID: space.isEmpty ? nil : space, harness: harness,
+                                                      model: picked, reasoning: effort)
+                    }
                     let message = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !message.isEmpty {
                         do { try await model.send(message, chat: chat) }

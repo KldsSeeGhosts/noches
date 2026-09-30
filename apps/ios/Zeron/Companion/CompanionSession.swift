@@ -20,6 +20,9 @@ struct CompanionSessionView: View {
     @State private var scroll = ScrollState()
     @State private var submittedID: String?
     @State private var inspector: CompanionInspector?
+    @State private var changes = CompanionChangesStore()
+    @State private var projectActions: [HostProjectAction] = []
+    @State private var runningAction: String?
     @State private var badge: UIImage?
     @State private var seen: Task<Void, Never>?
     @FocusState private var composerFocused: Bool
@@ -57,7 +60,11 @@ struct CompanionSessionView: View {
                     .buttonStyle(.plain)
             }
         }
-        .sheet(item: $inspector) { CompanionWorkspaceSheet(model: model, chat: currentChat, tab: $0) }
+        .sheet(item: $inspector) { CompanionWorkspaceSheet(model: model, chat: currentChat, tab: $0, changes: changes) }
+        .task(id: "changes-\(currentChat.cwd ?? "")-\(model.generation)-\(model.online)") {
+            await changes.run(model: model, chat: currentChat)
+        }
+        .task(id: "actions-\(currentChat.spaceId ?? "")-\(model.generation)") { await loadActions() }
         .task(id: "\(model.generation)-\(model.online)") { await watchTranscript() }
         .task(id: "queue-\(model.generation)-\(model.online)") { await watchQueue() }
         .task(id: "badge-\(currentChat.spaceId ?? "")-\(model.generation)") { await loadBadge() }
@@ -69,19 +76,30 @@ struct CompanionSessionView: View {
 
     // MARK: Header
 
-    /// One glass group for Changes and More (Files lives in More). Splitting them into three
-    /// toolbar items costs ~60pt each on iOS 26, which crushes the two-line
-    /// title; the compact slots buy the title back without shrinking any hit
-    /// target below 44pt (the visual glyph stays 16pt).
+    /// One glass group: a Workspace menu (Changes, Files, Terminal, project
+    /// actions) and the session More menu. Each slot stays 38pt wide so the
+    /// two-line title keeps its room; the hit target is 44pt tall.
     private var actions: some View {
         HStack(spacing: 0) {
-            Button { inspector = .changes } label: {
-                Image(systemName: "arrow.triangle.branch")
+            Menu {
+                Button("Review changes", systemImage: "arrow.triangle.branch") { inspector = .changes }
+                Button("Browse files", systemImage: "folder") { inspector = .files }
+                Button("Terminal", systemImage: "terminal") { inspector = .terminal }
+                if !projectActions.isEmpty {
+                    Divider()
+                    ForEach(projectActions) { action in
+                        Button("Run: \(action.name)", systemImage: "play") { run(action) }
+                            .disabled(runningAction != nil)
+                    }
+                }
+            } label: {
+                Image(systemName: "rectangle.stack")
                     .frame(width: 38, height: 44)
                     .contentShape(Rectangle())
             }
-            .accessibilityLabel("Review changes")
-            CompanionSessionMenu(model: model, chat: currentChat, archived: { dismiss() }, files: { inspector = .files })
+            .disabled(!model.online)
+            .accessibilityLabel("Workspace: changes, files, terminal, actions")
+            CompanionSessionMenu(model: model, chat: currentChat, archived: { dismiss() })
                 .frame(width: 38, height: 44)
         }
         .frame(height: 44)
@@ -107,10 +125,20 @@ struct CompanionSessionView: View {
                     .foregroundStyle(Theme.textFaint)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                if let diff = changes.diff, !diff.files.isEmpty {
+                    Button { inspector = .changes } label: {
+                        DiffStat(additions: diff.additions, deletions: diff.deletions)
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize()
+                    .accessibilityLabel("Review changes, \(diff.additions) additions, \(diff.deletions) deletions")
+                }
             }
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: 22)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("\(currentChat.displayTitle), \(contextLine)")
     }
 
@@ -200,6 +228,24 @@ struct CompanionSessionView: View {
     }
 
     // MARK: Wiring
+
+    private func loadActions() async {
+        guard model.online else { return }
+        projectActions = (try? await model.projectActions(for: currentChat)) ?? []
+    }
+
+    /// Runs a project action on the host and opens the terminal it returns.
+    private func run(_ action: HostProjectAction) {
+        runningAction = action.id
+        error = nil
+        Task {
+            do {
+                _ = try await model.runProjectAction(action, chat: currentChat)
+                inspector = .terminal
+            } catch { self.error = error.localizedDescription }
+            runningAction = nil
+        }
+    }
 
     private func send(_ text: String, _ attachments: [HostAttachment], _ messageID: String) async throws {
         let live = model.state(currentChat)
