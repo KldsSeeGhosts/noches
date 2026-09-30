@@ -23,7 +23,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-dev.1"
+# Human-facing SemVer. Bump intentionally for major/minor/patch changes.
+# Published build identities remain CI-owned and monotonically increasing.
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false

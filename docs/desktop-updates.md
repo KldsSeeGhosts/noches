@@ -44,7 +44,9 @@ Cua driver patches live in `scripts/cua/` on the same branch. They apply to a se
 2. Promote through a `dev` → `main` PR. The same workflow publishes a stable build and advances only the stable feed.
 3. In the installed app, open Settings → Updates. Checks also run after startup and every six hours, independently of account sign-in or remote-host connections.
 
-Versions are CI-owned: stable `0.1.<workflow-run-number>` and development `0.1.<workflow-run-number>-dev.<attempt>`. The source commit appears on the Updates page and in the release manifest. A completed release cannot be replaced with different artifacts. If a draft version release was interrupted, inspect and resolve that draft manually before rerunning; do not clobber it blindly. Start a new workflow run for a new stable build.
+The product version is plain SemVer in `[workspace.package].version` in `Cargo.toml` (currently `0.1.0`). Bump it deliberately: `1.0.0` for a major release, `0.2.0` for a feature/minor release, `0.1.1` for a fix/patch (increment the corresponding component from the current version). It appears in the About panel, Updates page, macOS marketing version, GitHub release title (`Noches Dev 0.1.0`), and new release manifests. Multiple builds can share the same product version.
+
+The **separate build identity** stays CI-owned: stable `0.1.<workflow-run-number>` and development `0.1.<workflow-run-number>-dev.<attempt>`. Unique tags, artifact filenames, installer directories, updater ordering, and macOS build numbers use this identity, not the product version. The Updates page and release title show it next to the product version for troubleshooting. Older manifests without `display_version` fall back to the build identity. Do not compare product versions to decide if an update is available. A completed release cannot be replaced with different artifacts. If a draft version release was interrupted, inspect and resolve it manually before rerunning; do not clobber it blindly. Start a new workflow run for a new stable build.
 
 Each channel uses a GitHub release containing `manifest.json`:
 

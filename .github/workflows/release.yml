@@ -40,6 +40,29 @@ permissions:
   contents: read
 
 jobs:
+  validation:
+    uses: ./.github/workflows/ui-tests.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  compatibility:
+    uses: ./.github/workflows/cursor-compatibility.yml
+
+  edge-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - run: npm ci --prefix edge
+      - run: npm --prefix edge run typecheck
+      - run: npm --prefix edge test
+
   prepare:
     if: github.repository_owner == 'KldsSeeGhosts' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || (inputs.migration == 'normal' && inputs.channel == 'auto' && inputs.confirm == '' || github.ref == 'refs/heads/dev' && inputs.migration != 'normal' && inputs.channel != '' && inputs.confirm == format('{0}-{1}', inputs.migration, inputs.channel)))
     runs-on: ubuntu-24.04
@@ -173,7 +196,7 @@ jobs:
 
   publish:
     if: github.event_name != 'pull_request'
-    needs: [prepare, linux, macos]
+    needs: [prepare, linux, macos, validation, compatibility, edge-validation]
     # Builds may run concurrently, but only one job may advance a channel feed.
     concurrency:
       group: noches-release-publish-${{ needs.prepare.outputs.channel }}

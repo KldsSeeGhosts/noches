@@ -375,7 +375,7 @@ mod about_panel {
             return;
         };
         let name = NSString::from_str(zeron_update::identity::app_name());
-        let version = NSString::from_str(zeron_update::current_version());
+        let version = NSString::from_str(zeron_update::display_version());
         // Empty build version: CFBundleVersion equals the marketing version, and
         // AppKit would otherwise render "Version 0.2.61 (0.2.61)".
         let build = NSString::from_str("");

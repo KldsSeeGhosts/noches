@@ -429,7 +429,7 @@ fn pi_spec() -> AcpAgentSpec {
         executable: "pi-acp",
         env_override: "PI_ACP_EXECUTABLE",
         args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
+        npm_package: Some("pi-acp@0.0.34"),
         archive: None,
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
@@ -1622,7 +1622,7 @@ impl AcpHarness {
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
-        let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
+        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
                 child.shutdown(self.kill_grace).await;
@@ -1638,6 +1638,9 @@ impl AcpHarness {
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
+            if self.spec.id == HarnessId::Pi {
+                refine_pi_ladders(&client, &mut incoming, &session, &mut models).await;
+            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -1670,6 +1673,72 @@ impl AcpHarness {
                 }
                 Err(HarnessError::Protocol(error))
             }
+        }
+    }
+}
+
+/// The `thought_level` ladder in a `configOptions` array, mapped onto zeron's
+/// levels. Values zeron has no level for (pi's `off`) are dropped.
+fn thought_ladder(config_options: Option<&Value>) -> Vec<ReasoningLevel> {
+    config_options
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+        })
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| o.get("value").and_then(Value::as_str))
+                .filter_map(reasoning_from_value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// pi-acp advertises one `thought_level` ladder — the CURRENT model's — so
+/// every other model would inherit it. Pi's supported levels differ per model
+/// (`thinkingLevelMap`: no `minimal` on gpt-6.x, `max` only where mapped), so
+/// switch the probe session through each model and keep the ladder the
+/// adapter reports back. A model that fails to switch keeps its fallback.
+async fn refine_pi_ladders(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    session: &Value,
+    models: &mut [Model],
+) {
+    let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(model_config_id) = session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        })
+        .and_then(|o| o.get("id").and_then(Value::as_str))
+    else {
+        return;
+    };
+    for model in models.iter_mut() {
+        let response = request_draining(
+            client,
+            incoming,
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": model_config_id,
+                "value": model.id,
+            }),
+        )
+        .await;
+        let Ok(response) = response else { continue };
+        let ladder = thought_ladder(response.get("configOptions"));
+        if !ladder.is_empty() {
+            model.reasoning_levels = ladder;
         }
     }
 }
@@ -2345,6 +2414,18 @@ fn validate_config_model_selection(
         "agent does not advertise requested model {requested}; available models: {}",
         available.join(", ")
     )))
+}
+
+fn is_thought_level_option(session_response: &Value, config_id: &str) -> bool {
+    session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                option.get("id").and_then(Value::as_str) == Some(config_id)
+                    && option.get("category").and_then(Value::as_str) == Some("thought_level")
+            })
+        })
 }
 
 fn is_model_config_option(session_response: &Value, config_id: &str) -> bool {
@@ -3196,6 +3277,7 @@ async fn run_session(session: Session) {
         // runs.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let options_snapshot = session_response;
+        let mut switched_options: Option<Value> = None;
         for (config_id, payload) in config_option_sets(
             &options_snapshot,
             requested_model.as_deref(),
@@ -3210,7 +3292,7 @@ async fn run_session(session: Session) {
                     params.insert(k.clone(), v.clone());
                 }
             }
-            if let Err(e) = request_draining(
+            match request_draining(
                 &client,
                 &mut incoming,
                 "session/set_config_option",
@@ -3218,19 +3300,63 @@ async fn run_session(session: Session) {
             )
             .await
             {
-                if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
-                    && requested_model.is_some()
-                    && is_model_config_option(&options_snapshot, &config_id)
-                {
-                    return Err(HarnessError::Protocol(format!(
-                        "agent rejected requested model {}: {e}",
-                        requested_model.as_deref().unwrap_or_default()
-                    )));
+                Ok(response) => {
+                    if is_model_config_option(&options_snapshot, &config_id)
+                        && let Some(options) = response.get("configOptions")
+                    {
+                        switched_options = Some(options.clone());
+                    }
                 }
-                tracing::debug!(
-                    target: "zeron_harness::acp",
-                    "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
-                );
+                Err(e) => {
+                    if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
+                        && requested_model.is_some()
+                        && is_model_config_option(&options_snapshot, &config_id)
+                    {
+                        return Err(HarnessError::Protocol(format!(
+                            "agent rejected requested model {}: {e}",
+                            requested_model.as_deref().unwrap_or_default()
+                        )));
+                    }
+                    tracing::debug!(
+                        target: "zeron_harness::acp",
+                        "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
+                    );
+                }
+            }
+        }
+        // pi's thinking ladder belongs to the model it is switched to. The
+        // snapshot above still describes the default model, so re-pick the
+        // effort against the options the model switch handed back.
+        if harness == HarnessId::Pi
+            && let Some(fresh) = switched_options
+        {
+            let fresh = json!({ "configOptions": fresh });
+            let resets = config_option_sets(&fresh, None, &efforts, &serde_json::Map::new());
+            for (config_id, payload) in resets {
+                if !is_thought_level_option(&fresh, &config_id) {
+                    continue;
+                }
+                let mut params = serde_json::Map::new();
+                params.insert("sessionId".into(), session_id.clone().into());
+                params.insert("configId".into(), config_id.clone().into());
+                if let Some(payload) = payload.as_object() {
+                    for (k, v) in payload {
+                        params.insert(k.clone(), v.clone());
+                    }
+                }
+                if let Err(e) = request_draining(
+                    &client,
+                    &mut incoming,
+                    "session/set_config_option",
+                    Value::Object(params),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        target: "zeron_harness::acp",
+                        "pi effort re-apply {config_id}={payload} rejected (agent default runs): {e}"
+                    );
+                }
             }
         }
         let pi_startup_info = (harness == HarnessId::Pi)
@@ -4740,6 +4866,38 @@ mod tests {
     }
 
     #[test]
+    fn thought_ladder_reads_per_model_levels_and_drops_off() {
+        let options = json!([
+            { "id": "model", "category": "model", "type": "select", "options": [] },
+            {
+                "id": "thought_level",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": "medium",
+                "options": [
+                    { "value": "off" },
+                    { "value": "low" },
+                    { "value": "medium" },
+                    { "value": "high" },
+                    { "value": "xhigh" },
+                    { "value": "max" },
+                ],
+            },
+        ]);
+        assert_eq!(
+            thought_ladder(Some(&options)),
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert!(thought_ladder(None).is_empty());
+    }
+
+    #[test]
     fn config_option_sets_map_model_effort_and_model_options() {
         let response = json!({
             "sessionId": "s-1",
@@ -4814,7 +4972,7 @@ mod tests {
             Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts),
+            config_option_sets(&response, Some("gpt-6-astra"), &[], &no_opts),
             Vec::new()
         );
         // No configOptions advertised → nothing to set.
@@ -4850,24 +5008,24 @@ mod tests {
     fn model_config_option_takes_precedence_over_legacy_models_state() {
         let response = json!({
             "models": {
-                "currentModelId": "gpt-5.6-sol low",
+                "currentModelId": "gpt-6-astra low",
                 "availableModels": [
-                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
+                    { "modelId": "gpt-6-astra low", "name": "GPT-6-Astra (low)" },
                 ],
             },
             "configOptions": [{
                 "id": "model",
                 "category": "model",
                 "type": "select",
-                "currentValue": "gpt-5.6-sol",
+                "currentValue": "gpt-6-astra",
                 "options": [
-                    { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
-                    { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                    { "value": "gpt-6-astra", "name": "GPT-6-Astra" },
+                    { "value": "gpt-6.1-sol", "name": "GPT-6.1-Sol" },
                 ],
             }],
         });
         assert_eq!(
-            first_class_model_change(&response, Some("gpt-5.6-terra")).unwrap(),
+            first_class_model_change(&response, Some("gpt-6.1-sol")).unwrap(),
             None
         );
     }
@@ -4879,11 +5037,11 @@ mod tests {
         let response = json!({
             "sessionId": "s-1",
             "models": {
-                "currentModelId": "gpt-5.6-sol low",
+                "currentModelId": "gpt-6-astra low",
                 "availableModels": [
-                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
-                    { "modelId": "gpt-5.6-sol medium", "name": "GPT-5.6-Sol (medium)" },
-                    { "modelId": "gpt-5.6-terra low", "name": "GPT-5.6-Terra (low)" },
+                    { "modelId": "gpt-6-astra low", "name": "GPT-6-Astra (low)" },
+                    { "modelId": "gpt-6-astra medium", "name": "GPT-6-Astra (medium)" },
+                    { "modelId": "gpt-6.1-sol low", "name": "GPT-6.1-Sol (low)" },
                 ],
             },
             "configOptions": [
@@ -4904,10 +5062,10 @@ mod tests {
                     "name": "Model",
                     "category": "model",
                     "type": "select",
-                    "currentValue": "gpt-5.6-sol",
+                    "currentValue": "gpt-6-astra",
                     "options": [
-                        { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "description": "Frontier" },
-                        { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                        { "value": "gpt-6-astra", "name": "GPT-6-Astra", "description": "Frontier" },
+                        { "value": "gpt-6.1-sol", "name": "GPT-6.1-Sol" },
                     ],
                 },
                 {
@@ -4939,11 +5097,11 @@ mod tests {
         // Two base models — never one row per effort variant.
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
+            vec!["gpt-6-astra", "gpt-6.1-sol"]
         );
         // Catalog match keeps the curated per-model ladder; wire wins on
         // label/description.
-        assert_eq!(models[0].label, "GPT-5.6-Sol");
+        assert_eq!(models[0].label, "GPT-6-Astra");
         assert_eq!(models[0].description.as_deref(), Some("Frontier"));
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
         // Wire config options become traits; mode/model/thought_level do not.
@@ -5085,7 +5243,7 @@ mod tests {
             "sessionId": "s-1",
             "models": {
                 "availableModels": [
-                    { "modelId": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
+                    { "modelId": "gpt-6-astra", "name": "GPT-6-Astra" },
                     { "modelId": "gpt-x", "name": "GPT-X" },
                 ],
             },

@@ -39,7 +39,7 @@
   hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
   the model list is discovered over ACP (below), with the Nous flagships as
   the static fallback. `AcpHarness::pi()` runs the pi coding
-  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
+  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.34,
   managed-install fallback; requires the pi CLI itself,
   `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
   ride pi's own provider config (catalog advertises a `default` pass-through

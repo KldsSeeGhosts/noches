@@ -2,6 +2,7 @@
 # Source from packaging scripts. Channel is explicit, never inferred from -O.
 export NOCHES_CHANNEL="${NOCHES_CHANNEL:-local}"
 export NOCHES_VERSION="${NOCHES_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)}"
+export NOCHES_DISPLAY_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 export NOCHES_REPOSITORY="${NOCHES_REPOSITORY:-KldsSeeGhosts/noches}"
 export NOCHES_COMMIT="${NOCHES_COMMIT:-$(git -C "$ROOT" rev-parse HEAD)}"
 case "$NOCHES_CHANNEL" in
@@ -15,6 +16,8 @@ export APP_NAME APP_SLUG BUNDLE_ID
 python3 - <<'PY'
 import os, re
 channel, version = os.environ['NOCHES_CHANNEL'], os.environ['NOCHES_VERSION']
+if not re.fullmatch(r'\d+\.\d+\.\d+', os.environ['NOCHES_DISPLAY_VERSION']):
+    raise SystemExit('Workspace display version must be plain numeric SemVer')
 pattern = r'\d+\.\d+\.\d+'
 if channel == 'dev': pattern += r'-dev\.\d+'
 elif channel == 'local': pattern += r'(?:-[a-zA-Z0-9.]+)?'

@@ -34,7 +34,7 @@ impl Shell {
                     Ok(Ok(manifest)) => {
                         let newer = manifest.newer_than(zeron_update::current_version());
                         shell.update_status = if newer {
-                            format!("Version {} is available.", manifest.version).into()
+                            format!("Version {} is available.", manifest.display_version()).into()
                         } else {
                             "You're up to date.".into()
                         };
@@ -140,14 +140,14 @@ impl Shell {
             .child(format!(
                 "{} {} · {} channel",
                 zeron_update::identity::app_name(),
-                zeron_update::current_version(),
+                zeron_update::display_version(),
                 zeron_update::identity::channel()
             ))
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child(format!("Build {}", zeron_update::identity::commit())),
-            )
+            .child(div().text_color(theme.text_muted).child(format!(
+                "Build {} · {}",
+                zeron_update::current_version(),
+                zeron_update::identity::commit()
+            )))
             .child(self.update_label())
             .when(ready, |page| page.child(self.update_status.clone()));
         if let Some(checked) = &self.update_checked_at {

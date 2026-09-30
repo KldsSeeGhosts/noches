@@ -31,7 +31,7 @@ python3 - "$ROOT/dist/macos/Info.plist" "$APP/Contents/Info.plist" <<'PLIST'
 import os, plistlib, sys
 with open(sys.argv[1], 'rb') as f: info = plistlib.load(f)
 info.update(CFBundleDisplayName=os.environ['APP_NAME'], CFBundleName=os.environ['APP_NAME'], CFBundleIdentifier=os.environ['BUNDLE_ID'],
-            CFBundleShortVersionString=os.environ['NOCHES_VERSION'].split('-')[0], CFBundleVersion=os.environ['NOCHES_VERSION'].split('-')[0])
+            CFBundleShortVersionString=os.environ['NOCHES_DISPLAY_VERSION'], CFBundleVersion=os.environ['NOCHES_VERSION'].split('-')[0])
 info['CFBundleURLTypes'] = [dict(CFBundleURLName=os.environ['BUNDLE_ID'] + '.conversation', CFBundleURLSchemes=[os.environ['APP_SLUG']])]
 with open(sys.argv[2], 'wb') as f: plistlib.dump(info, f)
 PLIST

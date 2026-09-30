@@ -13,6 +13,16 @@ TARGETS = ("linux-x86_64.tar.gz", "linux-aarch64.tar.gz",
            "macos-arm64.dmg", "macos-arm64-app.tar.gz")
 
 
+def display_version():
+    """The intentionally bumped product version, not the CI build identity."""
+    manifest = (Path(__file__).resolve().parent.parent / "Cargo.toml").read_text()
+    section = manifest.split("[workspace.package]\n", 1)[-1].split("\n[", 1)[0]
+    match = re.search(r'^version = "([0-9]+\.[0-9]+\.[0-9]+)"$', section, re.M)
+    if not match:
+        raise ValueError("Workspace product version must be plain numeric SemVer")
+    return match[1]
+
+
 def build_identity(branch, run, attempt, mode="normal", channel=None):
     if branch not in ("dev", "main") or int(run) <= 0 or int(attempt) <= 0:
         raise ValueError("Releases require dev/main and positive build numbers")
@@ -44,7 +54,8 @@ def manifest_for(directory, repository, channel, version, commit, epoch=EPOCH):
     if not all((directory / name).is_file() for name in required):
         raise ValueError("Cannot publish an incomplete platform release")
     root = f"https://github.com/{repository}/releases"
-    return dict(product="noches", channel=channel, version=version, epoch=epoch, commit=commit,
+    return dict(product="noches", channel=channel, version=version,
+                display_version=display_version(), epoch=epoch, commit=commit,
                 notes_url=f"{root}/tag/v{version}", files={
                     name: dict(sha256=hashlib.sha256((directory / name).read_bytes()).hexdigest(),
                                size=(directory / name).stat().st_size,
@@ -164,7 +175,7 @@ def publish(directory):
     else:
         files = [str(directory / name) for name in manifest["files"]] + [str(path)]
         gh("release", "create", tag, "--repo", repo, "--target", commit, "--draft", "--title",
-           f"Noches {'Dev ' if channel == 'dev' else ''}{version}", "--generate-notes")
+           f"Noches {'Dev ' if channel == 'dev' else ''}{display_version()} ({version})", "--generate-notes")
         gh("release", "upload", tag, *files, "--repo", repo)  # no --clobber
         gh("release", "edit", tag, "--repo", repo, "--draft=false",
            f"--prerelease={'true' if channel == 'dev' or mode == 'bridge' else 'false'}",

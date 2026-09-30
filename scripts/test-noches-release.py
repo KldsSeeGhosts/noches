@@ -21,6 +21,7 @@ spec.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
     def test_branch_and_ordering(self):
+        self.assertRegex(release.display_version(), r'^\d+\.\d+\.\d+$')
         self.assertEqual(release.build_identity('main', 12, 1), ('stable', '0.1.12'))
         self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.1.12-dev.2'))
         with self.assertRaises(ValueError): release.build_identity('feature/test', 12, 1)
@@ -48,6 +49,8 @@ class ReleaseTests(unittest.TestCase):
                 (directory / f'noches-0.4.1-dev.1-{target}').write_bytes(b'fixture')
             manifest = release.manifest_for(directory, 'owner/noches', 'dev', '0.4.1-dev.1', 'abc', epoch=0)
             self.assertEqual(manifest['epoch'], 0)
+            self.assertEqual(manifest['display_version'], release.display_version())
+            self.assertEqual(manifest['version'], '0.4.1-dev.1')
             for artifact in manifest['files'].values():
                 self.assertIn('/download/v0.4.1-dev.1/', artifact['url'])
                 self.assertEqual(artifact['size'], 7)

@@ -46,7 +46,7 @@ final class DemoDataset {
 
         let claude = ChatConfig(harness: "claude-code", model: "claude-fable-5",
                                 reasoning: "xhigh", sandbox: "workspace-write")
-        let codex = ChatConfig(harness: "codex", model: "gpt-5.6-terra",
+        let codex = ChatConfig(harness: "codex", model: "gpt-6.1-sol",
                                reasoning: "high", sandbox: "workspace-write")
 
         let chats = [

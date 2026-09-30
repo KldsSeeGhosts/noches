@@ -85,8 +85,18 @@ jobs:
           app_id="$(jq -r '.data[0].id' "$apps")"
 
           builds="$RUNNER_TEMP/builds.json"
-          api "https://api.appstoreconnect.apple.com/v1/builds?filter[app]=$app_id&fields[builds]=version&limit=200" > "$builds"
-          latest_build="$(jq -r '[.data[].attributes.version | select(test("^[0-9]+$")) | tonumber] | max // 0' "$builds")"
+          next="https://api.appstoreconnect.apple.com/v1/builds?filter[app]=$app_id&fields[builds]=version&limit=200"
+          latest_build=0
+          while [ -n "$next" ]; do
+            case "$next" in
+              https://api.appstoreconnect.apple.com/*) ;;
+              *) echo "Unexpected App Store Connect pagination URL" >&2; exit 3 ;;
+            esac
+            api "$next" > "$builds"
+            page_max="$(jq -r '[.data[].attributes.version | select(test("^[0-9]+$")) | tonumber] | max // 0' "$builds")"
+            if [ "$page_max" -gt "$latest_build" ]; then latest_build="$page_max"; fi
+            next="$(jq -r '.links.next // empty' "$builds")"
+          done
           build_number="$((latest_build + 1))"
 
           {
@@ -126,7 +136,11 @@ jobs:
           plutil -insert method -string app-store-connect "$options"
           plutil -insert destination -string upload "$options"
           plutil -insert signingStyle -string automatic "$options"
-          plutil -insert teamID -string 5XY3M483YQ "$options"
+          # Export with the team that actually signed the archive, not an
+          # independently hardcoded team that can drift from the Xcode project.
+          team="$(codesign -d --verbose=4 "$RUNNER_TEMP/Zeron.xcarchive/Products/Applications/Zeron.app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          [ -n "$team" ] && [ "$team" != "not set" ] || { echo "Archive has no signing team" >&2; exit 3; }
+          plutil -insert teamID -string "$team" "$options"
           plutil -insert manageAppVersionAndBuildNumber -bool false "$options"
           if [ "$AUDIENCE" = "internal" ]; then
             plutil -insert testFlightInternalTestingOnly -bool true "$options"

@@ -29,12 +29,17 @@ use tokio::sync::watch;
 #[cfg(windows)]
 pub mod windows;
 
-/// The version compiled into this binary (the workspace version).
+/// Unique, CI-owned build identity used for update ordering and artifacts.
 pub const fn current_version() -> &'static str {
     match option_env!("NOCHES_VERSION") {
         Some(version) => version,
         None => env!("CARGO_PKG_VERSION"),
     }
+}
+
+/// Human-facing SemVer, bumped deliberately in the workspace manifest.
+pub const fn display_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 /// Version-series epoch compiled into this binary. Bump when the version
@@ -61,6 +66,9 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    /// Human-facing version; older release manifests fall back to the build ID.
+    #[serde(default)]
+    pub display_version: String,
     /// Version-series epoch; absent in manifests from before the field existed.
     #[serde(default)]
     pub epoch: u32,
@@ -147,6 +155,14 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 }
 
 impl Manifest {
+    pub fn display_version(&self) -> &str {
+        if self.display_version.is_empty() {
+            &self.version
+        } else {
+            &self.display_version
+        }
+    }
+
     /// Whether the manifest offers an update over `current`: a higher
     /// version-series epoch always wins, otherwise SemVer precedence decides
     /// within the series.
@@ -217,6 +233,13 @@ fn validate_manifest(manifest: &Manifest, channel: &str) -> anyhow::Result<()> {
     );
     validate_version(&manifest.version)?;
     let version = semver::Version::parse(&manifest.version)?;
+    if !manifest.display_version.is_empty() {
+        let display = semver::Version::parse(&manifest.display_version)?;
+        anyhow::ensure!(
+            display.pre.is_empty() && display.build.is_empty(),
+            "Invalid display version"
+        );
+    }
     anyhow::ensure!(
         if channel == "stable" {
             version.pre.is_empty()
@@ -1202,6 +1225,21 @@ mod tests {
             "files": {"noches.tar.gz": {"sha256": "a".repeat(64), "size": 7,
                 "url": "https://github.com/owner/noches/releases/download/v0.3.1-dev.1/noches.tar.gz"}}
         })).unwrap()
+    }
+
+    #[test]
+    fn display_version_is_independent_of_update_order() {
+        let mut manifest = valid_manifest();
+        assert_eq!(manifest.display_version(), "0.3.1-dev.1"); // old manifests
+        manifest.version = "0.1.49-dev.1".into();
+        manifest.display_version = "0.1.0".into();
+        assert_eq!(manifest.display_version(), "0.1.0");
+        manifest.epoch = VERSION_EPOCH;
+        assert!(manifest.newer_than("0.1.48-dev.1"));
+        assert!(!manifest.newer_than("0.1.50-dev.1"));
+        assert!(validate_manifest(&manifest, "dev").is_ok());
+        manifest.display_version = "0.1.0-dev.1".into();
+        assert!(validate_manifest(&manifest, "dev").is_err());
     }
 
     #[test]

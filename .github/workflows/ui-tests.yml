@@ -41,12 +41,13 @@ on:
       - '.github/workflows/release.yml'
       - '.github/workflows/ui-tests.yml'
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ui-tests-${{ github.ref }}
+  group: ui-tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
