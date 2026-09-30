@@ -15,8 +15,8 @@
 //! as dormant identity cards: PTYs never reattach and `messages_snapshot`
 //! embedding is deliberately deferred (chat content lives in CRDT docs).
 
-use std::collections::BTreeMap;
-use std::io;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::Error as _;
@@ -53,6 +53,8 @@ pub struct WorkspaceLayoutStore {
     data_dir: PathBuf,
     revision: u64,
     saved_revision: u64,
+    changed: BTreeSet<String>,
+    removed: BTreeSet<String>,
 }
 
 /// The store key for a space selection (`None` = projectless canvas).
@@ -70,6 +72,7 @@ impl WorkspaceLayoutStore {
     /// (missing, corrupt, wrong version). The file itself is left untouched —
     /// the next successful save heals it.
     pub fn load(data_dir: &Path) -> Self {
+        let _lock = Self::file_lock(data_dir).ok();
         let layouts = match read_capped(&Self::path(data_dir)) {
             Ok(bytes) => match Self::parse(&bytes) {
                 Ok(layouts) => layouts,
@@ -91,6 +94,8 @@ impl WorkspaceLayoutStore {
             data_dir: data_dir.into(),
             revision: 0,
             saved_revision: 0,
+            changed: BTreeSet::new(),
+            removed: BTreeSet::new(),
         }
     }
 
@@ -128,7 +133,9 @@ impl WorkspaceLayoutStore {
         let contains = |layout: &WorkspaceLayout| {
             layout.views.values().any(|view| {
                 view.tabs.values().any(|tab| {
-                    tab.panes.values().any(|pane| pane.session_id.as_deref() == Some(session_id))
+                    tab.panes
+                        .values()
+                        .any(|pane| pane.session_id.as_deref() == Some(session_id))
                 })
             })
         };
@@ -137,9 +144,9 @@ impl WorkspaceLayoutStore {
         {
             return Some(preferred.map(str::to_owned));
         }
-        self.layouts.iter().find_map(|(key, layout)| {
-            contains(layout).then(|| key_space(key).map(str::to_owned))
-        })
+        self.layouts
+            .iter()
+            .find_map(|(key, layout)| contains(layout).then(|| key_space(key).map(str::to_owned)))
     }
 
     /// Replace the stored layout for a space selection. A no-op when the
@@ -151,6 +158,9 @@ impl WorkspaceLayoutStore {
             return;
         }
         self.layouts.insert(key, layout);
+        let key = key_for(space);
+        self.removed.remove(&key);
+        self.changed.insert(key);
         self.revision += 1;
     }
 
@@ -159,7 +169,14 @@ impl WorkspaceLayoutStore {
     /// entries were removed.
     pub fn retain_spaces(&mut self, keep: impl Fn(Option<&str>) -> bool) -> usize {
         let before = self.layouts.len();
-        self.layouts.retain(|key, _| keep(key_space(key)));
+        self.layouts.retain(|key, _| {
+            if keep(key_space(key)) {
+                return true;
+            }
+            self.changed.remove(key);
+            self.removed.insert(key.clone());
+            false
+        });
         let removed = before - self.layouts.len();
         if removed > 0 {
             self.revision += 1;
@@ -179,19 +196,62 @@ impl WorkspaceLayoutStore {
         if !self.needs_save() {
             return Ok(());
         }
+        std::fs::create_dir_all(&self.data_dir)?;
+        let _lock = Self::file_lock(&self.data_dir)?;
+        let path = Self::path(&self.data_dir);
+        // Apply only this window's edits over the latest complete store.
+        let mut layouts = match read_capped(&path) {
+            Ok(bytes) => Self::parse(&bytes).unwrap_or_default(),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.kind() == io::ErrorKind::InvalidData =>
+            {
+                BTreeMap::new()
+            }
+            Err(error) => return Err(error),
+        };
+        for key in &self.removed {
+            layouts.remove(key);
+        }
+        for key in &self.changed {
+            if let Some(layout) = self.layouts.get(key) {
+                layouts.insert(key.clone(), layout.clone());
+            }
+        }
         let file = StoreFile {
             version: VERSION,
-            layouts: self.layouts.clone(),
+            layouts,
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::create_dir_all(&self.data_dir)?;
-        let path = Self::path(&self.data_dir);
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)?;
+        if json.len() as u64 > MAX_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace-layout exceeds the size cap",
+            ));
+        }
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.data_dir)?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.data_dir)?.sync_all()?;
+        self.layouts = file.layouts;
+        self.changed.clear();
+        self.removed.clear();
         self.saved_revision = self.revision;
         Ok(())
+    }
+
+    fn file_lock(data_dir: &Path) -> io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join("workspace-layout.lock"))?;
+        file.lock()?;
+        Ok(file)
     }
 }
 
@@ -199,7 +259,9 @@ impl WorkspaceLayoutStore {
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    std::fs::File::open(path)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -217,11 +279,53 @@ mod tests {
     /// A non-trivial layout built through the engine's public ops.
     fn sample_layout() -> WorkspaceLayout {
         let mut layout = WorkspaceLayout::new();
-        layout.split_view(ViewId(1), Direction::Right, Default::default()).unwrap();
-        layout.split_pane(PaneId(3), Direction::Down, Default::default()).unwrap();
+        layout
+            .split_view(ViewId(1), Direction::Right, Default::default())
+            .unwrap();
+        layout
+            .split_pane(PaneId(3), Direction::Down, Default::default())
+            .unwrap();
         layout.set_view_ratio(&[], 0.72).unwrap();
         layout.validate().unwrap();
         layout
+    }
+
+    #[test]
+    fn independent_windows_merge_only_their_changes_and_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = WorkspaceLayoutStore::load(dir.path());
+        let mut b = WorkspaceLayoutStore::load(dir.path());
+        a.set_layout(Some("a"), WorkspaceLayout::new());
+        b.set_layout(Some("b"), sample_layout());
+        a.flush().unwrap();
+        b.flush().unwrap();
+        let saved = WorkspaceLayoutStore::load(dir.path());
+        assert!(saved.layout_for(Some("a")).is_some());
+        assert_eq!(saved.layout_for(Some("b")), Some(sample_layout()));
+        a.retain_spaces(|space| space != Some("a"));
+        a.flush().unwrap();
+        let saved = WorkspaceLayoutStore::load(dir.path());
+        assert!(saved.layout_for(Some("a")).is_none());
+        assert!(saved.layout_for(Some("b")).is_some());
+    }
+
+    #[test]
+    fn oversized_write_keeps_pending_revision_and_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceLayoutStore::load(dir.path());
+        store.set_layout(Some("a"), WorkspaceLayout::new());
+        store.flush().unwrap();
+        let before = std::fs::read(WorkspaceLayoutStore::path(dir.path())).unwrap();
+        let mut huge = WorkspaceLayout::new();
+        huge.extra
+            .insert("payload".into(), "x".repeat(MAX_FILE_BYTES as usize).into());
+        store.set_layout(Some("huge"), huge);
+        assert!(store.flush().is_err());
+        assert!(store.needs_save());
+        assert_eq!(
+            std::fs::read(WorkspaceLayoutStore::path(dir.path())).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -230,7 +334,8 @@ mod tests {
         let mut store = WorkspaceLayoutStore::load(dir.path());
         let a = sample_layout();
         let mut b = WorkspaceLayout::new();
-        b.split_pane(PaneId(3), Direction::Right, Default::default()).unwrap();
+        b.split_pane(PaneId(3), Direction::Right, Default::default())
+            .unwrap();
         let none = WorkspaceLayout::new();
         store.set_layout(Some("space-a"), a.clone());
         store.set_layout(Some("space-b"), b.clone());
@@ -277,7 +382,10 @@ mod tests {
         .unwrap();
         let store = WorkspaceLayoutStore::load(dir.path());
         assert_eq!(store.layout_for(Some("a")), None);
-        assert!(!store.needs_save(), "a corrupt load must not look like a change");
+        assert!(
+            !store.needs_save(),
+            "a corrupt load must not look like a change"
+        );
         // The damaged file survives until a real change rewrites it.
         assert!(WorkspaceLayoutStore::path(dir.path()).exists());
     }

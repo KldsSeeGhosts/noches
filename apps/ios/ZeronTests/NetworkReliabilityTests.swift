@@ -11,7 +11,7 @@ final class NetworkReliabilityTests: XCTestCase {
         let id = "verified-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
         let doc = LoroDoc()
-        DocDisk.saveChat2(doc: doc, id: id, cursor: 42, verified: true)
+        try DocDisk.saveChat2(doc: doc, id: id, cursor: 42, verified: true)
 
         let loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
         XCTAssertEqual(loaded?.cursor, 42)

@@ -138,6 +138,7 @@ struct RoutedSteer {
 }
 
 struct Inner {
+    admission: zeron_update::admission::AdmissionGate,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
@@ -190,10 +191,20 @@ impl SessionsEngine {
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
     ) -> Self {
+        Self::with_admission(device_id, journal, registry, Default::default())
+    }
+
+    pub fn with_admission(
+        device_id: String,
+        journal: Arc<RunJournal>,
+        registry: Arc<HarnessRegistry>,
+        admission: zeron_update::admission::AdmissionGate,
+    ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         let computer_use = crate::computer_use::ComputerUseManager::new(device_id.clone());
         Self {
             inner: Arc::new(Inner {
+                admission,
                 device_id,
                 journal,
                 registry,
@@ -211,6 +222,47 @@ impl SessionsEngine {
                 computer_use,
             }),
         }
+    }
+
+    pub(crate) fn admission(&self) -> zeron_update::admission::AdmissionGate {
+        self.inner.admission.clone()
+    }
+
+    pub(crate) fn admit_work(&self) -> Result<zeron_update::admission::WorkPermit, EngineError> {
+        self.inner
+            .admission
+            .enter()
+            .map_err(|e| EngineError::Other(e.to_string()))
+    }
+
+    pub(crate) fn prepare_restart_callback(&self) -> zeron_update::admission::PrepareRestart {
+        let weak = Arc::downgrade(&self.inner);
+        Arc::new(move || {
+            let inner = weak.upgrade();
+            Box::pin(async move {
+                let Some(inner) = inner else {
+                    anyhow::bail!("Engine runtime retired")
+                };
+                let sessions = Self { inner };
+                anyhow::ensure!(
+                    !sessions.any_active(),
+                    "An agent resumed; retry after it finishes"
+                );
+                let chats: Vec<_> = lock(&sessions.inner.runs).keys().cloned().collect();
+                // Completed warm wrappers can emit autonomous follow-ups; do
+                // not leave them alive through the installation/restart gap.
+                let results =
+                    futures::future::join_all(chats.iter().map(|id| sessions.interrupt(id))).await;
+                for result in results {
+                    result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                anyhow::ensure!(
+                    lock(&sessions.inner.runs).is_empty(),
+                    "Idle agents are still retiring; retry installation"
+                );
+                Ok(())
+            })
+        })
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -384,6 +436,7 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        let _admission = self.admit_work()?;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = crate::repos::expand_home(&request.cwd)
@@ -602,6 +655,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        let _admission = self.admit_work()?;
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)

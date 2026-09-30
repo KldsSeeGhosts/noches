@@ -6399,13 +6399,15 @@ impl Composer {
         // rich captures use the existing upload-before-send path.
         let queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
             let state = self.state.read(cx);
-            let local_ok = local_device_id
-                .as_deref()
-                .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
+            let local_ok = local_device_id.as_deref().is_some_and(|id| {
+                state.device_supports(id, zeron_proto::capabilities::QUEUED_ATTACHMENTS_V1)
+                    || state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN)
+            });
             let host_ok = !host_is_remote
-                || host_device_id
-                    .as_deref()
-                    .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
+                || host_device_id.as_deref().is_some_and(|id| {
+                    state.device_supports(id, zeron_proto::capabilities::QUEUED_ATTACHMENTS_V1)
+                        || state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN)
+                });
             local_ok && host_ok
         };
         // Upload identities minted NOW: in the queued flow the `pending://`
@@ -10218,7 +10220,9 @@ mod tests {
     #[gpui::test]
     fn a_pane_ring_tracks_its_own_chats_device(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
-        let state = handle.read_with(cx, |composer, _| composer.state.clone()).unwrap();
+        let state = handle
+            .read_with(cx, |composer, _| composer.state.clone())
+            .unwrap();
         let chat_on = |id: &str, device: &str| zeron_proto::Chat {
             id: id.into(),
             device_id: device.into(),

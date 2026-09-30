@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 
 use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
+const MAX_IN_FLIGHT: usize = 256;
 /// Serve one connection: read client frames from `inbound`, write server frames to `out`.
 /// Returns when `inbound` closes; all in-flight request tasks are aborted on exit.
 pub async fn serve_connection(
@@ -22,7 +23,7 @@ pub async fn serve_connection(
     mut inbound: mpsc::Receiver<String>,
 ) {
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
-    while let Some(payload) = inbound.recv().await {
+    'connection: while let Some(payload) = inbound.recv().await {
         // ndjson: a transport may batch several frames per message.
         for line in payload.lines() {
             let line = line.trim();
@@ -47,6 +48,26 @@ pub async fn serve_connection(
                 tracing::warn!(id = frame.id, "rpc: frame has neither method nor cancel");
                 continue;
             };
+            // A duplicate live id makes replies ambiguous. Retire the whole
+            // connection and every owned request, rather than losing an abort
+            // handle or accidentally executing a mutation twice.
+            if running.contains_key(&frame.id) {
+                tracing::warn!(id = frame.id, "rpc: duplicate live request id");
+                break 'connection;
+            }
+            if running.len() >= MAX_IN_FLIGHT {
+                let reply = ServerFrame {
+                    id: frame.id,
+                    err: Some("too many in-flight RPC requests".into()),
+                    ..Default::default()
+                };
+                if let Ok(json) = serde_json::to_string(&reply) {
+                    if out.send(json).await.is_err() {
+                        break 'connection;
+                    }
+                }
+                continue;
+            }
             let task = tokio::spawn(handle_request(
                 service.clone(),
                 out.clone(),
@@ -94,14 +115,17 @@ async fn handle_request(
             // Only the versioned checkout-PR stream uses an explicit readiness
             // frame. Sending it for legacy streams would make older clients remove
             // their pending stream as if it were a unary response.
-            if method == crate::methods::WATCH_CHECKOUT_CHANGE_REQUEST
-                && send(ServerFrame {
-                    id,
-                    ok: Some(serde_json::json!({ "stream": true })),
-                    ..Default::default()
-                })
-                .await
-                .is_err()
+            if matches!(
+                method.as_str(),
+                crate::methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                    | crate::methods::PREPARE_UPDATE_RESTART
+            ) && send(ServerFrame {
+                id,
+                ok: Some(serde_json::json!({ "stream": true })),
+                ..Default::default()
+            })
+            .await
+            .is_err()
             {
                 return;
             }

@@ -765,9 +765,9 @@ pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnaps
         Some(CacheEntry::Loading { .. }) => AttachmentSnapshot::Loading,
         None => {
             // Queued-send alias: the host materializes `pending://{id}/{name}`
-            // at `{uploads}/{id8}-{name}` and rewrites the persisted ref to
+            // at a deterministic identity-prefixed name and rewrites the ref to
             // that ABSOLUTE path — one the sender can't know up front (it's
-            // the host's disk). The id8 basename prefix IS derivable though,
+            // the host's disk). The identity basename prefix IS derivable though,
             // so the send seeds the bytes under an alias and this fallback
             // resolves the rewritten ref instantly instead of blanking the
             // thumbnail into a skeleton while the bytes round-trip
@@ -775,7 +775,7 @@ pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnaps
             if let Some(image) = source
                 .raster_mime
                 .is_none()
-                .then(|| upload_alias_id8(path))
+                .then(|| upload_alias_identity(path))
                 .flatten()
                 .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
                     Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
@@ -790,11 +790,16 @@ pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnaps
     }
 }
 
-/// The uploadId fragment a committed upload's basename starts with
-/// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
+/// The v2 digest or legacy uploadId fragment a committed basename starts with.
+/// `None` when
 /// the path can't be a committed upload.
-fn upload_alias_id8(path: &str) -> Option<String> {
+fn upload_alias_identity(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
+    if let Some(rest) = base.strip_prefix("v2-") {
+        let (digest, suffix) = rest.split_at_checked(64)?;
+        return (suffix.starts_with('-') && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("v2-{digest}"));
+    }
     let (id8, _) = base.split_at_checked(8)?;
     (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
         .then(|| id8.to_string())
@@ -808,6 +813,13 @@ fn alias_key(device_id: &str, id8: &str) -> AttachmentKey {
 /// message's rewritten absolute ref (host-side path) resolves from the same
 /// local bytes — see the alias fallback in [`attachment_snapshot`].
 pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
+    let identity = zeron_engine::uploads::committed_upload_identity(upload_id);
+    store_loaded_for(
+        &alias_key(device_id, &identity),
+        name.to_string().into(),
+        image.clone(),
+    );
+    // Legacy hosts still materialize the eight-character naming convention.
     let id8: String = upload_id.chars().take(8).collect();
     let source = alias_key(device_id, &id8);
     store_loaded_for(&source, name.to_string().into(), image);
@@ -1233,6 +1245,30 @@ mod tests {
 #[cfg(test)]
 mod generated_image_tests {
     use super::*;
+
+    #[test]
+    fn v2_thumbnail_aliases_keep_colliding_legacy_prefixes_distinct() {
+        let owner = format!("v2-alias-test-{}", uuid::Uuid::new_v4());
+        let first = Arc::new(Image::from_bytes(ImageFormat::Gif, b"GIF89a".to_vec()));
+        let second = Arc::new(Image::from_bytes(ImageFormat::Gif, b"GIF87a".to_vec()));
+        for (id, image) in [("12345678-first", &first), ("12345678-second", &second)] {
+            seed_attachment_alias(&owner, id, "image.gif", image.clone());
+            let identity = zeron_engine::uploads::committed_upload_identity(id);
+            let path = format!("/host/uploads/{identity}-image.gif");
+            assert_eq!(
+                upload_alias_identity(&path).as_deref(),
+                Some(identity.as_str())
+            );
+            match attachment_snapshot(&owner, &path) {
+                AttachmentSnapshot::Loaded(loaded) => assert!(Arc::ptr_eq(&loaded.image, image)),
+                _ => panic!("rewritten v2 ref must reuse the correct optimistic bytes"),
+            }
+        }
+        assert_eq!(
+            upload_alias_identity("/host/12345678-image.gif").as_deref(),
+            Some("12345678")
+        );
+    }
 
     #[test]
     fn generated_image_cache_isolates_policy_aliases_and_load_claims() {

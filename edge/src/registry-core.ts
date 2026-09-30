@@ -59,17 +59,21 @@ const HLC_RE = /^\d{13}-\d{6}-[A-Za-z0-9_-]{1,128}$/;
 /** Per-op serialized budget — a row is an index entry, never a document. */
 export const MAX_OP_BYTES = 16 * 1024;
 
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
 /** Structural validation for an op arriving off the wire. Returns an error
  * string or null. Merge assumes validated input. */
-export const validateOp = (op: Op): string | null => {
-  if (!KIND_RE.test(op.kind)) return "bad kind";
-  if (!ID_RE.test(op.id)) return "bad id";
+export const validateOp = (op: unknown): string | null => {
+  if (!isRecord(op)) return "bad operation";
+  if (typeof op.kind !== "string" || !KIND_RE.test(op.kind)) return "bad kind";
+  if (typeof op.id !== "string" || !ID_RE.test(op.id)) return "bad id";
   if (op.op !== "upsert" && op.op !== "update" && op.op !== "delete") return "bad op";
-  if (!HLC_RE.test(op.hlc)) return "bad hlc";
+  if (typeof op.hlc !== "string" || !HLC_RE.test(op.hlc)) return "bad hlc";
   if (op.op === "delete") {
     if (op.set !== undefined) return "delete carries set";
   } else {
-    if (op.set === undefined || typeof op.set !== "object" || Array.isArray(op.set)) {
+    if (!isRecord(op.set)) {
       return "missing set";
     }
     for (const key of Object.keys(op.set)) {
@@ -77,12 +81,13 @@ export const validateOp = (op: Op): string | null => {
     }
   }
   if (op.clocks !== undefined) {
+    if (!isRecord(op.clocks)) return "bad clocks";
     for (const [key, hlc] of Object.entries(op.clocks)) {
       if (!FIELD_RE.test(key)) return `bad clock field: ${key}`;
-      if (!HLC_RE.test(hlc)) return `bad clock: ${key}`;
+      if (typeof hlc !== "string" || !HLC_RE.test(hlc)) return `bad clock: ${key}`;
     }
   }
-  if (JSON.stringify(op).length > MAX_OP_BYTES) return "op too large";
+  if (new TextEncoder().encode(JSON.stringify(op)).byteLength > MAX_OP_BYTES) return "op too large";
   return null;
 };
 

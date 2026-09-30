@@ -289,7 +289,7 @@ struct ComposerView: View {
         // the graced stream (1Hz only while something is degraded/pending).
         let _ = model.connectivity.pulse
         return VStack(spacing: 6) {
-            if let error = uploadError ?? store.queueActionError {
+            if let error = store.persistenceError ?? model.workspace?.persistenceError ?? uploadError ?? store.queueActionError {
                 Text(error)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.danger)

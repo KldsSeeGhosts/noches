@@ -37,6 +37,7 @@
  *   POST /chat2/:chatId/reset
  */
 import { authenticate } from "./auth";
+import { readBody } from "./body-budget";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
@@ -393,10 +394,10 @@ export default {
       }
       const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
-        const body = await request.arrayBuffer();
+        const body = await readBody(request, MAX_TOOL_BLOB_BYTES);
         // Outputs are 4KiB-capped at the harness boundary; diffs can run
         // larger but a sidecar entry is one tool result, never a dump.
-        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
+        if (body === undefined) return json({ error: "too_large" }, 413);
         await env.BLOBS.put(key, body, {
           httpMetadata: {
             contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"

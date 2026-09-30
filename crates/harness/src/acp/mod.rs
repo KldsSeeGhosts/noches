@@ -1629,6 +1629,7 @@ impl AcpHarness {
                 return Err(HarnessError::Protocol("agent child has no stdio".into()));
             }
         };
+        let mut discovered = None;
         let discovery = async {
             client
                 .request("initialize", initialize_params(self.spec.id))
@@ -1638,6 +1639,7 @@ impl AcpHarness {
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
+            discovered = Some(models.clone());
             if self.spec.id == HarnessId::Pi {
                 refine_pi_ladders(&client, &mut incoming, &session, &mut models).await;
             }
@@ -1662,6 +1664,9 @@ impl AcpHarness {
         match result {
             Ok(inner) => inner,
             Err(_) => {
+                if let Some(models) = discovered {
+                    return Ok(models);
+                }
                 let mut error = format!(
                     "{} model discovery did not complete within {}s",
                     self.spec.display_name,
@@ -1697,6 +1702,16 @@ fn thought_ladder(config_options: Option<&Value>) -> Vec<ReasoningLevel> {
         .unwrap_or_default()
 }
 
+fn reported_thought_ladder(config_options: Option<&Value>) -> Option<Vec<ReasoningLevel>> {
+    config_options?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))?
+        .get("options")?
+        .as_array()?;
+    Some(thought_ladder(config_options))
+}
+
 /// pi-acp advertises one `thought_level` ladder — the CURRENT model's — so
 /// every other model would inherit it. Pi's supported levels differ per model
 /// (`thinkingLevelMap`: no `minimal` on gpt-6.x, `max` only where mapped), so
@@ -1723,21 +1738,29 @@ async fn refine_pi_ladders(
     else {
         return;
     };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     for model in models.iter_mut() {
-        let response = request_draining(
-            client,
-            incoming,
-            "session/set_config_option",
-            json!({
-                "sessionId": session_id,
-                "configId": model_config_id,
-                "value": model.id,
-            }),
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let response = tokio::time::timeout(
+            remaining.min(Duration::from_secs(2)),
+            request_draining(
+                client,
+                incoming,
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": model_config_id,
+                    "value": model.id,
+                }),
+            ),
         )
         .await;
+        let Ok(response) = response else { break };
         let Ok(response) = response else { continue };
-        let ladder = thought_ladder(response.get("configOptions"));
-        if !ladder.is_empty() {
+        if let Some(ladder) = reported_thought_ladder(response.get("configOptions")) {
             model.reasoning_levels = ladder;
         }
     }
@@ -4895,6 +4918,13 @@ mod tests {
             ]
         );
         assert!(thought_ladder(None).is_empty());
+        assert_eq!(
+            reported_thought_ladder(Some(&json!([{
+                "category": "thought_level", "options": [{ "value": "off" }]
+            }]))),
+            Some(Vec::new())
+        );
+        assert_eq!(reported_thought_ladder(None), None);
     }
 
     #[test]

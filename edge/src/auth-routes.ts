@@ -14,6 +14,7 @@
  * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
  */
 import { bearerFromRequest, verifyToken } from "./auth";
+import { readBody } from "./body-budget";
 import type { Env } from "./env";
 import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh } from "./workos";
 
@@ -30,7 +31,9 @@ const authFailed = (e: unknown): Response =>
 
 const bodyJson = async <T>(request: Request): Promise<T | undefined> => {
   try {
-    return (await request.json()) as T;
+    const bytes = await readBody(request, 16 * 1024);
+    if (bytes === undefined) return undefined;
+    return JSON.parse(new TextDecoder().decode(bytes)) as T;
   } catch {
     return undefined;
   }
@@ -67,15 +70,11 @@ export const handleAuthRoute = async (
     try {
       return json(await refresh(env, apiKey, body.refreshToken, body.organizationId));
     } catch (e) {
-      // Identify repeat offenders: a client with a rotated-out session
-      // retries every 30s forever and is otherwise anonymous in the tail
-      // (the Worker outcome is "ok" — only the 401 body says it failed).
-      // The token fingerprint is safe: single-use, and this one is dead.
+      // A transient error can involve a still-valid refresh credential.
+      // Never log even its prefix or an unfiltered upstream error body.
       console.warn(
         "auth/refresh failed",
-        request.headers.get("cf-connecting-ip") ?? "unknown-ip",
-        `token:${body.refreshToken.slice(0, 6)}…len${body.refreshToken.length}`,
-        e instanceof WorkOsAuthFailed ? e.message : String(e)
+        e instanceof WorkOsAuthFailed ? e.status : "transport failure"
       );
       // A failed network call or upstream outage is not revoked credentials.
       // Keep the OAuth code so clients can pause and ask for reauthentication

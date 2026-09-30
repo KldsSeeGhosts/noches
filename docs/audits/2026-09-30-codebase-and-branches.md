@@ -2,6 +2,48 @@
 
 Audit date: 30 September 2026.
 
+## Implementation update
+
+After approval, the local work was reconciled onto current dev without reverting the epoch-one updater migration. Only `main` and `dev` remain locally and on GitHub. The old fix/mobile refs were fully merged; the unique SDK update was merged into dev before deleting its GitHub branch. Both original worktrees remain recoverable through the named `noches pre-consolidation primary 2026-09-30` and `noches pre-consolidation mobile 2026-09-30` stashes. The secondary worktree is detached, not removed.
+
+The SDK is now pinned to 1.0.32 and its actual credential-free refresh/stream-auth contract passed. Its checker produces a proposed patch rather than a new branch. The old scheduled workflow is disabled on GitHub until the check-only version is promoted to main. Main now requires a PR and the observed release-validation check contexts; neither main nor dev permits force-pushes or deletion. Dev still permits ordinary integration pushes.
+
+The first hardening implementation covers the original correctness findings:
+
+| Finding | Implemented behavior |
+| --- | --- |
+| 1 Offline pruning | Pending commands, queue rows, and unreadable snapshots are preserved outside the cache budget. Older command-only headers are inspected before declaring a queue empty. |
+| 2 Failed persistence | Save/export errors propagate, dirty obligations retry, failed saves pin session stores, and the existing error caption reports storage trouble. Explicit sign-out still intentionally clears local data. |
+| 3 Stream blocking | Overflow ends that subscription for resynchronization; unrelated controls continue. Existing desktop transcript/sidebar watchers resubscribe. |
+| 4 Closure and cancellation | Closed-state registration and cleanup share synchronization; cancelled unary calls cancel their server work. |
+| 5 Update admission | Dispatch, steering, drains, terminal creation, local filesystem/Git operations, and imports participate in admission. Restart preparation retires completed warm wrappers while admission is closed; cancelling or failing an install releases the lease and re-drains queued work. |
+| 6 Publication | The publisher waits for reusable desktop/iOS validation, actual SDK compatibility, and edge checks. Release PR validation has no path filter that could strand required checks. |
+| 7 Request ownership | Duplicate live IDs retire the connection and its tasks; pending and in-flight requests have limits. |
+| 8 Attachment identity | New filenames and thumbnail aliases use the complete upload identity's SHA-256, retaining legacy reads and aliases. |
+| 9 Attachment publication | Chunks and final files publish atomically; completed identities are immutable and commit retries are idempotent. |
+| 10 Registry validation | Null/incorrect shapes produce controlled errors and operation/frame limits count UTF-8 bytes. |
+| 11 HTTP budgets | Current checkpoint, row, sidecar, registry, tool-blob, and auth paths enforce actual streamed-byte limits. |
+| 12 Desktop persistence | Locked merge-on-write preserves different windows' project edits; unique temporary files and matching size limits protect publication. |
+
+Additional defects found during implementation were addressed:
+
+- Noches' independent `0.1.x` version series disabled upstream `0.2.12` attachment/relay gates. Explicit protocol capabilities now override those gates, with legacy version fallback retained.
+- Retrying an already-applied managed update could replace the rollback symlink with the new build. Reapplication is now a no-op that preserves the actual previous version.
+- A burst of successful dials could overflow the four-event recovery bus. The peer-cache watcher treated `Lagged` as terminal and stopped watching sign-out. Recovery events now coalesce without terminating credential supervision, with an explicit regression for the lag condition.
+- A composer unit test could force-unwrap a window scene before SwiftUI connected it, crashing the entire test runner. Setup now waits with a bounded, reported failure.
+
+The Pi refinement path now bounds switches, retains a discovered catalog on refinement timeout, and distinguishes an off-only ladder from absent metadata. TestFlight export derives its team from the signed archive and build allocation follows pagination; no signed upload was performed.
+
+Performance changes already implemented are bounded journal tail reads and single-entry descriptor eviction, replay allocation filtering, cached upload-size accounting and periodic sweeping, streamed attachment assembly, moving upload IO off async workers, and indexed mobile markdown boundaries with Unicode/CRLF regressions. These are structural reductions in work, not measured percentage speedups.
+
+Validation includes 1,258 desktop UI tests, the core library suites, attachment/queue/restart/admission integrations, edge typechecking and 51 unit plus 20 workerd tests, actual SDK auth-contract checks, and simulator tests. The full simulator rerun executed 200 tests with one live-host test skipped and no failures; a subsequent 13-test persistence/projectless run covered the later queue-header and capability changes. New regression sources are checked into the repository. Native Windows results must be judged from CI, not inferred from macOS.
+
+This is a substantial first correctness batch, not completion of every performance proposal. Full incremental mobile document projection, verified workspace-image transfer caching, and sidebar projection/virtualization remain unimplemented. Independent manifest signing, Windows terminal buffering, non-ACP descendant policy, physical-device memory measurements, and signed TestFlight acceptance remain separate work with their stated trust/platform requirements.
+
+## Original audit baseline
+
+The sections below preserve the evidence and branch/source state from before implementation.
+
 The committed iOS work is already in both `main` and `dev`. The current checkout is on an obsolete, fully merged branch, with unrelated uncommitted changes layered over it. The most important remaining engineering work is protecting offline data, isolating RPC backpressure, making update installation exclude new work, and enforcing release checks. This audit did not implement fixes, commit existing edits, push changes, delete branches, or deploy anything.
 
 This is a broad, risk-based codebase analysis with executable checks, not a claim that every line or platform has been exhaustively proven correct. The tracked source inventory covers approximately 351,500 lines across the application, crates, edge, and scripts, including tests. The review follows the architecture and high-risk data paths.

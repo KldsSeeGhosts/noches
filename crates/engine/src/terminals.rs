@@ -119,6 +119,7 @@ impl LiveTerminal {
 }
 
 struct TerminalsInner {
+    admission: zeron_update::admission::AdmissionGate,
     sessions: Mutex<HashMap<String, Arc<Mutex<LiveTerminal>>>>,
 }
 
@@ -181,8 +182,13 @@ fn selected_shell() -> String {
 impl Terminals {
     /// Requires a tokio runtime (spawns the exited-session reaper).
     pub fn new() -> Self {
+        Self::with_admission(Default::default())
+    }
+
+    pub fn with_admission(admission: zeron_update::admission::AdmissionGate) -> Self {
         let terminals = Self {
             inner: Arc::new(TerminalsInner {
+                admission,
                 sessions: Mutex::new(HashMap::new()),
             }),
         };
@@ -253,6 +259,11 @@ impl Terminals {
         environment: &HashMap<String, String>,
         command: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
+        let _admission = self
+            .inner
+            .admission
+            .enter()
+            .map_err(|e| EngineError::Other(e.to_string()))?;
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
                 "Too many open terminals (maximum {MAX_TERMINALS})"

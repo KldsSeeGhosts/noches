@@ -24,6 +24,7 @@ final class WorkspaceStore {
     private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
     private(set) var changeRequestSnapshots: [ChangeRequestWatchKey: CheckoutChangeRequestStatus] = [:]
     private(set) var connected = false
+    private(set) var persistenceError: String?
     /// True once ANY transport delivered server state this session (socket
     /// state frame or HTTPS pull). Drives the "connecting" spinner: with the
     /// pull-first bootstrap this flips in ~1 round trip, while the socket
@@ -68,7 +69,9 @@ final class WorkspaceStore {
             doc = loaded
         }
         project()
-        saver = RegistrySaver(url: blobURL) { [weak self] in
+        saver = RegistrySaver(url: blobURL, onError: { [weak self] error in
+            self?.persistenceError = error == nil ? nil : "Workspace changes could not be saved. Free storage; retrying."
+        }) { [weak self] in
             try? self?.doc.toData()
         }
 

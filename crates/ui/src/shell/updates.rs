@@ -293,23 +293,32 @@ impl Shell {
         self.update_flow = UpdateFlow::Installing;
         let guard = Tokio::spawn(cx, async move {
             if let Some(engine) = engine {
-                tokio::time::timeout(
+                let lease = tokio::time::timeout(
                     Duration::from_secs(10),
-                    engine
-                        .client()
-                        .call(methods::CHECK_UPDATE_READY, serde_json::json!({})),
+                    async {
+                        let mut lease = engine.client()
+                            .subscribe_checked(methods::PREPARE_UPDATE_RESTART, serde_json::json!({}))
+                            .await.map_err(|e| e.to_string())?;
+                        let ready = lease.recv().await
+                            .ok_or_else(|| "The background engine cannot safely prepare a restart. Update it first.".to_owned())?;
+                        if ready["ready"] != true {
+                            return Err("The engine did not confirm restart readiness".to_owned());
+                        }
+                        Ok::<_, String>(lease)
+                    },
                 )
                 .await
                 .map_err(|_| "The engine did not answer. Retry once it is connected.".to_owned())?
                 .map_err(|error| error.to_string())?;
+                return Ok::<_, String>(Some(lease));
             }
-            Ok::<_, String>(())
+            Ok::<_, String>(None)
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let result = guard.await;
             let _ = this.update(cx, |shell, cx| {
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(_lease)) => {
                         if !shell.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
                             shell.update_flow = UpdateFlow::Ready(staged);
                             return;

@@ -74,6 +74,11 @@ pub struct ComposerDefaults {
 impl ComposerDefaults {
     /// Load from `{data_dir}/composer-defaults.json`; defaults on any failure.
     pub fn load(data_dir: &Path) -> Self {
+        // Windows replacement/read races can otherwise turn a transient open
+        // error into empty defaults. The lock is separate from the replaced file.
+        let Ok(_lock) = Self::file_lock(data_dir) else {
+            return Self::default();
+        };
         match std::fs::read_to_string(Self::path(data_dir)) {
             Ok(text) => match serde_json::from_str::<ComposerDefaults>(&text) {
                 Ok(defaults) => defaults,
@@ -89,6 +94,7 @@ impl ComposerDefaults {
     /// Write atomically (temp file + rename) so a crash mid-write never corrupts.
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
+        let _lock = Self::file_lock(data_dir)?;
         let path = Self::path(data_dir);
         // Each writer owns its temporary file; overlapping windows must not
         // truncate or rename one another's in-progress writes.
@@ -115,6 +121,17 @@ impl ComposerDefaults {
 
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join(FILE_NAME)
+    }
+
+    fn file_lock(data_dir: &Path) -> io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join("composer-defaults.lock"))?;
+        file.lock()?;
+        Ok(file)
     }
 
     /// The remembered model for a harness, if any.
@@ -256,7 +273,11 @@ mod tests {
                 });
             }
         });
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "one preference file and its coordination lock"
+        );
     }
 
     #[test]

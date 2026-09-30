@@ -230,6 +230,16 @@ describe("applyOp", () => {
 });
 
 describe("validateOp", () => {
+  it("rejects null maps and non-string identifiers without throwing", () => {
+    for (const op of [null, [], 42, { ...upsert(), set: null },
+      { ...upsert(), clocks: null }, { ...upsert(), id: null },
+      { ...upsert(), clocks: { title: 123 } }]) {
+      expect(validateOp(op)).not.toBeNull();
+    }
+  });
+  it("enforces the UTF-8 byte budget for Unicode operations", () => {
+    expect(validateOp(upsert({ set: { title: "界".repeat(10000) } }))).toMatch(/large/);
+  });
   it("accepts well-formed ops and rejects malformed ones", () => {
     expect(validateOp(upsert())).toBeNull();
     expect(validateOp({ ...upsert(), kind: "Nope Kind" })).toMatch(/kind/);

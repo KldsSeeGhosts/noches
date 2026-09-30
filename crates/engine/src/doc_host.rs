@@ -1073,8 +1073,20 @@ impl DocHost {
             lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
-            self.spawn_worker(async move { host.drain_commands(&handle).await });
+            self.spawn_worker(async move {
+                host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
+            });
         }
+    }
+
+    pub(crate) fn work_resumed_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let weak = Arc::downgrade(&self.inner);
+        Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                Self { inner }.kick_drains();
+            }
+        })
     }
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
@@ -3932,6 +3944,9 @@ impl DocHost {
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
+        let Ok(_admission) = sessions.admit_work() else {
+            return;
+        };
         if handle.queue_paused.load(Ordering::Acquire) {
             return;
         }
@@ -4331,8 +4346,13 @@ impl DocHost {
             .into_iter()
             .flatten()
             .find(|d| d.id == target)
-            .and_then(|d| d.version.as_deref().and_then(zeron_proto::version_triple))
-            .is_some_and(|v| v >= RELAY_MIN_VERSION);
+            .is_some_and(|d| {
+                d.supports(zeron_proto::capabilities::RELAY_COMMAND_V1)
+                    || d.version
+                        .as_deref()
+                        .and_then(zeron_proto::version_triple)
+                        .is_some_and(|v| v >= RELAY_MIN_VERSION)
+            });
         if !supported {
             return Err("host does not support relay delivery (version gate)".into());
         }
@@ -4521,6 +4541,7 @@ impl DocHost {
         let sessions = self
             .sessions()
             .ok_or_else(|| EngineError::Other("executor unavailable".into()))?;
+        let _admission = sessions.admit_work()?;
         let commands = handle.doc.read_commands()?;
         let messages = handle.doc.read_entries().unwrap_or_default();
         let current_turn_id = messages.last().map(|m| m.id.clone());
@@ -4588,7 +4609,15 @@ impl DocHost {
         for transfer in transfers {
             // Bytes come from the uploads jail only — a transfer names an
             // upload identity, never an arbitrary path.
-            let source = uploads.pending_target(&transfer.upload_id, &transfer.file_name);
+            let source = uploads
+                .resolve_pending(&crate::uploads::pending_ref(
+                    &transfer.upload_id,
+                    &transfer.file_name,
+                ))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    uploads.pending_target(&transfer.upload_id, &transfer.file_name)
+                });
             let bytes = tokio::fs::read(&source)
                 .await
                 .map_err(|e| Permanent(format!("staged attachment missing: {e}")))?;
@@ -4804,6 +4833,9 @@ impl DocHost {
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
+        };
+        let Ok(_admission) = sessions.admit_work() else {
+            return;
         };
         if !self.is_host(&handle.chat_id) {
             return;

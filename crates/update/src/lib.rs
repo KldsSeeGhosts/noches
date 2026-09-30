@@ -5,6 +5,7 @@
 //! Linux uses versioned directories and an atomic current symlink; macOS
 //! stages and replaces an ad-hoc or Developer ID signed application bundle.
 
+pub mod admission;
 pub mod identity;
 
 #[derive(Default)]
@@ -724,6 +725,11 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         if !target.join("zeron").exists() {
             bail!("{} is not a staged install", target.display());
         }
+        if app_root.join("current").canonicalize().ok().as_ref() == Some(&target.canonicalize()?) {
+            // Retrying after a failed service restart must not replace the
+            // real rollback pointer with another link to the new build.
+            return Ok(());
+        }
         if let Ok(previous) = std::fs::read_link(app_root.join("current")) {
             let backup = app_root.join(format!(".previous-{}", std::process::id()));
             let _ = std::fs::remove_file(&backup);
@@ -1024,6 +1030,7 @@ pub struct Updater {
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     check_tx: Arc<watch::Sender<u64>>,
     quiescent: Option<QuiescentCheck>,
+    admission: Option<admission::AdmissionGate>,
     /// Flips to true exactly once; the check loop selects against it so
     /// cancellation lands at any await point (no tokio-util in this crate).
     shutdown_tx: Arc<watch::Sender<bool>>,
@@ -1033,6 +1040,14 @@ pub struct Updater {
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
     pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+        Self::spawn_with_admission(edge_url, quiescent, None)
+    }
+
+    pub fn spawn_with_admission(
+        edge_url: String,
+        quiescent: Option<QuiescentCheck>,
+        admission: Option<admission::AdmissionGate>,
+    ) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
         let (check_tx, _) = watch::channel(0);
         let (shutdown_tx, _) = watch::channel(false);
@@ -1041,6 +1056,7 @@ impl Updater {
             status_tx: Arc::new(status_tx),
             check_tx: Arc::new(check_tx),
             quiescent,
+            admission,
             shutdown_tx: Arc::new(shutdown_tx),
             check_task: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -1197,8 +1213,21 @@ impl Updater {
             bail!("already up to date ({})", current_version());
         }
         stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        let permit = self
+            .admission
+            .as_ref()
+            .map(|gate| gate.begin_update(|| self.quiescent_now()))
+            .transpose()?;
+        if let Some(gate) = &self.admission {
+            gate.prepare_restart().await?;
+        }
+        anyhow::ensure!(
+            self.quiescent_now(),
+            "Work started while downloading; update remains staged"
+        );
         apply_headless(&app_root, &manifest.version)?;
-        tokio::spawn(async {
+        tokio::spawn(async move {
+            let _permit = permit; // Exclude new work through the restart itself.
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             if let Err(err) = restart_service() {
                 tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
@@ -1765,6 +1794,11 @@ mod tests {
         assert_eq!(
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.1")
+        );
+        apply_headless(&app_root, "0.1.1").unwrap();
+        assert_eq!(
+            std::fs::read_link(app_root.join("previous")).unwrap(),
+            app_root.join("0.1.0")
         );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());

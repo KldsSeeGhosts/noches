@@ -40,7 +40,7 @@ Cua driver patches live in `scripts/cua/` on the same branch. They apply to a se
 
 ## Release cadence
 
-1. Merge a feature or fix into `dev`. The Noches releases workflow tests and packages Linux on both architectures and macOS on Apple silicon. It publishes a numbered prerelease, then advances the dev feed only when the complete platform set is available.
+1. Integrate a feature or fix into `dev`. The Noches releases workflow tests and packages Linux on both architectures and macOS on Apple silicon. Publication also waits for desktop/iOS regressions, actual SDK compatibility, and edge tests on that commit. It publishes a numbered prerelease, then advances the dev feed only when the complete validated platform set is available.
 2. Promote through a `dev` → `main` PR. The same workflow publishes a stable build and advances only the stable feed.
 3. In the installed app, open Settings → Updates. Checks also run after startup and every six hours, independently of account sign-in or remote-host connections.
 
@@ -81,7 +81,7 @@ Install the resulting package from `target/package`. Future published dev versio
 
 ## Restart and recovery
 
-The update screen keeps the downloaded version until restart. Close additional Noches windows before installing so their editors and local work can remain safe. Local engine checks refuse a restart while runs or terminals are active. A failed download or checksum leaves the installation intact. Save-file handling runs before replacement.
+The update screen keeps the downloaded version until restart. Close additional Noches windows before installing so their editors and local work can remain safe. Local engine checks refuse a restart while runs, terminals, or admitted work are active. Installation holds a drop-cancelled lease that excludes new execution and retires completed warm agent wrappers; failed/cancelled installation releases it and resumes durable queues. An older background engine without this restart protocol must be upgraded first. A failed download or checksum leaves the installation intact. Save-file handling runs before replacement.
 
 Linux retains an `app/previous` symlink. Quit the app and stop its optional service before manually restoring that version. macOS keeps a hidden `.Noches.app.old-<pid>` or `.Noches Dev.app.old-<pid>` bundle next to the installation. A failed bundle rename attempts to restore the old bundle. Old versions are retained for manual recovery; there is no automatic crash-detection rollback or old-version cleanup yet. Restoring an executable does not reverse a database migration.
 

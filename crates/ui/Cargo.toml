@@ -85,6 +85,7 @@ chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 roxmltree = "0.21.1"
 png = "0.18"
 # Pairing QR codes for Settings > Connections. The crate's `image` feature is
@@ -120,7 +121,6 @@ x11rb = { version = "0.14.0", features = ["image"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-tempfile.workspace = true
 mimalloc.workspace = true
 tracing-subscriber.workspace = true
 

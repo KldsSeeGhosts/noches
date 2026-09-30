@@ -758,7 +758,9 @@ final class AppModel {
 
     func hostSupportsQueuedAttachmentsOn(deviceId: String) -> Bool {
         guard demo == nil else { return false }
-        return workspace?.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin) ?? false
+        guard let workspace else { return false }
+        return workspace.deviceSupports(deviceId, EngineCapability.queuedAttachmentsV1)
+            || workspace.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin)
     }
 
     /// The visible message queue is a personal-cut capability, not a semver
@@ -828,6 +830,7 @@ final class AppModel {
         for id in sessionStores.keys.sorted(by: { sessionUse[$0, default: 0] < sessionUse[$1, default: 0] }) {
             guard sessionStores.count > limit else { break }
             guard !visibleSessions.contains(id), let store = sessionStores[id], !store.hasPendingWork else { continue }
+            guard store.flushToDisk() else { continue }
             preloadTasks.removeValue(forKey: id)?.cancel()
             store.stop() // flushes the document before releasing it
             sessionStores.removeValue(forKey: id)

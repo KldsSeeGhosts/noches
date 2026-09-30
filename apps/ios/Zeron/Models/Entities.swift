@@ -26,6 +26,8 @@ struct DeviceRow: Identifiable, Hashable {
 }
 
 enum EngineCapability {
+    static let queuedAttachmentsV1 = "queued-attachments-v1"
+    static let relayCommandV1 = "relay-command-v1"
     static let messageQueueV1 = "message-queue-v1"
     static let messageQueueActionsV1 = "message-queue-actions-v1"
     static let messageQueueAttachmentsV1 = "message-queue-attachments-v1"

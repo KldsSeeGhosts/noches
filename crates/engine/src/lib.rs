@@ -256,7 +256,13 @@ impl EngineCore {
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
-        let terminals = Terminals::new();
+        let terminals = Terminals::with_admission(sessions.admission());
+        sessions
+            .admission()
+            .on_resumed(doc_host.work_resumed_callback());
+        sessions
+            .admission()
+            .on_prepare(sessions.prepare_restart_callback());
         let previews = zeron_preview::PreviewService::new(
             profile.store_root().join("previews.json"),
             device_id.clone(),
@@ -821,7 +827,11 @@ impl Engine {
                 let terminals = core.terminals.clone();
                 Arc::new(move || !sessions.any_active() && !terminals.any_open())
             };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            let updater = zeron_update::Updater::spawn_with_admission(
+                config.edge_url.clone(),
+                Some(quiescent),
+                Some(core.sessions.admission()),
+            );
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
                 let wake = tokio::spawn(async move {

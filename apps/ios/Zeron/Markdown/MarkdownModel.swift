@@ -189,17 +189,21 @@ enum MarkdownParser {
 
 /// Re-parses only the streaming tail: on append, parsing restarts from the
 /// start of the *second-to-last* top-level block (covers continuation merges),
-/// so per-append cost is O(delta + tail), never O(document). Link-reference
+/// Tail parsing and boundary indexing are incremental; verifying that the
+/// supplied full string is append-only still compares its prefix. Link-reference
 /// definitions (`[label]: url`) break the locality assumption and force full
 /// re-parses.
 final class IncrementalMarkdownParser {
     private(set) var source: String = ""
     private(set) var blocks: [TopBlock] = []
     private var fullOnly = false
+    private var sourceBytes = 0
+    private var lineOffsets = [0]
+    private var lastByte: UInt8?
 
     func setText(_ text: String) {
         if text == source { return }
-        if !fullOnly, text.hasPrefix(source), !source.isEmpty {
+        if !fullOnly, text.utf8.starts(with: source.utf8), !source.isEmpty {
             append(text)
         } else {
             reset(text)
@@ -208,12 +212,20 @@ final class IncrementalMarkdownParser {
 
     private func reset(_ text: String) {
         source = text
+        sourceBytes = text.utf8.count
+        lineOffsets = [0]
+        lastByte = nil
+        indexNewlines(text.utf8, from: 0)
         fullOnly = Self.hasLinkDefs(text)
         blocks = MarkdownParser.parse(text)
     }
 
     private func append(_ text: String) {
-        let delta = String(text.dropFirst(source.count))
+        let start = text.utf8.index(text.utf8.startIndex, offsetBy: sourceBytes)
+        let appended = text.utf8[start...]
+        let delta = String(decoding: appended, as: UTF8.self)
+        indexNewlines(appended, from: sourceBytes)
+        sourceBytes = text.utf8.count
         source = text
         if Self.hasLinkDefs(delta) {
             fullOnly = true
@@ -227,26 +239,26 @@ final class IncrementalMarkdownParser {
         // Stable boundary: the start line of the second-to-last block.
         let boundaryLine = blocks[blocks.count - 2].startLine
         let stable = Array(blocks.prefix(blocks.count - 2))
-        let tailSource = Self.suffix(of: text, fromLine: boundaryLine)
+        let offset = lineOffsets[max(0, min(boundaryLine - 1, lineOffsets.count - 1))]
+        let boundary = text.utf8.index(text.utf8.startIndex, offsetBy: offset)
+        let tailSource = String(decoding: text.utf8[boundary...], as: UTF8.self)
         let tailBlocks = MarkdownParser.parse(tailSource).map { top in
             TopBlock(startLine: top.startLine + boundaryLine - 1, block: top.block)
         }
         blocks = stable + tailBlocks
     }
 
-    /// The substring starting at the given 1-based line.
-    private static func suffix(of text: String, fromLine line: Int) -> String {
-        guard line > 1 else { return text }
-        var remaining = line - 1
-        var index = text.startIndex
-        while remaining > 0, let nl = text[index...].firstIndex(of: "\n") {
-            index = text.index(after: nl)
-            remaining -= 1
-        }
-        return String(text[index...])
-    }
-
     private static let linkDefPattern = /(?m)^\s{0,3}\[[^\]]+\]:/
+    private func indexNewlines<S: Sequence>(_ bytes: S, from start: Int) where S.Element == UInt8 {
+        for (offset, byte) in bytes.enumerated() {
+            if byte == 13 { lineOffsets.append(start + offset + 1) }
+            else if byte == 10 {
+                if lastByte == 13 { lineOffsets[lineOffsets.count - 1] = start + offset + 1 }
+                else { lineOffsets.append(start + offset + 1) }
+            }
+            lastByte = byte
+        }
+    }
     static func hasLinkDefs(_ text: String) -> Bool {
         text.contains(linkDefPattern)
     }

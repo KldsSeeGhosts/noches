@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
-mod server;
 pub mod remote;
+mod server;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -202,6 +202,8 @@ pub mod methods {
     // binary's update). Stream: current UpdateStatus, then every change.
     /// Refuse a local application restart while agents or terminals are active.
     pub const CHECK_UPDATE_READY: &str = "CheckUpdateReady";
+    /// Drop-cancelled stream holds atomic work exclusion until install/restart.
+    pub const PREPARE_UPDATE_RESTART: &str = "PrepareUpdateRestart";
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).

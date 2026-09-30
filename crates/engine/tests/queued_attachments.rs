@@ -231,7 +231,12 @@ async fn run_defers_until_attachment_bytes_land_then_executes_rewritten() {
         "persisted text must not leak pending refs: {user_text}"
     );
     assert!(
-        user_text.contains("att-1-photo_one.png"),
+        user_text.contains(
+            core.uploads
+                .pending_target("att-1", "photo one.png")
+                .to_str()
+                .unwrap()
+        ),
         "persisted text names the committed file: {user_text}"
     );
 

@@ -29,9 +29,9 @@ enum DocDisk {
     }
 
     /// Atomically persist the doc's snapshot.
-    static func save(doc: LoroDoc, id: String) {
-        guard let data = try? doc.export(mode: .snapshot) else { return }
-        try? data.write(to: url(for: id), options: .atomic)
+    static func save(doc: LoroDoc, id: String) throws {
+        let data = try doc.export(mode: .snapshot)
+        try data.write(to: url(for: id), options: .atomic)
     }
 
     /// The workspace registry's persisted blob ({rows, cursor, gcFloor,
@@ -92,43 +92,60 @@ enum DocDisk {
     }
 
     /// Atomically persist the chat2 doc snapshot + its room cursor.
-    static func saveChat2(doc: LoroDoc, id: String, cursor: UInt64, verified: Bool) {
-        guard let snapshot = try? doc.export(mode: .snapshot) else { return }
+    static func saveChat2(doc: LoroDoc, id: String, cursor: UInt64, verified: Bool) throws {
+        let snapshot = try doc.export(mode: .snapshot)
         var data = chat2Magic
         var le = cursor.littleEndian
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        // Bit 1 marks pending-command metadata as known; bit 2 pins unsent work.
+        // Bit 1 marks command metadata as known; bit 2 pins unsent work.
+        // Bit 3 additionally certifies queue-row coverage. Older clear flags
+        // must be inspected: they did not account for unsent queue messages.
         // The snapshot and flags are replaced atomically, so eviction cannot
         // observe a clean marker alongside newly queued commands.
-        let pending = doc.getList(id: "commands").getDeepValue().listValue?.contains {
+        let pending = (doc.getList(id: "queue").getDeepValue().listValue?.isEmpty == false)
+            || (doc.getList(id: "commands").getDeepValue().listValue?.contains {
             $0.mapValue?["status"]?.stringValue == "pending"
-        } ?? false
-        data.append((verified ? 1 : 0) | 2 | (pending ? 4 : 0))
+        } ?? false)
+        data.append((verified ? 1 : 0) | 2 | 8 | (pending ? 4 : 0))
         data.append(snapshot)
-        try? data.write(to: chat2URL(for: id), options: .atomic)
+        try data.write(to: chat2URL(for: id), options: .atomic)
     }
 
     /// Read a cheap header for new snapshots; older caches need one document
     /// inspection before deciding whether their pending work must stay warm.
     static func hasPendingCommands(id: String) -> Bool {
         let url = chat2URL(for: id)
+        if FileManager.default.fileExists(atPath: url.path) { return mustPreserve(url) }
+        let legacy = Self.url(for: id)
+        return FileManager.default.fileExists(atPath: legacy.path) && mustPreserve(legacy)
+    }
+
+    /// Failed reads/imports are not evidence that a snapshot is safe to delete.
+    private static func mustPreserve(_ url: URL) -> Bool {
         if let file = try? FileHandle(forReadingFrom: url) {
             defer { try? file.close() }
             if let header = try? file.read(upToCount: 17), header.count == 17,
-               header.prefix(8) == chat2Magic, header[16] & 2 != 0 {
+               header.prefix(8) == chat2Magic,
+               (header[16] & 4 != 0 || header[16] & 10 == 10) {
                 return header[16] & 4 != 0
             }
         }
         let doc = LoroDoc()
-        if loadChat2(into: doc, id: id) == nil { _ = load(into: doc, id: id) }
-        return doc.getList(id: "commands").getDeepValue().listValue?.contains {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return true }
+        let offset = data.prefix(8) == chat2Magic ? 17
+            : data.prefix(8) == legacyChat2Magic ? 16 : 0
+        guard data.count > offset,
+              (try? doc.importWith(bytes: Data(data.dropFirst(offset)), origin: "prune")) != nil
+        else { return true }
+        return (doc.getList(id: "queue").getDeepValue().listValue?.isEmpty == false)
+            || (doc.getList(id: "commands").getDeepValue().listValue?.contains {
             $0.mapValue?["status"]?.stringValue == "pending"
-        } ?? false
+        } ?? false)
     }
 
     /// LRU-prune session snapshots (the workspace registry blob is always
     /// kept; a leftover `ws3_` Loro snapshot is retained for rollback).
-    static func prune(keep: Int) {
+    static func prune(keep: Int, in directory: URL = DocDisk.directory) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory,
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
@@ -144,7 +161,9 @@ enum DocDisk {
             let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return a > b
         }
-        for stale in sorted.dropFirst(keep) {
+        // Pending/unreadable snapshots are outside the ordinary cache budget.
+        let prunable = sorted.filter { !mustPreserve($0) }
+        for stale in prunable.dropFirst(max(0, keep)) {
             try? fm.removeItem(at: stale)
         }
     }
@@ -161,16 +180,19 @@ enum DocDisk {
 /// written together (e.g. a chat2 doc AND its cursor — one atomic file).
 @MainActor
 final class DocSaver {
-    private let save: () -> Void
+    private let save: () throws -> Void
+    private let onError: (Error?) -> Void
     private var generation = 0
-    private var dirty = false
+    private(set) var needsSave = false
 
-    init(save: @escaping () -> Void) {
+    init(onError: @escaping (Error?) -> Void = { _ in },
+         save: @escaping () throws -> Void) {
         self.save = save
+        self.onError = onError
     }
 
     func poke() {
-        dirty = true
+        needsSave = true
         generation += 1
         let expected = generation
         Task { @MainActor [weak self] in
@@ -180,10 +202,19 @@ final class DocSaver {
         }
     }
 
-    func flush(force: Bool = false) {
-        guard dirty || force else { return }
-        dirty = false
-        save()
+    @discardableResult
+    func flush(force: Bool = false) -> Bool {
+        guard needsSave || force else { return true }
+        do {
+            try save()
+            needsSave = false
+            onError(nil)
+            return true
+        } catch {
+            onError(error)
+            poke() // Retain the obligation and retry, even with no new edits.
+            return false
+        }
     }
 }
 
@@ -192,31 +223,23 @@ final class DocSaver {
 /// `flush` forces it (backgrounding, store teardown).
 @MainActor
 final class RegistrySaver {
-    private let url: URL
-    private let data: () -> Data?
-    private var generation = 0
-    private var dirty = false
+    private let saver: DocSaver
+    var needsSave: Bool { saver.needsSave }
 
-    init(url: URL, data: @escaping () -> Data?) {
-        self.url = url
-        self.data = data
-    }
-
-    func poke() {
-        dirty = true
-        generation += 1
-        let expected = generation
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard let self, self.generation == expected else { return }
-            self.flush()
+    init(url: URL, onError: @escaping (Error?) -> Void = { _ in },
+         data: @escaping () -> Data?) {
+        saver = DocSaver(onError: onError) {
+            guard let bytes = data() else { throw CocoaError(.fileWriteUnknown) }
+            try bytes.write(to: url, options: .atomic)
         }
     }
 
-    func flush() {
-        guard dirty else { return }
-        dirty = false
-        guard let data = data() else { return }
-        try? data.write(to: url, options: .atomic)
+    func poke() {
+        saver.poke()
+    }
+
+    @discardableResult
+    func flush() -> Bool {
+        saver.flush()
     }
 }

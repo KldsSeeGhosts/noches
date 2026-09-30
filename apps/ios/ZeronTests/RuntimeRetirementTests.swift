@@ -87,14 +87,14 @@ final class RuntimeRetirementTests: XCTestCase {
         let doc = LoroDoc()
         let command = try doc.getList(id: "commands").pushContainer(child: LoroMap())
         try command.insert(key: "status", v: "pending")
-        DocDisk.saveChat2(doc: doc, id: id, cursor: 9, verified: true)
+        try DocDisk.saveChat2(doc: doc, id: id, cursor: 9, verified: true)
         XCTAssertTrue(DocDisk.hasPendingCommands(id: id))
         var legacy = try Data(contentsOf: DocDisk.chat2URL(for: id))
         legacy[16] = 1 // older writer knows only cursor verification
         try legacy.write(to: DocDisk.chat2URL(for: id))
         XCTAssertTrue(DocDisk.hasPendingCommands(id: id))
         try command.insert(key: "status", v: "done")
-        DocDisk.saveChat2(doc: doc, id: id, cursor: 10, verified: true)
+        try DocDisk.saveChat2(doc: doc, id: id, cursor: 10, verified: true)
         XCTAssertFalse(DocDisk.hasPendingCommands(id: id))
     }
 

@@ -4,8 +4,14 @@ import XCTest
 
 @MainActor
 final class ComposerEditorTests: XCTestCase {
-    func testSendingMarkedTextClearsNativeStorageWithoutLosingFocusOrNextDraft() async {
-        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first!
+    func testSendingMarkedTextClearsNativeStorageWithoutLosingFocusOrNextDraft() async throws {
+        // XCTest can begin before SwiftUI's initial scene connects. Report a
+        // bounded setup failure instead of crashing/relaunching the whole suite.
+        for _ in 0..<100 {
+            if UIApplication.shared.connectedScenes.contains(where: { $0 is UIWindowScene }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         let host = UIViewController()
         window.rootViewController = host

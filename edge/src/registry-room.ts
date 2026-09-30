@@ -19,7 +19,8 @@
  * Hibernation discipline: ZERO wall-clock timers; ping/pong rides the
  * auto-response pair; the daily alarm does tombstone GC + the R2 backup.
  */
-import { applyOp, validateOp, type Op, type Row } from "./registry-core";
+import { applyOp, validateOp, isRecord, type Op, type Row } from "./registry-core";
+import { readBody } from "./body-budget";
 import { AUTH_USER_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -228,7 +229,11 @@ export class RegistryRoom implements DurableObject {
       if (declared > 2 * 1024 * 1024) return json({ error: "too_large" }, 413);
       let frame: Record<string, unknown>;
       try {
-        frame = (await request.json()) as Record<string, unknown>;
+        const body = await readBody(request, MAX_FRAME_BYTES);
+        if (body === undefined) return json({ error: "too_large" }, 413);
+        const decoded: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body));
+        if (!isRecord(decoded)) return json({ error: "bad_push" }, 400);
+        frame = decoded;
       } catch {
         return json({ error: "bad_push", message: "malformed body" }, 400);
       }
@@ -264,13 +269,15 @@ export class RegistryRoom implements DurableObject {
       ws.close(1003, "text frames only");
       return;
     }
-    if (message.length > MAX_FRAME_BYTES) {
+    if (new TextEncoder().encode(message).byteLength > MAX_FRAME_BYTES) {
       ws.close(1009, "frame too large");
       return;
     }
     let frame: Record<string, unknown>;
     try {
-      frame = JSON.parse(message) as Record<string, unknown>;
+      const decoded: unknown = JSON.parse(message);
+      if (!isRecord(decoded)) { ws.close(1002, "bad frame"); return; }
+      frame = decoded;
     } catch {
       ws.close(1002, "bad json");
       return;
@@ -367,7 +374,7 @@ export class RegistryRoom implements DurableObject {
         // and a client that builds one bad op is a client bug to surface, not
         // to partially apply. Rejections are attributed per device on /stats.
         this.recordPush(device, false);
-        return { ok: false, code: "invalid_op", message: `${op.kind}/${op.id}: ${invalid}` };
+        return { ok: false, code: "invalid_op", message: `Invalid registry operation: ${invalid}` };
       }
     }
 

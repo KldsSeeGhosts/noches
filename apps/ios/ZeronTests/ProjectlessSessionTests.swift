@@ -211,4 +211,19 @@ final class ProjectlessSessionTests: XCTestCase {
         XCTAssertTrue(model.spaces.isEmpty)
         XCTAssertNil(model.createProjectlessChat(deviceId: phone.id, config: chatConfig))
     }
+
+    func testNochesVersionSeriesUsesExplicitQueuedAttachmentCapability() {
+        let doc = RegistryDoc(deviceId: appConfig.deviceId)
+        doc.applyState(seq: 1, full: true, gcFloor: 0, rows: [
+            row("devices", "noches-host", ["platform": .string("linux"),
+                "version": .string("0.1.77-dev.1"),
+                "capabilities": .array([.string(EngineCapability.queuedAttachmentsV1)])]),
+            row("devices", "unknown-host", ["platform": .string("linux"),
+                "version": .string("0.1.0")]),
+        ])
+        let model = AppModel()
+        model.workspace = WorkspaceStore(config: appConfig, doc: doc)
+        XCTAssertTrue(model.hostSupportsQueuedAttachmentsOn(deviceId: "noches-host"))
+        XCTAssertFalse(model.hostSupportsQueuedAttachmentsOn(deviceId: "unknown-host"))
+    }
 }

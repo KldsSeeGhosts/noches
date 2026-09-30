@@ -147,6 +147,7 @@ final class SessionStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    private(set) var persistenceError: String?
     @ObservationIgnored private var stopped = false
     @ObservationIgnored private var projectTask: Task<Void, Never>?
 
@@ -168,9 +169,11 @@ final class SessionStore {
             // entries; the chat2 catch-up repopulates the transcript.
             adoptLegacyCommands()
         }
-        saver = DocSaver { [weak self] in
+        saver = DocSaver(onError: { [weak self] error in
+            self?.persistenceError = error == nil ? nil : "Local changes could not be saved. Free storage; retrying."
+        }) { [weak self] in
             guard let self else { return }
-            DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
+            try DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
                               verified: self.cursorVerified)
         }
         // Subscription BEFORE any connect: every local commit lands in the
@@ -368,8 +371,9 @@ final class SessionStore {
     }
 
     /// Backgrounding hook: persist immediately.
-    func flushToDisk() {
-        saver?.flush(force: true)
+    @discardableResult
+    func flushToDisk() -> Bool {
+        saver?.flush(force: true) ?? true
     }
 
     /// Foreground hook: revive the room after a suspension (see
@@ -719,7 +723,9 @@ final class SessionStore {
     @ObservationIgnored private var activeUploads = 0
 
     var hasPendingWork: Bool {
+        if saver?.needsSave == true { return true }
         if activeUploads > 0 || !pendingSends.isEmpty || !activeEscorts.isEmpty || !queue.isEmpty { return true }
+        if doc.getList(id: "queue").getDeepValue().listValue?.isEmpty == false { return true }
         // Projection is asynchronous; consult durable commands too before eviction.
         guard let commands = doc.getList(id: "commands").getDeepValue().listValue else { return false }
         return commands.contains { $0.mapValue?["status"]?.stringValue == "pending" }

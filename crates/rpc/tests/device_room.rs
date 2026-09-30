@@ -410,6 +410,37 @@ impl TokenSource for RecoveringToken {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn token_observer_is_registered_before_the_cache_is_returned() {
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let _links = LinkCache::new(LinkCacheConfig::new("http://127.0.0.1:1", token.clone()));
+    assert_eq!(
+        token.changes.receiver_count(),
+        1,
+        "sign-out before the first watcher poll must be observed"
+    );
+    token.clear();
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
+async fn lagged_online_notifications_do_not_retire_sign_out_supervision() {
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let _links = LinkCache::new(LinkCacheConfig::new("http://127.0.0.1:1", token.clone()));
+    tokio::task::yield_now().await; // Registers the process-wide online receiver.
+    for _ in 0..32 {
+        zeron_sync::wake::notify_online();
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(
+        token.changes.receiver_count(),
+        1,
+        "lagged recovery must not drop the token observer"
+    );
+    token.clear();
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
 async fn token_recovery_wakes_a_signed_out_host_relay_immediately() {
     let relay = FakeRelay::start().await;
     let token = Arc::new(RecoveringToken::new(None));

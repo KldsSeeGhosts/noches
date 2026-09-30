@@ -946,7 +946,8 @@ impl EngineRpc {
 
     async fn cancel_remote_login(&self, target: &str, login_id: &str) {
         let params = serde_json::json!({ "loginId": login_id, "targetDeviceId": target });
-        if let Err(error) = Box::pin(self.forward(target, methods::CANCEL_AGENT_LOGIN, params)).await
+        if let Err(error) =
+            Box::pin(self.forward(target, methods::CANCEL_AGENT_LOGIN, params)).await
         {
             tracing::debug!(%error, "cancelling the remote login failed (best-effort)");
         }
@@ -1542,6 +1543,25 @@ impl RpcService for EngineRpc {
         if AuthRpc::handles(method) {
             return Box::pin(AuthRpc::new(self.auth()?.clone()).handle(method, params)).await;
         }
+        let _work = if matches!(
+            method,
+            methods::WRITE_WORKSPACE_FILE
+                | methods::DISCARD_WORKING_TREE
+                | methods::CLONE_REPO
+                | methods::CREATE_REPO
+                | methods::FETCH_ALL
+                | methods::SWITCH_REF
+                | methods::CREATE_WORKTREE
+                | methods::DELETE_WORKTREE
+        ) {
+            Some(
+                self.sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
@@ -1947,11 +1967,16 @@ impl RpcService for EngineRpc {
             }
             methods::IMPORT_LOCAL_WORKSPACE => {
                 let importer = self.local_importer()?.clone();
+                let admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // Progress rides an unbounded channel: the importer is
                 // blocking (sqlite + fs) and must never wedge on a slow
                 // viewer; items are tiny and bounded by the chat count.
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
                 tokio::task::spawn_blocking(move || {
+                    let _admission = admission;
                     let emit = |event: crate::local_import::ImportEvent| {
                         if let Ok(item) = serde_json::to_value(&event) {
                             let _ = tx.send(item);
@@ -1978,6 +2003,27 @@ impl RpcService for EngineRpc {
                     return Err(RpcError::Failed("Finish active runs and close terminals before installing the update. The download is saved.".into()));
                 }
                 RpcReply::value(&true)
+            }
+            methods::PREPARE_UPDATE_RESTART => {
+                let permit = self
+                    .sessions
+                    .admission()
+                    .begin_update(|| !self.sessions.any_active() && !self.terminals.any_open())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.sessions
+                    .admission()
+                    .prepare_restart()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let stream =
+                    futures::stream::unfold((Some(permit), false), |(permit, sent)| async move {
+                        if sent {
+                            std::future::pending::<()>().await;
+                            return None;
+                        }
+                        Some((serde_json::json!({"ready": true}), (permit, true)))
+                    });
+                Ok(RpcReply::Stream(Box::pin(stream)))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
@@ -2114,11 +2160,10 @@ impl RpcService for EngineRpc {
                         .cwd
                         .as_deref()
                         .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
-                    let identity = Box::pin(
-                        self.repos.checkout_identity(std::path::Path::new(cwd)),
-                    )
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let identity =
+                        Box::pin(self.repos.checkout_identity(std::path::Path::new(cwd)))
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
                     if identity.id != p.checkout_id {
                         return Err(RpcError::Failed(
                             "chat checkout changed since the confirmation was opened".into(),
@@ -2133,21 +2178,20 @@ impl RpcService for EngineRpc {
                         if candidate.device_id != self.doc_host.device_id() {
                             continue;
                         }
-                        let same_checkout =
-                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
-                                true
-                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
-                                Box::pin(
-                                    self.repos
-                                        .checkout_identity(std::path::Path::new(candidate_cwd)),
-                                )
-                                .await
-                                .is_ok_and(|candidate_identity| {
-                                    candidate_identity.id == identity.id
-                                })
-                            } else {
-                                false
-                            };
+                        let same_checkout = if candidate.checkout_id.as_deref()
+                            == Some(identity.id.as_str())
+                        {
+                            true
+                        } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                            Box::pin(
+                                self.repos
+                                    .checkout_identity(std::path::Path::new(candidate_cwd)),
+                            )
+                            .await
+                            .is_ok_and(|candidate_identity| candidate_identity.id == identity.id)
+                        } else {
+                            false
+                        };
                         if same_checkout
                             && self
                                 .sessions
@@ -2907,17 +2951,21 @@ impl RpcService for EngineRpc {
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;
-                self.uploads
-                    .append(&p.upload_id, &p.data, p.seq)
+                let uploads = self.uploads.clone();
+                tokio::task::spawn_blocking(move || uploads.append(&p.upload_id, &p.data, p.seq))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::UPLOAD_COMMIT => {
                 let p: UploadCommitParams = parse_params(params)?;
-                let path = self
-                    .uploads
-                    .commit(&p.upload_id, &p.file_name)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let uploads = self.uploads.clone();
+                let path =
+                    tokio::task::spawn_blocking(move || uploads.commit(&p.upload_id, &p.file_name))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // Bytes just landed on this device: any command deferred on
                 // them (queued-attachment refs) is executable NOW.
                 self.doc_host.kick_drains();
@@ -2934,10 +2982,13 @@ impl RpcService for EngineRpc {
                     .filter_map(|chat| chat.cwd)
                     .map(std::path::PathBuf::from)
                     .collect();
-                let chunk = self
-                    .uploads
-                    .read_chunk(&p.path, p.offset, &roots)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let uploads = self.uploads.clone();
+                let chunk = tokio::task::spawn_blocking(move || {
+                    uploads.read_chunk(&p.path, p.offset, &roots)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
             }
             methods::FETCH_TOOL_BLOB => {
@@ -3121,7 +3172,10 @@ mod tests {
     #[test]
     fn forward_deadlines_are_tiered_and_bounded() {
         for method in [methods::LIST_MODELS, methods::LIST_COMMANDS] {
-            assert_eq!(forward_deadline(method), std::time::Duration::from_secs(100));
+            assert_eq!(
+                forward_deadline(method),
+                std::time::Duration::from_secs(100)
+            );
         }
         use std::time::Duration;
         assert_eq!(

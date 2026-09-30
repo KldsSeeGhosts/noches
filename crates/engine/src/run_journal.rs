@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -40,12 +40,14 @@ struct ChatJournal {
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
+    used: u64,
 }
 
 /// Append-only JSONL journal store, one file per chat.
 pub struct RunJournal {
     dir: PathBuf,
     open_files: Mutex<HashMap<String, ChatJournal>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl RunJournal {
@@ -55,6 +57,7 @@ impl RunJournal {
         Ok(Self {
             dir,
             open_files: Mutex::new(HashMap::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -99,6 +102,9 @@ impl RunJournal {
     /// Append one event; returns its journal seq.
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut files = self.lock();
+        let used = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !files.contains_key(chat_id) {
             // Bound the open-fd set: entries were never removed, so every chat
             // ever run held a descriptor for the process lifetime. Dropping is
@@ -106,7 +112,13 @@ impl RunJournal {
             // comfortably exceeds concurrent runs, so eviction stays rare.
             const OPEN_FILE_CAP: usize = 16;
             if files.len() >= OPEN_FILE_CAP {
-                files.clear();
+                if let Some(oldest) = files
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used)
+                    .map(|(id, _)| id.clone())
+                {
+                    files.remove(&oldest);
+                }
             }
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
@@ -117,6 +129,7 @@ impl RunJournal {
                     file,
                     next_seq,
                     needs_newline,
+                    used,
                 },
             );
         }
@@ -127,6 +140,7 @@ impl RunJournal {
             )));
         };
         let seq = journal.next_seq;
+        journal.used = used;
         let line = serde_json::to_string(&JournalLine {
             seq,
             event: event.clone(),
@@ -155,10 +169,9 @@ impl RunJournal {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let all = read_lines(&path)?;
-        let last_seq = all.last().map(|(seq, _)| *seq).unwrap_or(0);
+        let last_seq = read_tail(&path)?.0.map(|(seq, _)| seq).unwrap_or(0);
         let from = if after_seq > last_seq { 0 } else { after_seq };
-        Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
+        read_lines_after(&path, from)
     }
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
@@ -167,7 +180,7 @@ impl RunJournal {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(read_lines(&path)?.into_iter().next_back())
+        Ok(read_tail(&path)?.0)
     }
 
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
@@ -183,7 +196,7 @@ impl RunJournal {
             let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let last = read_lines(&path)?.into_iter().next_back();
+            let last = read_tail(&path)?.0;
             match last {
                 Some((_, AgentEvent::Done { .. })) | None => {}
                 Some(_) => stale.push(chat_id.to_string()),
@@ -205,7 +218,7 @@ impl RunJournal {
 }
 
 /// Parse every valid line; malformed lines (torn tail writes) are skipped.
-fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+fn read_lines_after(path: &Path, after_seq: u64) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -218,7 +231,8 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
             continue;
         }
         match serde_json::from_str::<JournalLine>(&line) {
-            Ok(parsed) => out.push((parsed.seq, parsed.event)),
+            Ok(parsed) if parsed.seq > after_seq => out.push((parsed.seq, parsed.event)),
+            Ok(_) => {}
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
             }
@@ -229,17 +243,101 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
 
 /// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
 fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, false)),
+    let (last, needs_newline) = read_tail(path)?;
+    Ok((last.map(|(seq, _)| seq + 1).unwrap_or(1), needs_newline))
+}
+
+/// Grow a tail window only if the last valid record exceeds it or there is
+/// a damaged suffix. Ordinary reopening does not read/decode the full history.
+fn read_tail(path: &Path) -> Result<(Option<(u64, AgentEvent)>, bool), JournalError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
         Err(e) => return Err(e.into()),
     };
-    let needs_newline = bytes.last().is_some_and(|b| *b != b'\n');
-    let next_seq = read_lines(path)?
-        .last()
-        .map(|(seq, _)| seq + 1)
-        .unwrap_or(1);
-    Ok((next_seq, needs_newline))
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok((None, false));
+    }
+    let mut window = length.min(64 * 1024);
+    loop {
+        let start = length - window;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; window as usize];
+        file.read_exact(&mut bytes)?;
+        let needs_newline = bytes.last() != Some(&b'\n');
+        let complete = if start == 0 {
+            &bytes[..]
+        } else if let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            &bytes[newline + 1..]
+        } else {
+            &[]
+        };
+        for line in complete.rsplit(|b| *b == b'\n') {
+            if let Ok(parsed) = serde_json::from_slice::<JournalLine>(line) {
+                return Ok((Some((parsed.seq, parsed.event)), needs_newline));
+            }
+        }
+        if window == length {
+            return Ok((None, needs_newline));
+        }
+        window = window.saturating_mul(2).min(length);
+    }
+}
+
+#[cfg(test)]
+mod tail_regressions {
+    use super::*;
+    #[test]
+    fn descriptor_limit_evicts_one_entry_instead_of_flushing_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for i in 0..17 {
+            journal
+                .append(
+                    &format!("chat-{i}"),
+                    &AgentEvent::TextDelta { text: "x".into() },
+                )
+                .unwrap();
+        }
+        let files = journal.lock();
+        assert_eq!(files.len(), 16);
+        assert!(!files.contains_key("chat-0"));
+        assert!(files.contains_key("chat-1"));
+    }
+    #[test]
+    fn tail_handles_large_unicode_records_and_torn_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        let event = AgentEvent::TextDelta {
+            text: "🚀".repeat(40000),
+        };
+        journal.append("large", &event).unwrap();
+        let path = journal.path_for("large");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n{torn")
+            .unwrap();
+        assert_eq!(scan_tail(&path).unwrap(), (2, true));
+        assert_eq!(journal.last_event("large").unwrap().unwrap().0, 1);
+        // Reopening must isolate the broken suffix and retain the sequence.
+        drop(journal);
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(
+            journal
+                .append(
+                    "large",
+                    &AgentEvent::TextDelta {
+                        text: "after".into()
+                    }
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(journal.replay("large", 1).unwrap().len(), 1);
+    }
 }
 
 /// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an

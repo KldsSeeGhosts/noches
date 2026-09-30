@@ -17,6 +17,7 @@
  * auto-response pair; the daily alarm does the nightly R2 backup only.
  */
 import { createBlobStore, type BlobStore } from "./blobs";
+import { readBody } from "./body-budget";
 import {
   appendRow,
   CHECKPOINT_BLOB,
@@ -128,8 +129,8 @@ export class ChatRoom implements DurableObject {
       if (frontier.byteLength === 0 && seqCovered > 0) {
         return json({ error: "bad_frontier", message: "empty frontier on a content checkpoint" }, 400);
       }
-      const body = new Uint8Array(await request.arrayBuffer());
-      if (body.byteLength > MAX_CHECKPOINT_BYTES) return json({ error: "too_large" }, 413);
+      const body = await readBody(request, MAX_CHECKPOINT_BYTES);
+      if (body === undefined) return json({ error: "too_large" }, 413);
       const outcome = commitCheckpoint(sql, this.blobs, seqCovered, frontier, body, Date.now());
       if (!outcome.ok) return json({ error: outcome.error }, 409);
       this.markBackupDirty();
@@ -254,7 +255,8 @@ export class ChatRoom implements DurableObject {
         this.recordPush(device, false);
         return json({ error: "too_large" }, 413);
       }
-      const payload = new Uint8Array(await request.arrayBuffer());
+      const payload = await readBody(request, MAX_ROW_BYTES);
+      if (payload === undefined) return json({ error: "too_large" }, 413);
       if (!this.admitQuota(device, payload.byteLength)) {
         this.recordPush(device, false);
         return json({ error: "quota" }, 429);
@@ -280,8 +282,8 @@ export class ChatRoom implements DurableObject {
 
     if ((url.pathname === "/tail" || url.pathname === "/diff") && request.method === "PUT") {
       const name = url.pathname === "/tail" ? "sidecar-tail" : "sidecar-diff";
-      const body = new Uint8Array(await request.arrayBuffer());
-      if (body.byteLength > MAX_SIDECAR_BYTES) return json({ error: "too_large" }, 413);
+      const body = await readBody(request, MAX_SIDECAR_BYTES);
+      if (body === undefined) return json({ error: "too_large" }, 413);
       this.blobs.put(name, body);
       setMeta(sql, `${name}-type`, request.headers.get("content-type") ?? "application/json");
       return json({ ok: true, bytes: body.byteLength });
