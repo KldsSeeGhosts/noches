@@ -64,10 +64,11 @@ const SHOULD_INFO = 'Received on the fixture host. No real agent was started.';
 // ---------------------------------------------------------------------------
 // Workspace, chat, session, queue and doc state (real proto shapes).
 // ---------------------------------------------------------------------------
-const SPACES = [
+const INITIAL_SPACES = [
   {id:'fixture-space',deviceId:profile.deviceId,path:'/tmp/noches-fixture',name:'Noches',gitDetected:true,checkoutId:'fixture-checkout-noches',createdAt:'2026-09-01T09:00:00Z'},
   {id:'fixture-website',deviceId:profile.deviceId,path:'/tmp/noches-fixture-website',name:'Website',gitDetected:true,checkoutId:'fixture-checkout-website',createdAt:'2026-09-02T09:00:00Z'},
 ];
+const SPACES = structuredClone(INITIAL_SPACES);
 const CHECKOUT = Object.fromEntries(SPACES.map(space => [space.id, space.checkoutId]));
 const TEXTS = {
   'fixture-space': {
@@ -79,6 +80,7 @@ const TEXTS = {
     'index.html': '<!doctype html>\n<title>Fixture site</title>\n',
   },
 };
+const INITIAL_TEXTS = structuredClone(TEXTS);
 const WORKSPACE_IMAGES = {
   'fixture-space': {
     'public/favicon.png': {bytes:ICON_PNG,hash:fnv(`icon-${ICON_PNG.length}`),mimeType:'image/png'},
@@ -121,6 +123,22 @@ let uploads = new Map();
 let attachments = new Map();
 let chats = [];
 let docs = new Map();
+let terminals = new Map();
+let cleanCheckouts = new Set();
+
+function checkoutDiff(chat) {
+  const clean = cleanCheckouts.has(chat?.checkoutId);
+  return {checkoutId:chat?.checkoutId ?? CHECKOUT['fixture-space'],cwd:chat?.cwd ?? '/tmp/noches-fixture',
+    checksum:clean ? 'fixture-clean' : 'fixture-dirty',truncated:false,
+    files:clean ? [] : [{path:'Sources/Client.swift',status:'modified',additions:1,deletions:1,binary:false}],
+    additions:clean ? 0 : 1,deletions:clean ? 0 : 1,
+    patch:clean ? '' : 'diff --git a/Sources/Client.swift b/Sources/Client.swift\n--- a/Sources/Client.swift\n+++ b/Sources/Client.swift\n@@ -1 +1 @@\n-let connected = false\n+let connected = true\n'};
+}
+function openTerminal(chat, output = 'Fixture shell ready\r\n$ ') {
+  const terminal = {id:randomUUID(),cwd:chat?.cwd ?? '/tmp/noches-fixture',shell:'zsh'};
+  terminals.set(terminal.id,{...terminal,event:{type:'data',seq:1,data:Buffer.from(output).toString('base64')}});
+  return terminal;
+}
 
 function chatRow(overrides) {
   return {id:'',deviceId:profile.deviceId,title:null,archived:false,cwd:null,branch:null,checkoutId:null,
@@ -235,6 +253,11 @@ function initialDocs() {
   ]);
 }
 function resetState() {
+  SPACES.splice(0,SPACES.length,...structuredClone(INITIAL_SPACES));
+  for (const key of Object.keys(TEXTS)) delete TEXTS[key];
+  Object.assign(TEXTS,structuredClone(INITIAL_TEXTS));
+  terminals = new Map();
+  cleanCheckouts = new Set();
   commands = [];
   approvalResolved = false;
   working = true;
@@ -275,6 +298,8 @@ const snapshots = {
   WatchSessions: () => sessionRows(),
   WatchDocMessages: params => docFrame(params?.chatId),
   WatchQueue: params => ({items:queued.filter(item => item.chatId === params?.chatId).map(({chatId, ...item}) => item)}),
+  WatchCheckoutDiffs: () => SPACES.map(space => checkoutDiff({checkoutId:CHECKOUT[space.id],cwd:space.path})),
+  SubscribeTerminal: params => terminals.get(params?.terminalId)?.event,
 };
 function mimeFor(name) {
   const ext = (name.split('.').pop() ?? '').toLowerCase();
@@ -304,6 +329,10 @@ const host = http.createServer((req,res) => {
   if(req.url === '/reset' && req.method === 'POST') {resetState();return res.end('{}');}
   if(req.url === '/health') return res.end(JSON.stringify({fixture:true}));
   if(req.url === '/commands') return res.end(JSON.stringify(commands));
+  if(req.url === '/change-file' && req.method === 'POST') {
+    TEXTS['fixture-space']['Sources/Client.swift']='// Changed on host\n';
+    return res.end('{}');
+  }
   res.statusCode=404; res.end('{}');
 });
 const server = new WebSocketServer({server:host,verifyClient:({req})=>raw || req.headers.authorization === `Bearer ${profile.token}`});
@@ -344,6 +373,57 @@ server.on('connection',socket=>{
       if(rpc.method==='EngineInfo') return reply({id:rpc.id,ok:{deviceId:profile.deviceId,workspaceScope:'local'}});
       if(rpc.method==='ListHarnesses') return reply({id:rpc.id,ok:HARNESSES});
       if(rpc.method==='ListModels') return reply({id:rpc.id,ok:Object.hasOwn(MODELS,rpc.params?.harness) ? MODELS[rpc.params.harness] : MODELS['claude-code']});
+      if(rpc.method==='ListFolders') {
+        commands.push(rpc);
+        const path=rpc.params?.path ?? '/tmp';
+        const folders={
+          '/':[{name:'tmp',isDir:true,isRepo:false}],
+          '/tmp':[{name:'noches-fixture',isDir:true,isRepo:true},{name:'mobile-qa-project',isDir:true,isRepo:true},{name:'notes',isDir:true,isRepo:false}],
+          '/tmp/noches-fixture':[{name:'Sources',isDir:true,isRepo:false}],
+          '/tmp/mobile-qa-project':[],
+          '/tmp/notes':[],
+        };
+        if(!Object.hasOwn(folders,path)) return reply({id:rpc.id,err:`Folder not found: ${path}`});
+        return reply({id:rpc.id,ok:{path,entries:folders[path],truncated:false}});
+      }
+      if(rpc.method==='ListDrives') return reply({id:rpc.id,ok:{drives:[{name:'System',path:'/'}]}});
+      if(rpc.method==='ListBranches') return reply({id:rpc.id,ok:['main','dev']});
+      if(rpc.method==='CreateWorktree') {
+        commands.push(rpc);
+        return reply({id:rpc.id,ok:{repoPath:rpc.params.repoPath,path:'/tmp/fixture-worktrees/qa-fox',
+          branch:'zeron/qa-fox',name:'qa-fox',checkoutId:'fixture-worktree'}});
+      }
+      if(rpc.method==='ListCommands') return reply({id:rpc.id,ok:[{name:'review',description:'Review local changes'},{name:'compact',description:'Compact context'}]});
+      if(['SearchFiles','SearchWorkspaceFiles'].includes(rpc.method)) {
+        commands.push(rpc);
+        const spaceId=chatFor(rpc.params?.chatId)?.spaceId;
+        const paths=Object.keys(TEXTS[spaceId] ?? {}).filter(path=>path.toLowerCase().includes((rpc.params?.query ?? '').toLowerCase()));
+        return reply({id:rpc.id,ok:paths.map(path=>rpc.method==='SearchFiles' ? {path,isDir:false} : {path,name:path.split('/').pop(),kind:'file'})});
+      }
+      if(rpc.method==='ListProjectActions') return reply({id:rpc.id,ok:{actions:[{id:'fixture-test',name:'Fixture tests',command:'printf QA_ACTION_OK',icon:'play'}]}});
+      if(rpc.method==='ListGitHistory') return reply({id:rpc.id,ok:{commits:[],comparison:{base:'main',ahead:2,behind:1}}});
+      if(rpc.method==='OpenTerminal') {
+        commands.push(rpc);
+        return reply({id:rpc.id,ok:openTerminal(chatFor(rpc.params?.chatId))});
+      }
+      if(rpc.method==='RunProjectAction') {
+        commands.push(rpc);
+        return reply({id:rpc.id,ok:{actionId:'fixture-test',actionName:'Fixture tests',
+          terminal:openTerminal(chatFor(rpc.params?.chatId),'QA_ACTION_OK\r\n')}});
+      }
+      if(['WriteTerminal','ResizeTerminal','CloseTerminal'].includes(rpc.method)) {
+        commands.push(rpc);
+        const terminal=terminals.get(rpc.params?.terminalId);
+        if(!terminal) return reply({id:rpc.id,err:'Unknown terminal'});
+        if(rpc.method==='WriteTerminal') {
+          const text=Buffer.from(rpc.params.data,'base64').toString();
+          terminal.event={type:'data',seq:terminal.event.seq+1,
+            data:Buffer.from(text+'\r\nQA_TERMINAL_OK\r\n$ ').toString('base64')};
+        }
+        if(rpc.method==='CloseTerminal') terminal.event={type:'exit',seq:terminal.event.seq+1,exitCode:0};
+        reply({id:rpc.id,ok:{}});
+        return reemit();
+      }
       if(Object.hasOwn(snapshots,rpc.method)) {watches.set(rpc.id,{method:rpc.method,params:rpc.params});return reply({id:rpc.id,item:snapshots[rpc.method](rpc.params)});}
       if(rpc.method==='ListWorkspaceDirectory') {
         commands.push(rpc);
@@ -359,7 +439,22 @@ server.on('connection',socket=>{
         const isImage=Buffer.isBuffer(image?.bytes);
         if(typeof text !== 'string' && !isImage) return reply({id:rpc.id,err:`file not found: ${path}`});
         if(isImage) return reply({id:rpc.id,ok:{checkoutId:CHECKOUT[spaceId],path,contentHash:image.hash,size:image.bytes.length,encoding:'binary',truncated:false}});
-        return reply({id:rpc.id,ok:{checkoutId:CHECKOUT[spaceId],path,text,contentHash:fnv(text),size:Buffer.byteLength(text),encoding:'utf8',truncated:false}});
+        return reply({id:rpc.id,ok:{checkoutId:CHECKOUT[spaceId],path,text,contentHash:fnv(text),size:Buffer.byteLength(text),encoding:'utf8',lineEnding:'lf',truncated:false}});
+      }
+      if(rpc.method==='WriteWorkspaceFile') {
+        commands.push(rpc);
+        const spaceId=chatFor(rpc.params?.chatId)?.spaceId, path=rpc.params?.path;
+        const text=TEXTS[spaceId]?.[path];
+        if(typeof text!=='string') return reply({id:rpc.id,err:'Unknown file'});
+        if(rpc.params.expectedCheckoutId!==CHECKOUT[spaceId] || rpc.params.expectedContentHash!==fnv(text))
+          return reply({id:rpc.id,ok:{status:'conflict',currentContentHash:fnv(text)}});
+        TEXTS[spaceId][path]=rpc.params.text;
+        reply({id:rpc.id,ok:{status:'written',file:{contentHash:fnv(rpc.params.text)}}});
+        return reemit();
+      }
+      if(rpc.method==='FixtureChangeFile') {
+        TEXTS['fixture-space']['Sources/Client.swift']='// Changed on host\n';
+        return reply({id:rpc.id,ok:{}});
       }
       if(rpc.method==='ReadWorkspaceImage') {
         commands.push(rpc);
@@ -373,7 +468,14 @@ server.on('connection',socket=>{
       }
       if(rpc.method==='GetCheckoutDiff') {
         commands.push(rpc);
-        return reply({id:rpc.id,ok:{files:[{path:'Sources/Client.swift',additions:1,deletions:1}],additions:1,deletions:1,truncated:false,patch:'diff --git a/Sources/Client.swift b/Sources/Client.swift\n--- a/Sources/Client.swift\n+++ b/Sources/Client.swift\n@@ -1 +1 @@\n-let connected = false\n+let connected = true'}});
+        return reply({id:rpc.id,ok:checkoutDiff(chatFor(rpc.params?.chatId))});
+      }
+      if(rpc.method==='DiscardWorkingTree') {
+        commands.push(rpc);
+        if(rpc.params.expectedChecksum!=='fixture-dirty') return reply({id:rpc.id,err:'Stale diff'});
+        cleanCheckouts.add(rpc.params.checkoutId);
+        reply({id:rpc.id,ok:{}});
+        return reemit();
       }
       if(rpc.method==='ReadAttachmentChunk') {
         commands.push(rpc);
@@ -500,6 +602,19 @@ server.on('connection',socket=>{
       if(rpc.method==='Mutate') {
         commands.push(rpc);
         const op=rpc.params?.op;
+        if(op==='createSpace') {
+          const space={id:rpc.params.spaceId,deviceId:rpc.params.deviceId,path:rpc.params.path,name:rpc.params.name,
+            gitDetected:rpc.params.gitDetected ?? false,createdAt:now(),checkoutId:`checkout-${rpc.params.spaceId}`};
+          SPACES.push(space);CHECKOUT[space.id]=space.checkoutId;TEXTS[space.id]={'README.md':'# New fixture project\n'};
+          reply({id:rpc.id,ok:{}});return reemit();
+        }
+        if(op==='renameSpace' || op==='deleteSpace') {
+          const index=SPACES.findIndex(space=>space.id===rpc.params.spaceId);
+          if(index<0) return reply({id:rpc.id,err:'Unknown project'});
+          if(op==='renameSpace') SPACES[index].name=rpc.params.name;
+          else {SPACES.splice(index,1);chats=chats.filter(chat=>chat.spaceId!==rpc.params.spaceId);}
+          reply({id:rpc.id,ok:{}});return reemit();
+        }
         if(op==='createChat') {
           const space=SPACES.find(entry => entry.id===rpc.params.spaceId);
           chats.push(chatRow({id:rpc.params.chatId,title:'New mobile session',spaceId:rpc.params.spaceId ?? null,

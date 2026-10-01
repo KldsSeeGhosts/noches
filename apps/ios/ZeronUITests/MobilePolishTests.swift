@@ -16,10 +16,19 @@ final class MobilePolishTests: XCTestCase {
     }
 
     private func capture(_ name: String) {
-        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        let screenshot = XCUIScreen.main.screenshot()
+        if let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            try? screenshot.pngRepresentation.write(to: directory.appendingPathComponent("\(name).png"))
+        }
+        let attachment = XCTAttachment(screenshot: screenshot)
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+    override func tearDown() {
+        capture("final-\(name.replacingOccurrences(of: "/", with: "-"))")
+        print(app.debugDescription)
+        super.tearDown()
     }
 
     private func waitUntilHittable(_ element: XCUIElement, timeout: TimeInterval = 5) {
@@ -78,7 +87,7 @@ final class MobilePolishTests: XCTestCase {
     }
 
     func testStreamingComposerAndCancelledBackSwipeKeepTranscriptVisible() {
-        launch(["-route", "chat:chat-tabs", "-slowstream"])
+        launch(["-route", "chat:chat-tabs", "-slowstream", "-focuscomposer"])
         composer.tap()
         composer.typeText("Check keyboard and navigation transitions.")
         app.buttons["composer-send"].tap()
@@ -114,7 +123,7 @@ final class MobilePolishTests: XCTestCase {
     }
 
     func testSendClearsComposerAndKeepsTheNextDraft() {
-        launch(["-route", "chat:chat-tabs", "-slowstream"])
+        launch(["-route", "chat:chat-tabs", "-slowstream", "-focuscomposer"])
         composer.tap()
         for (cycle, prompt) in ["Fix teh flicker", "A multiline draft\nwith another line", "Keep emoji 👋🏽 and 你好"].enumerated() {
             composer.typeText(prompt)
@@ -130,6 +139,12 @@ final class MobilePolishTests: XCTestCase {
             XCTAssertEqual(composer.value as? String, next)
             capture("sent-cleared-next-draft-\(cycle)")
             composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: next.count))
+            // Demo hosts don't advertise a shared queue. Finish this turn
+            // before the next cycle submits another run.
+            let idle = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                self.app.buttons["composer-send"].label == "Send message"
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [idle], timeout: 60), .completed)
         }
     }
 
@@ -140,7 +155,7 @@ final class MobilePolishTests: XCTestCase {
         for (index, project) in ["zeron", "edge", "All", "zeron", "All"].enumerated() {
             filter.tap()
             if index == 0 { capture("project-menu") }
-            let choice = app.buttons.matching(NSPredicate(format: "label == %@", project)).firstMatch
+            let choice = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", project)).firstMatch
             XCTAssertTrue(choice.waitForExistence(timeout: 3))
             choice.tap()
             XCTAssertTrue(filter.waitForExistence(timeout: 3))
@@ -222,7 +237,7 @@ final class MobilePolishTests: XCTestCase {
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "cargo test")).firstMatch.exists)
         capture("tool-activity")
         composer.tap()
-        let model = app.buttons["GPT-5.6-Terra"]
+        let model = app.buttons["GPT-6.1-Sol"]
         XCTAssertTrue(model.waitForExistence(timeout: 3))
         model.tap()
         capture("model-picker")
@@ -244,7 +259,7 @@ final class MobilePolishTests: XCTestCase {
         let create = app.buttons["New session"]
         XCTAssertTrue(create.waitForExistence(timeout: 3))
         create.tap()
-        app.buttons.matching(NSPredicate(format: "label == %@", "zeron")).firstMatch.tap()
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "zeron")).firstMatch.tap()
         XCTAssertTrue(app.buttons["composer-send"].waitForExistence(timeout: 3))
         capture("new-session")
     }

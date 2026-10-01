@@ -248,15 +248,21 @@ struct AppearanceSettingsView: View {
     @State private var error: String?
     var body: some View {
         Form {
-            Section("Appearance") {
-                Picker("Appearance", selection: $settings.mode) {
+            Section {
+                AppearancePreview()
+                    .listRowBackground(Theme.surface)
+            } footer: {
+                Text("A live sample of the current theme, accent and status colors.").font(Theme.sans(12))
+            }
+            Section {
+                Picker("Mode", selection: $settings.mode) {
                     Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark")
                 }
                 themePicker("Light theme", appearance: "light", selection: $settings.light)
                 themePicker("Dark theme", appearance: "dark", selection: $settings.dark)
-            }
-            .listRowBackground(Theme.surfaceRaised)
-            Section("Color and surfaces") {
+            } header: { Text("Theme").font(Theme.sans(13, weight: .medium)) }
+            .listRowBackground(Theme.surface)
+            Section {
                 Picker("Accent", selection: $settings.accent) {
                     Text("Theme default").tag("themeDefault")
                     ForEach(AppearanceSettings.presetNames, id: \.self) {
@@ -267,29 +273,29 @@ struct AppearanceSettingsView: View {
                     Text("Theme default").tag("themeDefault")
                     Text("Frosted").tag("frosted"); Text("Opaque").tag("opaque")
                 }
-            }
-            .listRowBackground(Theme.surfaceRaised)
+            } header: { Text("Color").font(Theme.sans(13, weight: .medium)) }
+            .listRowBackground(Theme.surface)
             Section {
-                VStack(alignment: .leading, spacing: 12) {
-                    Label("Your agents, on your computer", systemImage: "desktopcomputer")
-                        .font(Theme.sans(18, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text("Geist for conversation. Geist Mono for code.")
-                        .font(Theme.sans(14)).foregroundStyle(Theme.textMuted)
-                    Text("noches · connected").font(Theme.mono(13)).foregroundStyle(Theme.accent)
-                }.padding(.vertical, 12)
-            }.listRowBackground(Theme.surfaceRaised)
-            Section {
-                Button("Import desktop theme…") { importing = true }
-                if let error { Text(error).foregroundStyle(Theme.danger) }
+                Button { importing = true } label: {
+                    HStack(spacing: 8) {
+                        Text("Import desktop theme…").foregroundStyle(Theme.text)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if let error { Text(error).font(Theme.sans(13)).foregroundStyle(Theme.danger) }
             } footer: {
                 Text("Uses the desktop's theme catalog and accent colors. Import a resolved theme family JSON file to add a custom theme.")
+                    .font(Theme.sans(12))
             }
-            .listRowBackground(Theme.surfaceRaised)
+            .listRowBackground(Theme.surface)
         }
-        .font(Theme.sans(16))
+        .listStyle(.insetGrouped)
+        .font(Theme.sans(15))
         .foregroundStyle(Theme.text)
         .scrollContentBackground(.hidden).background(Theme.bg)
-        .navigationTitle("Appearance")
+        .navigationTitle("Appearance").navigationBarTitleDisplayMode(.inline)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
             do {
                 let url = try result.get()
@@ -306,6 +312,61 @@ struct AppearanceSettingsView: View {
                 Text(variant.name.replacingOccurrences(of: "Zeron", with: "Noches")).tag(variant.id)
             }
         }
+    }
+}
+
+/// A live sample of the active theme: a thread card with its status hue and
+/// monospace metadata, a few syntax-colored lines, and the accent. It reads
+/// the same `Theme` tokens the rest of the app does, so it changes with every
+/// picker above it.
+private struct AppearancePreview: View {
+    private let states: [(String, Color)] = [
+        ("Working", Theme.statusWorking),
+        ("Awaiting input", SessionState.awaitingInput.color ?? Theme.accent),
+        ("Completed", Theme.statusCompleted),
+        ("Failed", Theme.danger),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Circle().fill(Theme.statusWorking).frame(width: 7, height: 7).alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Build the mobile companion").font(Theme.sans(15, weight: .medium)).foregroundStyle(Theme.text)
+                    Text("companion/mobile · 12m").font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
+                }
+                Spacer(minLength: 0)
+                Text("Working").font(Theme.sans(12)).foregroundStyle(Theme.statusWorking)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                (Text("struct ").foregroundColor(Theme.tokenKeyword) + Text("Client {").foregroundColor(Theme.text))
+                (Text("    let ").foregroundColor(Theme.tokenKeyword) + Text("host = ").foregroundColor(Theme.text)
+                    + Text("\"studio\"").foregroundColor(Theme.tokenString))
+                (Text("    let ").foregroundColor(Theme.tokenKeyword) + Text("retries = ").foregroundColor(Theme.text)
+                    + Text("3").foregroundColor(Theme.tokenNumber))
+                Text("}").foregroundColor(Theme.text)
+            }
+            .font(Theme.mono(12))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 14) {
+                ForEach(states, id: \.0) { state in
+                    HStack(spacing: 5) {
+                        Circle().fill(state.1).frame(width: 6, height: 6)
+                        Text(state.0).font(Theme.mono(11)).foregroundStyle(Theme.textMuted).lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .minimumScaleFactor(0.8)
+            Text("Accent")
+                .font(Theme.sans(13, weight: .medium)).foregroundStyle(Theme.accent)
+                .padding(.horizontal, 12).frame(height: 28)
+                .background(Theme.accent.opacity(0.14), in: Capsule())
+        }
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Theme preview")
     }
 }
 

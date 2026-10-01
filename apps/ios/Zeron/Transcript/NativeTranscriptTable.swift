@@ -541,7 +541,9 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         cell.contentView.backgroundColor = .clear
         let content = render?(row)
         cell.contentConfiguration = UIHostingConfiguration {
-            content.id(row.id).ignoresSafeArea()
+            // The native viewport owns safe-area underlap. Ignoring it again
+            // here inflates tall hosted rows and leaves a gap beneath the tail.
+            content.id(row.id)
         }.margins(.all, 0)
         return cell
     }

@@ -59,7 +59,7 @@ struct CompanionProjectList: View {
     }
 
     private func row(_ group: CompanionProjectGroup) -> some View {
-        Button { selection = group.projectID; dismiss() } label: {
+        Button { selection = group.filterID; dismiss() } label: {
             HStack(spacing: 12) {
                 CompanionProjectBadge(model: model, space: group.space, name: group.name,
                                       seed: group.space?.path ?? "home", size: 22)
@@ -71,7 +71,7 @@ struct CompanionProjectList: View {
                 Spacer(minLength: 8)
                 CompanionStateDots(needsYou: group.needsYou, running: group.running)
                 Text("\(group.chats.count)").font(Theme.mono(12)).foregroundStyle(Theme.textFaint)
-                check(selection == group.projectID)
+                check(selection == group.filterID)
             }
             .frame(minHeight: 52).contentShape(Rectangle())
         }

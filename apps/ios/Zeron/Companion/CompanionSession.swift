@@ -76,37 +76,20 @@ struct CompanionSessionView: View {
 
     // MARK: Header
 
-    /// One glass group: a Workspace menu (Changes, Files, Terminal, project
-    /// actions) and the session More menu. Each slot stays 38pt wide so the
-    /// two-line title keeps its room; the hit target is 44pt tall.
+    /// One menu: Workspace (changes, files, terminal, project actions), then
+    /// the session itself (rename, archive). One 44pt glass target instead of
+    /// two pills competing with the title for width.
     private var actions: some View {
-        HStack(spacing: 0) {
-            Menu {
-                Button("Review changes", systemImage: "arrow.triangle.branch") { inspector = .changes }
-                Button("Browse files", systemImage: "folder") { inspector = .files }
-                Button("Terminal", systemImage: "terminal") { inspector = .terminal }
-                if !projectActions.isEmpty {
-                    Divider()
-                    ForEach(projectActions) { action in
-                        Button("Run: \(action.name)", systemImage: "play") { run(action) }
-                            .disabled(runningAction != nil)
-                    }
-                }
-            } label: {
-                Image(systemName: "rectangle.stack")
-                    .frame(width: 38, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .disabled(!model.online)
-            .accessibilityLabel("Workspace: changes, files, terminal, actions")
-            CompanionSessionMenu(model: model, chat: currentChat, archived: { dismiss() })
-                .frame(width: 38, height: 44)
-        }
-        .frame(height: 44)
+        CompanionSessionActions(model: model, chat: currentChat, projectActions: projectActions,
+                                runningAction: runningAction,
+                                open: { inspector = $0 }, run: run, archived: { dismiss() })
     }
 
+    /// Line one: harness mark and title. Line two: project, branch, and the
+    /// working-tree diff, all 11pt mono metadata. Nothing is joined with
+    /// punctuation; the branch carries its own glyph.
     private var header: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 3) {
             HStack(spacing: 6) {
                 BrandMarkShape(mark: mark)
                     .fill(BrandMark.tint(for: harness), style: FillStyle(eoFill: mark.evenOddFill))
@@ -117,14 +100,19 @@ struct CompanionSessionView: View {
                     .truncationMode(.tail)
             }
             .frame(maxWidth: .infinity)
-            HStack(spacing: 5) {
+            HStack(spacing: 6) {
                 ProjectBadge(name: model.projectName(for: currentChat),
                              seed: model.monogramSeed(for: currentChat), image: badge, size: 12)
-                Text(contextLine)
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.textFaint)
+                Text(model.projectName(for: currentChat))
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .layoutPriority(1)
+                if let branch = currentChat.branch, !branch.isEmpty {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.triangle.branch").font(.system(size: 9, weight: .medium))
+                        Text(branch).lineLimit(1).truncationMode(.middle)
+                    }
+                }
                 if let diff = changes.diff, !diff.files.isEmpty {
                     Button { inspector = .changes } label: {
                         DiffStat(additions: diff.additions, deletions: diff.deletions)
@@ -136,16 +124,18 @@ struct CompanionSessionView: View {
                     .accessibilityLabel("Review changes, \(diff.additions) additions, \(diff.deletions) deletions")
                 }
             }
+            .font(Theme.mono(11))
+            .foregroundStyle(Theme.textFaint)
             .frame(maxWidth: .infinity, maxHeight: 22)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(currentChat.displayTitle), \(contextLine)")
     }
 
-    /// `{project}:{branch}`, just the project when there is no branch.
+    /// Spoken form of the second line: project, then branch.
     private var contextLine: String {
         let project = model.projectName(for: currentChat)
-        if let branch = currentChat.branch, !branch.isEmpty { return "\(project):\(branch)" }
+        if let branch = currentChat.branch, !branch.isEmpty { return "\(project), branch \(branch)" }
         return project
     }
 
@@ -157,74 +147,76 @@ struct CompanionSessionView: View {
                                 busy: responding, submittedID: submittedID) { id, answers in
                 perform { try await model.respond(requestID: id, answers: answers, chat: currentChat) }
             }
-            if !loaded { ProgressView("Loading session…").font(Theme.sans(13)) }
+            if !loaded { ProgressView().accessibilityLabel("Loading session") }
             if loaded && messages.isEmpty { emptyState }
         }
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             BrandMarkShape(mark: mark)
                 .fill(BrandMark.tint(for: harness), style: FillStyle(eoFill: mark.evenOddFill))
-                .frame(width: 28, height: 28)
+                .frame(width: 24, height: 24)
             Text("What are we working on?")
-                .font(Theme.sans(21, weight: .medium))
-                .tracking(-0.5)
+                .font(Theme.sans(20, weight: .medium))
+                .tracking(-0.4)
             Text(currentChat.cwd ?? "Home folder")
-                .font(Theme.mono(12))
+                .font(Theme.mono(11))
                 .foregroundStyle(Theme.textFaint)
+                .lineLimit(1)
+                .truncationMode(.head)
         }
-        .padding(30)
+        .padding(.horizontal, Theme.spaceLG)
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: Bottom cluster
 
+    /// Top to bottom: connection and error notes, the live activity line, the
+    /// flush tray sections, then the composer pill. Every row shares the same
+    /// 16pt side margin.
     private var bottom: some View {
         VStack(alignment: .leading, spacing: 0) {
             if !model.online {
-                Text("Reconnecting to your computer…")
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.warning)
-                    .padding(.bottom, 6)
+                note("Reconnecting to your computer…", color: Theme.warning)
             }
             if let error {
-                Text(error)
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.danger)
-                    .textSelection(.enabled)
-                    .lineLimit(3)
-                    .padding(.bottom, 6)
+                note(error, color: Theme.danger).textSelection(.enabled).lineLimit(3)
             }
             if state == .working || state == .awaitingInput || state == .failed {
                 CompanionActivityLine(state: state, since: model.workingSince(currentChat))
-                    .padding(.leading, 4)
-                    .padding(.bottom, 8)
+                    .padding(.horizontal, Theme.spaceLG)
+                    .padding(.bottom, 10)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            VStack(spacing: -trayTuck) {
-                if !agents.isEmpty {
-                    CompanionAgentsTray(model: model, agents: agents)
-                        .zIndex(0)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-                if !queue.isEmpty {
-                    CompanionQueueTray(model: model, chat: currentChat, items: queue,
-                                       steers: steers, error: $error)
-                        .zIndex(1)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-                CompanionComposer(model: model, chat: currentChat, draft: draft,
-                                  usage: contextUsage, state: state,
-                                  send: send, stop: { try await model.stop(currentChat) },
-                                  error: $error, focused: $composerFocused)
-                    .zIndex(2)
+            if !agents.isEmpty && !composerFocused {
+                CompanionAgentsTray(model: model, agents: agents)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            if !queue.isEmpty {
+                CompanionQueueTray(model: model, chat: currentChat, items: queue,
+                                   steers: steers, composing: composerFocused, error: $error)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            CompanionComposer(model: model, chat: currentChat, draft: draft,
+                              usage: contextUsage, state: state,
+                              send: send, stop: { try await model.stop(currentChat) },
+                              error: $error, focused: $composerFocused)
+                .padding(.horizontal, Theme.spaceLG)
+                .padding(.top, 8)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 6)
+        .padding(.top, 8)
         .padding(.bottom, 8 + (composerFocused ? 48 : 0))
         .background(Theme.bg)
         .motionAnimation(Motion.fadeQuick, value: composerFocused)
+    }
+
+    private func note(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(Theme.sans(13))
+            .foregroundStyle(color)
+            .padding(.horizontal, Theme.spaceLG)
+            .padding(.bottom, 8)
     }
 
     // MARK: Wiring

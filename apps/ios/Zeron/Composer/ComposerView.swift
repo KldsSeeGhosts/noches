@@ -123,7 +123,7 @@ struct ComposerShell<Chips: View>: View {
             }
         }
         .padding(.horizontal, expanded ? 12 : 5)
-        .padding(.vertical, expanded ? 12 : 5)
+        .padding(.vertical, expanded ? (compact ? 6 : 12) : 5)
         .background(Theme.wash(0.04), in: surfaceShape)
         .nochesGlass(.regular.interactive(), in: surfaceShape)
         .overlay(surfaceShape.strokeBorder(Theme.wash(0.05), lineWidth: 1))
@@ -739,78 +739,83 @@ struct QuestionPanel: View {
         }
     }
 
+    /// A flush request card: a hairline outline, rows divided by hairlines,
+    /// no nested fills. The header carries the awaiting-input status hue (the
+    /// only color on the card); every row is a 44pt target.
     private func panel(for question: UserInputQuestion) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(question.header.uppercased())
-                    .font(Theme.sans(10.5, weight: .medium))
-                    .kerning(1)
-                    .foregroundStyle(Theme.textMuted.opacity(0.6))
-                Spacer()
-                if questions.count > 1 {
-                    Text("\(page + 1)/\(questions.count)")
-                        .font(Theme.sans(10))
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    StatusGlyph(state: .awaitingInput, size: 11)
+                    Text(question.header)
+                        .font(Theme.sans(12, weight: .medium))
                         .foregroundStyle(Theme.textMuted)
-                        .padding(.horizontal, 6)
-                        .frame(height: 20)
-                        .background(Theme.wash(0.06), in: RoundedRectangle(cornerRadius: 6))
-                }
-            }
-
-            Text(question.question)
-                .font(Theme.sans(15, weight: .medium))
-                .foregroundStyle(Theme.text)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if question.multiSelect == true {
-                Text("Select one or more options.")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textMuted)
-            }
-
-            VStack(spacing: 4) {
-                ForEach(Array(question.options.enumerated()), id: \.offset) { ix, option in
-                    optionRow(question: question, ix: ix, option: option)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Rectangle().fill(Theme.wash(0.06)).frame(height: 1)
-                TextField("Or type your own answer", text: Binding(
-                    get: { typed[question.id] ?? "" },
-                    set: { typed[question.id] = $0 }
-                ))
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.text)
-                .padding(.top, 6)
-            }
-
-            HStack {
-                if page > 0 {
-                    Button("Back") {
-                        page -= 1
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if questions.count > 1 {
+                        Text("\(page + 1)/\(questions.count)")
+                            .font(Theme.mono(11))
+                            .foregroundStyle(Theme.textFaint)
                     }
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(Theme.textMuted)
+                }
+                Text(question.question)
+                    .font(Theme.sans(16, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                if question.multiSelect == true {
+                    Text("Select one or more options.")
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.textFaint)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+
+            ForEach(Array(question.options.enumerated()), id: \.offset) { ix, option in
+                hairline
+                optionRow(question: question, ix: ix, option: option)
+            }
+
+            hairline
+            TextField("Or type your own answer", text: Binding(
+                get: { typed[question.id] ?? "" },
+                set: { typed[question.id] = $0 }
+            ))
+            .font(Theme.sans(15))
+            .foregroundStyle(Theme.text)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 44)
+
+            hairline
+            HStack(spacing: 0) {
+                if page > 0 {
+                    Button("Back") { page -= 1 }
+                        .font(Theme.sans(14, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(minWidth: 44, minHeight: 44, alignment: .leading)
                 }
                 Spacer()
                 Button(page < questions.count - 1 ? "Next" : "Submit") {
                     advance()
                 }
-                .font(Theme.sans(13, weight: .medium))
-                .foregroundStyle(Theme.bg)
+                .font(Theme.sans(14, weight: .medium))
+                .foregroundStyle(canAdvance(question) ? Theme.bg : Theme.textFaint)
                 .padding(.horizontal, 16)
-                .frame(height: 34)
-                .background(Theme.text, in: Capsule())
-                .opacity(canAdvance(question) ? 1 : 0.4)
+                .frame(height: 36)
+                .background(canAdvance(question) ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.wash(0.08)), in: Capsule())
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
                 .disabled(!canAdvance(question))
             }
+            .padding(.horizontal, 16)
         }
-        .padding(16)
-        .nochesGlass(.regular, in: RoundedRectangle(cornerRadius: 26))
-        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(Theme.wash(0.05), lineWidth: 1))
-        .padding(.horizontal, 12)
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.border, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .transition(.opacity)
+    }
+
+    private var hairline: some View {
+        Rectangle().fill(Theme.border).frame(height: 1)
     }
 
     private func optionRow(question: UserInputQuestion, ix: Int, option: String) -> some View {
@@ -820,27 +825,25 @@ struct QuestionPanel: View {
             pick(question: question, option: option)
         } label: {
             HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(option)
-                        .font(Theme.sans(13.5, weight: .medium))
-                        .foregroundStyle(Theme.text)
-                        .multilineTextAlignment(.leading)
-                }
+                Text(option)
+                    .font(Theme.sans(15))
+                    .foregroundStyle(Theme.text)
+                    .multilineTextAlignment(.leading)
                 Spacer(minLength: 0)
-                if ix < 9 {
+                if isPicked {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                } else if ix < 9 {
                     Text("\(ix + 1)")
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textMuted)
-                        .frame(width: 22, height: 22)
-                        .background(Theme.wash(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.textFaint)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(isPicked ? Theme.wash(0.09) : Theme.wash(0.025),
-                        in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(isPicked ? Theme.wash(0.16) : .clear, lineWidth: 1))
+            .padding(.horizontal, 16)
+            .frame(minHeight: 44)
+            .background(isPicked ? Theme.wash(0.05) : .clear)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }

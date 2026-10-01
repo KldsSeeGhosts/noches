@@ -274,20 +274,43 @@ struct CompanionTerminalView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            statusStrip
             scrollback
-            Divider().overlay(Theme.border)
-            keyRow
+            SheetHairline()
+            keyRow.padding(.top, 8)
             inputRow
         }
         .background(Theme.bg).foregroundStyle(Theme.text)
         .navigationTitle("Terminal").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button("Close terminal", systemImage: "xmark.bin") { session.close(model: model, chat: chat) }
-                    .frame(minWidth: 44, minHeight: 44).disabled(session.terminalId == nil)
-            }
-        }
         .task(id: "\(model.generation)-\(model.online)") { await session.run(model: model, chat: chat) }
+    }
+
+    /// Connection state and the one destructive action, in a quiet strip under
+    /// the nav bar rather than a bare glyph in it.
+    private var statusStrip: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Circle().fill(statusTint).frame(width: 6, height: 6)
+                Text(session.error.map { "\(session.status): \($0)" } ?? session.status)
+                    .font(Theme.mono(11)).foregroundStyle(session.exited || session.error != nil ? Theme.warning : Theme.textFaint)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button { session.close(model: model, chat: chat) } label: {
+                    Text("Close").font(Theme.sans(13, weight: .medium)).foregroundStyle(Theme.textMuted)
+                        .padding(.horizontal, 8).frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close terminal")
+                .disabled(session.terminalId == nil)
+            }
+            .padding(.leading, SheetMetrics.margin).padding(.trailing, 8)
+            SheetHairline()
+        }
+    }
+
+    private var statusTint: Color {
+        if session.exited || session.error != nil { return Theme.warning }
+        return session.status == "Connected" ? Theme.statusCompleted : Theme.textFaint
     }
 
     private var scrollback: some View {
@@ -303,25 +326,20 @@ struct CompanionTerminalView: View {
                         }
                         Color.clear.frame(height: 1).id("end")
                     }
-                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 8)
                     .textSelection(.enabled)
                 }
                 .defaultScrollAnchor(.bottom)
                 .onChange(of: session.revision) { _, _ in reader.scrollTo("end", anchor: .bottom) }
             }
             .onChange(of: proxy.size) { _, size in
-                session.resize(cols: Int((size.width - 20) / Self.charWidth), rows: Int((size.height - 16) / Self.lineHeight),
+                session.resize(cols: Int((size.width - 32) / Self.charWidth), rows: Int((size.height - 16) / Self.lineHeight),
                                model: model, chat: chat)
             }
             .onAppear {
-                session.resize(cols: Int((proxy.size.width - 20) / Self.charWidth), rows: Int((proxy.size.height - 16) / Self.lineHeight),
+                session.resize(cols: Int((proxy.size.width - 32) / Self.charWidth), rows: Int((proxy.size.height - 16) / Self.lineHeight),
                                model: model, chat: chat)
             }
-        }
-        .overlay(alignment: .topTrailing) {
-            Text(session.error.map { "\(session.status): \($0)" } ?? session.status)
-                .font(Theme.mono(11)).foregroundStyle(session.exited || session.error != nil ? Theme.warning : Theme.textFaint)
-                .lineLimit(1).padding(.horizontal, 10).padding(.top, 4)
         }
     }
 
@@ -334,7 +352,7 @@ struct CompanionTerminalView: View {
                     keyButton(symbol) { session.send(Data(symbol.utf8), model: model, chat: chat) }
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, SheetMetrics.margin)
         }
     }
 
@@ -345,8 +363,10 @@ struct CompanionTerminalView: View {
     private func keyButton(_ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(label).font(Theme.mono(13)).foregroundStyle(Theme.text)
-                .frame(minWidth: 44, minHeight: 44).padding(.horizontal, 4)
-                .background(Theme.elementHover, in: RoundedRectangle(cornerRadius: Theme.controlRadius))
+                .frame(minWidth: 44, minHeight: 36).padding(.horizontal, 4)
+                .background(Theme.wash(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain).disabled(session.exited)
     }
@@ -357,16 +377,25 @@ struct CompanionTerminalView: View {
                 .font(Theme.mono(14)).focused($focused)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .submitLabel(.send).onSubmit(send)
-                .padding(.horizontal, 12).frame(minHeight: 44)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.panelRadius))
+                .padding(.horizontal, 14).frame(minHeight: 44)
+                .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
             Button(action: send) {
-                Image(systemName: "return").frame(width: 44, height: 44)
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(canSend ? Theme.bg : Theme.textFaint)
+                    .frame(width: 36, height: 36)
+                    .background(canSend ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.wash(0.08)), in: Circle())
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("Send")
+            .accessibilityIdentifier("terminal-send")
             .disabled(session.exited)
         }
-        .padding(.horizontal, 10).padding(.bottom, 8)
+        .padding(.horizontal, SheetMetrics.margin).padding(.bottom, 8)
     }
+
+    private var canSend: Bool { !session.exited && !input.isEmpty }
 
     private func send() {
         session.send(Data((input + "\r").utf8), model: model, chat: chat)

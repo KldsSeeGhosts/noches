@@ -26,6 +26,7 @@ struct CompanionComposer: View {
     @State private var saving = false
     @State private var uploading: (done: Int, total: Int)?
     @State private var showContext = false
+    @State private var showAccess = false
     @State private var access: CompanionAccess = .ask
     @State private var fileMatches: [HostFileMatch] = []
     @State private var commands: [HostSlashCommand] = []
@@ -49,10 +50,10 @@ struct CompanionComposer: View {
         if let reasoning = chat.config?.reasoning, currentModel.reasoningLevels.contains(reasoning) { return reasoning }
         return HarnessCatalog.defaultReasoning(for: currentModel)
     }
-    /// `pickers.rs chip_model_label`: only the last `/` segment survives.
-    private var modelName: String {
-        currentModel.label.components(separatedBy: "/").last ?? currentModel.label
-    }
+    /// `pickers.rs chip_model_label`: only the last `/` segment survives, and
+    /// the chip drops a leading vendor word the brand mark already says
+    /// ("Claude Sonnet 4.5" reads "Sonnet 4.5").
+    private var modelName: String { chipLabel(currentModel.label) }
 
     private var placeholder: String {
         running ? "Queue a follow-up…" : "Message \(harnessLabel)…"
@@ -113,7 +114,7 @@ struct CompanionComposer: View {
     // MARK: Pill
 
     private var pill: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             if hasSuggestions { suggestionList }
             if !staged.isEmpty { attachmentRow }
             TextField(placeholder, text: $draft, axis: .vertical)
@@ -127,13 +128,12 @@ struct CompanionComposer: View {
                     submit()
                     return .handled
                 }
-                .padding(.horizontal, 2)
-                .padding(.top, 2)
+                .padding(.horizontal, 8)
             controlRow
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 8)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
         .background(Theme.wash(0.04), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .nochesGlass(.regular.interactive(), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
     }
@@ -152,6 +152,7 @@ struct CompanionComposer: View {
                 }
             }
         }
+        .padding(.horizontal, 4)
         .accessibilityIdentifier("composer-suggestions")
     }
 
@@ -195,6 +196,7 @@ struct CompanionComposer: View {
                 attachmentThumb(item)
             }
         }
+        .padding(.horizontal, 8)
     }
 
     private func attachmentThumb(_ item: StagedAttachment) -> some View {
@@ -221,28 +223,30 @@ struct CompanionComposer: View {
             .accessibilityLabel("Attached image")
     }
 
+    /// One 44pt-tall row: attach, model, access, then context and the action
+    /// button pinned right. Adjacent targets touch rather than overlap, so
+    /// the glyphs share a single optical baseline.
     private var controlRow: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 0) {
             attachButton
             modelChip
             accessChip
-            Spacer(minLength: 4)
+            Spacer(minLength: 0)
             if showsRing {
                 contextButton
             }
             actionButton
         }
+        .frame(height: 44)
     }
 
     private var attachButton: some View {
         Button { pickerPresented = true } label: {
             Image(systemName: "plus")
-                .font(.system(size: 15, weight: .medium))
+                .font(.system(size: 16, weight: .regular))
                 .foregroundStyle(Theme.textMuted)
-                .frame(width: 32, height: 32)
-                .background(Theme.wash(0.06), in: Circle())
                 .frame(width: 44, height: 44)
-                .contentShape(Circle())
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(busy || !model.online || staged.count >= 6)
@@ -269,61 +273,130 @@ struct CompanionComposer: View {
                 }
             }
         } label: {
-            HStack(spacing: 6) {
-                BrandMarkShape(mark: mark)
-                    .fill(BrandMark.tint(for: harness), style: FillStyle(eoFill: mark.evenOddFill))
-                    .frame(width: 12, height: 12)
-                Text(modelName)
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.textMuted)
-                    .lineLimit(1)
-                if let reasoning = currentReasoning {
-                    Text(HarnessCatalog.reasoningLabel(reasoning))
-                        .font(Theme.sans(12))
-                        .foregroundStyle(Theme.textFaint)
-                        .lineLimit(1)
-                }
+            ViewThatFits(in: .horizontal) {
+                chipLabelRow(showReasoning: true)
+                chipLabelRow(showReasoning: false)
             }
             .padding(.horizontal, 8)
-            .frame(minHeight: 32)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .disabled(busy || saving || !model.online)
         .accessibilityLabel("Model: \(modelName)\(currentReasoning.map { ", reasoning \(HarnessCatalog.reasoningLabel($0))" } ?? "")")
     }
 
-    private var accessChip: some View {
-        Menu {
-            Picker("Approvals", selection: Binding(get: { access }, set: { setAccess($0) })) {
-                ForEach(CompanionAccess.allCases, id: \.self) { Label($0.label, systemImage: $0.icon).tag($0) }
+    private func chipLabelRow(showReasoning: Bool) -> some View {
+        HStack(spacing: 6) {
+            BrandMarkShape(mark: mark)
+                .fill(BrandMark.tint(for: harness), style: FillStyle(eoFill: mark.evenOddFill))
+                .frame(width: 12, height: 12)
+            Text(modelName)
+                .font(Theme.sans(13))
+                .foregroundStyle(Theme.textMuted)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if showReasoning, let reasoning = currentReasoning {
+                Text(HarnessCatalog.reasoningLabel(reasoning))
+                    .font(Theme.sans(13))
+                    .foregroundStyle(Theme.textFaint)
+                    .lineLimit(1)
+                    .fixedSize()
             }
-            Divider()
-            Picker("Sandbox", selection: Binding(get: { sandbox }, set: { setSandbox($0) })) {
-                ForEach(CompanionSandbox.allCases, id: \.self) { Text($0.label).tag($0) }
-            }
-        } label: {
-            Image(systemName: access.icon)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(access == .auto ? Theme.text : Theme.textMuted)
-                .frame(minWidth: 32, minHeight: 44)
-                .contentShape(Rectangle())
         }
-        .disabled(busy || saving || !model.online)
-        .accessibilityLabel("Access: \(access.label), \(sandbox.label)")
     }
 
+    /// Approval policy as a labelled glyph ("Ask" or "Auto") instead of a bare
+    /// icon. Auto-approve is the one elevated state, so only it takes the
+    /// warning hue.
+    private var accessChip: some View {
+        Button { focused = false; showAccess = true } label: {
+            HStack(spacing: 4) {
+                Image(systemName: access == .auto ? "bolt.shield.fill" : "checkmark.shield")
+                    .font(.system(size: 13, weight: .regular))
+                Text(access == .auto ? "Auto" : "Ask")
+                    .font(Theme.sans(13))
+            }
+            .foregroundStyle(access == .auto ? Theme.warning : Theme.textMuted)
+            .padding(.horizontal, 8)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(busy || saving || !model.online)
+        .accessibilityLabel("Access: \(access.label), \(sandbox.label)")
+        .sheet(isPresented: $showAccess) { accessSheet }
+    }
+
+    private var accessSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(CompanionAccess.allCases, id: \.self) { value in
+                        Button { setAccess(value); showAccess = false } label: {
+                            optionRow(title: value.label, detail: accessDetail(value), selected: access == value)
+                        }.listRowBackground(Theme.surfaceRaised)
+                    }
+                } header: { Text("Approvals") }
+                Section {
+                    ForEach(CompanionSandbox.allCases, id: \.self) { value in
+                        Button { setSandbox(value); showAccess = false } label: {
+                            optionRow(title: value.label, detail: sandboxDetail(value), selected: sandbox == value)
+                        }.listRowBackground(Theme.surfaceRaised)
+                    }
+                } header: { Text("Sandbox") }
+            }
+            .scrollContentBackground(.hidden).background(Theme.bg)
+            .foregroundStyle(Theme.text)
+            .navigationTitle("Access").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showAccess = false } } }
+        }
+        .tint(Theme.text)
+        .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
+    }
+
+    private func optionRow(title: String, detail: String, selected: Bool) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(Theme.sans(16))
+                Text(detail).font(Theme.sans(13)).foregroundStyle(Theme.textFaint)
+            }
+            Spacer(minLength: 8)
+            if selected { Image(systemName: "checkmark").font(.system(size: 14, weight: .semibold)) }
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityHint(detail)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func accessDetail(_ value: CompanionAccess) -> String {
+        value == .ask ? "Ask before running commands or editing files" : "Run without asking"
+    }
+
+    private func sandboxDetail(_ value: CompanionSandbox) -> String {
+        switch value {
+        case .readOnly: "Read files only"
+        case .workspaceWrite: "Edit files in the project folder"
+        case .full: "No filesystem limits"
+        }
+    }
+
+    /// The ring alone says "context"; the number only joins it once the window
+    /// is nearly full (state, not decoration). The popover has the detail.
     private var contextButton: some View {
         Button { showContext = true } label: {
             HStack(spacing: 5) {
-                ContextRing(usage: usage, size: 16)
-                if let fraction = usage?.fraction {
+                ContextRing(usage: usage, size: 18)
+                if let fraction = usage?.fraction, fraction >= 0.75 {
                     Text("\(Int((fraction * 100).rounded()))%")
-                        .font(Theme.mono(12))
-                        .foregroundStyle(fraction >= 0.75 ? ContextFill(fraction: fraction).color : Theme.textFaint)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(ContextFill(fraction: fraction).color)
                         .monospacedDigit()
                 }
             }
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 8)
             .frame(minWidth: 44, minHeight: 44)
             .contentShape(Rectangle())
         }
@@ -472,7 +545,11 @@ struct CompanionComposer: View {
 
     /// The stored first `/` segment goes to the host; the chip shows the last.
     private func chipLabel(_ label: String) -> String {
-        label.components(separatedBy: "/").last ?? label
+        let last = label.components(separatedBy: "/").last ?? label
+        for prefix in ["Claude ", "Anthropic "] where last.hasPrefix(prefix) && last.count > prefix.count {
+            return String(last.dropFirst(prefix.count))
+        }
+        return last
     }
 
     private func mimeType(_ name: String) -> String {

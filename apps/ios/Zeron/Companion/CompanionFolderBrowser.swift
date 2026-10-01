@@ -30,12 +30,11 @@ struct CompanionFolderBrowser: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Rectangle().fill(Theme.border).frame(height: 0.5)
+            SheetHairline()
             content
-            Rectangle().fill(Theme.border).frame(height: 0.5)
-            chooseBar
         }
         .background(Theme.bg).foregroundStyle(Theme.text)
+        .safeAreaInset(edge: .bottom, spacing: 0) { chooseBar }
         .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
         .task { await start() }
     }
@@ -50,7 +49,7 @@ struct CompanionFolderBrowser: View {
                     ForEach(drives) { drive in
                         rootChip(drive.name, icon: "externaldrive") { go(drive.path) }
                     }
-                }.padding(.horizontal, 16)
+                }.padding(.horizontal, SheetMetrics.margin)
             }
             if typing { pathField } else { breadcrumb }
             HStack(spacing: 8) {
@@ -65,9 +64,8 @@ struct CompanionFolderBrowser: View {
                 }
             }
             .padding(.leading, 12).frame(minHeight: 44)
-            .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Theme.border, lineWidth: 1))
-            .padding(.horizontal, 16)
+            .padding(.horizontal, SheetMetrics.margin)
         }
         .padding(.vertical, 10)
     }
@@ -76,12 +74,13 @@ struct CompanionFolderBrowser: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 12))
-                Text(name).font(Theme.mono(12)).lineLimit(1)
+                Text(name).font(Theme.sans(13)).lineLimit(1)
             }
             .foregroundStyle(Theme.textMuted)
-            .padding(.horizontal, 12).frame(minHeight: 44)
-            .background(Theme.text.opacity(0.06), in: Capsule())
-            .contentShape(Capsule())
+            .padding(.horizontal, 12).frame(minHeight: 32)
+            .background(Theme.wash(0.06), in: Capsule())
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }.buttonStyle(.plain)
     }
 
@@ -121,7 +120,7 @@ struct CompanionFolderBrowser: View {
                 .font(Theme.mono(12)).textInputAutocapitalization(.never).autocorrectionDisabled()
                 .keyboardType(.URL).submitLabel(.go).focused($pathFocused)
                 .onSubmit { typing = false; go(typedPath) }
-                .padding(.leading, 16).frame(minHeight: 44)
+                .padding(.leading, SheetMetrics.margin).frame(minHeight: 44)
             Button { typing = false } label: {
                 Text("Cancel").font(Theme.sans(14)).foregroundStyle(Theme.textMuted)
                     .padding(.horizontal, 12).frame(minHeight: 44).contentShape(Rectangle())
@@ -188,17 +187,17 @@ struct CompanionFolderBrowser: View {
                 if isRepo {
                     HStack(spacing: 4) {
                         LineIconView(.gitBranch, size: 12, color: Theme.textMuted)
-                        Text("repo").font(Theme.mono(12)).foregroundStyle(Theme.textMuted)
+                        Text("repo").font(Theme.mono(11)).foregroundStyle(Theme.textMuted)
                     }
                     .accessibilityLabel("Git repository")
                 }
                 Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.textFaint)
             }
-            .padding(.horizontal, 16).frame(minHeight: 48)
+            .padding(.horizontal, SheetMetrics.margin).frame(minHeight: SheetMetrics.rowHeight)
             .contentShape(Rectangle())
         }
-        .buttonStyle(CompanionPressStyle())
-        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 0.5).padding(.leading, 50) }
+        .buttonStyle(SheetPressStyle())
+        .overlay(alignment: .bottom) { SheetHairline().padding(.leading, SheetMetrics.margin + 22 + 12) }
     }
 
     private func message(icon: String, text: String, retry: Bool) -> some View {
@@ -213,24 +212,20 @@ struct CompanionFolderBrowser: View {
     }
 
     private var chooseBar: some View {
-        VStack(spacing: 8) {
+        SheetPinnedBar {
             if let path = listing?.path {
-                Text(path).font(Theme.mono(12)).foregroundStyle(Theme.textFaint)
+                Text(path).font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
                     .lineLimit(1).truncationMode(.head).frame(maxWidth: .infinity, alignment: .leading)
             }
             Button {
                 if let listing { onChoose(listing.path, currentIsRepo) }
             } label: {
-                Text(actionTitle).font(Theme.sans(16, weight: .medium))
-                    .frame(maxWidth: .infinity, minHeight: 50)
-                    .background(Theme.text, in: Capsule()).foregroundStyle(Theme.bg)
-                    .opacity(listing == nil ? 0.4 : 1)
+                Text(actionTitle)
             }
+            .buttonStyle(SheetPrimaryButtonStyle(enabled: listing != nil))
             .disabled(listing == nil)
             .accessibilityIdentifier("use-folder")
         }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .background(Theme.bg)
     }
 
     // MARK: - Loading

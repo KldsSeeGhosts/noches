@@ -2,61 +2,28 @@ import SwiftUI
 
 // The session tray stack (docs/design/mobile.md "Tray stack"): the live
 // activity line, the agents tray, and the queue tray, stacked over the
-// composer pill. Trays use `surfaceRaised` with 16pt top corners and a
-// `border` hairline, and tuck 14pt behind the element below them, so Agents,
-// Queue, and the pill read as one continuous surface.
+// composer pill. Trays sit flush on the shell backdrop like the desktop
+// panes: no cards, just a 1px hairline across the top of each section.
 
-/// How far a tray's bottom edge hides behind the element below it. One hair
-/// more than the 16pt corner radius so the corner arcs never expose a notch.
-let trayTuck: CGFloat = 18
-
-/// One stacked tray surface: `surfaceRaised`, 16pt top corners, a hairline
-/// border, and enough bottom padding that the tuck hides surface, not content.
+/// One stacked tray section: full-bleed hairline on top, 16pt side margins.
 struct TraySurface<Content: View>: View {
     @ViewBuilder var content: Content
 
-    private var shape: UnevenRoundedRectangle {
-        UnevenRoundedRectangle(topLeadingRadius: 16, bottomLeadingRadius: 0,
-                               bottomTrailingRadius: 0, topTrailingRadius: 16,
-                               style: .continuous)
-    }
-
     var body: some View {
         content
-            .padding(.horizontal, 12)
-            .padding(.bottom, trayTuck + 8)
-            .background(Theme.surfaceRaised, in: shape)
-            .overlay(TrayEdge())
-    }
-}
-
-/// The tray's outline: top corners and both sides, with no bottom edge. The
-/// bottom edge lives behind the next surface, and drawing it would leave a
-/// hairline across the sliver the next surface's rounded corner does not
-/// cover.
-private struct TrayEdge: View {
-    var body: some View {
-        GeometryReader { geometry in
-            Path { path in
-                let width = geometry.size.width
-                let bottom = geometry.size.height + 24
-                path.move(to: CGPoint(x: 0, y: bottom))
-                path.addLine(to: CGPoint(x: 0, y: 16))
-                path.addQuadCurve(to: CGPoint(x: 16, y: 0), control: .zero)
-                path.addLine(to: CGPoint(x: width - 16, y: 0))
-                path.addQuadCurve(to: CGPoint(x: width, y: 16), control: CGPoint(x: width, y: 0))
-                path.addLine(to: CGPoint(x: width, y: bottom))
+            .padding(.horizontal, Theme.spaceLG)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .top) {
+                Rectangle().fill(Theme.border).frame(height: 1)
             }
-            .stroke(Theme.border, lineWidth: 1)
-        }
-        .allowsHitTesting(false)
     }
 }
 
 // MARK: - Activity line
 
 /// The single 13pt row above the tray stack: Working with mono elapsed time,
-/// Awaiting input, or Failed. Settled sessions render nothing.
+/// Awaiting input, or Failed. Settled sessions render nothing. The status hue
+/// comes from `SessionState`; the glyph and label share it.
 struct CompanionActivityLine: View {
     let state: SessionState
     let since: Date?
@@ -89,8 +56,8 @@ struct CompanionActivityLine: View {
             }
             if let elapsed {
                 Text(elapsed)
-                    .font(Theme.mono(12))
-                    .foregroundStyle(tint)
+                    .font(Theme.mono(11))
+                    .foregroundStyle(Theme.textFaint)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -115,11 +82,10 @@ struct CompanionAgentsTray: View {
                     Text("Agents")
                         .font(Theme.sans(12, weight: .medium))
                     Text("\(done)/\(agents.count)")
-                        .font(Theme.mono(12))
+                        .font(Theme.mono(11))
                 }
                 .foregroundStyle(Theme.textFaint)
                 .fixedSize()
-                .padding(.leading, 4)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(agents) { agent in
@@ -135,10 +101,7 @@ struct CompanionAgentsTray: View {
                     .padding(.vertical, 6)
                 }
                 .scrollClipDisabled()
-                .mask(LinearGradient(stops: [.init(color: .black, location: 0.9), .init(color: .clear, location: 1)],
-                                     startPoint: .leading, endPoint: .trailing))
             }
-            .padding(.top, 2)
         }
     }
 }
@@ -172,19 +135,24 @@ struct CompanionQueueTray: View {
     let items: [HostQueueItem]
     /// The chat's harness steers mid-turn (`HarnessDescriptor::steers_mid_turn`).
     let steers: Bool
+    var composing = false
     @Binding var error: String?
     @State private var expanded = true
     @State private var editing: HostQueueItem?
     @State private var busy = false
+    private var rowsVisible: Bool { expanded && !composing }
 
     var body: some View {
         TraySurface {
             VStack(alignment: .leading, spacing: 0) {
                 header
-                if expanded {
-                    ForEach(items) { item in
-                        row(item)
+                if rowsVisible {
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            ForEach(items) { item in row(item).frame(minHeight: 44) }
+                        }
                     }
+                    .frame(height: min(CGFloat(items.count) * 44, 176))
                     .transition(.opacity)
                 }
             }
@@ -200,22 +168,25 @@ struct CompanionQueueTray: View {
             expanded.toggle()
         } label: {
             HStack(spacing: 6) {
-                Text("Queued · \(items.count)")
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(Theme.textMuted)
+                Text("Queued")
+                    .font(Theme.sans(12, weight: .medium))
+                    .foregroundStyle(Theme.textFaint)
+                Text("\(items.count)")
+                    .font(Theme.mono(11))
+                    .foregroundStyle(Theme.textFaint)
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Theme.textFaint)
-                    .rotationEffect(.degrees(expanded ? 0 : -90))
+                    .rotationEffect(.degrees(rowsVisible ? 0 : -90))
             }
-            .padding(.horizontal, 4)
-            .frame(minHeight: 40)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(composing)
         .accessibilityLabel("Queued · \(items.count)")
-        .accessibilityHint(expanded ? "Collapse queued messages" : "Expand queued messages")
+        .accessibilityHint(rowsVisible ? "Collapse queued messages" : "Expand queued messages")
     }
 
     private func row(_ item: HostQueueItem) -> some View {
@@ -232,7 +203,6 @@ struct CompanionQueueTray: View {
                         .foregroundStyle(Theme.textFaint)
                 }
             }
-            .padding(.leading, 4)
             Menu {
                 Button(actionLabel(item), systemImage: actionIcon(item)) { advance(item) }
                 Button("Edit", systemImage: "pencil") { editing = item }
@@ -251,13 +221,12 @@ struct CompanionQueueTray: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Theme.textMuted)
-                    .frame(width: 44, height: 36)
+                    .frame(width: 44, height: 44, alignment: .trailing)
                     .contentShape(Rectangle())
             }
             .accessibilityLabel("Queued message actions")
             .disabled(busy || !model.online)
         }
-        .padding(.vertical, 1)
     }
 
     private func actionLabel(_ item: HostQueueItem) -> String {

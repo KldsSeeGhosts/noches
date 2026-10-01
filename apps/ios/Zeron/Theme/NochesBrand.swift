@@ -1,7 +1,7 @@
 // The Noches identity: a crescent over the night palace. Las Noches is a white
 // fortress under a moon that never sets, so the brand is exactly that - one
-// crescent mark and a Roman-capital wordmark (Cinzel), used with restraint:
-// the home header, the signed-out hero, and nowhere else. Everything working
+// crescent mark and a small "Noches" wordmark, used with restraint: the home
+// header and the signed-out hero (Cinzel display capitals). Everything working
 // (cards, metadata, controls) stays in Geist and Geist Mono.
 //
 // Brand surfaces are monochrome - `Theme.text` on the shell - so they never
@@ -49,15 +49,16 @@ struct NochesMark: View {
     }
 }
 
-/// The header lockup: crescent + NOCHES in widely tracked Roman capitals.
+/// The header lockup: a small crescent and "Noches" in the UI sans, sized
+/// like a navigation title so it never competes with the list below it.
 struct NochesWordmark: View {
     var size: CGFloat = 17
     var body: some View {
-        HStack(spacing: size * 0.5) {
-            NochesMark(size: size * 1.05)
-            Text("NOCHES")
-                .font(Theme.display(size, weight: .bold))
-                .tracking(size * 0.28)
+        HStack(spacing: 8) {
+            NochesMark(size: size)
+            Text("Noches")
+                .font(Theme.sans(size, weight: .semibold))
+                .tracking(-0.3)
                 .foregroundStyle(Theme.text)
         }
         .fixedSize()

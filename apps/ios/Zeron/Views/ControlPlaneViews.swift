@@ -151,7 +151,7 @@ struct StatusSlot: View {
             }
             if let elapsed {
                 Text(elapsed)
-                    .font(Theme.mono(12))
+                    .font(Theme.mono(11))
                     .foregroundStyle(color)
             }
         }
@@ -194,8 +194,8 @@ struct ProjectBadge: View {
 
 // MARK: - Section header
 
-/// A state section header: optional 6pt dot, a mono capital eyebrow, a
-/// hairline running to the right edge, and the mono count.
+/// A quiet section header: optional 6pt dot, a 13pt medium muted title, and
+/// the mono count. No rule, no capitals - the spacing above it is the divider.
 struct SectionHeader: View {
     let title: String
     let dotColor: Color?
@@ -208,13 +208,16 @@ struct SectionHeader: View {
                     .fill(dotColor)
                     .frame(width: 6, height: 6)
             }
-            Eyebrow(text: title, color: Theme.textMuted)
-            Rectangle().fill(Theme.border).frame(height: 0.5).frame(maxWidth: .infinity)
+            Text(title)
+                .font(Theme.sans(13, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
+                .lineLimit(1)
             if let count {
                 Text("\(count)")
-                    .font(Theme.mono(12))
+                    .font(Theme.mono(11))
                     .foregroundStyle(Theme.textFaint)
             }
+            Spacer(minLength: 0)
         }
     }
 }

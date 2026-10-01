@@ -194,7 +194,8 @@ Sessions are scoped to the selected computer:
 - send: `QueueMessage` with `holdForTurnEnd` while a session is working or
   awaiting input, otherwise a `run` command carrying the prompt, working
   directory, sandbox, `autoApprove: false`, and the session's harness, model,
-  and reasoning options. Queued rows render read-only above the composer;
+  and reasoning options. Queued rows render above the composer with host-confirmed
+  edit, reorder, delivery, and removal actions;
 - rename, archive, and restore through host-confirmed `Mutate` operations.
   Long-press a session for actions, use its chat menu, or swipe to archive.
   Restore from the Archived filter;
@@ -251,12 +252,33 @@ branch from `ListBranches`; the engine names the `zeron/…` branch.
 Home groups sessions **By status** or **By project** (collapsible groups with a
 per-project **+**). On iPad the list is the sidebar of a split view.
 
-Composer: the access chip switches the run's `autoApprove` between Ask and
-Auto-approve (stored per host and chat on the phone) and sets the sandbox
-through `setChatConfig`. `@` suggests files from `SearchFiles`; `/` at the
+Composer: the access chip opens a native sheet to switch the run's `autoApprove`
+between Ask and Auto-approve (stored per host and chat on the phone) and set the
+sandbox through `setChatConfig`. `@` suggests files from `SearchFiles`; `/` at the
 start of the draft suggests `ListCommands` entries, sent as prompt text.
 Queued rows can move up, to the top, or down (`MoveQueuedMessage`), and edit
 leases renew every 20 seconds.
+
+The Projects drawer distinguishes **All projects** from **No project**. Queue
+details are height-bounded and scrollable; opening the composer keyboard hides
+agent details and folds queued rows so the transcript retains usable space.
+Per-file diffs keep a **Done** action, and entering file editing focuses the editor.
+
+### Overhaul acceptance coverage
+
+`CompanionUITests` exercises pairing/send, project grouping and collapse, folder
+browsing and project creation, worktree sessions, file search/editing, stale-hash
+conflicts, discard cancellation/confirmation, terminal and project actions,
+mention/command suggestions, queue ordering/editing/lease renewal, access/sandbox
+dispatch, session management, draft retention, and light/dark themes.
+
+The final iOS 27 simulator verification passed all 235 unit/hosted tests on
+iPhone 18 Pro, including the actual Rust gateway and an isolated live host,
+and all 19 companion/mobile-polish UI scenarios on iPhone 17e. Screenshots were
+reviewed. A smaller-device hosted keyboard test initially received only the
+hardware-keyboard accessory bar; its unchanged full-motion assertion passed on
+the freshly booted second simulator. Physical camera scanning, actual provider
+execution, and real-phone performance are not covered by this pass.
 
 Not implemented today:
 

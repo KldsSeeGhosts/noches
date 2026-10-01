@@ -182,3 +182,172 @@ struct ChipPressButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
+
+// MARK: - Companion sheet language
+//
+// Flat and quiet, per docs/design/control-plane.md: sentence-case section
+// labels, hairline-divided rows on the shell backdrop, no filled islands, one
+// pinned primary action. Every companion sheet (new session, pairing, folder
+// browser, terminal) composes these so they read as one product.
+
+enum SheetMetrics {
+    /// Horizontal page margin shared by every sheet.
+    static let margin: CGFloat = 16
+    static let rowHeight: CGFloat = 44
+}
+
+/// 13pt medium section label with an optional trailing accessory.
+struct SheetSectionLabel<Trailing: View>: View {
+    let title: String
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title).font(Theme.sans(13, weight: .medium)).foregroundStyle(Theme.textMuted)
+            Spacer(minLength: 0)
+            trailing
+        }
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+extension SheetSectionLabel where Trailing == EmptyView {
+    init(_ title: String) {
+        self.init(title: title) { EmptyView() }
+    }
+}
+
+/// A section: label, hairline-separated rows between top and bottom hairlines,
+/// and a footnote attached underneath. Rows run edge to edge; the hairlines
+/// inset by `separatorInset` so they line up with the row text.
+struct SheetGroup<Content: View>: View {
+    var title: String?
+    var footer: String?
+    var separatorInset: CGFloat = SheetMetrics.margin
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let title {
+                SheetSectionLabel(title)
+                    .padding(.horizontal, SheetMetrics.margin).padding(.bottom, 8)
+            }
+            SheetHairline()
+            Group(subviews: content) { rows in
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    if index > 0 { SheetHairline().padding(.leading, separatorInset) }
+                    row
+                }
+            }
+            SheetHairline()
+            if let footer {
+                Text(footer)
+                    .font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, SheetMetrics.margin).padding(.top, 8)
+            }
+        }
+    }
+}
+
+struct SheetHairline: View {
+    var body: some View {
+        Rectangle().fill(Theme.border).frame(height: 0.5)
+    }
+}
+
+/// Pressed-row wash for edge-to-edge rows.
+struct SheetPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Theme.elementHover : Color.clear)
+    }
+}
+
+/// Full-width segmented control: one flat track, a raised thumb on the
+/// selection. Replaces fixed-width tile rows and mono pill strips.
+struct SheetSegmented<Value: Hashable>: View {
+    struct Option: Identifiable {
+        let value: Value
+        let title: String
+        var icon: AnyView?
+        var identifier: String?
+        var id: String { identifier ?? title }
+    }
+
+    let options: [Option]
+    @Binding var selection: Value
+    var height: CGFloat = 40
+    @Namespace private var thumb
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options) { option in
+                let selected = option.value == selection
+                Button {
+                    guard !selected else { return }
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    withAnimation(.snappy(duration: 0.2)) { selection = option.value }
+                } label: {
+                    HStack(spacing: 6) {
+                        if let icon = option.icon { icon }
+                        Text(option.title)
+                            .font(Theme.sans(13, weight: selected ? .medium : .regular))
+                            .lineLimit(1).minimumScaleFactor(0.8)
+                    }
+                    .foregroundStyle(selected ? Theme.text : Theme.textMuted)
+                    .frame(maxWidth: .infinity, minHeight: height - 6)
+                    .background {
+                        if selected {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(AppearanceSettings.shared.isDark ? Theme.wash(0.14) : Theme.bg)
+                                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .stroke(Theme.border, lineWidth: 0.5))
+                                .matchedGeometryEffect(id: "thumb", in: thumb)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(option.identifier ?? option.title)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .frame(minHeight: height)
+        .background(Theme.wash(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+/// The bottom bar that pins a sheet's primary action above the home
+/// indicator, separated by a hairline.
+struct SheetPinnedBar<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(spacing: 8) {
+            content
+        }
+        .padding(.horizontal, SheetMetrics.margin).padding(.top, 12).padding(.bottom, 8)
+        .frame(maxWidth: .infinity)
+        .background(Theme.bg)
+        .overlay(alignment: .top) { SheetHairline() }
+    }
+}
+
+/// Primary action as a button style, so call sites keep their own action,
+/// label text, and identifier. Disabled reads as a quiet wash, not a faded
+/// black pill.
+struct SheetPrimaryButtonStyle: ButtonStyle {
+    var enabled = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.sans(16, weight: .medium))
+            .foregroundStyle(enabled ? Theme.bg : Theme.textFaint)
+            .frame(maxWidth: .infinity, minHeight: 50)
+            .background(enabled ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.wash(0.08)), in: Capsule())
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}

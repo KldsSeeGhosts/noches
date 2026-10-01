@@ -38,28 +38,30 @@ struct NewHostSessionSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "desktopcomputer").font(.system(size: 11))
-                        Text("Run on \(model.selected?.name ?? "your computer")").font(Theme.mono(11))
-                    }.foregroundStyle(Theme.textFaint)
+                VStack(alignment: .leading, spacing: 22) {
                     projectSection
                     agentSection
                     modelSection
                     messageSection
-                    startButton
-                    if let error {
-                        Text(error).font(Theme.sans(13)).foregroundStyle(Theme.danger)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                 }
-                .padding(20)
+                .padding(.top, 12).padding(.bottom, 16)
                 .frame(maxWidth: 620)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
             .background(Theme.bg).foregroundStyle(Theme.text)
             .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                SheetPinnedBar {
+                    if let error {
+                        Text(error).font(Theme.sans(13)).foregroundStyle(Theme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    startButton
+                }
+            }
             .navigationTitle("New session").navigationBarTitleDisplayMode(.inline)
+            .navigationSubtitle(model.selected?.name ?? "")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
             .onAppear {
                 space = initialProject
@@ -107,21 +109,15 @@ struct NewHostSessionSheet: View {
     // MARK: - Sections
 
     private var projectSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Project", dotColor: nil, count: nil)
-            VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 22) {
+            SheetGroup(title: "Project", separatorInset: SheetMetrics.margin + 20 + 12) {
                 projectRow(title: "No project · home folder", name: "Home", seed: "home", project: nil, id: "")
-                ForEach(Array(model.localSpaces.enumerated()), id: \.element.id) { index, item in
-                    if index > 0 { rowSeparator }
+                ForEach(model.localSpaces) { item in
                     projectRow(title: item.displayName, name: item.displayName, seed: item.path, project: item, id: item.id)
                 }
-                rowSeparator
                 actionRow("Add project…", icon: "plus", id: "add-project-row") { addingProject = true }
-                rowSeparator
                 actionRow("Browse folder…", icon: "folder", id: "browse-folder-row") { browsingFolder = true }
             }
-            .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
             if !branches.isEmpty { branchControls }
         }
     }
@@ -129,15 +125,15 @@ struct NewHostSessionSheet: View {
     private func actionRow(_ title: String, icon: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 12) {
-                Image(systemName: icon).font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.textMuted)
+                Image(systemName: icon).font(.system(size: 14, weight: .regular)).foregroundStyle(Theme.textMuted)
                     .frame(width: 20, height: 20)
                 Text(title).font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
                 Spacer(minLength: 8)
             }
-            .padding(.horizontal, 14).frame(minHeight: 48)
+            .padding(.horizontal, SheetMetrics.margin).frame(minHeight: SheetMetrics.rowHeight)
             .contentShape(Rectangle())
         }
-        .buttonStyle(CompanionPressStyle())
+        .buttonStyle(SheetPressStyle())
         .disabled(!model.online)
         .accessibilityIdentifier(id)
     }
@@ -160,43 +156,36 @@ struct NewHostSessionSheet: View {
     /// Git projects: stay on the current branch, or start in a fresh worktree
     /// (`zeron/<name>` off the chosen base branch).
     private var branchControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                modeChip("Current branch", on: !useWorktree) { useWorktree = false }
-                modeChip("New worktree", on: useWorktree) { useWorktree = true }
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            SheetSectionLabel("Branch").padding(.horizontal, SheetMetrics.margin)
+            SheetSegmented(options: [
+                .init(value: false, title: "Current branch"),
+                .init(value: true, title: "New worktree"),
+            ], selection: $useWorktree)
+            .padding(.horizontal, SheetMetrics.margin)
             if useWorktree {
-                Menu {
-                    ForEach(branches, id: \.self) { name in
-                        Button { baseBranch = name } label: {
-                            if baseBranch == name { Label(name, systemImage: "checkmark") } else { Text(name) }
+                SheetGroup(footer: "Creates an isolated checkout on a new branch so this session can't touch your working tree.") {
+                    Menu {
+                        ForEach(branches, id: \.self) { name in
+                            Button { baseBranch = name } label: {
+                                if baseBranch == name { Label(name, systemImage: "checkmark") } else { Text(name) }
+                            }
                         }
+                    } label: {
+                        HStack(spacing: 12) {
+                            LineIconView(.gitBranch, size: 14, color: Theme.textMuted).frame(width: 20)
+                            Text("Based on").font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            Spacer(minLength: 8)
+                            Text(baseBranch).font(Theme.mono(12)).foregroundStyle(Theme.textMuted).lineLimit(1)
+                            Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.textFaint)
+                        }
+                        .padding(.horizontal, SheetMetrics.margin).frame(minHeight: SheetMetrics.rowHeight)
+                        .contentShape(Rectangle())
                     }
-                } label: {
-                    HStack(spacing: 8) {
-                        LineIconView(.gitBranch, size: 14, color: Theme.textMuted)
-                        Text("Based on \(baseBranch)").font(Theme.mono(12)).foregroundStyle(Theme.text).lineLimit(1)
-                        Spacer(minLength: 8)
-                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textFaint)
-                    }
-                    .padding(.horizontal, 14).frame(minHeight: 48)
-                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
                 }
-                Text("Creates an isolated checkout on a new branch so this session can't touch your working tree.")
-                    .font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
             }
         }
-    }
-
-    private func modeChip(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title).font(Theme.mono(12))
-                .foregroundStyle(on ? Theme.bg : Theme.textMuted)
-                .padding(.horizontal, 12).frame(minHeight: 44)
-                .background(on ? Theme.text : Theme.text.opacity(0.06), in: Capsule())
-                .contentShape(Capsule())
-        }.buttonStyle(.plain)
     }
 
     private func projectRow(title: String, name: String, seed: String, project: HostSpace?, id: String) -> some View {
@@ -206,106 +195,84 @@ struct NewHostSessionSheet: View {
                 Text(title).font(Theme.sans(15)).foregroundStyle(Theme.text).lineLimit(1)
                 Spacer(minLength: 8)
                 if space == id {
-                    Image(systemName: "checkmark").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textMuted)
+                    Image(systemName: "checkmark").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
                 }
             }
-            .padding(.horizontal, 14).frame(minHeight: 48)
+            .padding(.horizontal, SheetMetrics.margin).frame(minHeight: SheetMetrics.rowHeight)
             .contentShape(Rectangle())
         }
-        .buttonStyle(CompanionPressStyle())
-    }
-
-    private var rowSeparator: some View {
-        Rectangle().fill(Theme.border).frame(height: 0.5).padding(.leading, 46)
+        .buttonStyle(SheetPressStyle())
+        .accessibilityAddTraits(space == id ? .isSelected : [])
     }
 
     private var agentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Agent", dotColor: nil, count: nil)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(offered) { item in
-                        Button { harness = item.id } label: {
-                            VStack(spacing: 9) {
-                                BrandMarkShape(mark: .forHarness(item.id))
-                                    .fill(BrandMark.tint(for: item.id), style: FillStyle(eoFill: BrandMark.forHarness(item.id).evenOddFill))
-                                    .frame(width: 20, height: 20)
-                                Text(item.label).font(Theme.sans(13))
-                                    .foregroundStyle(harness == item.id ? Theme.text : Theme.textMuted)
-                                    .lineLimit(1)
-                            }
-                            .frame(width: 100, height: 74)
-                            .background(harness == item.id ? Theme.surfaceRaised : Theme.text.opacity(0.04),
-                                        in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .stroke(harness == item.id ? Theme.text.opacity(0.5) : Theme.border, lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("harness-\(item.id)")
-                    }
-                }.padding(.vertical, 2)
-            }
+            SheetSectionLabel("Agent").padding(.horizontal, SheetMetrics.margin)
+            SheetSegmented(options: offered.map { item in
+                .init(value: item.id, title: item.label,
+                      icon: AnyView(BrandMarkShape(mark: .forHarness(item.id))
+                        .fill(BrandMark.tint(for: item.id), style: FillStyle(eoFill: BrandMark.forHarness(item.id).evenOddFill))
+                        .frame(width: 14, height: 14)),
+                      identifier: "harness-\(item.id)")
+            }, selection: $harness, height: 44)
+            .padding(.horizontal, SheetMetrics.margin)
         }
     }
 
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "Model", dotColor: nil, count: nil)
-            Menu {
-                Button { agentModel = "" } label: {
-                    if agentModel.isEmpty { Label("Agent default", systemImage: "checkmark") } else { Text("Agent default") }
-                }
-                ForEach(models) { item in
-                    Button { agentModel = item.id } label: {
-                        if agentModel == item.id { Label(item.label, systemImage: "checkmark") } else { Text(item.label) }
+        VStack(alignment: .leading, spacing: 16) {
+            SheetGroup(title: "Model") {
+                Menu {
+                    Button { agentModel = "" } label: {
+                        if agentModel.isEmpty { Label("Agent default", systemImage: "checkmark") } else { Text("Agent default") }
                     }
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Text(modelLabel).font(Theme.sans(15)).foregroundStyle(Theme.text).lineLimit(1)
-                    Spacer(minLength: 8)
-                    if loadingModels { ProgressView().controlSize(.small) }
-                    else { Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textFaint) }
-                }
-                .padding(.horizontal, 14).frame(minHeight: 48)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
-            }
-            .disabled(loadingModels)
-            if !levels.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(levels, id: \.self) { level in
-                            Button { reasoning = level } label: {
-                                Text(HarnessCatalog.reasoningLabel(level))
-                                    .font(Theme.mono(12))
-                                    .foregroundStyle(reasoning == level ? Theme.bg : Theme.textMuted)
-                                    .padding(.horizontal, 12).frame(height: 32)
-                                    .background(reasoning == level ? Theme.text : Theme.text.opacity(0.06), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier("reasoning-\(level)")
+                    ForEach(models) { item in
+                        Button { agentModel = item.id } label: {
+                            if agentModel == item.id { Label(item.label, systemImage: "checkmark") } else { Text(item.label) }
                         }
-                    }.padding(.vertical, 2)
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(modelLabel).font(Theme.sans(15)).foregroundStyle(Theme.text).lineLimit(1)
+                        Spacer(minLength: 8)
+                        if loadingModels { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.textFaint) }
+                    }
+                    .padding(.horizontal, SheetMetrics.margin).frame(minHeight: SheetMetrics.rowHeight)
+                    .contentShape(Rectangle())
+                }
+                .disabled(loadingModels)
+            }
+            if !levels.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    SheetSectionLabel("Reasoning").padding(.horizontal, SheetMetrics.margin)
+                    SheetSegmented(options: levels.map { level in
+                        .init(value: level, title: HarnessCatalog.reasoningLabel(level), identifier: "reasoning-\(level)")
+                    }, selection: $reasoning)
+                    .padding(.horizontal, SheetMetrics.margin)
                 }
             }
             if let catalogError {
                 Text(catalogError).font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
+                    .padding(.horizontal, SheetMetrics.margin)
             }
         }
     }
 
     private var messageSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionHeader(title: "First message", dotColor: nil, count: nil)
+            SheetSectionLabel(title: "First message") {
+                Text("Optional").font(Theme.sans(12)).foregroundStyle(Theme.textFaint)
+            }
+            .padding(.horizontal, SheetMetrics.margin)
             TextField("Message \(harnessLabel)…", text: $draft, axis: .vertical)
                 .font(Theme.sans(16))
-                .lineLimit(4...8)
-                .padding(14)
-                .frame(minHeight: 96, alignment: .topLeading)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Theme.border, lineWidth: 1))
+                .lineLimit(2...8)
                 .accessibilityIdentifier("first-message")
+                .padding(14)
+                .frame(minHeight: 72, alignment: .topLeading)
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Theme.border, lineWidth: 1))
+                .padding(.horizontal, SheetMetrics.margin)
         }
     }
 
@@ -336,11 +303,8 @@ struct NewHostSessionSheet: View {
             }
         } label: {
             Text(busy ? "Starting…" : "Start session")
-                .font(Theme.sans(16, weight: .medium))
-                .frame(maxWidth: .infinity, minHeight: 50)
-                .background(Theme.text, in: Capsule()).foregroundStyle(Theme.bg)
-                .opacity(busy || harness.isEmpty || !model.online ? 0.4 : 1)
         }
+        .buttonStyle(SheetPrimaryButtonStyle(enabled: !(busy || harness.isEmpty || !model.online)))
         .disabled(busy || harness.isEmpty || !model.online)
         .accessibilityIdentifier("start-session")
     }

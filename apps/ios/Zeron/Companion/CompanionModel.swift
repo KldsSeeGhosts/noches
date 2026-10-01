@@ -98,8 +98,10 @@ final class CompanionModel {
     func visibleChats(project: String = "", query: String = "", scope: CompanionScope = .all) -> [HostChat] {
         let source = scope == .archived ? archivedChats : localChats
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let knownProjects = Set(localSpaces.map(\.id))
         return source.filter { chat in
-            (project.isEmpty || chat.spaceId == project)
+            (project.isEmpty || (project == Self.noProjectFilter
+                ? chat.spaceId.map { !knownProjects.contains($0) } ?? true : chat.spaceId == project))
                 && (scope != .attention || state(chat).needsYou)
                 && (scope != .working || state(chat).running)
                 && (search.isEmpty || [chat.displayTitle, chat.lastMessagePreview ?? "", chat.branch ?? "",

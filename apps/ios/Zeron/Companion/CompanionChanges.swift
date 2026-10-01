@@ -121,6 +121,7 @@ struct CompanionChangesView: View {
     let model: CompanionModel
     let chat: HostChat
     let store: CompanionChangesStore
+    var close: () -> Void = {}
     @State private var confirming = false
     @State private var discarding = false
     @State private var actionError: String?
@@ -135,20 +136,23 @@ struct CompanionChangesView: View {
                                                description: Text("No changes in this working tree."))
                     }
                 } else {
-                    List {
-                        summary(diff).listRowInsets(EdgeInsets()).listRowBackground(Theme.bg)
-                            .listRowSeparator(.hidden)
-                        ForEach(diff.files) { file in
-                            NavigationLink(value: file) { row(file) }
-                                .listRowBackground(Theme.bg)
+                    VStack(spacing: 0) {
+                        summary(diff)
+                        List {
+                            ForEach(diff.files) { file in
+                                NavigationLink(value: file) { row(file) }
+                                    .listRowBackground(Theme.bg)
+                                    .listRowSeparatorTint(Theme.border)
+                            }
+                            if diff.truncated {
+                                Text("Partial snapshot. Very large diffs are cut off on the computer.")
+                                    .font(Theme.sans(12)).foregroundStyle(Theme.warning)
+                                    .listRowBackground(Theme.bg)
+                            }
                         }
-                        if diff.truncated {
-                            Text("Partial snapshot. Very large diffs are cut off on the computer.")
-                                .font(Theme.sans(12)).foregroundStyle(Theme.warning)
-                                .listRowBackground(Theme.bg)
-                        }
+                        .listStyle(.plain).scrollContentBackground(.hidden)
+                        .refreshable { await store.refresh(model: model, chat: chat) }
                     }
-                    .listStyle(.plain).scrollContentBackground(.hidden)
                 }
             } else if let error = store.error {
                 CompanionReadError(message: error) { Task { await store.refresh(model: model, chat: chat) } }.padding(24)
@@ -160,18 +164,20 @@ struct CompanionChangesView: View {
         .background(Theme.bg).foregroundStyle(Theme.text)
         .navigationTitle("Changes").navigationBarTitleDisplayMode(.inline)
         .navigationDestination(for: HostDiffFile.self) { file in
-            CompanionFileDiffView(model: model, chat: chat, store: store, file: file)
+            CompanionFileDiffView(model: model, chat: chat, store: store, file: file, close: close)
         }
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await store.refresh(model: model, chat: chat) } }
-                    .frame(minWidth: 44, minHeight: 44)
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                if let diff = store.diff, !diff.files.isEmpty {
-                    Button("Discard all changes", systemImage: "trash", role: .destructive) { confirming = true }
-                        .tint(Theme.danger).disabled(discarding || !model.online)
-                        .frame(minWidth: 44, minHeight: 44)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if let diff = store.diff, !diff.files.isEmpty {
+                // The destructive action lives apart from Done, behind a confirmation.
+                SheetPinnedBar {
+                    Button("Discard all changes", role: .destructive) { confirming = true }
+                        .font(Theme.sans(15, weight: .medium))
+                        .foregroundStyle(Theme.danger)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                        .disabled(discarding || !model.online)
+                        .opacity(discarding || !model.online ? 0.4 : 1)
                 }
             }
         }
@@ -187,30 +193,37 @@ struct CompanionChangesView: View {
         } message: { Text(actionError ?? "") }
     }
 
+    /// Branch and upstream distance on the first line, the change tally on the
+    /// second. Metadata is monospace; the hairline closes the header.
     private func summary(_ diff: HostCheckoutDiff) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                if let branch = chat.branch, !branch.isEmpty {
-                    Label(branch, systemImage: "arrow.triangle.branch")
-                        .font(Theme.mono(12)).foregroundStyle(Theme.textMuted)
-                        .lineLimit(1).truncationMode(.middle)
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    if let branch = chat.branch, !branch.isEmpty {
+                        HStack(spacing: 6) {
+                            LineIconView(.gitBranch, size: 13, color: Theme.textMuted)
+                            Text(branch).font(Theme.mono(12)).foregroundStyle(Theme.text)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    if let c = store.comparison, c.ahead > 0 || c.behind > 0 {
+                        Text(([c.ahead > 0 ? "↑\(c.ahead)" : nil, c.behind > 0 ? "↓\(c.behind)" : nil]
+                            .compactMap { $0 }.joined(separator: " ")) + " vs \(c.base)")
+                            .font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
+                            .lineLimit(1)
+                    }
                 }
-                if let c = store.comparison, c.ahead > 0 || c.behind > 0 {
-                    Text([c.ahead > 0 ? "↑\(c.ahead)" : nil, c.behind > 0 ? "↓\(c.behind)" : nil]
-                        .compactMap { $0 }.joined(separator: " ") + " \(c.base)")
-                        .font(Theme.mono(12)).foregroundStyle(Theme.textFaint)
-                        .lineLimit(1)
+                HStack(spacing: 8) {
+                    Text("\(diff.files.count) changed \(diff.files.count == 1 ? "file" : "files")")
+                        .font(Theme.sans(13)).foregroundStyle(Theme.textMuted)
+                    Spacer(minLength: 8)
+                    DiffStat(additions: diff.additions, deletions: diff.deletions)
                 }
-                Spacer(minLength: 0)
             }
-            HStack(spacing: 14) {
-                Text("\(diff.files.count) changed \(diff.files.count == 1 ? "file" : "files")")
-                    .font(Theme.mono(12)).foregroundStyle(Theme.textMuted)
-                Spacer()
-                DiffStat(additions: diff.additions, deletions: diff.deletions)
-            }
+            .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 12)
+            SheetHairline()
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
     }
 
     private func row(_ file: HostDiffFile) -> some View {
@@ -218,8 +231,8 @@ struct CompanionChangesView: View {
             Text(file.letter)
                 .font(Theme.mono(12, weight: .semibold)).foregroundStyle(file.statusTint)
                 .frame(width: 16)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(file.name).font(Theme.sans(14)).lineLimit(1).truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(file.name).font(Theme.sans(15)).lineLimit(1).truncationMode(.middle)
                 if !file.directory.isEmpty {
                     Text(file.directory).font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
                         .lineLimit(1).truncationMode(.head)
@@ -253,6 +266,7 @@ struct CompanionFileDiffView: View {
     let chat: HostChat
     let store: CompanionChangesStore
     let file: HostDiffFile
+    var close: () -> Void = {}
     @State private var lines: [DiffLine]?
     @State private var note: String?
     @State private var error: String?
@@ -276,9 +290,28 @@ struct CompanionFileDiffView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg).foregroundStyle(Theme.text)
+        .safeAreaInset(edge: .top, spacing: 0) { header }
         .navigationTitle(file.name).navigationBarTitleDisplayMode(.inline)
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { DiffStat(additions: file.additions, deletions: file.deletions) } }
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) } }
         .task(id: "\(model.generation)-\(store.diff?.checksum ?? "")") { await load() }
+    }
+
+    /// Where the file lives and how much of it changed; the nav bar keeps only
+    /// the name and Done.
+    private var header: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text(file.letter)
+                    .font(Theme.mono(12, weight: .semibold)).foregroundStyle(file.statusTint)
+                Text(file.path).font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
+                    .lineLimit(1).truncationMode(.head)
+                Spacer(minLength: 8)
+                if !file.binary { DiffStat(additions: file.additions, deletions: file.deletions) }
+            }
+            .padding(.horizontal, SheetMetrics.margin).frame(minHeight: 40)
+            SheetHairline()
+        }
+        .background(Theme.bg)
     }
 
     private func load() async {

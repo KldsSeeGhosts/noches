@@ -94,6 +94,14 @@ final class CompanionDashboardTests: XCTestCase {
         XCTAssertEqual(model.projectName(for: home), "Home")
         XCTAssertEqual(model.monogramSeed(for: home), "home")
     }
+    func testNoProjectFilterIsDistinctFromAllProjects() {
+        let model = model()
+        let home = model.visibleChats(project: CompanionModel.noProjectFilter)
+        XCTAssertFalse(home.isEmpty)
+        XCTAssertTrue(home.allSatisfy { $0.spaceId == nil })
+        XCTAssertGreaterThan(model.visibleChats().count, home.count)
+        XCTAssertNotEqual(CompanionModel.noProjectFilter, "")
+    }
     func testHostDateParsesChronoPrecision() {
         let base = Date(timeIntervalSince1970: 1_790_078_400)
         XCTAssertEqual(HostDate.parse("2026-09-22T12:00:00Z"), base)

@@ -104,6 +104,8 @@ struct CompanionView: View {
             let arguments = ProcessInfo.processInfo.arguments
             if arguments.contains("-companion-settings") { settings = true }
             #if DEBUG
+            if arguments.contains("-companion-new-session") { newSession = NewSessionRequest(project: "") }
+            if arguments.contains("-companion-pair-sheet") { pairing = true }
             // Simulator rigs (scripts/companion-rig.sh): pair from a launch argument.
             if let index = arguments.firstIndex(of: "-companion-pair"), arguments.indices.contains(index + 1) {
                 try? model.pair(arguments[index + 1])
@@ -125,25 +127,24 @@ struct CompanionView: View {
     private var settingsSheet: some View {
         NavigationStack {
             List {
-                Section("Computers") {
+                Section {
                     ForEach(model.profiles) { host in
                         Button { model.select(host.id); settings = false } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: "desktopcomputer")
-                                    .font(.system(size: 15)).foregroundStyle(Theme.textMuted)
-                                    .frame(width: 22)
+                                settingsIcon("desktopcomputer")
                                 Text(host.name).font(Theme.sans(15)).foregroundStyle(Theme.text).lineLimit(1)
                                 Spacer(minLength: 8)
                                 if model.selectedID == host.id {
-                                    Circle()
-                                        .fill(model.online ? Theme.statusCompleted : Theme.warning)
-                                        .frame(width: 6, height: 6)
+                                    Text(model.online ? "Online" : "Offline")
+                                        .font(Theme.mono(11))
+                                        .foregroundStyle(model.online ? Theme.statusCompleted : Theme.warning)
                                     Image(systemName: "checkmark")
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(Theme.textMuted)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Theme.text)
                                 }
                             }
-                            .frame(minHeight: 44)
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .swipeActions {
@@ -153,31 +154,77 @@ struct CompanionView: View {
                         }
                     }
                     Button { afterSettings = { pairing = true }; settings = false } label: {
-                        Label("Pair a computer", systemImage: "plus")
-                            .font(Theme.sans(15)).foregroundStyle(Theme.text)
-                            .frame(minHeight: 44)
+                        HStack(spacing: 12) {
+                            settingsIcon("plus")
+                            Text("Pair a computer").font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(minHeight: 36).contentShape(Rectangle())
                     }
-                }
-                Section {
-                    NavigationLink("Appearance") { AppearanceSettingsView() }
-                }
-                Section {
-                    Button { afterSettings = { cloud = true }; settings = false } label: {
-                        Label("Connect a cloud account", systemImage: "cloud")
-                            .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
-                    }
-                    Button { settings = false; app.enterDemoMode() } label: {
-                        Label("Explore demo sessions", systemImage: "sparkles")
-                            .font(Theme.sans(15)).foregroundStyle(Theme.textMuted)
-                    }
+                    .buttonStyle(.plain)
+                } header: {
+                    Text("Computers").font(Theme.sans(13, weight: .medium))
                 } footer: {
-                    Text("Forgetting a computer removes its key from this phone. Revoke the key on the host to disable it everywhere.")
+                    Text("Swipe a computer to forget it. That removes its key from this phone; revoke the key on the host to disable it everywhere.")
+                        .font(Theme.sans(12))
                 }
+                .listRowBackground(Theme.surface)
+
+                Section {
+                    NavigationLink {
+                        AppearanceSettingsView()
+                    } label: {
+                        HStack(spacing: 12) {
+                            settingsIcon("circle.lefthalf.filled")
+                            Text("Appearance").font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            Spacer(minLength: 8)
+                            Text(appearanceSummary).font(Theme.sans(14)).foregroundStyle(Theme.textMuted)
+                        }
+                        .frame(minHeight: 36)
+                    }
+                    .accessibilityLabel("Appearance")
+                    .accessibilityValue(appearanceSummary)
+                    Button { afterSettings = { cloud = true }; settings = false } label: {
+                        HStack(spacing: 12) {
+                            settingsIcon("cloud")
+                            Text("Connect a cloud account").font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(minHeight: 36).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Button { settings = false; app.enterDemoMode() } label: {
+                        HStack(spacing: 12) {
+                            settingsIcon("sparkles")
+                            Text("Explore demo sessions").font(Theme.sans(15)).foregroundStyle(Theme.text)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(minHeight: 36).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listRowBackground(Theme.surface)
             }
+            .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden).background(Theme.bg)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { settings = false } } }
+        }
+    }
+
+    /// Leading icon on a fixed 24pt column so every settings row lines up.
+    private func settingsIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 16)).foregroundStyle(Theme.textMuted)
+            .frame(width: 24)
+    }
+
+    private var appearanceSummary: String {
+        switch AppearanceSettings.shared.mode {
+        case "light": "Light"
+        case "dark": "Dark"
+        default: "System"
         }
     }
 

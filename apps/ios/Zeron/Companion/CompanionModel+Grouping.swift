@@ -14,6 +14,8 @@ struct CompanionProjectGroup: Identifiable {
     var isHome: Bool { space == nil }
     /// The project filter / new-session value: empty means "no project".
     var projectID: String { space?.id ?? "" }
+    /// Filtering must distinguish the home group from the All-projects value.
+    var filterID: String { space?.id ?? CompanionModel.noProjectFilter }
     /// Mono path hint, home-relative where the host path allows it.
     var hint: String { space.map { CompanionProjectGroup.pathHint($0.path) } ?? "~" }
 
@@ -31,6 +33,7 @@ enum CompanionGrouping: String, CaseIterable {
 }
 
 extension CompanionModel {
+    static let noProjectFilter = "__no_project__"
     /// Groups `chats` by project. Chats whose project is unknown fall into the
     /// home group. Order: groups with the most urgent session first, then the
     /// most recent activity, then name; empty projects (when `keepEmpty`) sort

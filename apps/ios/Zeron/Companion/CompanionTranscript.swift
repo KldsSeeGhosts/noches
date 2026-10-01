@@ -193,7 +193,7 @@ struct CompanionTranscript: View {
             expansionHeight: submittedID.flatMap { expansionHeights[$0] } ?? 0,
             bottomSpacing: 18, reduceMotion: reduceMotion,
             configurationID: expanded.hashValue ^ openTools.hashValue ^ dynamicTypeSize.hashValue ^ online.hashValue ^ busy.hashValue) { row in
-                AnyView(content(row).padding(.top, row.topGap).padding(.horizontal, 20)
+                AnyView(content(row).padding(.top, row.topGap).padding(.horizontal, Theme.spaceLG)
                     .frame(maxWidth: TranscriptView.maxContentWidth).frame(maxWidth: .infinity)
                     .environment(\.dynamicTypeSize, dynamicTypeSize)
                     .environment(\.companionImageLoader, imageLoader))

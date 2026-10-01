@@ -48,7 +48,7 @@ struct CompanionWorkspaceSheet: View {
             Group {
                 switch tab {
                 case .files: CompanionDirectoryView(model: model, chat: chat, directory: "", close: { dismiss() })
-                case .changes: CompanionChangesView(model: model, chat: chat, store: changes)
+                case .changes: CompanionChangesView(model: model, chat: chat, store: changes, close: { dismiss() })
                 case .terminal: CompanionTerminalView(model: model, chat: chat)
                 }
             }
@@ -85,12 +85,12 @@ struct CompanionDirectoryView: View {
                 }
                 ForEach(matches) { file in
                     NavigationLink(value: file) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(file.name).font(Theme.sans(14)).lineLimit(1)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.name).font(Theme.sans(15)).lineLimit(1)
                             Text(file.path).font(Theme.mono(11)).foregroundStyle(Theme.textFaint)
                                 .lineLimit(1).truncationMode(.head)
                         }.frame(minHeight: 44, alignment: .leading)
-                    }.listRowBackground(Theme.bg)
+                    }.listRowBackground(Theme.bg).listRowSeparatorTint(Theme.border)
                 }
             } else {
                 if let error { CompanionReadError(message: error) { Task { await load(more: false) } } }
@@ -98,9 +98,13 @@ struct CompanionDirectoryView: View {
                 if loaded && entries.isEmpty { Text("This folder is empty.").foregroundStyle(Theme.textMuted) }
                 ForEach(entries) { file in
                     NavigationLink(value: file) {
-                        Label(file.name, systemImage: file.kind == "directory" ? "folder" : file.kind == "symlink" ? "link" : "doc.text")
-                            .font(Theme.sans(14)).frame(minHeight: 44, alignment: .leading)
-                    }.listRowBackground(Theme.bg)
+                        HStack(spacing: 12) {
+                            Image(systemName: file.kind == "directory" ? "folder" : file.kind == "symlink" ? "link" : "doc.text")
+                                .font(.system(size: 15)).foregroundStyle(Theme.textMuted).frame(width: 24)
+                            Text(file.name).font(Theme.sans(15)).lineLimit(1).truncationMode(.middle)
+                        }
+                        .frame(minHeight: 44, alignment: .leading)
+                    }.listRowBackground(Theme.bg).listRowSeparatorTint(Theme.border)
                 }
                 if cursor != nil {
                     Button(busy ? "Loading…" : "Load more files") { Task { await load(more: true) } }
@@ -175,12 +179,15 @@ struct CompanionFileView: View {
     @State private var saving = false
     @State private var saveError: String?
     @State private var conflict = false
+    @FocusState private var editorFocused: Bool
 
     var body: some View {
         Group {
             if let file {
                 if editing {
                     TextEditor(text: $draft)
+                        .focused($editorFocused)
+                        .onAppear { editorFocused = true }
                         .font(Theme.mono(12)).scrollContentBackground(.hidden)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .padding(.horizontal, 12)
@@ -193,6 +200,7 @@ struct CompanionFileView: View {
             else { ProgressView("Reading file…") }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Theme.bg).foregroundStyle(Theme.text)
             .navigationTitle((path as NSString).lastPathComponent).navigationBarTitleDisplayMode(.inline)
+            .navigationSubtitle((path as NSString).deletingLastPathComponent)
             .navigationBarBackButtonHidden(editing)
             .toolbar {
                 if editing {
