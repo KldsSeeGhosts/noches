@@ -909,10 +909,7 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
             .any(|((old_key, _), (new_key, _))| old_key != new_key)
 }
 
-/// Exact active-session card height. Every row is one fixed three-line card
-/// (project/status, title, mono metadata), so the FLIP estimates and the
-/// drawn row agree in every state (control-plane.md, "Card (three lines,
-/// 72px)").
+/// Exact two-line thread height, shared by rendering and FLIP estimates.
 pub(super) fn chat_row_height() -> f32 {
     CHAT_ROW_HEIGHT
 }
@@ -991,18 +988,15 @@ impl Render for SidebarTooltip {
     }
 }
 
-/// One three-line session card, T3 Code's thread card: the project badge and
-/// state slot, the title, then the mono metadata line. Constant height.
-const CHAT_ROW_HEIGHT: f32 = 72.0;
-/// The card's line heights, top to bottom: 18 + 18 + 16, centered in 72.
-const SIDEBAR_CARD_LINE1_HEIGHT: f32 = 18.0;
-const SIDEBAR_CARD_LINE2_HEIGHT: f32 = 18.0;
-const SIDEBAR_CARD_LINE3_HEIGHT: f32 = 16.0;
-/// Project badge edge on line 1 (`Shell::render_project_icon`).
-const SIDEBAR_PROJECT_BADGE_SIZE: f32 = 16.0;
-/// Session avatar edge; also the leading column of the footer and filter
-/// rows.
-const SIDEBAR_BUDDY_SIZE: f32 = 20.0;
+/// Compact title-first thread: 8px + 20px title + 4px gap + 16px context + 8px.
+const CHAT_ROW_HEIGHT: f32 = 56.0;
+const SIDEBAR_CARD_TITLE_HEIGHT: f32 = 20.0;
+const SIDEBAR_CARD_META_HEIGHT: f32 = 16.0;
+const SIDEBAR_CARD_GAP: f32 = 4.0;
+const SIDEBAR_CARD_PAD: f32 = 8.0;
+const SIDEBAR_PROJECT_BADGE_SIZE: f32 = 14.0;
+/// Leading icon column of the footer and project filter. No avatars.
+const SIDEBAR_CONTROL_ICON_SIZE: f32 = 20.0;
 /// Gap between a row's leading icon column and its label.
 const SIDEBAR_ROW_ICON_GAP: f32 = 8.0;
 /// Flex gap between sidebar list items.
@@ -6508,9 +6502,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session card, T3 Code's thread card: the project badge and name
-    /// with the state slot, the title, then a mono metadata line (branch, PR,
-    /// remote device, harness mark). Click selects; right-click opens its menu.
+    /// Compact title-first thread with harness identity, live status, and a
+    /// single project/branch context line. Click selects; right-click opens its menu.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -6539,10 +6532,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = badge.chat_id.clone();
-        // Activity, not position: live rows put the state icon and label in
-        // the top-right slot; settled rows show relative time. Hovering the
-        // ROW swaps the slot for the ARCHIVE button (UNARCHIVE on rows in the
-        // sidebar's archived accordion), t3code's settle-on-hover.
+        // Activity, not position: live rows put a state glyph and clock in
+        // the title's trailing slot; settled rows show relative time. Hover
+        // reveals Archive without hiding live status.
         // A chat can appear on both surfaces at once. Namespace every hover
         // key and child id so the palette never animates the sidebar copy.
         let row_id = if search_query.is_some() {
@@ -6551,6 +6543,8 @@ impl Shell {
             format!("chat-{id}")
         };
         let corner_hovered = self.chat_status_hover.as_deref() == Some(row_id.as_str());
+        let show_jump_hint = jump_label.is_some();
+        let show_archive = corner_hovered && !show_jump_hint;
         // One source of truth for state (status_palette.rs): send truth
         // overrides the engine's indicator, and the title weight, gutter bar,
         // icon, label and elapsed clock all read the same resolved state.
@@ -6609,46 +6603,9 @@ impl Shell {
                     .child(label)
                     .into_any_element()
             }
-        } else if corner_hovered {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0))
-                .h(px(18.0))
-                // The pill's padding bleeds right into the row's padding so
-                // its TEXT right-aligns exactly where the status word/time
-                // sits — the swap moves pixels around the label, not it.
-                // 4px: what's left of the row's 8px padding.
-                .px(px(4.0))
-                .mr(px(-4.0))
-                .rounded(px(5.0))
-                .bg(crate::theme::wash(0.10))
-                .hover(|s| s.bg(crate::theme::wash(0.18)))
-                .child(
-                    icon(if archived {
-                        icons::ARCHIVE_UP_MINIMALISTIC
-                    } else {
-                        icons::ARCHIVE_MINIMALISTIC
-                    })
-                    .size(px(11.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .text_size(crate::typography::ui_rems(10.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(if archived {
-                            "Unarchive"
-                        } else {
-                            "Archive"
-                        })),
-                )
-                .into_any_element()
         } else if let Some(label) = session.label() {
-            // Rule 1: every live state is its 12px icon plus label in the
-            // state hue (Queued stays neutral). Working earns the clock.
+            // Every live state keeps a 12px glyph in its state hue.
+            // Queued stays neutral; Working earns the clock.
             let color = session.color(theme).unwrap_or(theme.text_muted);
             let glyph: AnyElement = match session {
                 SessionState::Working => loaders::mini_equalizer(
@@ -6680,22 +6637,29 @@ impl Shell {
                     .into_any_element(),
                 SessionState::Idle => unreachable!("label() is None for idle"),
             };
+            // Keep status legible without spending the title's width on a
+            // repeated word in every row. The tooltip/AX label carries the
+            // full state; Working retains its live clock.
             let mut slot = div()
+                .id(SharedString::from(format!("{row_id}-state")))
+                .role(gpui::Role::Image)
+                .aria_label(label)
+                .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(5.0))
                 .h(px(16.0))
-                .child(glyph)
-                .child(
+                .child(motion::fade_quick(
+                    SharedString::from(format!("{row_id}-state-{session:?}")),
                     div()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .line_height(px(16.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(color)
-                        .child(SharedString::from(label)),
-                );
-            if let Some(elapsed) = elapsed {
+                        .size(px(12.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(glyph),
+                ));
+            if let Some(elapsed) = elapsed.filter(|_| !show_archive) {
                 slot = slot.child(
                     div()
                         .font_family(theme.font_mono.clone())
@@ -6706,48 +6670,80 @@ impl Shell {
                 );
             }
             slot.into_any_element()
+        } else if show_archive {
+            div().into_any_element()
         } else {
             // Settled rows: the time is tertiary information - faint,
             // regular weight, mono (rule 3), never competing with the title.
             div()
                 .text_size(crate::typography::ui_rems(11.5))
-                .line_height(px(SIDEBAR_CARD_LINE1_HEIGHT))
+                .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_faint)
                 .child(time_ago.clone())
                 .into_any_element()
         };
-        // One stable wrapper across both states (identity keeps the hover
-        // from flickering as the content swaps); the swap is driven by the
-        // ROW's hover (user request — corner-only felt undiscoverable), but
-        // archiving only clicks on the corner itself, so the row's own click
-        // stays the selector.
-        let corner: AnyElement = {
-            let archive_id = id.clone();
-            div()
-                .id(SharedString::from(format!("{row_id}-corner")))
-                .flex_none()
-                // Pin the slot to line 1's height so the archive pill
-                // (taller, padded) overflows vertically instead of growing the
-                // card - the swap must not shift the card's content.
-                // NO occlude: the ROW's hover drives the swap, and an
-                // occluding corner un-hovered the row underneath it —
-                // pill mounts, steals the pointer, row un-hovers, pill
-                // unmounts, repeat (user-reported flicker). The pill's
-                // stop_propagation click is separation enough.
-                .h(px(SIDEBAR_CARD_LINE1_HEIGHT))
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .when(corner_hovered, |el| {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_chat_archived(archive_id.clone(), !archived, cx);
-                    }))
-                })
-                .child(corner_body)
-                .into_any_element()
-        };
+        // A stable slot prevents title jitter on hover. Live glyphs never
+        // disappear behind an action; only their elapsed clock yields.
+        // Custom jump bindings can be wider than 56px (Ctrl+Shift+A):
+        // while hints are held, grow the slot rather than overlap the title.
+        let corner: AnyElement = div()
+            .id(SharedString::from(format!("{row_id}-corner")))
+            .flex_none()
+            .min_w(px(56.0))
+            .when(!show_jump_hint, |el| el.w(px(56.0)))
+            .h(px(SIDEBAR_CARD_TITLE_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(5.0))
+            .child(corner_body)
+            .when(show_archive, |el| {
+                let archive_id = id.clone();
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("{row_id}-archive")))
+                        .role(gpui::Role::Button)
+                        .aria_label(if archived {
+                            "Unarchive session"
+                        } else {
+                            "Archive session"
+                        })
+                        .size(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .hover(|s| s.bg(crate::theme::wash(0.10)))
+                        .cursor_pointer()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                SidebarTooltip(if archived {
+                                    "Unarchive session"
+                                } else {
+                                    "Archive session"
+                                })
+                            })
+                            .into()
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_chat_archived(archive_id.clone(), !archived, cx);
+                        }))
+                        .child(
+                            icon(if archived {
+                                icons::ARCHIVE_UP_MINIMALISTIC
+                            } else {
+                                icons::ARCHIVE_MINIMALISTIC
+                            })
+                            .size(px(13.0))
+                            .text_color(theme.text_muted),
+                        ),
+                )
+            })
+            .into_any_element();
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
         let select_id = id.clone();
@@ -6775,19 +6771,13 @@ impl Shell {
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         div()
             .id(SharedString::from(row_id.clone()))
-            // Fixed three-line card: 9px top/bottom padding centers the
-            // 54px of lines (the old fixed-height + justify_center drew
-            // the same 72px box), and nested child rows below line 3 grow
-            // the card from there - the caller adds their height to the
-            // keyed row so the list's FLIP estimates and the drawn row
-            // always agree.
             .relative()
             .flex()
             .flex_col()
-            .pt(px(9.0))
-            // A bare card keeps the original 72px (justify_center's 9px
-            // bottom); with children the block carries its own pb(4px).
-            .pb(px(if sub_children.is_some() { 0.0 } else { 9.0 }))
+            .pt(px(SIDEBAR_CARD_PAD))
+            // Child disclosure owns its own bottom pad. The base card keeps
+            // the same height whether expanded or not, matching FLIP.
+            .pb(px(SIDEBAR_CARD_PAD))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
@@ -6799,7 +6789,7 @@ impl Shell {
             // No selection ring (user request) — the wash alone marks the
             // active row.
             // Row hover drives BOTH the wash blend and the corner's
-            // status→Archive swap (one listener — gpui allows a single
+            // time→Archive reveal (one listener - gpui allows a single
             // hover listener per element).
             .on_hover({
                 let fade_hover = motion::hover_listener(fade_key.clone());
@@ -6853,14 +6843,55 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1 - identity and state: the project badge and name, then
-            // the status slot (or its hover/jump replacement).
+            // Title first, with harness identity at the leading edge and a
+            // quiet status/time/action slot. Both lines share the text start.
             .child(
                 div()
                     .w_full()
-                    .h(px(SIDEBAR_CARD_LINE1_HEIGHT))
+                    .h(px(SIDEBAR_CARD_TITLE_HEIGHT))
                     .flex()
-                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .w(px(SIDEBAR_PROJECT_BADGE_SIZE))
+                            .h(px(SIDEBAR_CARD_TITLE_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(harness_mark, |el, (path, tint)| {
+                                el.child(
+                                    icon(path)
+                                        .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                        .text_color(tint.unwrap_or(theme.text_muted)),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
+                            .when(needs_you, |el| el.font_weight(gpui::FontWeight::MEDIUM))
+                            .child(popover::search_highlight(
+                                title.clone(),
+                                search_query,
+                                theme,
+                            )),
+                    )
+                    .child(corner),
+            )
+            // One compact context line. No empty third line for sessions
+            // without a branch; project identity always remains visible.
+            .child(
+                div()
+                    .mt(px(SIDEBAR_CARD_GAP))
+                    .w_full()
+                    .h(px(SIDEBAR_CARD_META_HEIGHT))
+                    .flex()
                     .items_center()
                     .gap(px(6.0))
                     .child(self.render_project_icon(
@@ -6871,62 +6902,19 @@ impl Shell {
                     ))
                     .child(
                         div()
-                            .flex_1()
+                            .max_w(px(if branch.is_some() { 88.0 } else { 140.0 }))
                             .min_w_0()
                             .truncate()
                             .text_size(crate::typography::ui_rems(11.5))
-                            .line_height(px(SIDEBAR_CARD_LINE1_HEIGHT))
-                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .line_height(px(SIDEBAR_CARD_META_HEIGHT))
                             .text_color(theme.text_muted)
-                            .child(popover::search_highlight(
-                                project.clone(),
-                                search_query,
-                                theme,
-                            )),
+                            .child(popover::search_highlight(project, search_query, theme)),
                     )
-                    .child(corner),
-            )
-            // Line 2 - the title. Rule 4: NORMAL weight, MEDIUM and full
-            // strength when the session needs you.
-            .child(
-                div()
-                    .w_full()
-                    .h(px(SIDEBAR_CARD_LINE2_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .line_height(px(18.0))
-                            .when(needs_you, |el| el.font_weight(gpui::FontWeight::MEDIUM))
-                            .child(popover::search_highlight(
-                                title.clone(),
-                                search_query,
-                                theme,
-                            )),
-                    ),
-            )
-            // Line 3 - mono metadata, all 11px: the branch on the left; PR
-            // badge, remote device and the harness mark on the right, in that
-            // order. Text starts at the badge's left edge (no leading column
-            // on the lines below line 1).
-            .child(
-                div()
-                    .w_full()
-                    .h(px(SIDEBAR_CARD_LINE3_HEIGHT))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .flex_row()
                             .items_center()
                             .gap(px(4.0))
                             .when_some(branch, |el, branch| {
@@ -6942,7 +6930,7 @@ impl Shell {
                                         .truncate()
                                         .font_family(theme.font_mono.clone())
                                         .text_size(crate::typography::ui_rems(11.0))
-                                        .line_height(px(SIDEBAR_CARD_LINE3_HEIGHT))
+                                        .line_height(px(SIDEBAR_CARD_META_HEIGHT))
                                         .text_color(theme.text_faint)
                                         .child(popover::search_highlight(
                                             branch,
@@ -6964,29 +6952,19 @@ impl Shell {
                     .when_some(remote_device, |el, device| {
                         el.child(
                             div()
-                                .max_w(px(96.0))
+                                .max_w(px(72.0))
                                 .min_w_0()
                                 .truncate()
                                 .font_family(theme.font_mono.clone())
                                 .text_size(crate::typography::ui_rems(11.0))
-                                .line_height(px(SIDEBAR_CARD_LINE3_HEIGHT))
+                                .line_height(px(SIDEBAR_CARD_META_HEIGHT))
                                 .text_color(theme.text_faint)
                                 .child(device),
-                        )
-                    })
-                    .when_some(harness_mark, |el, (path, tint)| {
-                        el.child(
-                            icon(path)
-                                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                .flex_none()
-                                // Rule 1: identity keeps its brand tint; the
-                                // monochrome marks stay muted.
-                                .text_color(tint.unwrap_or(theme.text_muted)),
                         )
                     }),
             )
             // Running subagent lines live INSIDE the card's wash/radius,
-            // after line 3 (subagents.rs sidebar_children owns the rows;
+            // after the context line (subagents.rs sidebar_children owns the rows;
             // the caller wraps them in the `sub:{chat}` disclosure tween).
             .children(sub_children)
             .when(needs_you, |row| {
@@ -7019,7 +6997,9 @@ impl Shell {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
         let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn.chats.iter()
+        let chat = conn
+            .chats
+            .iter()
             .find(|c| Some(c.chat_id.as_str()) == selected);
         let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
@@ -7039,9 +7019,13 @@ impl Shell {
                 (
                     caption.into(),
                     loaders::mini_mono_spinner(
-                        "chat-sync-spinner", 2.0, theme.text_muted,
-                        self.sidebar_pane.entity_id(), cx,
-                    ).into_any_element(),
+                        "chat-sync-spinner",
+                        2.0,
+                        theme.text_muted,
+                        self.sidebar_pane.entity_id(),
+                        cx,
+                    )
+                    .into_any_element(),
                 )
             }
             S::Offline => (
@@ -7170,8 +7154,8 @@ impl Shell {
                         .child(element)
                         .with_animation(
                             id,
-                            MotionSpec::new(350, motion::EASE)
-                                .with_delay((index.min(7) as u64) * 30)
+                            MotionSpec::new(180, motion::EASE)
+                                .with_delay((index.min(5) as u64) * 15)
                                 .animation(),
                             |el, t| el.relative().opacity(t).top(px(4.0 * (1.0 - t))),
                         )
@@ -7399,7 +7383,7 @@ impl Shell {
                     .gap(px(SIDEBAR_ROW_ICON_GAP))
                     .child(
                         div()
-                            .size(px(SIDEBAR_BUDDY_SIZE))
+                            .size(px(SIDEBAR_CONTROL_ICON_SIZE))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -9924,22 +9908,20 @@ impl Shell {
                 // up the carve-out. The bubble dispatch reaches the chip
                 // before the strip, and the handler consumes the drag, so
                 // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(
-                    move |this, payload: &RightTabDrag, _, cx| {
-                        if payload.panel_key != this.panel_key(cx) {
-                            this.right_tab_drag = None;
-                            cx.notify();
-                            return;
-                        }
-                        let to = this
-                            .right_tab_drag
-                            .as_ref()
-                            .map(|d| d.over)
-                            .unwrap_or(payload.from);
+                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
                         this.right_tab_drag = None;
-                        this.reorder_right_tabs(payload.from, to, cx);
-                    },
-                ))
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                }))
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -11729,17 +11711,26 @@ mod tests {
 
         chat.sync_state = S::Waiting;
         chat.connected = false;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued - changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued - changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
         chat.sync_state = S::Offline;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline - changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Offline - changes are saved")
+        );
 
         // Real pending pushes remain visible even with a live room.
         chat.connected = true;
         chat.pending_pushes = 1;
         chat.sync_state = S::Waiting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued - changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued - changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
@@ -12612,27 +12603,22 @@ mod tests {
 
     #[test]
     fn sidebar_chat_rows_keep_one_constant_height() {
-        // "Card (three lines, 72px)": the badge line, the title, and the
-        // metadata line are always drawn, so the FLIP estimates and the
-        // drawn card agree in every state. The needs-you bar is centered in
-        // that block.
-        assert_eq!(chat_row_height(), CHAT_ROW_HEIGHT);
-        assert_eq!(CHAT_ROW_HEIGHT, 72.0);
+        assert_eq!(chat_row_height(), 56.0);
         assert_eq!(
-            SIDEBAR_CARD_LINE1_HEIGHT + SIDEBAR_CARD_LINE2_HEIGHT + SIDEBAR_CARD_LINE3_HEIGHT,
-            52.0
+            CHAT_ROW_HEIGHT,
+            SIDEBAR_CARD_PAD * 2.0
+                + SIDEBAR_CARD_TITLE_HEIGHT
+                + SIDEBAR_CARD_GAP
+                + SIDEBAR_CARD_META_HEIGHT
         );
-        assert_eq!((CHAT_ROW_HEIGHT - SIDEBAR_NEEDS_BAR_HEIGHT) / 2.0, 26.0);
+        assert_eq!((CHAT_ROW_HEIGHT - SIDEBAR_NEEDS_BAR_HEIGHT) / 2.0, 18.0);
     }
 
     #[test]
     fn sidebar_card_geometry_matches_the_spec() {
-        // control-plane.md: line 1 is 18px with the 16px project badge, the
-        // title line 18px, the metadata line 16px, and the harness mark 13px.
-        assert_eq!(SIDEBAR_CARD_LINE1_HEIGHT, 18.0);
-        assert_eq!(SIDEBAR_CARD_LINE2_HEIGHT, 18.0);
-        assert_eq!(SIDEBAR_CARD_LINE3_HEIGHT, 16.0);
-        assert_eq!(SIDEBAR_PROJECT_BADGE_SIZE, 16.0);
+        assert_eq!(SIDEBAR_CARD_TITLE_HEIGHT, 20.0);
+        assert_eq!(SIDEBAR_CARD_META_HEIGHT, 16.0);
+        assert_eq!(SIDEBAR_PROJECT_BADGE_SIZE, 14.0);
         assert_eq!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, 13.0);
     }
 
@@ -14408,6 +14394,111 @@ mod workspace_persistence {
             },
             cx,
         )
+    }
+
+    #[gpui::test]
+    fn compact_threads_match_flip_height_in_light_dark_and_hover(cx: &mut TestAppContext) {
+        use zeron_proto::ChatIndicator::{AwaitingInput, Completed, Errored, Idle, Working};
+        struct Geometry {
+            shell: Entity<Shell>,
+            status: zeron_proto::ChatIndicator,
+            index: usize,
+            hovered: bool,
+            jump: bool,
+            children: bool,
+            measured: std::rc::Rc<std::cell::Cell<Option<gpui::Size<Pixels>>>>,
+        }
+        impl Render for Geometry {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let id = format!("geometry-{}", self.index);
+                let row = self.shell.update(cx, |shell, cx| {
+                    shell.chat_status_hover = self.hovered.then(|| format!("chat-{id}"));
+                    shell.render_chat_row(
+                        project_icon::ProjectIconRequest::monogram_fallback(&id, "Noches"),
+                        "Refine the sidebar without hiding agent activity".into(),
+                        "12m".into(),
+                        "Noches".into(),
+                        (self.status != Idle).then(|| "design/a-very-long-sidebar-branch".into()),
+                        (self.status == Working).then(|| "Remote workstation".into()),
+                        None,
+                        Some(zeron_proto::HarnessId::Pi),
+                        self.status,
+                        true,
+                        false,
+                        self.jump.then(|| {
+                            if self.index == 5 {
+                                "Ctrl+Shift+A"
+                            } else {
+                                "⌘1"
+                            }
+                            .into()
+                        }),
+                        None,
+                        self.children.then(|| div().h(px(28.0)).into_any_element()),
+                        &theme,
+                        cx,
+                    )
+                });
+                let measured = self.measured.clone();
+                div().child(
+                    div().w(px(SIDEBAR_MIN)).relative().child(row).child(
+                        gpui::canvas(
+                            move |bounds, _, _| measured.set(Some(bounds.size)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    ),
+                )
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| init_app(dir.path(), cx));
+        let measured = std::rc::Rc::new(std::cell::Cell::new(None));
+        let window = cx.add_window(|_, cx| Geometry {
+            shell: cx.new(|cx| new_shell(dir.path(), cx)),
+            status: Idle,
+            index: 0,
+            hovered: false,
+            jump: false,
+            children: false,
+            measured: measured.clone(),
+        });
+        // Branchless, metadata-heavy, hovered, jump-hinted, and expanded rows.
+        for (index, (status, light, hovered, jump, children)) in [
+            (Idle, false, false, false, false),
+            (Working, false, true, false, false),
+            (AwaitingInput, true, true, true, false),
+            (Errored, true, false, false, true),
+            (Completed, false, true, false, false),
+            (Idle, false, true, true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            window
+                .update(cx, |fixture, _, cx| {
+                    cx.set_global(if light { Theme::light() } else { Theme::dark() });
+                    fixture.status = status;
+                    fixture.index = index;
+                    fixture.hovered = hovered;
+                    fixture.jump = jump;
+                    fixture.children = children;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            let measured = measured.get().expect("row was painted");
+            let extra_height = if children { 28.0 } else { 0.0 };
+            assert_eq!(
+                measured.height,
+                px(chat_row_height() + extra_height),
+                "rendered height and FLIP estimate diverged for {status:?}"
+            );
+            assert_eq!(measured.width, px(SIDEBAR_MIN));
+        }
     }
 
     #[gpui::test]

@@ -1,6 +1,6 @@
 # Noches Desktop: UI design system
 
-The desktop UI follows **docs/design/control-plane.md**: a control plane for coding agents, with T3 Code's thread cards in the sidebar and Cursor-style meaningful color. Read it before changing any sidebar, pane-header, or composer chrome. It supersedes the earlier open-design "buddy bot" sidebar plan. Buddy avatars were removed on purpose; do not bring them back.
+The desktop UI follows **docs/design/control-plane.md**: a control plane for coding agents, with BB-style compact title-first threads in the sidebar and Cursor-style meaningful color. Read it before changing any sidebar, pane-header, or composer chrome. It supersedes the earlier open-design "buddy bot" sidebar plan. Buddy avatars were removed on purpose; do not bring them back.
 
 ## Rules in one breath
 
