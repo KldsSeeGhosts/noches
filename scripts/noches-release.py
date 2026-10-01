@@ -129,8 +129,13 @@ def publish(directory):
     commit = os.environ["GITHUB_SHA"]
     branch = os.environ["GITHUB_REF_NAME"]
     mode = os.environ.get("NOCHES_RELEASE_MODE", "normal")
+    # A failed-job rerun retains prepare's outputs and successful packages.
+    # Its workflow attempt increments, but the packages' identity must not.
+    attempt = os.environ.get("NOCHES_BUILD_ATTEMPT", os.environ["GITHUB_RUN_ATTEMPT"])
+    if not 0 < int(attempt) <= int(os.environ["GITHUB_RUN_ATTEMPT"]):
+        raise ValueError("Invalid prepared build attempt")
     if (channel, version) != build_identity(branch, os.environ["GITHUB_RUN_NUMBER"],
-                                            os.environ["GITHUB_RUN_ATTEMPT"], mode,
+                                            attempt, mode,
                                             channel if mode != "normal" else None):
         raise ValueError("Release identity differs from the workflow run")
     if mode != "normal" and os.environ.get("NOCHES_MIGRATION_CONFIRM") != f"{mode}-{channel}":
@@ -219,7 +224,8 @@ def main():
                                           os.environ.get("NOCHES_RELEASE_MODE", "normal"),
                                           os.environ.get("NOCHES_MIGRATION_CHANNEL") or None)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-            output.write(f"channel={channel}\nversion={version}\n")
+            output.write(f"channel={channel}\nversion={version}\n"
+                         f"build_attempt={int(os.environ['GITHUB_RUN_ATTEMPT'])}\n")
     else:
         publish(args.directory)
 
