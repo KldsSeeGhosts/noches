@@ -39,7 +39,32 @@ class ReleaseTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_REF_NAME='10/merge', NOCHES_SOURCE_BRANCH='dev',
                        GITHUB_RUN_NUMBER='12', GITHUB_RUN_ATTEMPT='1', GITHUB_OUTPUT=str(output))
             subprocess.run(['python3', str(ROOT / 'scripts/noches-release.py'), 'prepare'], env=env, check=True)
-            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.1.12-dev.1\n')
+            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.1.12-dev.1\nbuild_attempt=1\n')
+
+    def test_failed_job_rerun_preserves_prepared_identity(self):
+        env = dict(GITHUB_REPOSITORY='owner/noches', GITHUB_REF_NAME='dev',
+                   GITHUB_SHA='abc123', GITHUB_RUN_NUMBER='42', GITHUB_RUN_ATTEMPT='2',
+                   NOCHES_CHANNEL='dev', NOCHES_VERSION='0.1.42-dev.1',
+                   NOCHES_BUILD_ATTEMPT='1', NOCHES_RELEASE_MODE='normal')
+        with patch.dict(os.environ, env), \
+             patch.object(release, 'branch_is_current', return_value=False) as current:
+            # Reaching the branch guard proves the retained identity is valid.
+            with self.assertRaisesRegex(ValueError, 'Branch advanced'):
+                release.publish(Path('unused'))
+            current.assert_called_once_with('owner/noches', 'dev', 'abc123')
+            for attempt in ('0', '3'):
+                with patch.dict(os.environ, NOCHES_BUILD_ATTEMPT=attempt):
+                    with self.assertRaisesRegex(ValueError, 'Invalid prepared build attempt'):
+                        release.publish(Path('unused'))
+            with patch.dict(os.environ, NOCHES_VERSION='0.1.42-dev.2'):
+                with self.assertRaisesRegex(ValueError, 'identity differs'):
+                    release.publish(Path('unused'))
+
+    def test_release_workflow_passes_prepared_attempt_to_publisher(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('build_attempt: ${{ steps.identity.outputs.build_attempt }}', workflow)
+        publisher = workflow.split('  publish:\n', 1)[1]
+        self.assertIn('NOCHES_BUILD_ATTEMPT: ${{ needs.prepare.outputs.build_attempt }}', publisher)
 
     def test_complete_manifest_uses_immutable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -56,6 +56,7 @@ jobs:
     outputs:
       channel: ${{ steps.identity.outputs.channel }}
       version: ${{ steps.identity.outputs.version }}
+      build_attempt: ${{ steps.identity.outputs.build_attempt }}
     steps:
       - uses: actions/checkout@v4
       - id: identity
@@ -195,6 +196,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
       NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
+      NOCHES_BUILD_ATTEMPT: ${{ needs.prepare.outputs.build_attempt }}
       NOCHES_RELEASE_MODE: ${{ inputs.migration || 'normal' }}
       NOCHES_MIGRATION_CONFIRM: ${{ inputs.confirm || '' }}
     steps:
