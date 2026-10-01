@@ -87,7 +87,7 @@ impl Catalog {
         }
         let mut cmd = Command::new(exe);
         cmd.args(["models", "list", "--format", "json"]);
-        crate::compose_child_path(&mut cmd, exe);
+        crate::compose_child_environment(&mut cmd, exe);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

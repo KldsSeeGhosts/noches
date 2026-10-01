@@ -1,4 +1,4 @@
-//! Login-shell PATH snapshot.
+//! Login-shell environment snapshot.
 //!
 //! GUI/service launches (Dock, Finder, launchd, systemd) never run the user's
 //! shell init, so the daemon's own PATH misses everything the shell shapes:
@@ -7,8 +7,9 @@
 //! lists in the resolvers cover the common managers, but the only fix that
 //! works for *any* setup is asking the user's actual shell: spawn it once as
 //! an interactive login shell, have it print its environment between markers,
-//! and keep the PATH it reports. If `codex`/`claude` runs in their terminal,
-//! it resolves here too.
+//! and keep the environment it reports. Agent children need provider keys
+//! (including CPA's configured env key) as well as PATH. The snapshot stays
+//! host-local and is never logged or installed into the daemon's global env.
 //!
 //! The snapshot is captured once per process (cached, including a negative
 //! result) and is defensive about hostile shell init:
@@ -25,19 +26,59 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
-static CACHE: OnceLock<Option<OsString>> = OnceLock::new();
+type Environment = Vec<(OsString, OsString)>;
+
+static CACHE: OnceLock<Option<Environment>> = OnceLock::new();
+
+fn login_shell_environment() -> Option<&'static Environment> {
+    #[cfg(unix)]
+    {
+        CACHE.get_or_init(unix::capture).as_ref()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
 
 /// The PATH the user's login shell reports, captured once and cached for the
 /// life of the process. `None` when disabled, non-unix, no usable shell, or
 /// the shell never produced a parseable snapshot.
 pub fn login_shell_path() -> Option<&'static OsStr> {
-    #[cfg(unix)]
-    {
-        CACHE.get_or_init(unix::capture).as_deref()
+    login_shell_environment()?
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_os_str())
+}
+
+/// Fill gaps in a GUI/service child's inherited environment. Explicit command
+/// overrides (including env_remove) and the host process's values always win.
+/// Do not copy probe/shell bookkeeping into agents. PATH is composed separately.
+pub(crate) fn apply_to_child(command: &mut std::process::Command) {
+    if let Some(environment) = login_shell_environment() {
+        apply_environment(command, environment, &|key| std::env::var_os(key));
     }
-    #[cfg(not(unix))]
-    {
-        None
+}
+
+fn apply_environment(
+    command: &mut std::process::Command,
+    environment: &Environment,
+    inherited: &impl Fn(&OsStr) -> Option<OsString>,
+) {
+    let explicit: std::collections::HashSet<OsString> =
+        command.get_envs().map(|(key, _)| key.to_owned()).collect();
+    for (key, value) in environment {
+        if matches!(
+            key.to_str(),
+            Some(
+                "PATH" | "PWD" | "OLDPWD" | "SHLVL" | "_" | "TERM" | "ZERON_RESOLVING_ENVIRONMENT"
+            )
+        ) || explicit.contains(key)
+            || inherited(key).is_some()
+        {
+            continue;
+        }
+        command.env(key, value);
     }
 }
 
@@ -56,6 +97,7 @@ pub fn prewarm() {
 
 #[cfg(unix)]
 mod unix {
+    use super::Environment;
     use std::ffi::OsString;
     use std::io::Read;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -72,12 +114,12 @@ mod unix {
     /// After the shell exits, wait this long for the pipe to flush.
     const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
-    pub(super) fn capture() -> Option<OsString> {
+    pub(super) fn capture() -> Option<Environment> {
         if std::env::var_os("ZERON_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty()) {
             return None;
         }
         let shell = user_shell()?;
-        snapshot_path(&shell, ATTEMPT_TIMEOUT)
+        snapshot_environment(&shell, ATTEMPT_TIMEOUT)
     }
 
     /// The user's shell: `$SHELL`, then the passwd entry, then well-known
@@ -135,14 +177,15 @@ mod unix {
         }
     }
 
-    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until one
-    /// yields a parseable PATH.
-    pub(super) fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
-        let script = format!("echo {BEGIN_MARKER}; env; echo {END_MARKER}");
+    /// NUL-delimited records preserve multiline/non-UTF8 secrets and cannot
+    /// mistake a newline in a value for a second environment variable. Use the
+    /// absolute env path so unusual shell PATHs cannot break or shadow the probe.
+    fn snapshot_environment(shell: &Path, timeout: Duration) -> Option<Environment> {
+        let script = format!("echo {BEGIN_MARKER}; /usr/bin/env -0; echo {END_MARKER}");
         for flags in attempt_flag_sets(shell) {
             let output = run_and_capture(shell, &flags, &script, timeout);
-            if let Some(path) = parse_snapshot_path(&output) {
-                return Some(path);
+            if let Some(environment) = parse_snapshot_environment(&output) {
+                return Some(environment);
             }
         }
         None
@@ -231,22 +274,38 @@ mod unix {
         b.clone()
     }
 
-    /// Extract PATH from the `env` dump between the LAST begin marker and the
+    /// Extract environment from the `env` dump between the LAST begin marker and the
     /// first end marker after it (rc noise printed before our command — or a
     /// marker echoed by init itself — lands before the real one).
-    fn parse_snapshot_path(output: &[u8]) -> Option<OsString> {
+    fn parse_snapshot_environment(output: &[u8]) -> Option<Environment> {
         let begin = rfind_subslice(output, BEGIN_MARKER.as_bytes())?;
         let after = &output[begin + BEGIN_MARKER.len()..];
         let end = find_subslice(after, END_MARKER.as_bytes())?;
-        for line in after[..end].split(|b| *b == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if let Some(value) = line.strip_prefix(b"PATH=")
-                && !value.is_empty()
-            {
-                return Some(OsString::from_vec(value.to_vec()));
-            }
+        let records = after[..end]
+            .strip_prefix(b"\r\n")
+            .or_else(|| after[..end].strip_prefix(b"\n"))?;
+        if !records.ends_with(b"\0") {
+            return None;
         }
-        None
+        let mut environment = Vec::new();
+        for record in records.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let separator = record.iter().position(|b| *b == b'=')?;
+            let (key, value) = (&record[..separator], &record[separator + 1..]);
+            if key.is_empty()
+                || !(key[0].is_ascii_alphabetic() || key[0] == b'_')
+                || !key.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                continue;
+            }
+            environment.push((
+                OsString::from_vec(key.to_vec()),
+                OsString::from_vec(value.to_vec()),
+            ));
+        }
+        environment
+            .iter()
+            .any(|(key, value)| key == "PATH" && !value.is_empty())
+            .then_some(environment)
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -264,6 +323,7 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::OsStr;
         use std::os::unix::fs::PermissionsExt;
 
         fn fake_shell(dir: &Path, body: &str) -> PathBuf {
@@ -282,10 +342,24 @@ done
 exit 1
 "#;
 
+        fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
+            snapshot_environment(shell, timeout)?
+                .into_iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value)
+        }
+
+        fn parse_snapshot_path(output: &[u8]) -> Option<OsString> {
+            parse_snapshot_environment(output)?
+                .into_iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value)
+        }
+
         #[test]
         fn parses_path_between_markers() {
             let output = format!(
-                "rc noise\n{BEGIN_MARKER}\nHOME=/home/u\nPATH=/custom/bin:/usr/bin\nX=y\n{END_MARKER}\ntrailing"
+                "rc noise\n{BEGIN_MARKER}\nHOME=/home/u\0PATH=/custom/bin:/usr/bin\0X=y\0{END_MARKER}\ntrailing"
             );
             let path = parse_snapshot_path(output.as_bytes()).unwrap();
             assert_eq!(path, OsString::from("/custom/bin:/usr/bin"));
@@ -296,9 +370,72 @@ exit 1
             // rc noise that happens to contain the begin marker but no PATH
             // after it must not shadow the real snapshot.
             let output =
-                format!("{BEGIN_MARKER}\ngarbage\n{BEGIN_MARKER}\nPATH=/real/bin\n{END_MARKER}\n");
+                format!("{BEGIN_MARKER}\ngarbage\n{BEGIN_MARKER}\nPATH=/real/bin\0{END_MARKER}\n");
             let path = parse_snapshot_path(output.as_bytes()).unwrap();
             assert_eq!(path, OsString::from("/real/bin"));
+        }
+
+        #[test]
+        fn preserves_secret_values_without_parsing_newlines_as_variables() {
+            let output = format!(
+                "{BEGIN_MARKER}\nPATH=/bin\0CPA_API_KEY=first=second\nINJECTED=not-a-variable\r\n\0EMPTY=\0BINARY="
+            );
+            let mut output = output.into_bytes();
+            output.extend_from_slice(b"\xff\0");
+            output.extend_from_slice(END_MARKER.as_bytes());
+            let environment = parse_snapshot_environment(&output).unwrap();
+            assert_eq!(
+                environment,
+                vec![
+                    ("PATH".into(), "/bin".into()),
+                    (
+                        "CPA_API_KEY".into(),
+                        "first=second\nINJECTED=not-a-variable\r\n".into()
+                    ),
+                    ("EMPTY".into(), "".into()),
+                    ("BINARY".into(), OsString::from_vec(vec![0xff])),
+                ]
+            );
+        }
+
+        #[test]
+        fn rejects_incomplete_or_pathless_snapshots() {
+            for records in ["PATH=/bin", "CPA_API_KEY=test\0", "PATH=\0"] {
+                let output = format!("{BEGIN_MARKER}\n{records}{END_MARKER}\n");
+                assert!(parse_snapshot_environment(output.as_bytes()).is_none());
+            }
+        }
+
+        #[test]
+        fn child_environment_preserves_overrides_removals_and_host_values() {
+            let environment = vec![
+                ("CPA_API_KEY".into(), "shell-key".into()),
+                ("PROVIDER_ENDPOINT".into(), "shell-endpoint".into()),
+                ("REMOVED_KEY".into(), "must-not-return".into()),
+                ("HOST_KEY".into(), "must-not-override".into()),
+                ("PWD".into(), "/probe".into()),
+                ("TERM".into(), "dumb".into()),
+                ("ZERON_RESOLVING_ENVIRONMENT".into(), "1".into()),
+            ];
+            let mut command = std::process::Command::new("unused");
+            command.env("PROVIDER_ENDPOINT", "explicit-endpoint");
+            command.env_remove("REMOVED_KEY");
+            super::super::apply_environment(&mut command, &environment, &|key| {
+                (key == "HOST_KEY").then(|| "host-value".into())
+            });
+            let values: std::collections::HashMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                values[OsStr::new("CPA_API_KEY")],
+                Some(OsStr::new("shell-key"))
+            );
+            assert_eq!(
+                values[OsStr::new("PROVIDER_ENDPOINT")],
+                Some(OsStr::new("explicit-endpoint"))
+            );
+            assert_eq!(values[OsStr::new("REMOVED_KEY")], None);
+            for key in ["HOST_KEY", "PWD", "TERM", "ZERON_RESOLVING_ENVIRONMENT"] {
+                assert!(!values.contains_key(OsStr::new(key)));
+            }
         }
 
         #[test]

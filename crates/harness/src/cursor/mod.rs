@@ -138,7 +138,7 @@ impl CursorHarness {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         cmd.arg("models")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -213,7 +213,7 @@ pub async fn login_command(store_path: &std::path::Path) -> Result<Command, Harn
     let (exe, args) = CursorHarness::default().resolve_shim().await?;
     let mut cmd = Command::new(&exe);
     cmd.args(&args);
-    crate::compose_child_path(&mut cmd, &exe);
+    crate::compose_child_environment(&mut cmd, &exe);
     cmd.arg("login").arg(store_path);
     Ok(cmd)
 }
@@ -276,7 +276,7 @@ impl Harness for CursorHarness {
         if lease.is_some() {
             cmd.env("ZERON_CURSOR_STATE_DIR", state::state_root());
         }
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

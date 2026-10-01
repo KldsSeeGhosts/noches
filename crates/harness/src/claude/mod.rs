@@ -148,7 +148,7 @@ impl ClaudeHarness {
 
     fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
-        crate::compose_child_path(&mut cmd, exe);
+        crate::compose_child_environment(&mut cmd, exe);
         cmd.args([
             "--print",
             "--input-format",
@@ -231,7 +231,7 @@ impl ClaudeHarness {
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         cmd.args([
             "--print",
             "--input-format",

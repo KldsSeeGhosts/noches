@@ -90,13 +90,13 @@ pub fn resolve_codex_executable() -> Option<PathBuf> {
 ///
 /// Shares the harness's full resolution (`CODEX_EXECUTABLE`, PATH, login-shell
 /// snapshot, install locations — including the Windows npm payload layout) and
-/// its child-PATH composition, so "Add account" launches exactly the binary
+/// its child-environment composition, so "Add account" launches exactly the binary
 /// the harness itself would run. `CODEX_HOME` isolates the login from the live
 /// `~/.codex` session; the caller owns stdio wiring and cancellation.
 pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessError> {
     let exe = CodexHarness::new().resolve_executable()?;
     let mut cmd = Command::new(&exe);
-    crate::compose_child_path(&mut cmd, &exe);
+    crate::compose_child_environment(&mut cmd, &exe);
     cmd.arg("login").env("CODEX_HOME", codex_home);
     Ok(cmd)
 }
@@ -173,7 +173,7 @@ impl CodexHarness {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -226,7 +226,7 @@ impl CodexHarness {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -629,7 +629,7 @@ impl CodexHarness {
                 serde_json::to_string(&browser.args()).unwrap()
             ));
         }
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

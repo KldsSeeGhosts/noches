@@ -19,6 +19,16 @@ as a launchd agent on macOS or a systemd user service on Linux;
 the workspace mode. An open desktop window embeds the same engine, so a
 desktop window is also a host.
 
+Provider credentials belong on that host, never on the phone. On macOS and
+Linux, every agent launch (including model discovery, titles, and login) fills
+missing environment variables from a cached login-shell snapshot, so a
+shell-exported `CPA_API_KEY` is available even when Noches starts from Finder or
+launchd/systemd. Explicit host or child environment values and removals take
+precedence. The snapshot is kept in host memory only, not logged, sent to the
+companion, or copied into service files. Restart the host after changing shell
+credentials. `ZERON_NO_LOGIN_SHELL=1` disables this fallback; in that case,
+configure credentials directly in the host service environment.
+
 The engine serves its WebSocket RPC on loopback only, at
 `ws://127.0.0.1:PORT`. `PORT` is whatever `ZERON_IPC_PORT` held when the engine
 started, `27654` by default. Since `zeron daemon install` captures that variable

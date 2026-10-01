@@ -1047,7 +1047,7 @@ impl AcpHarness {
         let (exe, args) = self.resolve_program(true).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         if let Some(home) = std::env::var_os("HOME") {
             cmd.current_dir(home);
         }
@@ -1321,7 +1321,7 @@ impl AcpHarness {
         launch_args.truncate(prefix);
         let mut cmd = Command::new(&exe);
         cmd.args(launch_args).args(args);
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         Ok(cmd)
     }
 
@@ -1499,7 +1499,7 @@ impl AcpHarness {
         cmd.args(args);
         cmd.args(extra_args);
         child::configure(&mut cmd);
-        crate::compose_child_path(&mut cmd, &exe);
+        crate::compose_child_environment(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
         }

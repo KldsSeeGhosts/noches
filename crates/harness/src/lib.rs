@@ -145,11 +145,21 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
 /// version manager's bin dir, and the CLIs themselves shell out to tools
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
-pub fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
+/// This PATH-only helper is for installers; agent launches must use
+/// [`compose_child_environment`] so provider credentials are not forgotten.
+pub(crate) fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
     compose_path(
         cmd.as_std_mut(),
         exe.parent().filter(|d| !d.as_os_str().is_empty()),
     );
+}
+
+/// Give every agent launch (runs, titles, discovery, login) the same host-local
+/// provider environment, even when the host starts from Finder or a service.
+/// Command overrides/removals and inherited values win over shell fallback.
+pub fn compose_child_environment(cmd: &mut process::Command, exe: &std::path::Path) {
+    shell_env::apply_to_child(cmd.as_std_mut());
+    compose_child_path(cmd, exe);
 }
 
 fn compose_path<'a>(

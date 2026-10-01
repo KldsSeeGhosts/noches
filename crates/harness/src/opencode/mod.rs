@@ -534,7 +534,7 @@ impl Server {
             .arg("127.0.0.1")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
-        crate::compose_child_path(&mut cmd, exe);
+        crate::compose_child_environment(&mut cmd, exe);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
