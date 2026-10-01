@@ -317,17 +317,7 @@ struct CompanionTerminalView: View {
         GeometryReader { proxy in
             ScrollViewReader { reader in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(session.buffer.lines.enumerated()), id: \.offset) { index, line in
-                            Text(Self.attributed(line))
-                                .font(Theme.mono(12)).lineLimit(nil)
-                                .frame(maxWidth: .infinity, minHeight: Self.lineHeight, alignment: .leading)
-                                .id(index)
-                        }
-                        Color.clear.frame(height: 1).id("end")
-                    }
-                    .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 8)
-                    .textSelection(.enabled)
+                    scrollbackLines
                 }
                 .defaultScrollAnchor(.bottom)
                 .onChange(of: session.revision) { _, _ in reader.scrollTo("end", anchor: .bottom) }
@@ -341,6 +331,25 @@ struct CompanionTerminalView: View {
                                model: model, chat: chat)
             }
         }
+    }
+
+    // Keep the line stack and each row outside the geometry/scroll-reader
+    // expression so older supported Swift compilers can type-check it.
+    private var scrollbackLines: some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(session.buffer.lines.enumerated()), id: \.offset) { row in
+                terminalLine(row.element).id(row.offset)
+            }
+            Color.clear.frame(height: 1).id("end")
+        }
+        .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 8)
+        .textSelection(.enabled)
+    }
+
+    private func terminalLine(_ line: [TerminalBuffer.Cell]) -> some View {
+        Text(Self.attributed(line))
+            .font(Theme.mono(12)).lineLimit(nil)
+            .frame(maxWidth: .infinity, minHeight: Self.lineHeight, alignment: .leading)
     }
 
     private var keyRow: some View {
