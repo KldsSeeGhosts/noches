@@ -315,41 +315,16 @@ struct CompanionTerminalView: View {
 
     private var scrollback: some View {
         GeometryReader { proxy in
-            ScrollViewReader { reader in
-                ScrollView {
-                    scrollbackLines
-                }
-                .defaultScrollAnchor(.bottom)
-                .onChange(of: session.revision) { _, _ in reader.scrollTo("end", anchor: .bottom) }
-            }
-            .onChange(of: proxy.size) { _, size in
-                session.resize(cols: Int((size.width - 32) / Self.charWidth), rows: Int((size.height - 16) / Self.lineHeight),
-                               model: model, chat: chat)
-            }
-            .onAppear {
-                session.resize(cols: Int((proxy.size.width - 32) / Self.charWidth), rows: Int((proxy.size.height - 16) / Self.lineHeight),
-                               model: model, chat: chat)
-            }
+            CompanionTerminalScrollback(session: session)
+                .onChange(of: proxy.size) { _, size in resizeTerminal(to: size) }
+                .onAppear { resizeTerminal(to: proxy.size) }
         }
     }
 
-    // Keep the line stack and each row outside the geometry/scroll-reader
-    // expression so older supported Swift compilers can type-check it.
-    private var scrollbackLines: some View {
-        LazyVStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(session.buffer.lines.enumerated()), id: \.offset) { row in
-                terminalLine(row.element).id(row.offset)
-            }
-            Color.clear.frame(height: 1).id("end")
-        }
-        .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 8)
-        .textSelection(.enabled)
-    }
-
-    private func terminalLine(_ line: [TerminalBuffer.Cell]) -> some View {
-        Text(Self.attributed(line))
-            .font(Theme.mono(12)).lineLimit(nil)
-            .frame(maxWidth: .infinity, minHeight: Self.lineHeight, alignment: .leading)
+    private func resizeTerminal(to size: CGSize) {
+        let cols = Int((size.width - 32) / Self.charWidth)
+        let rows = Int((size.height - 16) / Self.lineHeight)
+        session.resize(cols: cols, rows: rows, model: model, chat: chat)
     }
 
     private var keyRow: some View {
@@ -410,6 +385,48 @@ struct CompanionTerminalView: View {
         session.send(Data((input + "\r").utf8), model: model, chat: chat)
         input = ""
         focused = true
+    }
+
+}
+
+/// Separate compiler boundaries for the reader, viewport, stack and line keep
+/// the terminal expression small on every supported Xcode version.
+private struct CompanionTerminalScrollback: View {
+    let session: CompanionTerminalSession
+
+    var body: some View {
+        ScrollViewReader { reader in
+            viewport(reader: reader)
+        }
+    }
+
+    private func viewport(reader: ScrollViewProxy) -> some View {
+        ScrollView {
+            lines
+        }
+        .defaultScrollAnchor(.bottom)
+        .onChange(of: session.revision) { _, _ in reader.scrollTo("end", anchor: .bottom) }
+    }
+
+    private var lines: some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(session.buffer.lines.enumerated()), id: \.offset) { row in
+                CompanionTerminalLine(line: row.element).id(row.offset)
+            }
+            Color.clear.frame(height: 1).id("end")
+        }
+        .padding(.horizontal, SheetMetrics.margin).padding(.vertical, 8)
+        .textSelection(.enabled)
+    }
+}
+
+private struct CompanionTerminalLine: View {
+    let line: [TerminalBuffer.Cell]
+
+    var body: some View {
+        Text(Self.attributed(line))
+            .font(Theme.mono(12)).lineLimit(nil)
+            .frame(maxWidth: .infinity, minHeight: 16, alignment: .leading)
     }
 
     private static func attributed(_ line: [TerminalBuffer.Cell]) -> AttributedString {
