@@ -1,10 +1,10 @@
 //! Computer use owned by the engine. The Pi adapter only forwards tool calls.
 //!
-//! A lease covers one active turn, not the lifetime of a parked Pi process.
+//! A lease covers one active operation, not a coding turn or connection.
 //! Interrupts, disconnected callers and turn boundaries cancel outstanding work
 //! before reaping the private Linux driver and releasing that lease. Approval
-//! is session-scoped: it survives that teardown so a resumed turn re-acquires
-//! the lease and driver without asking again. On a real host the serve daemon
+//! is session-scoped: it survives that teardown so a resumed turn starts a
+//! driver without asking again. On a real host the serve daemon
 //! carries the existing-profile grant only once that approval exists; metadata
 //! asked before approval runs on a daemon spawned without the grant.
 
@@ -259,7 +259,7 @@ fn managed_schema(mut tool: Value) -> Value {
 pub type RequestInput =
     Arc<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
 
-type CuaResult<T> = Result<T, String>;
+pub(super) type CuaResult<T> = Result<T, String>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -477,7 +477,7 @@ fn attach_driver_metadata(result: &mut Value, metadata: Value) {
 /// symlinked invocation path resolves to the file itself, so the engine
 /// reports and hashes the target rather than the link. An unresolvable path
 /// fails the spawn instead of falling back to the unresolved link.
-fn canonical_executable(path: &Path) -> CuaResult<PathBuf> {
+pub(super) fn canonical_executable(path: &Path) -> CuaResult<PathBuf> {
     std::fs::canonicalize(path)
         .map_err(|e| format!("Cannot resolve executable {}: {e}", path.display()))
 }
@@ -548,7 +548,7 @@ async fn reap_spawned(child: &mut Child, daemon: Option<&mut Child>) {
 }
 
 pub struct ComputerUseManager {
-    lease: Arc<Mutex<Option<String>>>,
+    lease: PathBuf,
     approvals: Arc<Mutex<HashSet<String>>>,
     device_id: String,
     // Tests inject an executable rather than modifying the process environment.
@@ -558,7 +558,7 @@ pub struct ComputerUseManager {
 impl ComputerUseManager {
     pub fn new(device_id: String) -> Self {
         Self {
-            lease: Arc::new(Mutex::new(None)),
+            lease: super::host::lease_root(),
             approvals: Arc::new(Mutex::new(HashSet::new())),
             device_id,
             driver_path: None,
@@ -575,7 +575,7 @@ impl ComputerUseManager {
     pub async fn start_bridge(
         &self,
         chat_id: &str,
-        run_id: &str,
+        _run_id: &str,
         request_input: RequestInput,
         interrupt: CancellationToken,
     ) -> CuaResult<(PathBuf, RunBridge)> {
@@ -599,7 +599,6 @@ impl ComputerUseManager {
         let granted = lock(&self.approvals).contains(chat_id);
         let state = Arc::new(BridgeState {
             chat_id: chat_id.to_string(),
-            owner: format!("chat {chat_id}, run {run_id}"),
             label: format!("noches-{}", uuid::Uuid::new_v4()),
             device_id: self.device_id.clone(),
             lease: self.lease.clone(),
@@ -672,15 +671,16 @@ struct Runtime {
     // ask again.
     granted: bool,
     denied: bool,
-    lease_held: bool,
+    // Held through driver teardown, including kill failures. Coordinates
+    // ownership with standalone Pi and other Noches engine processes.
+    desktop_lease: Option<super::host::OperationLease>,
 }
 
 struct BridgeState {
     chat_id: String,
-    owner: String,
     label: String,
     device_id: String,
-    lease: Arc<Mutex<Option<String>>>,
+    lease: PathBuf,
     approvals: Arc<Mutex<HashSet<String>>>,
     request_input: RequestInput,
     driver_path: Option<PathBuf>,
@@ -716,12 +716,6 @@ impl BridgeState {
         }
         if let Err(err) = remove_socket_if_present(&self.daemon_socket) {
             tracing::warn!(error = %err, path = %self.daemon_socket.display(), "computer-use daemon socket cleanup failed");
-        }
-        if runtime.lease_held {
-            let mut owner = lock(&self.lease);
-            if owner.as_deref() == Some(self.owner.as_str()) {
-                *owner = None;
-            }
         }
         // The positive grant is session/chat-scoped and survives teardown; everything
         // else (driver, lease marker, a denial) belongs to the turn or attempt.
@@ -985,14 +979,6 @@ async fn handle_call(
                 "An ungranted daemon is still running after cleanup; restart computer use and start a new turn",
             );
         }
-        if !runtime.lease_held {
-            let mut lease = lock(&state.lease);
-            if let Some(owner) = lease.as_ref() {
-                return error(format!("Computer use is busy on this host: {owner}"));
-            }
-            *lease = Some(state.owner.clone());
-            runtime.lease_held = true;
-        }
         if let Err(err) = approve(state, &mut runtime, action).await {
             // A denial must not reserve the desktop for a parked chat.
             if !runtime.granted {
@@ -1037,6 +1023,18 @@ async fn handle_call(
             return error(format!("Could not initialize cua-driver: {detail}"));
         }
     }
+    if runtime.desktop_lease.is_some() {
+        return error(
+            "A previous computer-use operation has not stopped; its ownership is retained. Restart the private runtime before trying again.",
+        );
+    }
+    // Ask approval and establish the connection before reserving input. The
+    // reservation stays in Runtime across cancelled futures until cleanup
+    // confirms the actuator exited; successful calls release it immediately.
+    match super::host::acquire_operation_lease(&state.lease, action, &args) {
+        Ok(lease) => runtime.desktop_lease = lease,
+        Err(err) => return error(err),
+    }
     let driver = runtime.driver.as_mut().expect("initialized");
     let marker_pid = args.get("pid").and_then(Value::as_u64);
     let result = if action == "help" {
@@ -1053,7 +1051,10 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid),
+        Ok(result) => {
+            runtime.desktop_lease = None;
+            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
+        }
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -1124,18 +1125,11 @@ impl Driver {
                 command.env_remove(key);
             }
         }
-        // Select CUA's production Hyprland backend and the native input-v3
-        // route that this host explicitly enables in its compositor config.
-        // The driver still requires an exact target and the engine still
-        // permits background-only input; this only avoids silently restoring
-        // the driver's narrow package matrix after the engine sanitizes CUA_*.
-        // Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT would instead select
-        // the test protocol and look for cua-input-test.sock, so it must stay
-        // unset.
+        // Compatibility settings are applied explicitly at spawn. Neither the
+        // removed OPEN_INPUT switch nor inherited approval bypasses are used.
         command
             .env("CUA_DRIVER_PERMISSION_MODE", "standard")
-            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1")
-            .env("CUA_HYPRLAND_OPEN_INPUT", "1");
+            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1");
         command
     }
 
@@ -1186,7 +1180,32 @@ impl Driver {
         // digest covers the file the kernel executes rather than a symlink.
         // Never derive this from package metadata; an unreadable binary
         // fails here.
-        let canonical_exe = canonical_executable(&exe)?;
+        let canonical_exe = if path.is_none() {
+            super::host::native_executable(&exe)?
+        } else {
+            canonical_executable(&exe)?
+        };
+        let host = if path.is_none() {
+            super::host::settings()?
+        } else {
+            Default::default()
+        };
+        let desktop = if path.is_none() {
+            super::host::desktop_environment().await
+        } else {
+            Default::default()
+        };
+        let packages = host
+            .get("CUA_HYPRLAND_LOCAL_PACKAGES")
+            .cloned()
+            .or_else(|| std::env::var("CUA_HYPRLAND_LOCAL_PACKAGES").ok());
+        let configure = |mut command: Command| {
+            command.envs(&desktop);
+            if let Some(packages) = &packages {
+                command.env("CUA_HYPRLAND_LOCAL_PACKAGES", packages);
+            }
+            command
+        };
         let exe_sha256 = hash_executable(&canonical_exe).await?;
         // The real driver runs as a per-run serve daemon plus an mcp proxy so
         // the agent cursor overlay has a UI runloop. Injected test fixtures
@@ -1194,10 +1213,13 @@ impl Driver {
         // have no daemon whose grant state could matter.
         let (mut daemon, mcp_socket, existing_profile_granted) = if path.is_none() {
             remove_socket_if_present(daemon_socket)?;
-            let mut daemon =
-                Self::serve_command(&canonical_exe, daemon_socket, grant_existing_profile)
-                    .spawn()
-                    .map_err(|e| format!("Cannot start {} serve: {e}", canonical_exe.display()))?;
+            let mut daemon = configure(Self::serve_command(
+                &canonical_exe,
+                daemon_socket,
+                grant_existing_profile,
+            ))
+            .spawn()
+            .map_err(|e| format!("Cannot start {} serve: {e}", canonical_exe.display()))?;
             if let Some(mut stderr) = daemon.stderr.take() {
                 tokio::spawn(async move {
                     let mut line = String::new();
@@ -1237,7 +1259,7 @@ impl Driver {
             // ungranted-daemon restart logic in handle_call never applies.
             (None, None, true)
         };
-        let mut child = Self::mcp_command(&canonical_exe, mcp_socket.as_ref())
+        let mut child = configure(Self::mcp_command(&canonical_exe, mcp_socket.as_ref()))
             .spawn()
             .map_err(|e| format!("Cannot start {}: {e}", canonical_exe.display()))?;
         // The real driver runs as native binaries; injected test fixtures are
@@ -1546,6 +1568,13 @@ fn resolve_driver_exe() -> CuaResult<PathBuf> {
             return Ok(path);
         }
         return Err("Configured CUA_DRIVER_PATH is not a file".into());
+    }
+    if let Some(path) = super::host::settings()?.get("CUA_DRIVER_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err("CUA_DRIVER_PATH in ~/.config/cua-driver/host.env is not a file".into());
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {

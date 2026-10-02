@@ -25,9 +25,10 @@ fn managed_driver_explicitly_enables_the_reviewed_hyprland_input_route() {
         environment.get("CUA_DRIVER_RS_ENABLE_WAYLAND"),
         Some(&Some("1".into()))
     );
-    assert_eq!(
-        environment.get("CUA_HYPRLAND_OPEN_INPUT"),
-        Some(&Some("1".into()))
+    assert!(
+        !environment
+            .get("CUA_HYPRLAND_OPEN_INPUT")
+            .is_some_and(Option::is_some)
     );
     assert!(
         !environment.contains_key("CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT"),
@@ -181,7 +182,13 @@ for line in sys.stdin:
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut manager = ComputerUseManager::new("test-host".into());
     manager.driver_path = Some(path);
+    manager.lease = dir.join("ownership");
     manager
+}
+
+fn lease_is_idle(manager: &ComputerUseManager) -> bool {
+    crate::computer_use::host::acquire_operation_lease(&manager.lease, "unknown", &json!({}))
+        .is_ok()
 }
 
 fn approval(allow: bool, count: Arc<AtomicUsize>) -> RequestInput {
@@ -270,7 +277,7 @@ async fn dropping_a_routing_clone_does_not_cancel_the_shared_bridge() {
 }
 
 #[tokio::test]
-async fn full_results_permissions_and_turn_lease() {
+async fn full_results_permissions_and_operation_lease() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path());
     let count = Arc::new(AtomicUsize::new(0));
@@ -309,7 +316,11 @@ async fn full_results_permissions_and_turn_lease() {
     assert_ne!(result["structuredContent"]["args"]["session"], "untrusted");
     let pid = result["structuredContent"]["pid"].as_u64().unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert_eq!(call(&b, "list_windows", json!({})).await["isError"], true);
+    assert!(
+        lease_is_idle(&manager),
+        "an idle connection must not reserve input"
+    );
+    assert_eq!(call(&b, "list_windows", json!({})).await["isError"], false);
     assert_eq!(
         call(&a, "click", json!({"pid":42,"window_id":7,"refuse":true})).await["isError"],
         true
@@ -325,13 +336,13 @@ async fn full_results_permissions_and_turn_lease() {
     );
     assert_eq!(
         count.load(Ordering::SeqCst),
-        1,
+        2,
         "a forbidden foreground request must not ask for another grant"
     );
     bridge_a.turn_ended().await;
     assert!(
         !PathBuf::from(format!("/proc/{pid}")).exists(),
-        "driver must be reaped before releasing its lease"
+        "turn end must still reap the private driver"
     );
     assert_eq!(call(&a, "list_windows", json!({})).await["isError"], true);
     assert_eq!(call(&b, "list_windows", json!({})).await["isError"], false);
@@ -342,7 +353,7 @@ async fn full_results_permissions_and_turn_lease() {
     assert_ne!(
         resumed["structuredContent"]["pid"].as_u64().unwrap(),
         pid,
-        "a resumed turn re-acquires the lease behind a fresh driver"
+        "a resumed turn starts a fresh private driver"
     );
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -396,6 +407,67 @@ async fn structured_refusal_normalizes_to_error_and_preserves_evidence() {
         "normalization must not replace the driver's evidence"
     );
     bridge.finish().await;
+}
+
+#[tokio::test]
+async fn concurrent_bridges_coordinate_operations_not_idle_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (a, bridge_a) = manager
+        .start_bridge(
+            "parallel-a",
+            "a",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let (b, bridge_b) = manager
+        .start_bridge(
+            "parallel-b",
+            "b",
+            approval(true, count),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let pending = tokio::spawn(async move {
+        call(&a, "click", json!({"pid":42,"window_id":7,"block":true})).await
+    });
+    let started = || {
+        std::fs::read_to_string(dir.path().join("driver.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|req| req.pointer("/params/arguments/block") == Some(&json!(true)))
+    };
+    for _ in 0..100 {
+        if started() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(started(), "first operation reached the fixture");
+    let busy = call(&b, "click", json!({"pid":42,"window_id":7})).await;
+    assert_eq!(busy["isError"], true);
+    assert!(busy.to_string().contains("busy for window-42-7"));
+    assert_eq!(
+        call(&b, "click", json!({"pid":42,"window_id":8})).await["isError"],
+        false
+    );
+    assert_eq!(call(&b, "list_windows", json!({})).await["isError"], false);
+    assert_ne!(call(&b, "help", json!({})).await["isError"], true);
+    assert_eq!(call(&b, "clipboard_read", json!({})).await["isError"], true);
+    bridge_a.turn_ended().await;
+    assert_eq!(pending.await.unwrap()["isError"], true);
+    assert_eq!(
+        call(&b, "click", json!({"pid":42,"window_id":7})).await["isError"],
+        false
+    );
+    assert!(lease_is_idle(&manager));
+    bridge_a.finish().await;
+    bridge_b.finish().await;
 }
 
 #[tokio::test]
@@ -895,7 +967,7 @@ async fn denial_and_unreviewed_actions_fail_closed_without_holding_lease() {
         );
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert!(lock(&manager.lease).is_none());
+    assert!(lease_is_idle(&manager));
     assert!(!dir.path().join("driver.log").exists());
     bridge.turn_ended().await;
     bridge.turn_started();
@@ -963,7 +1035,7 @@ async fn interrupt_and_disconnect_reap_inflight_driver_without_replaying() {
         })
         .await
         .expect("blocked driver was not reaped promptly");
-        assert!(lock(&manager.lease).is_none());
+        assert!(lease_is_idle(&manager));
         let log = std::fs::read_to_string(dir.path().join("driver.log")).unwrap();
         assert_eq!(
             log.matches("\"block\": true").count(),
@@ -1028,13 +1100,16 @@ async fn installed_driver_metadata_smoke() {
     let health = call(&socket, "health_report", json!({})).await;
     assert_ne!(health["isError"], true, "{health}");
     assert!(health["structuredContent"].is_object(), "{health}");
+    assert!(bridge.state.runtime.lock().await.desktop_lease.is_none());
     let schema = call(&socket, "describe", json!({"name":"get_window_state"})).await;
     assert_eq!(
         schema["structuredContent"]["tools"][0]["name"], "get_window_state",
         "{schema}"
     );
     bridge.turn_ended().await;
-    assert!(lock(&manager.lease).is_none());
+    // Other live clients can legitimately own the shared desktop gate. Check
+    // this smoke's ownership rather than requiring the whole desktop to idle.
+    assert!(bridge.state.runtime.lock().await.desktop_lease.is_none());
 
     bridge.turn_started();
     let restarted = call(&socket, "health_report", json!({})).await;
@@ -1067,7 +1142,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
     bridge1.finish().await;
     assert!(!socket1.exists());
     assert!(
-        lock(&manager.lease).is_none(),
+        lease_is_idle(&manager),
         "lease must be released when bridge is destroyed"
     );
 
@@ -1091,7 +1166,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
     bridge2.finish().await;
     assert!(!socket2.exists());
     assert!(
-        lock(&manager.lease).is_none(),
+        lease_is_idle(&manager),
         "lease must not be held merely because a chat has approval"
     );
 
@@ -1113,7 +1188,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
         "another chat must prompt independently"
     );
     bridge3.finish().await;
-    assert!(lock(&manager.lease).is_none());
+    assert!(lease_is_idle(&manager));
 }
 
 #[tokio::test]
@@ -1399,10 +1474,7 @@ async fn strict_policy_denies_before_driver_lease_and_approval_even_after_grant(
                 0,
                 "denials must not start a driver"
             );
-            assert!(
-                lock(&manager.lease).is_none(),
-                "denials must not take the lease"
-            );
+            assert!(lease_is_idle(&manager), "denials must not take the lease");
             assert_eq!(
                 call(&socket, "list_windows", json!({})).await["isError"],
                 false
