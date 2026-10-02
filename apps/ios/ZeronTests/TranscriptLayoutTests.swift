@@ -340,7 +340,11 @@ final class TranscriptLayoutTests: XCTestCase {
                 // Give this chunk a display update before reversing the animation.
                 return
             }
-            if toggle < 6, streamed, progress >= 0.5, progress < 1, abs(target - height) > 1 {
+            // The streaming chunk has had a display update. Reverse on any
+            // strict intermediate frame: a delayed callback can skip the
+            // halfway window without ever observing an animation defect.
+            if toggle < 6, streamed, progress > 0, progress < 1,
+               abs(height - legStart) > 1, abs(target - height) > 1 {
                 events.append("reverse toggle=\(toggle) timestamp=\(link.timestamp) height=\(height)")
                 legStart = height
                 toggle += 1
