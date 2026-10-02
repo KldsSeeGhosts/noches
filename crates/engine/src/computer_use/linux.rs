@@ -259,7 +259,7 @@ fn managed_schema(mut tool: Value) -> Value {
 pub type RequestInput =
     Arc<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
 
-type CuaResult<T> = Result<T, String>;
+pub(super) type CuaResult<T> = Result<T, String>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -477,7 +477,7 @@ fn attach_driver_metadata(result: &mut Value, metadata: Value) {
 /// symlinked invocation path resolves to the file itself, so the engine
 /// reports and hashes the target rather than the link. An unresolvable path
 /// fails the spawn instead of falling back to the unresolved link.
-fn canonical_executable(path: &Path) -> CuaResult<PathBuf> {
+pub(super) fn canonical_executable(path: &Path) -> CuaResult<PathBuf> {
     std::fs::canonicalize(path)
         .map_err(|e| format!("Cannot resolve executable {}: {e}", path.display()))
 }
@@ -673,6 +673,9 @@ struct Runtime {
     granted: bool,
     denied: bool,
     lease_held: bool,
+    // Held through driver teardown, including kill failures. Coordinates
+    // ownership with standalone Pi and other Noches engine processes.
+    desktop_lease: Option<std::fs::File>,
 }
 
 struct BridgeState {
@@ -986,8 +989,15 @@ async fn handle_call(
             );
         }
         if !runtime.lease_held {
+            if state.driver_path.is_none() && runtime.desktop_lease.is_none() {
+                match super::host::desktop_lease() {
+                    Ok(lease) => runtime.desktop_lease = Some(lease),
+                    Err(err) => return error(err),
+                }
+            }
             let mut lease = lock(&state.lease);
             if let Some(owner) = lease.as_ref() {
+                runtime.desktop_lease = None;
                 return error(format!("Computer use is busy on this host: {owner}"));
             }
             *lease = Some(state.owner.clone());
@@ -1124,18 +1134,11 @@ impl Driver {
                 command.env_remove(key);
             }
         }
-        // Select CUA's production Hyprland backend and the native input-v3
-        // route that this host explicitly enables in its compositor config.
-        // The driver still requires an exact target and the engine still
-        // permits background-only input; this only avoids silently restoring
-        // the driver's narrow package matrix after the engine sanitizes CUA_*.
-        // Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT would instead select
-        // the test protocol and look for cua-input-test.sock, so it must stay
-        // unset.
+        // Compatibility settings are applied explicitly at spawn. Neither the
+        // removed OPEN_INPUT switch nor inherited approval bypasses are used.
         command
             .env("CUA_DRIVER_PERMISSION_MODE", "standard")
-            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1")
-            .env("CUA_HYPRLAND_OPEN_INPUT", "1");
+            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1");
         command
     }
 
@@ -1186,7 +1189,32 @@ impl Driver {
         // digest covers the file the kernel executes rather than a symlink.
         // Never derive this from package metadata; an unreadable binary
         // fails here.
-        let canonical_exe = canonical_executable(&exe)?;
+        let canonical_exe = if path.is_none() {
+            super::host::native_executable(&exe)?
+        } else {
+            canonical_executable(&exe)?
+        };
+        let host = if path.is_none() {
+            super::host::settings()?
+        } else {
+            Default::default()
+        };
+        let desktop = if path.is_none() {
+            super::host::desktop_environment().await
+        } else {
+            Default::default()
+        };
+        let packages = host
+            .get("CUA_HYPRLAND_LOCAL_PACKAGES")
+            .cloned()
+            .or_else(|| std::env::var("CUA_HYPRLAND_LOCAL_PACKAGES").ok());
+        let configure = |mut command: Command| {
+            command.envs(&desktop);
+            if let Some(packages) = &packages {
+                command.env("CUA_HYPRLAND_LOCAL_PACKAGES", packages);
+            }
+            command
+        };
         let exe_sha256 = hash_executable(&canonical_exe).await?;
         // The real driver runs as a per-run serve daemon plus an mcp proxy so
         // the agent cursor overlay has a UI runloop. Injected test fixtures
@@ -1194,10 +1222,13 @@ impl Driver {
         // have no daemon whose grant state could matter.
         let (mut daemon, mcp_socket, existing_profile_granted) = if path.is_none() {
             remove_socket_if_present(daemon_socket)?;
-            let mut daemon =
-                Self::serve_command(&canonical_exe, daemon_socket, grant_existing_profile)
-                    .spawn()
-                    .map_err(|e| format!("Cannot start {} serve: {e}", canonical_exe.display()))?;
+            let mut daemon = configure(Self::serve_command(
+                &canonical_exe,
+                daemon_socket,
+                grant_existing_profile,
+            ))
+            .spawn()
+            .map_err(|e| format!("Cannot start {} serve: {e}", canonical_exe.display()))?;
             if let Some(mut stderr) = daemon.stderr.take() {
                 tokio::spawn(async move {
                     let mut line = String::new();
@@ -1237,7 +1268,7 @@ impl Driver {
             // ungranted-daemon restart logic in handle_call never applies.
             (None, None, true)
         };
-        let mut child = Self::mcp_command(&canonical_exe, mcp_socket.as_ref())
+        let mut child = configure(Self::mcp_command(&canonical_exe, mcp_socket.as_ref()))
             .spawn()
             .map_err(|e| format!("Cannot start {}: {e}", canonical_exe.display()))?;
         // The real driver runs as native binaries; injected test fixtures are
@@ -1546,6 +1577,13 @@ fn resolve_driver_exe() -> CuaResult<PathBuf> {
             return Ok(path);
         }
         return Err("Configured CUA_DRIVER_PATH is not a file".into());
+    }
+    if let Some(path) = super::host::settings()?.get("CUA_DRIVER_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err("CUA_DRIVER_PATH in ~/.config/cua-driver/host.env is not a file".into());
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {

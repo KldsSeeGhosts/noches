@@ -25,9 +25,10 @@ fn managed_driver_explicitly_enables_the_reviewed_hyprland_input_route() {
         environment.get("CUA_DRIVER_RS_ENABLE_WAYLAND"),
         Some(&Some("1".into()))
     );
-    assert_eq!(
-        environment.get("CUA_HYPRLAND_OPEN_INPUT"),
-        Some(&Some("1".into()))
+    assert!(
+        !environment
+            .get("CUA_HYPRLAND_OPEN_INPUT")
+            .is_some_and(Option::is_some)
     );
     assert!(
         !environment.contains_key("CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT"),

@@ -13,6 +13,12 @@ while (($#)); do
   esac
 done
 CUA="$(realpath "$CUA")"
+HOST_INSTALLER="$CUA/libs/cua-driver/examples/linux-host/install.mjs"
+if ((INSTALL)) && [[ ! -f "$HOST_INSTALLER" ]]; then
+  echo "--install requires a CUA checkout with examples/linux-host/install.mjs." >&2
+  echo "Use the reviewed background-integration checkout, or omit --install to build only." >&2
+  exit 2
+fi
 python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys, tomllib
@@ -54,7 +60,7 @@ python3 "$ROOT/scripts/cua/native/apply_hyprland.py" "$CUA"
 python3 "$ROOT/scripts/cua/native/apply_hyprland_same_client.py" "$CUA" --check
 python3 "$ROOT/scripts/cua/native/apply_hyprland_same_client.py" "$CUA"
 PLUGIN_ROOT="$CUA/libs/cua-driver/hyprland-plugin"
-PLUGIN_BUILD="$CUA/.git/noches-cua-build/hyprland-plugin"
+PLUGIN_BUILD="$(git -C "$CUA" rev-parse --path-format=absolute --git-path noches-cua-build/hyprland-plugin)"
 cmake -S "$PLUGIN_ROOT" -B "$PLUGIN_BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
   -DCUA_HYPRLAND_BUILD_PLUGIN=ON -DCUA_HYPRLAND_EXPECTED_VERSION=0.56.2 \
@@ -76,15 +82,11 @@ ctest --test-dir "$PLUGIN_BUILD" --output-on-failure --no-tests=error
   node --experimental-vm-modules --test crates/harness/tests/noches-cua.test.mjs
 )
 sha256sum "$DRIVER" "$PLUGIN_BUILD/cua-hyprland-plugin.so"
-LINK="$HOME/.local/bin/cua-driver"
 if ((INSTALL)); then
-  mkdir -p "$HOME/.local/bin"
-  ln -sfn "$DRIVER" "$LINK"
-  echo "Installed $LINK -> $DRIVER"
-  echo "Noches finds this path without CUA_DRIVER_PATH. Restart the app so the engine process picks it up."
+  node "$HOST_INSTALLER" "$DRIVER"
 else
   echo "Driver built at $DRIVER"
-  echo "Re-run with --install to link it at $LINK. No app or compositor was restarted."
+  echo "Re-run with --install to install the shared launcher and host settings. No app or compositor was restarted."
 fi
 echo "Hyprland plugin staged at $PLUGIN_BUILD/cua-hyprland-plugin.so"
 echo "The loaded compositor module is unchanged until you replace it in a fresh session."
