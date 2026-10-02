@@ -225,7 +225,9 @@ class ReleaseTests(unittest.TestCase):
         script = (ROOT / 'scripts/cua/build_native.sh').read_text()
         self.assertNotIn('branch --show-current', script)
         self.assertNotIn('zui-c2d273d-cua', script)
-        self.assertIn('.local/bin/cua-driver', script)
+        self.assertIn('libs/cua-driver/examples/linux-host/install.mjs', script)
+        self.assertIn('node "$HOST_INSTALLER" "$DRIVER"', script)
+        self.assertNotIn('ln -sfn "$DRIVER"', script)
         self.assertTrue((ROOT / 'scripts/cua/native/apply_cua.py').is_file())
         self.assertTrue((ROOT / 'crates/harness/src/pi/noches-cua.ts').is_file())
         self.assertTrue((ROOT / 'crates/engine/src/computer_use/linux.rs').is_file())
@@ -239,6 +241,10 @@ class ReleaseTests(unittest.TestCase):
         unsupported = (ROOT / 'crates/engine/src/computer_use/unsupported.rs').read_text()
         self.assertIn('fn turn_started', unsupported)
         self.assertIn('fn turn_ended', unsupported)
+        module = (ROOT / 'crates/engine/src/computer_use/mod.rs').read_text()
+        for name in ('host', 'linux'):
+            self.assertIn(f'#[cfg(target_os = "linux")]\nmod {name};', module)
+        self.assertIn('#[cfg(not(target_os = "linux"))]\nmod unsupported;', module)
 
 
 if __name__ == '__main__': unittest.main()
