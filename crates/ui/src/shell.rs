@@ -68,6 +68,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
 mod command_palette;
+mod file_mutations;
 mod panes;
 mod project_icon;
 mod spaces;
@@ -3078,7 +3079,16 @@ impl Shell {
                 return None;
             }
         };
-        Some(WorkspacePathDrag::new(path, false))
+        let files = match surface {
+            RightSurface::Files => self.files.get(&self.panel_key(cx))?,
+            RightSurface::File(id) => self.file_surfaces.get(&id)?,
+            _ => return None,
+        };
+        Some(WorkspacePathDrag::new(path, false).with_origin(
+            files.read(cx).interaction_origin(cx),
+            crate::files::WorkspacePathSource::FileTab,
+            None,
+        ))
     }
 
     /// Drag-reorder a surface tab within this chat's strip.
@@ -3139,7 +3149,10 @@ impl Shell {
 
     fn suspend_file_images(&mut self, cx: &mut Context<Self>) {
         for files in self.files.values().chain(self.file_surfaces.values()) {
-            files.update(cx, |files, cx| files.suspend_images(cx));
+            files.update(cx, |files, cx| {
+                files.suspend_images(cx);
+                files.suspend_tree_interactions(cx);
+            });
         }
     }
 
@@ -3464,7 +3477,12 @@ impl Shell {
             let sub = cx.subscribe_in(
                 &files,
                 window,
-                move |this: &mut Self, _, event, window, cx| match event {
+                move |this: &mut Self, source, event, window, cx| match event {
+                    FilesEvent::HoldMutation { .. }
+                    | FilesEvent::AddToChat { .. }
+                    | FilesEvent::Mutate(_) => {
+                        this.handle_file_mutation_event(source.clone(), event, window, cx)
+                    }
                     FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
                     FilesEvent::OpenWebLink(activation) => {
                         if let crate::markdown::render::LinkOutcome::External(url) =
@@ -3546,7 +3564,12 @@ impl Shell {
         let sub = cx.subscribe_in(
             &file,
             window,
-            move |this: &mut Self, _, event, window, cx| match event {
+            move |this: &mut Self, source, event, window, cx| match event {
+                FilesEvent::HoldMutation { .. }
+                | FilesEvent::AddToChat { .. }
+                | FilesEvent::Mutate(_) => {
+                    this.handle_file_mutation_event(source.clone(), event, window, cx)
+                }
                 FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
                 FilesEvent::OpenWebLink(activation) => {
                     if let crate::markdown::render::LinkOutcome::External(url) =
@@ -8771,6 +8794,7 @@ impl Shell {
         // such as a pane resize.
         div()
             .id("chat-dropzone")
+            .debug_selector(|| "chat-dropzone".into())
             .relative()
             .flex_1()
             .min_w_0()
@@ -8786,18 +8810,14 @@ impl Shell {
             .on_drop::<WorkspacePathDrag>(cx.listener(
                 |this, payload: &WorkspacePathDrag, window, cx| {
                     let composer = this.active_composer();
-                    composer.update(cx, |composer, cx| {
-                        composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
-                    });
+                    this.attach_workspace_drag(payload, &composer, window, cx);
                     cx.notify();
                 },
             ))
             .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
                 if let Some(path) = &payload.workspace_path {
                     let composer = this.active_composer();
-                    composer.update(cx, |composer, cx| {
-                        composer.add_workspace_path(&path.path, path.is_directory, window, cx)
-                    });
+                    this.attach_workspace_drag(path, &composer, window, cx);
                 }
                 cx.notify();
             }))
@@ -10918,6 +10938,25 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(all(unix, not(feature = "webkit-browser")))]
         self.ensure_browser_control(window, cx);
+        let visible_files = if matches!(self.route, Route::Chat) && self.right_pane_open(cx) {
+            match self.resolved_right_active(cx) {
+                RightSurface::Files => self
+                    .files
+                    .get(&self.panel_key(cx))
+                    .map(|files| files.entity_id()),
+                RightSurface::File(id) => {
+                    self.file_surfaces.get(&id).map(|files| files.entity_id())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        for files in self.files.values().chain(self.file_surfaces.values()) {
+            if Some(files.entity_id()) != visible_files {
+                files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
+            }
+        }
         self.render_time = Some(std::time::Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()

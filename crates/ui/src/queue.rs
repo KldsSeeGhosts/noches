@@ -206,6 +206,15 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
+/// Project file references for display without changing the stored delivery text.
+fn queue_row_text(text: &str, attachments: &[String]) -> SharedString {
+    let visible = queue_visible_text(text, attachments);
+    let display = crate::composer::sent_mention_display(&visible)
+        .map(|(display, _)| display)
+        .unwrap_or(visible);
+    one_line(&display)
+}
+
 /// Presentation-only metadata. Never expose the observed accessibility payload.
 fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
     let presentations = crate::appshots::presentations(text);
@@ -424,7 +433,7 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => one_line(&queue_visible_text(&item.text, &item.attachments)),
+            _ => queue_row_text(&item.text, &item.attachments),
         };
 
         let edit_id = item.id.clone();
@@ -1984,6 +1993,27 @@ mod tests {
         assert_eq!(
             super::queue_attachment_labels(&malformed, &paths),
             vec!["shot & detail.png", "reference.png"]
+        );
+    }
+
+    #[test]
+    fn queue_rows_show_file_labels_without_changing_delivery_text() {
+        let link = "[queue.rs](zeron-file:src/queue.rs)";
+        let text = format!("inspect\n{link}");
+        assert_eq!(
+            super::queue_row_text(&text, &[]).as_ref(),
+            "inspect @queue.rs"
+        );
+        assert!(text.contains("zeron-file:"));
+        let paths = vec!["/tmp/image.png".to_string()];
+        let legacy = crate::attachments::with_attachments(&text, &paths);
+        assert_eq!(
+            super::queue_row_text(&legacy, &paths).as_ref(),
+            "inspect @queue.rs"
+        );
+        assert_eq!(
+            super::queue_row_text("plain  text", &[]).as_ref(),
+            "plain text"
         );
     }
 
