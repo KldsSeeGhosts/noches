@@ -7,8 +7,11 @@ certification remains pending. Noches Dev now selects
 `0.1.78-dev.1.cua.20261002.2`, built from runtime commit `17bf29d0`.
 Its base includes the exact `0b82bf6d` source used for the previously installed
 `0.1.78-dev.1` release. The browser bundle and icon were checked unchanged.
-The old package and all user data were retained. Running engine and UI
-processes were not restarted and still execute `0.1.78-dev.1`.
+The old package and all user data were retained. The initial installation left
+running sessions untouched. After the user confirmed their work was closed,
+`noches-dev.service` was restarted. Its live executable and version now match
+the new build, its loopback listener is healthy, and its restart count is zero.
+The UI was not reopened automatically.
 
 Standalone Pi and the Linux launcher were installed from CUA
 `585283f5ec8b3f89e398f32ba5849c3598a3190f`. The native driver bytes did not
@@ -37,21 +40,38 @@ Verification for this rollout:
 - Driver `doctor` reached the accessibility bus and Wayland display. Its X11
   probe warned that no top-level X11 windows were returned.
 
-An older Pi process still owned the legacy exclusive lock throughout the
-metadata check. That process was preserved. Fresh live input testing was
-deferred, not bypassed. Real kernel-lock and fixture-process tests cover
-independent windows, conflicting operations and cancellation; these do not
-replace native application input qualification.
+An older Pi process owned the legacy exclusive lock throughout the initial
+metadata check, so live input testing was deferred then. After the user closed
+that session, the lock was verified free and live testing completed:
+
+- Two independent installed Pi-adapter connections, both through the installed
+  launcher, typed distinct text and clicked buttons in separate GTK fixtures.
+- The final run used a third disposable window to keep both action targets
+  out of the foreground. Real per-window leases overlapped for both input
+  types. `verify_state` confirmed both text values and both click effects;
+  the final screenshots were also visually checked.
+- Physical focus and cursor position matched before input, after typing and
+  after clicking. This is sampled input evidence, not continuous monitoring
+  or a claim about application-launch focus behavior.
+- The desktop gate could be acquired while both idle connections remained
+  open. All three test-owned windows were closed and their absence verified.
+  No desktop ownership remained afterward.
+
+The native text replies reported `unverifiable` and suggested foreground
+delivery, even though subsequent verification proved the edits landed.
+No escalation or replay occurred. This diagnostic discrepancy remains in the
+native driver. The test proves GTK AT-SPI background concurrency, not arbitrary
+raw Wayland input. Evidence is retained under the rollout directory in
+`live-EJTRBw/`; the earlier two-window run is in `live-v795og/`.
 
 The metadata smoke previously asserted that the entire desktop was idle after
 its turn. That fails legitimately when an unrelated client owns the gate.
 It now checks that its own bridge holds no operation lease during metadata
 and after cleanup. The native executable and response checks remain intact.
 
-Activation requires finishing existing jobs, running `/cua-disconnect` in
-the old Pi session and restarting Pi. For Noches Dev, close the idle UI,
-restart `noches-dev.service`, then reopen the UI. No running session was
-terminated by this rollout.
+Activation is complete for the Noches Dev engine. Pi loads the updated
+extension on its next launch. The old Pi session was closed by the user;
+the rollout did not terminate it. Noches Dev and Pi can now be reopened.
 
 Backups, installation hashes, read-only verification evidence and a checked
 rollback helper are in
