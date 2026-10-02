@@ -426,10 +426,9 @@ mod tests {
             assert!(!cx.has_active_drag());
         });
     }
-    #[cfg(target_os = "windows")]
-    #[gpui::test]
-    fn windows_row_jitter_preserves_click_without_starting_a_drag(cx: &mut gpui::TestAppContext) {
+    fn assert_row_click_activation(cx: &mut gpui::TestAppContext, jitter: f32) {
         let (files, cx) = super::super::test_support::setup(cx);
+        cx.update(|_, cx| crate::motion::set_reduced_motion(cx, true));
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let recorded = events.clone();
         let _sub = cx.update(|_, cx| {
@@ -437,39 +436,57 @@ mod tests {
                 recorded.borrow_mut().push(event.clone())
             })
         });
-        let row = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
-        cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_move(
-            row + gpui::point(px(3.), px(0.)),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::default(),
-        );
-        cx.update(|_, cx| assert!(!cx.has_active_drag()));
-        cx.simulate_mouse_up(
-            row + gpui::point(px(3.), px(0.)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::default(),
-        );
-        cx.run_until_parked();
-        assert!(
-            events
-                .borrow()
-                .iter()
-                .any(|event| matches!(event,FilesEvent::OpenFile(path) if path=="a.txt"))
-        );
-        cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
-        cx.simulate_mouse_move(
-            row + gpui::point(px(9.), px(0.)),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::default(),
-        );
+        for presentation in [FilesPresentation::Browser, FilesPresentation::Editor] {
+            files.read_with(cx, |files, _| assert_eq!(files.presentation, presentation));
+            let row = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
+            let end = row + gpui::point(px(jitter), px(0.));
+            cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                end,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.update(|_, cx| assert!(!cx.has_active_drag()));
+            cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.run_until_parked();
+            files.read_with(cx, |files, _| {
+                assert_eq!(files.tree.selected(), Some("a.txt"));
+                assert_eq!(files.presentation, FilesPresentation::Editor);
+                assert_eq!(files.attachment_path(), Some("a.txt"));
+            });
+            // Browsers promote in place; existing editors route a new tab to the shell.
+            match presentation {
+                FilesPresentation::Browser => {
+                    assert!(matches!(
+                        events.borrow().as_slice(),
+                        [FilesEvent::TitleChanged]
+                    ));
+                    files.update(cx, |files, cx| files.show_tree_sidebar(cx));
+                    cx.update(|window, cx| window.draw(cx).clear());
+                }
+                FilesPresentation::Editor => {
+                    assert!(matches!(
+                        events.borrow().as_slice(),
+                        [FilesEvent::OpenFile(path)] if path == "a.txt"
+                    ));
+                }
+            }
+            events.borrow_mut().clear();
+        }
+    }
+
+    #[gpui::test]
+    fn row_click_promotes_browser_then_routes_from_editor(cx: &mut gpui::TestAppContext) {
+        assert_row_click_activation(cx, 1.);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn windows_row_jitter_preserves_click_without_starting_a_drag(cx: &mut gpui::TestAppContext) {
         // Noches' pinned zui still requires click-first Windows rows.
-        cx.update(|_, cx| assert!(!cx.has_active_drag()));
-        cx.simulate_mouse_up(
-            row + gpui::point(px(9.), px(0.)),
-            gpui::MouseButton::Left,
-            gpui::Modifiers::default(),
-        );
+        for jitter in [3., 9.] {
+            assert_row_click_activation(cx, jitter);
+        }
     }
     #[test]
     fn autoscroll_is_bounded_and_stops_outside_the_viewport() {
