@@ -566,14 +566,13 @@ pub fn agents_tray_row(
 
 pub const SIDEBAR_CHILD_HEIGHT: f32 = 22.0;
 pub const SIDEBAR_CHILD_MAX: usize = 3;
-/// Breathing room between a card's line 3 and its first child row.
+/// Breathing room between a card's context line and its first child row.
 pub const SIDEBAR_CHILD_GAP: f32 = 2.0;
-/// Bottom inset when the card carries children (the same 10px a bare card
-/// gets from `justify_center`; line 3's own row keeps its height).
+/// Extra bottom inset inside the child disclosure; the card keeps its base padding.
 pub const SIDEBAR_CHILD_PAD_BOTTOM: f32 = 4.0;
 
 /// Up to `SIDEBAR_CHILD_MAX` running subagents as EXTRA LINES inside the
-/// chat card (after line 3), sharing its wash and radius. Each row: 12px
+/// chat card (after the context line), sharing its wash and radius. Each row: 12px
 /// status glyph at the card's text-start x, 6px gap, 12px `text_muted`
 /// title truncating, mono 11px `text_faint` elapsed flush to the card's
 /// right edge. No tree stubs, no hairlines. `+N more` opens the Agents

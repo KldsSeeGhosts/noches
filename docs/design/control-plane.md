@@ -3,7 +3,7 @@
 Noches supervises coding agents running on several machines. The chrome must
 answer at a glance: **what** is each session doing, **where** (project,
 branch, device), **which agent**, and **does it need me**. The sidebar
-follows T3 Code's thread card; the color language follows Cursor and T3:
+uses BB's compact, title-first thread hierarchy; the color language follows Cursor and T3:
 color is plentiful but always *means* something.
 
 ## Rules
@@ -18,7 +18,7 @@ color is plentiful but always *means* something.
      or a colored monogram (`Shell::render_project_icon`).
    - Change: PR badges keep their state colors. Diff stats in the Changes pane
      use `theme.diff_add` and `theme.diff_del`; per-card diff counts in the
-     sidebar are deferred to a later phase (see Card line 3).
+     sidebar are deferred to a later phase (see the context line).
    - Surfaces, text, and hairlines stay neutral theme tokens.
 2. **One surface, hairline splits.** Panes are flush on the same shell
    backdrop as a lone session and are separated by 1px `theme.border`
@@ -35,58 +35,56 @@ Status colors are explicit hues with light and dark variants (like the
 monogram palette), so every theme reads a state the same way. Do not hardcode
 any other hex values in UI code.
 
-## Sidebar (T3 Code thread card)
+## Sidebar (compact control-plane threads)
+
+The thread, not the repository, is the primary navigation target. BB's
+compact thread hierarchy replaces the earlier three-line T3 card: title
+first, one context line below, status at the trailing edge. No blank
+metadata row, repeated status words, or archive text pill.
 
 ```
  ●●●  ▯  ← →                           +
  [dir] All projects ⌄         [⌕] [≡]
  Needs you
-▌[N] noches              ◌ Awaiting input     line 1: project + status
-    Fix auth token refresh                    line 2: title
-    ⑂ feat/auth-refresh            #42  ✳     line 3: branch, PR, device, harness
+▌✳ Fix auth token refresh              ◌
+ [N] noches  ⑂ feat/auth-refresh      #42
  Running
- [N] noches                 ◌ Working 2m
-    Port sidebar sections
-    ⑂ design/control-plane              ✳
+ ✳ Port sidebar sections           ▥ 2m
+ [N] noches  ⑂ design/control-plane
  Recent
- [W] website                          3h
-    Pricing page copy pass
-    ⑂ main                              ◎
+ ◎ Pricing page copy pass            3h
+ [W] website  ⑂ main
 ```
 
-### Card (three lines, 72px)
+### Thread (two lines, 56px)
 
-- Line 1 (18px):
-  - A 16px project badge from `render_project_icon`, then the project name at
-    11.5px MEDIUM in `text_muted`.
-  - The status slot sits on the right: a 12px icon or loader plus a label at
-    11.5px MEDIUM in the state color.
-  - Working also shows elapsed time in mono (`2m`, `1h 4m`) if the start
-    time is available.
-  - Settled rows show the relative time in mono `text_faint`.
-  - On hover the slot swaps to the Archive action, and jump hints take the
-    slot as they do today.
-- Line 2 (18px): the title at 13px. It is `text` at 0.9 opacity at rest, and
-  full `text` plus MEDIUM when the session needs you.
-- Line 3 (16px), all mono 11px:
-  - Left: a git-branch glyph and the branch in `text_faint`, truncating.
-  - Right, in order: the PR badge, the remote device name in `text_faint`
-    (only when it is not the local device), and the harness mark at 13px in
-    its brand tint.
-  - Deferred (later phase): per-card `+a -d` diff counts between the PR badge
-    and the remote device name. Today `WatchCheckoutDiffs` is opened lazily by
-    the Changes pane for a single target device and streams full `CheckoutDiff`
-    frames carrying up to 3 MiB of unified patch (`MAX_PATCH_BYTES`). Showing
-    counts on sidebar cards needs a bounded summary-only engine stream
-    (`{checkout_id, device_id, cwd, additions, deletions, updated_at}` without
-    the patch), subscribed once per engine connection in `AppState` and keyed
-    to cards via `changes::resolve_diff`-style checkout identity
-    (`checkout_id` first, then `device_id + cwd`, then `cwd`).
-- Text starts at the badge's left edge; there is no leading column on lines
-  2 and 3. That is how T3 aligns the card.
-- Needs-you rows keep the 2px bar in the list's side padding, colored by
-  state (indigo for awaiting, danger for failed).
-- The selected row keeps today's wash.
+- Geometry: 8px top padding, 20px title line, 4px gap, 16px context
+  line, 8px bottom padding. FLIP and keyboard projection share the rendered
+  list. Child-agent disclosures add their measured height to the base row.
+- Title line: 13px harness mark in its brand tint, 6px gap, title at 13px
+  NORMAL (MEDIUM when the session needs you). The trailing 56px slot keeps
+  title truncation stable across hover and status changes. While jump hints
+  are held, wider custom shortcut labels can grow that slot without overlapping
+  the title.
+- Live status uses a 12px glyph from the shared state palette, with the full
+  state in its tooltip and accessibility label. Working keeps the animated
+  equalizer and mono 11px elapsed time. Idle rows show mono relative time.
+  State changes fade quickly; reduced motion stays static.
+- Hover reveals a quiet 20px Archive icon button. Only the clock yields:
+  live status remains visible. The action stops propagation and never starts
+  a sidebar drag or selects the thread. Jump hints take precedence over the
+  action while the shortcut modifier is held.
+- Context line: 14px project favicon/colored monogram, project name at
+  11.5px `text_muted`, branch glyph + truncated branch in mono 11px
+  `text_faint`, PR badge, and remote device (only when not local). Branchless
+  sessions still have a useful project line, not a reserved empty third row.
+- Needs-you rows keep the 2px gutter bar in the state hue (indigo awaiting,
+  danger failed). Selection is a neutral wash, not a ring or a new accent.
+- Running child agents stay inside the selected/open row's wash and radius.
+  Their disclosure and the list's reorder glides remain animated. Initial
+  list entry is a restrained 180ms settle with a capped 15ms stagger.
+- Deferred: per-row `+a -d` counts need a bounded summary-only engine stream
+  keyed by checkout identity. Do not subscribe every row to full patches.
 
 ### State sections
 
@@ -135,8 +133,10 @@ The placeholder is "Message {Harness}…". The model chip keeps the harness
 mark's brand tint, shows the model name without the `provider/` prefix at
 NORMAL weight in `text_muted`, and shows reasoning in `text_faint`.
 
-The context ring (16px, 1.8px stroke) sits left of the send button
-whenever the harness reports a window. Its fill is `text_muted`, turning
+Only the context ring (16px, 1.8px stroke) sits left of the send button
+whenever the harness reports a window. Provider/account limits and account
+switching live in Settings > Accounts (the sidebar cog); rendering a composer
+never polls account usage. Its fill is `text_muted`, turning
 `warning` at 75% and `danger` at 90%. Hovering opens the context card:
 "Context window" with the percent in mono, a 4px usage bar, then mono
 11px lines - `used / window tokens`, `left`, `Auto-compacts at ~N%`
@@ -212,12 +212,12 @@ triangle Failed, neutral dot Started.
   subagent-interrupt call.
 - **Sidebar children**: under selected or pane-open cards with running
   agents only, up to three 22px rows rendered as extra lines INSIDE the
-  card after line 3 (sharing the card's wash and radius; no tree stubs,
+  card after the context line (sharing the card's wash and radius; no tree stubs,
   no hairlines). Each row: 12px status glyph at the card's text-start x,
   6px gap, 12px `text_muted` title truncating, mono 11px `text_faint`
   elapsed flush to the card's right edge. A `+N more` row (no glyph,
   indented to the title start) selects the chat and opens the Agents tab.
-  2px between line 3 and the first child, 4px bottom pad. Child clicks
+  2px between the context line and the first child, 4px bottom pad. Child clicks
   stop propagation and open the agent thread. Finished agents never
   nest; card height animates via the disclosure tween.
 

@@ -85,10 +85,9 @@ const SESSION_FOOTER_HEIGHT: f32 = 24.0;
 /// One footer ring chip: 16px ring + label + padding, plus the cluster gap.
 const RING_CHIP_WIDTH: f32 = 56.0;
 
-/// Footer width the model handoff reserves for the ring cluster: one chip
-/// per visible ring (context occupancy, account usage), none when empty.
-fn ring_cluster_width(context: bool, account: bool) -> f32 {
-    RING_CHIP_WIDTH * (context as u8 + account as u8) as f32
+/// Only context occupancy belongs in the footer. Provider limits live in Settings.
+fn context_indicator_width(visible: bool) -> f32 {
+    if visible { RING_CHIP_WIDTH } else { 0.0 }
 }
 
 /// Route chrome dissolves around the middle of the shared-element move. The
@@ -4063,8 +4062,8 @@ pub struct Composer {
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
-    /// The footer's ring cluster: plan-usage ring beside the context ring.
-    account_usage: Entity<crate::account_usage::AccountUsage>,
+    /// The footer's context-only indicator. Provider limits live in Settings.
+    context_indicator: Entity<crate::context_usage::ContextIndicator>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -4406,14 +4405,15 @@ impl Composer {
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
         let current_key = target.key(state.read(cx));
-        let account_usage = cx.new(|cx| crate::account_usage::AccountUsage::new(state.clone(), cx));
+        let context_indicator =
+            cx.new(|cx| crate::context_usage::ContextIndicator::new(state.clone(), cx));
         let mut composer = Self {
             state,
             target,
             input,
             queue_edit_draft: None,
             pickers,
-            account_usage,
+            context_indicator,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             appshots: HashMap::new(),
@@ -7996,31 +7996,13 @@ impl Render for Composer {
             .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
                 f32::from(bounds.size.width)
             });
-        // The footer's ring cluster (account usage + context) tracks the
-        // session's harness and device; it renders itself when there is
-        // anything to show. The device is THIS composer's target - never the
-        // globally selected chat, which a split pane may not be showing.
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let ring_target = {
-            let state = self.state.read(cx);
-            let device = self
-                .target
-                .chat(state)
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.effective_device_id());
-            device.filter(|device| state.local_device_id.as_ref() != Some(device))
-        };
-        self.account_usage.update(cx, |usage, cx| {
-            usage.track(harness, ring_target, self.target.clone(), cx)
-        });
-        // The ring cluster takes footer width per visible ring (context
-        // occupancy, account usage) - labeled chips run wider than a bare
-        // ring. Empty cluster reserves nothing.
+        // The context indicator is bound to THIS composer, never another
+        // pane's selection. Provider usage is available in Settings > Accounts.
+        self.context_indicator
+            .update(cx, |usage, cx| usage.track(self.target.clone(), cx));
         let usage = crate::context_usage::usage_for_target(self.state.read(cx), &self.target);
-        let context_ring = crate::context_usage::has_window(usage);
-        let account_ring = self.account_usage.read(cx).has_account_ring(cx);
-        let show_rings = context_ring || account_ring;
-        let context_ring_width = ring_cluster_width(context_ring, account_ring);
+        let show_context = crate::context_usage::has_window(usage);
+        let context_ring_width = context_indicator_width(show_context);
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
@@ -8116,8 +8098,8 @@ impl Render for Composer {
                                 .items_center()
                                 .gap(px(6.0))
                                 .children(
-                                    show_rings
-                                        .then(|| self.account_usage.clone().into_any_element()),
+                                    show_context
+                                        .then(|| self.context_indicator.clone().into_any_element()),
                                 )
                                 .child(send_button),
                         ),
@@ -8188,8 +8170,8 @@ impl Render for Composer {
                                 .relative()
                                 .top(px(-cluster_dy))
                                 .children(
-                                    show_rings
-                                        .then(|| self.account_usage.clone().into_any_element()),
+                                    show_context
+                                        .then(|| self.context_indicator.clone().into_any_element()),
                                 )
                                 .child(send_button),
                         ),
@@ -10214,47 +10196,13 @@ mod tests {
         });
     }
 
-    /// A split pane's ring cluster serves its OWN chat's device: a pane bound
-    /// to a chat on another machine loads/switches accounts there, while the
-    /// global selection sits on a local chat.
+    /// The indicator follows a fixed pane even when global selection moves.
     #[gpui::test]
-    fn a_pane_ring_tracks_its_own_chats_device(cx: &mut gpui::TestAppContext) {
+    fn context_indicator_tracks_its_own_pane(cx: &mut gpui::TestAppContext) {
         let (_dir, handle) = composer_focus_window(cx);
-        let state = handle
-            .read_with(cx, |composer, _| composer.state.clone())
-            .unwrap();
-        let chat_on = |id: &str, device: &str| zeron_proto::Chat {
-            id: id.into(),
-            device_id: device.into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: chrono::Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        };
-        state.update(cx, |state, _| {
-            state.local_device_id = Some("local".into());
-            state.apply_chats(vec![
-                chat_on("local-chat", "local"),
-                chat_on("remote-chat", "remote-device"),
-            ]);
-            state.selected_chat = Some("local-chat".into());
-        });
-        // This pane's composer is fixed to the remote chat; the selection
-        // (and the Selected composer's ring) stays on the local one.
         handle
             .update(cx, |composer, _, cx| {
-                composer.set_target(ChatTarget::Fixed(Some("remote-chat".into())), cx);
+                composer.set_target(ChatTarget::Fixed(Some("pane-chat".into())), cx);
             })
             .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
@@ -10264,20 +10212,14 @@ mod tests {
         handle
             .read_with(cx, |composer, cx| {
                 assert_eq!(
-                    composer.account_usage.read(cx).target_device(),
-                    Some("remote-device"),
-                    "a pane's account ring must load its own chat's device"
+                    composer.context_indicator.read(cx).target,
+                    ChatTarget::Fixed(Some("pane-chat".into()))
                 );
             })
             .unwrap();
-        // A new-chat canvas follows the pane's effective device, never the
-        // selection's: selected_device stays local, canvas picks remote.
         handle
             .update(cx, |composer, _, cx| {
                 composer.set_target(ChatTarget::Fixed(None), cx);
-                composer.state.update(cx, |state, _| {
-                    state.selected_device = Some("remote-device".into());
-                });
             })
             .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
@@ -10287,22 +10229,17 @@ mod tests {
         handle
             .read_with(cx, |composer, cx| {
                 assert_eq!(
-                    composer.account_usage.read(cx).target_device(),
-                    Some("remote-device"),
-                    "a canvas's account ring must follow its device pick"
+                    composer.context_indicator.read(cx).target,
+                    ChatTarget::Fixed(None)
                 );
             })
             .unwrap();
     }
 
-    /// The footer reserves per-ring width, so both labeled chips fit in the
-    /// model chip's handoff instead of sharing one ring's slot.
     #[test]
-    fn each_visible_ring_reserves_its_own_width() {
-        assert_eq!(ring_cluster_width(false, false), 0.0);
-        assert_eq!(ring_cluster_width(true, false), 56.0);
-        assert_eq!(ring_cluster_width(false, true), 56.0);
-        assert_eq!(ring_cluster_width(true, true), 112.0);
+    fn footer_reserves_only_context_usage_width() {
+        assert_eq!(context_indicator_width(false), 0.0);
+        assert_eq!(context_indicator_width(true), 56.0);
     }
 }
 

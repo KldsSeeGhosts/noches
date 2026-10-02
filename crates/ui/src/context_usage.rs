@@ -1,8 +1,87 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
 use crate::state::{AppState, ChatTarget};
 use crate::theme::Theme;
-use gpui::{PathBuilder, SharedString, canvas, div, point, prelude::*, px};
+use gpui::{
+    Context, Entity, IntoElement, PathBuilder, Render, SharedString, Subscription, Window, canvas,
+    div, point, prelude::*, px,
+};
 use zeron_proto::ContextUsage;
+
+/// Context-only composer indicator. Provider limits and account switching live
+/// in Settings > Accounts, so rendering a composer never probes a provider.
+pub(crate) struct ContextIndicator {
+    state: Entity<AppState>,
+    pub(crate) target: ChatTarget,
+    popup: crate::popover::Popup<()>,
+    _state: Subscription,
+}
+
+impl ContextIndicator {
+    pub(crate) fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self {
+            _state: cx.observe(&state, |_, _, cx| cx.notify()),
+            state,
+            target: ChatTarget::Selected,
+            popup: crate::popover::Popup::default(),
+        }
+    }
+
+    pub(crate) fn track(&mut self, target: ChatTarget, cx: &mut Context<Self>) {
+        if self.target != target {
+            self.target = target;
+            self.dismiss(cx);
+        }
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.popup.begin_close() {
+            crate::popover::reap_popup(cx, |usage: &mut Self| &mut usage.popup);
+        }
+        cx.notify();
+    }
+}
+
+impl Render for ContextIndicator {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let usage = usage_for_target(self.state.read(cx), &self.target);
+        if !has_window(usage) {
+            return div().into_any_element();
+        }
+        let trigger = chip(usage, self.popup.is_open(), &theme)
+            .role(gpui::Role::Button)
+            .aria_label("Context window usage")
+            .aria_expanded(self.popup.is_open())
+            .relative()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.popup.note_trigger_press();
+                }),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.popup.take_press_was_open() {
+                    this.dismiss(cx);
+                } else {
+                    this.popup.open(());
+                    cx.notify();
+                }
+            }));
+        if self.popup.get().is_none() {
+            return trigger.into_any_element();
+        }
+        let content = card(usage, &theme.for_popup())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss(cx)))
+            .into_any_element();
+        trigger
+            .child(crate::popover::anchored_menu_above_end(
+                "context-usage-menu",
+                content,
+                self.popup.closing_since(),
+            ))
+            .into_any_element()
+    }
+}
 
 /// The replicated usage frame belongs to the selected chat. Neither an
 /// unbound composer nor another split may borrow its ring or tooltip data.
@@ -13,8 +92,8 @@ pub(crate) fn usage_for_target(state: &AppState, target: &ChatTarget) -> Option<
         .flatten()
 }
 
-/// The context ring's trigger chip; the footer's ring cluster
-/// ([`crate::account_usage`]) opens [`card`] from it on click. `open` holds
+/// The context ring's trigger chip; [`ContextIndicator`] opens [`card`] on
+/// click. `open` holds
 /// the hover wash while its popover is up.
 pub(crate) fn chip(
     usage: Option<ContextUsage>,
@@ -37,8 +116,7 @@ pub(crate) fn chip(
     )
 }
 
-/// One footer ring indicator: ring + percent, identical geometry for every
-/// ring so they sit side by side as equals. `arc` colours the ring's fill,
+/// The footer context indicator: ring + percent. `arc` colors the ring's fill,
 /// `text` the label; `open` holds the hover wash while its popover is up.
 pub(crate) fn ring_chip(
     id: &'static str,

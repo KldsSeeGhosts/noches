@@ -151,7 +151,7 @@ fn sidebar_rows(
     let mut rows: Vec<ActiveChatRow> = chats
         .into_iter()
         .map(|(status, chat)| {
-            // Line 2 is "project:branch" + " · device" for a remote session;
+            // Context is "project:branch" + " · device" for a remote session;
             // project-less sessions read as their home-dir cwd `~`.
             let space = state.space_for_chat(&chat);
             let badge = ProjectIconRequest::resolve(state, &chat, space);
@@ -1131,13 +1131,16 @@ impl Shell {
 
         let trigger = div()
             .id("spaces-filter")
+            .role(gpui::Role::Button)
+            .aria_label("Filter projects")
+            .aria_expanded(open)
             .flex_1()
             .min_w_0()
             .h(px(SIDEBAR_FILTER_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(super::SIDEBAR_ROW_ICON_GAP))
+            .gap(px(6.0))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .text_size(crate::typography::ui_rems(12.0))
@@ -1173,7 +1176,7 @@ impl Shell {
             }))
             .child(
                 div()
-                    .size(px(super::SIDEBAR_BUDDY_SIZE))
+                    .size(px(super::SIDEBAR_CONTROL_ICON_SIZE))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1879,7 +1882,7 @@ impl Shell {
         let running_count = sub_summaries.len();
         // +1 extra row's height when the running set overflows the 3-row
         // cap (the `+N more` line). Children sit INSIDE the card (after
-        // line 3), so their block also carries the 2px gap and 4px bottom
+        // the context line), so their block also carries the 2px gap and 4px bottom
         // pad the card adds around them.
         let target_rows = running_count.min(crate::subagents::SIDEBAR_CHILD_MAX)
             + usize::from(running_count > crate::subagents::SIDEBAR_CHILD_MAX);
