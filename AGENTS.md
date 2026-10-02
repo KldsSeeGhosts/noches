@@ -29,6 +29,8 @@ Split panes, view splits, header drag, sidebar-row drag-to-split, drop previews,
 - Do not finish a large change with only local, uncommitted edits unless the user explicitly requests that. Inspect existing PRs and branch ancestry before choosing the PR base; always specify the Noches repository explicitly in `gh` commands so the fork's upstream is not selected accidentally.
 - Commit only task-related files; preserve unrelated changes and untracked files. Include implemented scope, validation results, known failures, and unverified platforms or visual QA in the PR description.
 - Do not push directly to an integration branch, merge the PR, or publish a release unless explicitly requested.
+- Once the PR lands, confirm it is merged and all task changes are included, fetch the updated integration branch, and return the main checkout to it. Remove any worktree created for the task and delete the task's local and remote feature branches if they still exist.
+- Inspect branches and worktrees before cleanup. Preserve unrelated changes, untracked files, and pre-existing worktrees; never discard unmerged work or force-remove a dirty worktree. If cleanup would lose work, stop and ask the user.
 
 ## Visual QA
 
