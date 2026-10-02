@@ -1,10 +1,10 @@
 //! Computer use owned by the engine. The Pi adapter only forwards tool calls.
 //!
-//! A lease covers one active turn, not the lifetime of a parked Pi process.
+//! A lease covers one active operation, not a coding turn or connection.
 //! Interrupts, disconnected callers and turn boundaries cancel outstanding work
 //! before reaping the private Linux driver and releasing that lease. Approval
-//! is session-scoped: it survives that teardown so a resumed turn re-acquires
-//! the lease and driver without asking again. On a real host the serve daemon
+//! is session-scoped: it survives that teardown so a resumed turn starts a
+//! driver without asking again. On a real host the serve daemon
 //! carries the existing-profile grant only once that approval exists; metadata
 //! asked before approval runs on a daemon spawned without the grant.
 
@@ -548,7 +548,7 @@ async fn reap_spawned(child: &mut Child, daemon: Option<&mut Child>) {
 }
 
 pub struct ComputerUseManager {
-    lease: Arc<Mutex<Option<String>>>,
+    lease: PathBuf,
     approvals: Arc<Mutex<HashSet<String>>>,
     device_id: String,
     // Tests inject an executable rather than modifying the process environment.
@@ -558,7 +558,7 @@ pub struct ComputerUseManager {
 impl ComputerUseManager {
     pub fn new(device_id: String) -> Self {
         Self {
-            lease: Arc::new(Mutex::new(None)),
+            lease: super::host::lease_root(),
             approvals: Arc::new(Mutex::new(HashSet::new())),
             device_id,
             driver_path: None,
@@ -575,7 +575,7 @@ impl ComputerUseManager {
     pub async fn start_bridge(
         &self,
         chat_id: &str,
-        run_id: &str,
+        _run_id: &str,
         request_input: RequestInput,
         interrupt: CancellationToken,
     ) -> CuaResult<(PathBuf, RunBridge)> {
@@ -599,7 +599,6 @@ impl ComputerUseManager {
         let granted = lock(&self.approvals).contains(chat_id);
         let state = Arc::new(BridgeState {
             chat_id: chat_id.to_string(),
-            owner: format!("chat {chat_id}, run {run_id}"),
             label: format!("noches-{}", uuid::Uuid::new_v4()),
             device_id: self.device_id.clone(),
             lease: self.lease.clone(),
@@ -672,18 +671,16 @@ struct Runtime {
     // ask again.
     granted: bool,
     denied: bool,
-    lease_held: bool,
     // Held through driver teardown, including kill failures. Coordinates
     // ownership with standalone Pi and other Noches engine processes.
-    desktop_lease: Option<std::fs::File>,
+    desktop_lease: Option<super::host::OperationLease>,
 }
 
 struct BridgeState {
     chat_id: String,
-    owner: String,
     label: String,
     device_id: String,
-    lease: Arc<Mutex<Option<String>>>,
+    lease: PathBuf,
     approvals: Arc<Mutex<HashSet<String>>>,
     request_input: RequestInput,
     driver_path: Option<PathBuf>,
@@ -719,12 +716,6 @@ impl BridgeState {
         }
         if let Err(err) = remove_socket_if_present(&self.daemon_socket) {
             tracing::warn!(error = %err, path = %self.daemon_socket.display(), "computer-use daemon socket cleanup failed");
-        }
-        if runtime.lease_held {
-            let mut owner = lock(&self.lease);
-            if owner.as_deref() == Some(self.owner.as_str()) {
-                *owner = None;
-            }
         }
         // The positive grant is session/chat-scoped and survives teardown; everything
         // else (driver, lease marker, a denial) belongs to the turn or attempt.
@@ -988,21 +979,6 @@ async fn handle_call(
                 "An ungranted daemon is still running after cleanup; restart computer use and start a new turn",
             );
         }
-        if !runtime.lease_held {
-            if state.driver_path.is_none() && runtime.desktop_lease.is_none() {
-                match super::host::desktop_lease() {
-                    Ok(lease) => runtime.desktop_lease = Some(lease),
-                    Err(err) => return error(err),
-                }
-            }
-            let mut lease = lock(&state.lease);
-            if let Some(owner) = lease.as_ref() {
-                runtime.desktop_lease = None;
-                return error(format!("Computer use is busy on this host: {owner}"));
-            }
-            *lease = Some(state.owner.clone());
-            runtime.lease_held = true;
-        }
         if let Err(err) = approve(state, &mut runtime, action).await {
             // A denial must not reserve the desktop for a parked chat.
             if !runtime.granted {
@@ -1047,6 +1023,18 @@ async fn handle_call(
             return error(format!("Could not initialize cua-driver: {detail}"));
         }
     }
+    if runtime.desktop_lease.is_some() {
+        return error(
+            "A previous computer-use operation has not stopped; its ownership is retained. Restart the private runtime before trying again.",
+        );
+    }
+    // Ask approval and establish the connection before reserving input. The
+    // reservation stays in Runtime across cancelled futures until cleanup
+    // confirms the actuator exited; successful calls release it immediately.
+    match super::host::acquire_operation_lease(&state.lease, action, &args) {
+        Ok(lease) => runtime.desktop_lease = lease,
+        Err(err) => return error(err),
+    }
     let driver = runtime.driver.as_mut().expect("initialized");
     let marker_pid = args.get("pid").and_then(Value::as_u64);
     let result = if action == "help" {
@@ -1063,7 +1051,10 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid),
+        Ok(result) => {
+            runtime.desktop_lease = None;
+            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
+        }
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;

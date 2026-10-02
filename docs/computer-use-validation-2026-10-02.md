@@ -71,6 +71,25 @@ error and the CUA-pinned toolchain download failed.
 
 ## Remaining coverage limits
 
+### Follow-up ownership correction
+
+The initial installed integration above held ownership for an entire agent
+turn. User feedback showed that a CUA call followed by coding could block
+unrelated agents. The follow-up source changes replace that reservation with
+per-operation ownership in Noches and standalone Pi. Reviewed explicit
+background actions coordinate by window; global or unreviewed operations
+remain exclusive. Help and observations do not reserve input. Connections and
+snapshot tokens survive successful calls. Split held-button gestures in Pi
+must use atomic `drag` instead.
+
+The updated Noches suite passed 36 tests with one opt-in test ignored. New
+tests cover two concurrent bridges, same-window refusal, independent windows,
+inspection during input, and release after cancellation. Pi includes a real
+private-process test that ignores SIGTERM and proves ownership is retained
+until forced exit. These are coordination tests, not a new GUI/app qualification.
+The installed-state record above predates this correction; updating source
+does not update already running Pi processes or the Noches service.
+
 This is not blanket macOS parity. The installed Hyprland input-v3 plugin
 matches the current compositor ABI, but arbitrary occluded Wayland surfaces
 still have no portable raw-input route. The GTK test proves AT-SPI delivery.

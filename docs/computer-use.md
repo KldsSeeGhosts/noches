@@ -30,23 +30,27 @@ configuration and ownership in `crates/engine/src/computer_use/host.rs`.
   setup remain forbidden after approval. Unsupported background actions
   refuse rather than escalating. A denial lasts until the turn ends; a fresh
   turn may ask again.
-- One chat at a time can hold the desktop lease. It covers the
-  whole active turn, including pauses between tool calls, rather than just
-  individual clicks. Other chats receive a busy error. A private advisory
-  lock at `/run/user/<uid>/cua-driver/control.lock` also coordinates separate
-  Noches engines, standalone Pi and the shared CLI launcher. The file stays
-  in place; process lifetime, not file deletion, releases ownership.
+- Ownership covers one operation, not a coding turn. Help and observations
+  take no input lock. Reviewed background actions with exact pid/window_id
+  share `/run/user/<uid>/cua-driver/control.lock` and exclusively own
+  `window-<pid>-<window_id>.lock` beside it. Different windows can proceed
+  independently; overlapping work on one window returns busy. Keyboard
+  shortcuts, clipboard reads and unreviewed operations require exclusive
+  desktop ownership. The protocol coordinates separate Noches engines and
+  updated standalone Pi clients. Lock files stay in place and are never
+  deleted to clear a busy result.
 - Turn completion closes the driver session, reaps the driver and releases
   the lease. A parked Pi process keeps its bridge socket and its approval,
-  but no desktop lease or driver. The next turn re-acquires both without
-  asking again.
+  but no desktop lease or driver. The next turn starts a fresh driver without
+  asking again. During an active turn, successful calls release ownership
+  immediately while retaining the connection and its snapshot tokens.
 - On a real host the engine runs `cua-driver serve` behind the MCP child for
   the length of the turn. Metadata asked before approval starts a daemon
   without `--grant existing-profile`; that daemon never has the grant, and
   it is replaced by a granted daemon once approval exists. The daemon owns
   the agent cursor overlay runloop, so the synthetic
   cursor renders on screen instead of only updating in memory. Both
-  processes are reaped before the lease is released.
+  processes are reaped before releasing ownership after an interrupted call.
 - Stop, a disconnected tool caller, transport failure or timeout cancels
   outstanding work. The Linux driver process is killed and reaped before
   its lease is released. Already delivered input cannot be undone. Unknown
@@ -86,6 +90,10 @@ same host settings and advisory lock, starts a private Linux MCP runtime,
 and disconnects at turn end, session switch or shutdown. It retains the
 handshake, caches live schemas, and reports structured refusals as errors.
 Cancellation ends its private process group and never replays uncertain input.
+An older installed client can still hold the former turn-wide lock. Disconnect
+that client voluntarily and restart it after updating. Do not terminate another
+agent or delete its lock. Observe fresh state after contention; another agent
+may have changed the window while this agent was coding.
 Standalone Pi is not governed by Noches' action allowlist. It must still
 respect driver permissions and obtain authorization for foreground control.
 
@@ -179,8 +187,8 @@ cargo +stable test --locked -p zeron-engine --lib installed_driver_metadata_smok
 
 The adapter tests require Node 22 with `stripTypeScriptTypes` support. Engine
 tests use injected Python MCP fixtures, never a real driver or process-global
-environment mutation. They check full results, permissions, lease release
-between turns, interruption during blocked input, client disconnection,
+environment mutation. They check full results, permissions, per-operation
+release, same-window contention, independent windows, cancellation, client disconnection,
 frame limits and partial-client teardown.
 
 Install the candidate into a separate version directory, retain the previous
