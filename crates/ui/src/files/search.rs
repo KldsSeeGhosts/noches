@@ -526,7 +526,11 @@ impl FilesSurface {
         let expanded = row.has_children && self.search_state.tree.is_expanded(&row.path);
         let is_directory = row.kind == WorkspaceEntryKind::Directory;
         let padding = 8.0 + row.depth as f32 * super::tree::TREE_INDENT;
-        let drag_payload = WorkspacePathDrag::new(row.path.clone(), is_directory);
+        let drag_payload = WorkspacePathDrag::new(row.path.clone(), is_directory).with_origin(
+            self.interaction_origin(cx),
+            super::WorkspacePathSource::Search,
+            None,
+        );
         let content = div()
             .id(("files-search-result", index))
             .role(gpui::Role::TreeItem)

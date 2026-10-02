@@ -1643,6 +1643,12 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    /// Cmd+C with no input selection copies the transcript selection. Only
+    /// the message composer keeps focus while the user reads the transcript;
+    /// dialog and palette fields copy only their own selection. A flag rather
+    /// than `key_context`, which the question wizard swaps while it borrows
+    /// the message input.
+    copies_transcript_selection: bool,
     accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
@@ -1741,6 +1747,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            copies_transcript_selection: false,
             accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
@@ -2567,9 +2574,9 @@ impl ComposerInput {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-        } else if let Some(text) = crate::markdown::selection::selected_text() {
-            // The composer keeps focus while the user reads the transcript -
-            // Cmd+C with no input selection copies the markdown selection.
+        } else if self.copies_transcript_selection
+            && let Some(text) = crate::markdown::selection::selected_text()
+        {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -4343,6 +4350,7 @@ impl Composer {
             let mut input =
                 ComposerInput::with_context("Message the agent…", MESSAGE_COMPOSER_CONTEXT, cx);
             input.enable_mentions();
+            input.copies_transcript_selection = true;
             input
         });
         let pickers = match &target {
@@ -7230,16 +7238,24 @@ impl Composer {
                 })
         });
 
-        div()
+        // Stands in for the composer pill, so it is the same frosted surface:
+        // without the backdrop blur the translucent fill let the transcript
+        // show through unblurred.
+        let panel = div()
             .id("question-panel")
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
+            .occlude()
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(if theme.is_frost() {
+                theme.composer_sidebar_tint()
+            } else {
+                theme.input_glass_bg()
+            })
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -7344,8 +7360,8 @@ impl Composer {
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
-            )
-            .into_any_element()
+            );
+        crate::frost::frosted(COMPOSER_RADIUS, crate::frost::MENU_BLUR, panel).into_any_element()
     }
 
     fn render_send_button(
@@ -8331,6 +8347,9 @@ impl Render for Composer {
         container
     }
 }
+
+#[cfg(test)]
+mod modal_selection_tests;
 
 #[cfg(test)]
 mod tests {

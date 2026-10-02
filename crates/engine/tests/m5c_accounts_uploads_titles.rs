@@ -835,7 +835,10 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .append("up-1", &chunks[1], Some(1))
         .expect("chunk 1");
     let path = uploads.commit("up-1", "photo.png").expect("commit");
-    assert!(path.ends_with("up-1-photo.png"), "path: {path}");
+    assert_eq!(
+        PathBuf::from(&path),
+        uploads.pending_target("up-1", "photo.png")
+    );
     assert_eq!(std::fs::read(&path).expect("committed file"), payload);
 
     // Readback: chunked reassembly round-trips.
@@ -844,7 +847,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
     loop {
         let chunk = uploads.read_chunk(&path, offset, &[]).expect("read chunk");
         assert_eq!(chunk.mime_type, "image/png");
-        assert_eq!(chunk.name, "up-1-photo.png");
+        assert_eq!(chunk.name, "photo.png");
         assembled.extend(BASE64.decode(&chunk.data).expect("chunk base64"));
         offset = chunk.next_offset;
         if chunk.done {
@@ -1116,7 +1119,10 @@ async fn rpc_dispatch_for_m5c_methods() {
         .await
         .expect("UploadCommit");
     let path = committed["path"].as_str().expect("path").to_string();
-    assert!(path.ends_with("rpc-up-shot.png"));
+    assert_eq!(
+        PathBuf::from(&path),
+        core.uploads.pending_target("rpc-up", "shot.png")
+    );
     let chunk = client
         .call(
             methods::READ_ATTACHMENT_CHUNK,
@@ -1125,6 +1131,7 @@ async fn rpc_dispatch_for_m5c_methods() {
         .await
         .expect("ReadAttachmentChunk");
     assert_eq!(chunk["mimeType"], "image/png");
+    assert_eq!(chunk["name"], "shot.png");
     assert_eq!(chunk["done"], true);
     assert_eq!(
         BASE64

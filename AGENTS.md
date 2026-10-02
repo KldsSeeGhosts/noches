@@ -23,6 +23,13 @@ The desktop UI follows **docs/design/control-plane.md**: a control plane for cod
 
 Split panes, view splits, header drag, sidebar-row drag-to-split, drop previews, divider drag and equalize, and focus routing are covered by `crates/ui/src/shell/pane_surface_regressions.rs`, `workspace_regressions.rs`, and the `pane::` tests. Run `cargo test -p zeron-ui --lib` after any pane or sidebar change.
 
+## Delivery workflow
+
+- Large changes, including multi-file features, substantial refactors, and upstream integrations, must be committed on a dedicated branch, pushed to `origin`, and opened as a pull request in `KldsSeeGhosts/noches` against the appropriate integration branch.
+- Do not finish a large change with only local, uncommitted edits unless the user explicitly requests that. Inspect existing PRs and branch ancestry before choosing the PR base; always specify the Noches repository explicitly in `gh` commands so the fork's upstream is not selected accidentally.
+- Commit only task-related files; preserve unrelated changes and untracked files. Include implemented scope, validation results, known failures, and unverified platforms or visual QA in the PR description.
+- Do not push directly to an integration branch, merge the PR, or publish a release unless explicitly requested.
+
 ## Visual QA
 
 `scripts/dev-demo.sh` boots a seeded mock engine and the headed app (it runs under macOS bash 3.2). For a split layout, seed `{data_dir}/workspace-layout.json` with a `split` root for the selected space; `SplitNode` is serde-tagged `{"type":"split","horizontal":..,"ratio":..,"first":..,"second":..}`. Check light and dark appearance.
