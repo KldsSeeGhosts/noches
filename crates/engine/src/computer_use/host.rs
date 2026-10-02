@@ -158,6 +158,17 @@ pub(super) struct OperationLease {
     _files: Vec<File>,
 }
 
+impl Drop for OperationLease {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit these open-file
+        // descriptions before CLOEXEC closes them. Closing only our descriptors
+        // would leave ownership behind until that child execs or exits.
+        for file in self._files.iter().rev() {
+            let _ = file.unlock();
+        }
+    }
+}
+
 /// Files are never unlinked. On uncertain delivery the caller retains these
 /// descriptors until its private driver has been killed and reaped.
 pub(super) fn acquire_operation_lease(
@@ -201,17 +212,18 @@ pub(super) fn acquire_operation_lease(
         )
     };
     let gate = open("control.lock")?;
+    let mut lease = OperationLease { _files: Vec::new() };
     if scope == "desktop" {
         gate.try_lock().map_err(busy)?;
-        Ok(Some(OperationLease { _files: vec![gate] }))
+        lease._files.push(gate);
     } else {
         gate.try_lock_shared().map_err(busy)?;
+        lease._files.push(gate);
         let window = open(&format!("{scope}.lock"))?;
         window.try_lock().map_err(busy)?;
-        Ok(Some(OperationLease {
-            _files: vec![gate, window],
-        }))
+        lease._files.push(window);
     }
+    Ok(Some(lease))
 }
 
 #[cfg(test)]
@@ -276,6 +288,62 @@ mod tests {
         assert!(acquire_operation_lease(&root, "hotkey", &one).is_err());
         drop(second);
         assert!(acquire_operation_lease(&root, "hotkey", &one).is_ok());
+    }
+
+    #[test]
+    fn release_unlocks_descriptors_inherited_by_a_child_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ownership");
+        let args = serde_json::json!({"pid":42,"window_id":7,"delivery_mode":"background"});
+        let lease = acquire_operation_lease(&root, "click", &args).unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // Only async-signal-safe calls after fork in this threaded test.
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        if child < 0 {
+            unsafe {
+                libc::close(pipe[1]);
+            }
+            panic!("fork failed: {}", std::io::Error::last_os_error());
+        }
+        drop(lease);
+        // The child is still alive with both original descriptors open.
+        let global = acquire_operation_lease(&root, "clipboard_read", &serde_json::json!({}));
+        let global_released = global.is_ok();
+        drop(global);
+        let window = acquire_operation_lease(&root, "click", &args);
+        let window_released = window.is_ok();
+        drop(window);
+        unsafe {
+            libc::close(pipe[1]);
+            while libc::waitpid(child, std::ptr::null_mut(), 0) == -1 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            global_released,
+            "desktop gate survived lease release in the child"
+        );
+        assert!(
+            window_released,
+            "window lock survived lease release in the child"
+        );
     }
 
     #[test]
