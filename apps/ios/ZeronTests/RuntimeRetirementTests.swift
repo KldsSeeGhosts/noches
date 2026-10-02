@@ -4,13 +4,26 @@ import UIKit
 @testable import Zeron
 
 private actor RefreshGate {
-    var calls = 0
-    var continuation: CheckedContinuation<AuthTokens, Never>?
-    func refresh() async -> AuthTokens {
+    private(set) var calls = 0
+    private var continuation: CheckedContinuation<AuthTokens, Never>?
+    private var finished = false
+    private let response = AuthTokens(accessToken: "new", refreshToken: "rotated")
+
+    func refresh(started: XCTestExpectation) async -> AuthTokens {
         calls += 1
-        return await withCheckedContinuation { continuation = $0 }
+        // Timeout cleanup may finish the gate before the refresh is scheduled.
+        guard !finished else { return response }
+        return await withCheckedContinuation {
+            continuation = $0
+            started.fulfill()
+        }
     }
-    func finish() { continuation?.resume(returning: AuthTokens(accessToken: "new", refreshToken: "rotated")); continuation = nil }
+
+    func finish() {
+        finished = true
+        continuation?.resume(returning: response)
+        continuation = nil
+    }
 }
 private final class TokenWrites: @unchecked Sendable {
     private let lock = NSLock()
@@ -25,18 +38,25 @@ final class RuntimeRetirementTests: XCTestCase {
     func testRetirementRejectsLateRefreshAndCredentialWrite() async {
         let gate = RefreshGate()
         let writes = TokenWrites()
+        let started = expectation(description: "Refresh is suspended before retirement")
         let config = AppConfig(edgeURL: URL(string: "https://example.invalid")!, mode: .workos,
             userId: "old", orgId: "org", deviceId: "ios", deviceName: "test",
             tokens: AuthTokens(accessToken: expired, refreshToken: "old-refresh"),
-            refreshTokens: { _, _ in await gate.refresh() }, persistTokens: { writes.save($0) })
+            refreshTokens: { _, _ in await gate.refresh(started: started) }, persistTokens: { writes.save($0) })
         let task = Task { await config.currentToken() }
-        for _ in 0..<1000 {
-            if await gate.calls > 0 { break }
-            await Task.yield()
+        // A yield count is not a deadline or a guarantee that refresh has run.
+        // Signal only after installing the continuation that retirement races.
+        let ready = await XCTWaiter.fulfillment(of: [started], timeout: 5) == .completed
+        XCTAssertTrue(ready, "Refresh must suspend before testing retirement")
+        guard ready else {
+            config.retire()
+            task.cancel()
+            await gate.finish()
+            _ = await task.value
+            return
         }
         let calls = await gate.calls
         XCTAssertEqual(calls, 1)
-        guard calls == 1 else { config.retire(); task.cancel(); return }
         config.retire()
         await gate.finish()
         let token = await task.value
