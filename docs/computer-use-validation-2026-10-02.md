@@ -1,8 +1,72 @@
 # Linux computer-use integration, 2026-10-02
 
-## Installed state
+## Current Linux installation, operation-scoped follow-up
 
-The Noches dev engine is running `0.1.62-dev.1.cua.20261002` from
+The user approved a reversible Linux-only installation while full remote
+certification remains pending. Noches Dev now selects
+`0.1.78-dev.1.cua.20261002.2`, built from runtime commit `17bf29d0`.
+Its base includes the exact `0b82bf6d` source used for the previously installed
+`0.1.78-dev.1` release. The browser bundle and icon were checked unchanged.
+The old package and all user data were retained. Running engine and UI
+processes were not restarted and still execute `0.1.78-dev.1`.
+
+Standalone Pi and the Linux launcher were installed from CUA
+`585283f5ec8b3f89e398f32ba5849c3598a3190f`. The native driver bytes did not
+change; the installer selected its content-addressed copy under
+`~/.local/lib/cua-driver/sha256-c5a1730ee425d10079a91b18fcfa28d3f7cf18effc0b9f9164a19a65e347c59c/`.
+Compatibility pins, services, the compositor plugin, permissions and stable
+Noches were not changed. No work ran on the user's Mac Studio.
+
+The Noches rerun caught an intermittent lock-release race. A child forked by
+another thread could retain the open-file description until exec, extending
+a lock after the parent's file closed. `OperationLease` now explicitly
+unlocks before closing. A deterministic fork regression checks both the
+desktop gate and window lock while the child still holds inherited descriptors.
+Partial acquisition failures also release through that guard.
+
+Verification for this rollout:
+
+- 35 tests against the installed Pi extension passed; 2 host installer tests passed.
+- 37 Noches computer-use tests passed in five consecutive runs. The opt-in
+  installed-driver metadata smoke also passed separately.
+- 17 managed Pi tests and 11 release tests passed. The optimized Noches build
+  and installed version/hash checks passed.
+- Pi's actual extension loader registered `cua` without errors. Two concurrent
+  installed-adapter clients, one through the launcher, each listed 60 tools and
+  read live window metadata without claiming input ownership.
+- Driver `doctor` reached the accessibility bus and Wayland display. Its X11
+  probe warned that no top-level X11 windows were returned.
+
+An older Pi process still owned the legacy exclusive lock throughout the
+metadata check. That process was preserved. Fresh live input testing was
+deferred, not bypassed. Real kernel-lock and fixture-process tests cover
+independent windows, conflicting operations and cancellation; these do not
+replace native application input qualification.
+
+The metadata smoke previously asserted that the entire desktop was idle after
+its turn. That fails legitimately when an unrelated client owns the gate.
+It now checks that its own bridge holds no operation lease during metadata
+and after cleanup. The native executable and response checks remain intact.
+
+Activation requires finishing existing jobs, running `/cua-disconnect` in
+the old Pi session and restarting Pi. For Noches Dev, close the idle UI,
+restart `noches-dev.service`, then reopen the UI. No running session was
+terminated by this rollout.
+
+Backups, installation hashes, read-only verification evidence and a checked
+rollback helper are in
+`~/.local/state/cua-operation-rollout-20261002-SOIRc8/`.
+`node rollback.mjs` checks rollback safety; `node rollback.mjs --apply`
+restores installation files without restarting sessions. It refuses if the
+checked installation changed afterward. The host installer's original files
+are retained in `~/.local/state/cua-driver/install/backup-X9aWI7/`.
+Published Noches updates can replace this local build until the source lands
+in the release branch. No full Mac/Windows certification or dev merge is
+claimed by this local deployment.
+
+## Earlier installation record
+
+The initial Noches dev engine ran `0.1.62-dev.1.cua.20261002` from
 `~/.local/share/noches-dev/app/0.1.62-dev.1.cua.20261002/zeron`.
 `noches-dev.service` and its IPC listener passed the post-install check.
 Production Noches, existing user data and the loaded Hyprland plugin were
@@ -87,8 +151,9 @@ tests cover two concurrent bridges, same-window refusal, independent windows,
 inspection during input, and release after cancellation. Pi includes a real
 private-process test that ignores SIGTERM and proves ownership is retained
 until forced exit. These are coordination tests, not a new GUI/app qualification.
-The installed-state record above predates this correction; updating source
-does not update already running Pi processes or the Noches service.
+The earlier installation predates this correction. The current rollout above
+installs it for future launches; updating files does not update already
+running Pi processes or the Noches service.
 
 This is not blanket macOS parity. The installed Hyprland input-v3 plugin
 matches the current compositor ABI, but arbitrary occluded Wayland surfaces
@@ -103,7 +168,7 @@ participate; direct native/daemon clients and older engines can bypass it.
 Future published Noches updates can replace this locally built binary, so
 retain the source changes when rebasing or rebuilding.
 
-## Rollback
+## Earlier installation rollback record
 
 Backups are in `~/.local/state/cua-background-20261002/`:
 `launcher.before`, `service.before`, `pi-extension.before/`,

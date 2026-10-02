@@ -1100,13 +1100,16 @@ async fn installed_driver_metadata_smoke() {
     let health = call(&socket, "health_report", json!({})).await;
     assert_ne!(health["isError"], true, "{health}");
     assert!(health["structuredContent"].is_object(), "{health}");
+    assert!(bridge.state.runtime.lock().await.desktop_lease.is_none());
     let schema = call(&socket, "describe", json!({"name":"get_window_state"})).await;
     assert_eq!(
         schema["structuredContent"]["tools"][0]["name"], "get_window_state",
         "{schema}"
     );
     bridge.turn_ended().await;
-    assert!(lease_is_idle(&manager));
+    // Other live clients can legitimately own the shared desktop gate. Check
+    // this smoke's ownership rather than requiring the whole desktop to idle.
+    assert!(bridge.state.runtime.lock().await.desktop_lease.is_none());
 
     bridge.turn_started();
     let restarted = call(&socket, "health_report", json!({})).await;
