@@ -2755,13 +2755,50 @@ impl Pickers {
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
+        Self::footer_label_shell(icon_path, theme)
+            .max_w(px(160.0))
+            .child(div().min_w_0().truncate().child(label))
+    }
+
+    /// A [`Self::footer_label`] that takes whatever width the row leaves it
+    /// and fades its tail only when that isn't enough.
+    fn footer_faded_label(
+        id: &'static str,
+        icon_path: &'static str,
+        label: SharedString,
+        theme: &Theme,
+    ) -> gpui::Div {
+        let overflow = gpui::ScrollHandle::new();
+        Self::footer_label_shell(icon_path, theme)
+            .child(Self::footer_faded_text(id, label, &overflow))
+    }
+
+    fn footer_faded_text(
+        id: &'static str,
+        label: impl IntoElement,
+        overflow: &gpui::ScrollHandle,
+    ) -> impl IntoElement {
+        crate::edge_fade::edge_faded(
+            20.0,
+            false,
+            false,
+            div()
+                .id(id)
+                .min_w_0()
+                .overflow_hidden()
+                .track_scroll(overflow)
+                .flex()
+                .child(div().flex_none().whitespace_nowrap().child(label)),
+        )
+        .fade_right(true)
+        .fade_overflow_x(overflow)
+    }
+
+    fn footer_label_shell(icon_path: &'static str, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
-            // Four of these share one row now (device, project, checkout,
-            // ref): cap each early and let them SHRINK (`min_w_0`) — without
-            // it the clusters overflowed into each other and the labels
-            // painted overlapped (user report).
-            .max_w(px(160.0))
+            // Labels SHRINK (`min_w_0`) — without it the clusters overflowed
+            // into each other and the labels painted overlapped (user report).
             .min_w_0()
             .flex()
             .flex_row()
@@ -2774,9 +2811,9 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             )
-            .child(div().min_w_0().truncate().child(label))
     }
 
     /// New-session destination controls. Machine and project form the
@@ -2979,7 +3016,8 @@ impl Pickers {
                 .items_center()
                 .gap(px(4.0))
                 .min_w_0()
-                .child(Self::footer_label(
+                .child(Self::footer_faded_label(
+                    "composer-session-branch",
                     crate::icons::GIT_BRANCH,
                     chat.branch
                         .clone()
@@ -5335,6 +5373,55 @@ mod tests {
             assert!((f32::from(pair[1].left() - pair[0].right()) - 4.0).abs() < 0.1);
             assert_eq!(pair[0].top(), pair[1].top());
             assert!((f32::from(pair[2].right() - pair[0].left()) - (width - 20.0)).abs() < 0.1);
+        }
+    }
+
+    #[gpui::test]
+    fn session_branch_uses_free_width_and_tracks_overflow(cx: &mut gpui::TestAppContext) {
+        struct Fixture {
+            width: f32,
+            overflow: gpui::ScrollHandle,
+        }
+        impl gpui::Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let fixed = |width| div().w(px(width)).h(px(20.0)).flex_none();
+                div().w(px(self.width)).child(
+                    workspace_footer_row()
+                        .child(fixed(120.0))
+                        .child(
+                            Pickers::footer_label_shell(
+                                crate::icons::GIT_BRANCH,
+                                &Theme::dark(),
+                            )
+                            .child(Pickers::footer_faded_text(
+                                "branch",
+                                fixed(300.0),
+                                &self.overflow,
+                            )),
+                        )
+                        .child(div().flex_1().min_w_0())
+                        .child(fixed(60.0)),
+                )
+            }
+        }
+        let overflow = gpui::ScrollHandle::new();
+        let handle = cx.add_window(|_, _| Fixture {
+            width: 600.0,
+            overflow: overflow.clone(),
+        });
+        for (width, overflowing) in [(600.0, false), (320.0, true), (600.0, false)] {
+            handle
+                .update(cx, |fixture, _, cx| {
+                    fixture.width = width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            assert_eq!(overflow.max_offset().x > px(1.0), overflowing);
+            if !overflowing {
+                assert!(overflow.bounds().size.width > px(160.0));
+            }
         }
     }
 
