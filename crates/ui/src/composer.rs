@@ -6470,9 +6470,8 @@ impl Composer {
             || resolved.interaction_mode != zeron_proto::InteractionMode::Default)
             && !self.state.read(cx).runtime_policy_supported(&device_id)
         {
-            self.failure = Some(
-                "Update the local and execution engines to enforce this runtime mode.".into(),
-            );
+            self.failure =
+                Some("Update the local and execution engines to enforce this runtime mode.".into());
             self.failure_key = Some(self.current_key.clone());
             cx.notify();
             return;

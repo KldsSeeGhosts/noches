@@ -817,13 +817,11 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
-/// surface the questions through the engine's input bridge (which owns the
-/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
-/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
-/// by question text, as the tool expects.
+/// Serve one control request through the permission bridge, except for
+/// `AskUserQuestion`, which uses the separate content-input bridge. Native
+/// permission modes filter requests before this callback; anything reaching
+/// it requires explicit consent. Subtasks keep the frame loop flowing, and
+/// unsupported requests are denied rather than left unanswered.
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,

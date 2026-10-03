@@ -39,6 +39,8 @@ async fn roundtrip(
     .unwrap();
     let seen = Arc::new(Mutex::new(0));
     let seen_permission = seen.clone();
+    let unknown_seen = Arc::new(Mutex::new(0));
+    let unknown_permission = unknown_seen.clone();
     let (_steer, steering) = mpsc::channel(1);
     let controls = RunControls {
         browser: None,
@@ -46,7 +48,18 @@ async fn roundtrip(
         steering,
         interrupt: CancellationToken::new(),
         request_permission: Box::new(move |request| {
-            *seen_permission.lock().unwrap() += 1;
+            let unknown = request.description == "Future approval";
+            if unknown {
+                *unknown_permission.lock().unwrap() += 1;
+                assert!(
+                    request
+                        .options
+                        .iter()
+                        .all(|o| o.decision == PermissionDecision::Decline)
+                );
+            } else {
+                *seen_permission.lock().unwrap() += 1;
+            }
             assert!(
                 !request
                     .options
@@ -58,12 +71,20 @@ async fn roundtrip(
                 request
                     .options
                     .into_iter()
-                    .find(|o| o.decision == decision)
+                    .find(|o| {
+                        o.decision
+                            == if unknown {
+                                PermissionDecision::Decline
+                            } else {
+                                decision
+                            }
+                    })
                     .unwrap_or_default(),
             );
             PermissionReceiver::new(rx, || {})
         }),
         request_input: Box::new(|questions| {
+            assert!(questions.iter().all(|q| q.question != "Future approval"));
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(
                 questions
@@ -115,6 +136,20 @@ async fn roundtrip(
             0
         } else {
             1
+        }
+    );
+    assert_eq!(
+        *unknown_seen.lock().unwrap(),
+        if matches!(
+            harness.id(),
+            zeron_proto::HarnessId::Grok
+                | zeron_proto::HarnessId::Antigravity
+                | zeron_proto::HarnessId::Hermes
+                | zeron_proto::HarnessId::Devin
+        ) {
+            1
+        } else {
+            0
         }
     );
     let text = events
@@ -187,7 +222,10 @@ async fn claude_permission_answer_cannot_exit_plan_mode() {
         true,
     )
     .await;
-    assert_eq!(value["planExit"]["response"]["response"]["behavior"], "deny");
+    assert_eq!(
+        value["planExit"]["response"]["response"]["behavior"],
+        "deny"
+    );
     assert!(value["args"].as_array().unwrap().contains(&json!("plan")));
 }
 
@@ -269,6 +307,10 @@ async fn acp_native_mode_and_permission_question_roundtrips() {
                 );
             }
             assert_eq!(value["question"]["result"]["outcome"]["optionId"], "b");
+            assert_eq!(
+                value["unknownApproval"]["result"]["outcome"]["outcome"],
+                "cancelled"
+            );
             if harness.id() == zeron_proto::HarnessId::Grok {
                 assert_eq!(value["init"]["_meta"]["clientType"], "extension");
                 assert!(
@@ -288,6 +330,22 @@ async fn acp_native_mode_and_permission_question_roundtrips() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn acp_full_access_still_refuses_unknown_permission_kinds() {
+    let value = roundtrip(
+        &AcpHarness::hermes().with_executable(fixture()),
+        RuntimeMode::FullAccess,
+        PermissionDecision::Accept,
+        false,
+    )
+    .await;
+    assert_eq!(
+        value["unknownApproval"]["result"]["outcome"]["outcome"],
+        "cancelled"
+    );
+    assert_eq!(value["question"]["result"]["outcome"]["optionId"], "b");
 }
 
 #[tokio::test]

@@ -66,6 +66,7 @@ channel; it does not offer Noches approval-modal parity.
 
 `PermissionRequest` has stable option IDs, decision/scope, and
 pending/resolved/expired state. Only the owning engine registers the callback.
+Provider-stream events cannot mint permission requests or forge resolutions.
 `RespondPermission` travels through the existing `QueueCommand` RPC/durable
 command plane; it accepts an exact request ID and option ID, not a label.
 Unknown IDs, duplicate answers, unknown options, and dead callbacks refuse.
@@ -85,6 +86,8 @@ replacement/restart. Unknown requests and missing UI answers default to denial.
 Content questions use the separate `UserInputQuestion` / `UserInputRequest`
 contract and `RespondInput` bridge; questions never auto-approve, including in
 Full access. Grok's two native ask_user_question aliases return native answers.
+Legacy ACP kind-less content choices remain compatible; unknown, null, or
+mixed permission option kinds cannot route through the question bridge.
 Existing orphan content-question recovery remains a conversation continuation,
 not an approval mechanism. Persistent consent (`acceptAlways`) is represented
 in proto but is not exposed by this minimal UI.

@@ -1529,11 +1529,10 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one server→client request. Approval requests round-trip through
-/// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// Serve one server→client request. Native approvals use the permission
+/// bridge, never the content-question bridge. Subtasks keep the message
+/// loop flowing; unknown requests are explicitly rejected so the server
+/// never wedges awaiting a reply.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,

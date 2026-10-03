@@ -2100,6 +2100,16 @@ async fn drive_run(
                 }
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
+                    Some(Ok(event)) if matches!(
+                        event,
+                        AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionUpdated { .. }
+                    ) => {
+                        // Permission lifecycle events come only from the
+                        // engine channel. A provider stream cannot mint an
+                        // answerable-looking request or forge its resolution.
+                        tracing::warn!(chat = %chat_id, "dropping harness-emitted permission lifecycle event");
+                        continue;
+                    }
                     Some(Ok(event)) => event,
                     // A stream error while PARKED is a post-turn child death —
                     // the turn was already finalized, so the run ends clean

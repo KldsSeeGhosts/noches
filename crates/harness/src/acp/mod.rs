@@ -2730,12 +2730,10 @@ fn prompt_turn(
     })
 }
 
-/// Answer a server→client request. Permission requests are auto-accepted with
-/// the agent's preferred allow option — parity with the claude harness's
-/// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Everything else (fs, terminal, elicitation) was
-/// declined at initialize, so a stray request gets method-not-found rather
-/// than wedging the agent.
+/// Startup/discovery has no live permission bridge, so every permission
+/// request is cancelled. Everything else (fs, terminal, elicitation) was
+/// declined at initialize and gets method-not-found rather than wedging
+/// the agent. Live requests use the policy-aware handler below.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -2767,28 +2765,24 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// A permission request is a QUESTION (not a tool permission) when any of
-/// its options lacks an allow/reject kind — that's how the agent relays
-/// user-facing choices (Claude's AskUserQuestion arrives this way through
-/// the adapter). Every option carrying an allow/reject kind means a real
-/// tool permission, which auto-accepts (unattended parity); kinds may
-/// legitimately repeat — codex sends two `allow_always` options ("Allow for
-/// Session" and a prefix-rule amendment) on every exec approval.
+/// Legacy adapters relay content choices through request_permission without
+/// option kinds. Only well-formed, entirely kind-less choices qualify.
+/// Unknown, null, or mixed permission kinds stay on the permission bridge:
+/// RespondInput must never acquire authority to grant a future permission.
 fn is_user_question(options: &[Value]) -> bool {
     !options.is_empty()
         && options.iter().all(|option| {
-            !matches!(
-                option.get("kind").and_then(Value::as_str),
-                Some("allow_once" | "allow_always" | "reject_once" | "reject_always")
-            )
+            option.is_object()
+                && option.get("kind").is_none()
+                && option["optionId"].as_str().is_some_and(|id| !id.is_empty())
+                && option["name"].as_str().is_some_and(|name| !name.is_empty())
         })
 }
 
-/// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// The live-run request handler separates policy-aware tool permissions from
+/// legacy question-shaped requests. Both bridges run in subtasks so the
+/// message loop keeps flowing. Unknown permission kinds are not grantable;
+/// dropped resolvers cancel, never silently allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -5469,7 +5463,7 @@ mod tests {
     #[test]
     fn codex_exec_approval_options_are_not_a_question() {
         // codex-acp's real exec-approval shape: two allow_always entries (the
-        // session allow + a prefix-rule amendment). Must auto-accept.
+        // session allow + a prefix-rule amendment). Must stay a permission.
         let options = vec![
             json!({ "optionId": "allow_once", "name": "Allow Once", "kind": "allow_once" }),
             json!({ "optionId": "allow_always", "name": "Allow for Session", "kind": "allow_always" }),
@@ -5488,6 +5482,29 @@ mod tests {
             json!({ "optionId": "b", "name": "Другое", "kind": "other" }),
         ];
         assert!(!is_user_question(&mixed));
+    }
+
+    #[test]
+    fn unknown_or_malformed_permission_options_cannot_be_content_questions() {
+        for options in [
+            vec![
+                json!({"optionId":"future", "name":"B", "kind":"allow_future"}),
+                json!({"optionId":"deny", "name":"Deny", "kind":"reject_future"}),
+            ],
+            vec![json!({"optionId":"future", "name":"B", "kind":null})],
+            vec![
+                json!({"optionId":"choice", "name":"B"}),
+                json!({"optionId":"future", "name":"B", "kind":"other"}),
+            ],
+            vec![json!({"name":"B"})],
+            vec![json!({"optionId":"choice"})],
+            vec![json!({"optionId":"", "name":"B"})],
+            vec![json!({"optionId":"choice", "name":""})],
+            vec![Value::Null],
+            Vec::new(),
+        ] {
+            assert!(!is_user_question(&options), "{options:?}");
+        }
     }
 
     #[test]

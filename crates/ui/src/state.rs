@@ -1411,7 +1411,8 @@ impl AppState {
 
     pub fn runtime_policy_supported(&self, device_id: &str) -> bool {
         let capability = zeron_proto::capabilities::RUNTIME_POLICY_V1;
-        self.engine().is_some_and(|engine| engine.engine_info().supports(capability))
+        self.engine()
+            .is_some_and(|engine| engine.engine_info().supports(capability))
             && self.device_supports(device_id, capability)
     }
 

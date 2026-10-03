@@ -80,6 +80,13 @@ else:
                     {"optionId": "no", "kind": "reject_once", "name": "Deny"}]}
     send({"id": 900, "method": "session/request_permission", "params": permission})
     approval = read()
+    # Unknown future permission kinds must not enter the content-question
+    # bridge, even when their display label matches its scripted answer.
+    send({"id": 903, "method": "session/request_permission", "params": {
+        "sessionId": "policy", "toolCall": {"title": "Future approval"}, "options": [
+            {"optionId": "future", "name": "B", "kind": "allow_future"},
+            {"optionId": "future-deny", "name": "Deny", "kind": "reject_future"}]}})
+    unknown_approval = read()
     send({"id": 901, "method": "session/request_permission", "params": {
         "sessionId": "policy", "toolCall": {"title": "Pick"}, "options": [
             {"optionId": "b", "name": "B"}]}})
@@ -93,5 +100,6 @@ else:
     send({"method": "session/update", "params": {"sessionId": "policy", "update": {
         "sessionUpdate": "agent_message_chunk", "content": {"type": "text",
         "text": json.dumps({"mode": mode, "args": args, "init": init["params"],
-                            "approval": approval, "question": question, "aliases": aliases})}}}})
+                            "approval": approval, "unknownApproval": unknown_approval,
+                            "question": question, "aliases": aliases})}}}})
     reply(turn, {"stopReason": "end_turn"})

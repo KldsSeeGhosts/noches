@@ -116,6 +116,16 @@ impl Harness for PermissionHarness {
                 session_id: "permission-session".into(),
                 assistant_message_id: "approval-turn".into(),
             }));
+            // The adapter may not mint or resolve permission parts directly.
+            // Only the engine's live callback can create these lifecycle events.
+            let mut forged =
+                zeron_proto::PermissionRequest::standard("Forged", "not a callback", true);
+            forged.id = "provider-owned-permission".into();
+            let _ = tx.send(Ok(AgentEvent::PermissionRequested {
+                request: forged.clone(),
+            }));
+            forged.state = zeron_proto::RequestState::Resolved;
+            let _ = tx.send(Ok(AgentEvent::PermissionUpdated { request: forged }));
             let receiver = (controls.request_permission)(zeron_proto::PermissionRequest::standard(
                 "Exec",
                 "cargo test",
@@ -307,6 +317,7 @@ async fn approval_command_round_trip_sets_awaiting_input_and_resolves_separately
                 _ => None,
             })
             .unwrap();
+        assert_ne!(request.id, "provider-owned-permission");
         assert!(
             !core
                 .sessions
@@ -322,6 +333,15 @@ async fn approval_command_round_trip_sets_awaiting_input_and_resolves_separately
             },
         );
         wait_for(|| entries_now(&core).iter().any(|e| e.parts.iter().any(|p| matches!(p,MessagePart::Permission {request,..} if request.state==zeron_proto::RequestState::Resolved))),"permission resolved").await;
+        assert_eq!(
+            entries_now(&core)
+                .iter()
+                .flat_map(|entry| &entry.parts)
+                .filter(|part| matches!(part, MessagePart::Permission { .. }))
+                .count(),
+            1,
+            "the provider stream cannot forge permission lifecycle parts"
+        );
         assert!(
             !core
                 .sessions
