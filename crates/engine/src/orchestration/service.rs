@@ -1,8 +1,11 @@
-//! Trusted MCP/domain seam. Credentials and transport framing stay outside it.
+//! Shared engine/MCP boundary. Scope is minted by the authenticated session,
+//! never accepted from a tool's JSON arguments.
+use std::path::PathBuf;
+
 use zeron_proto::orchestration::{ProjectId, RunId, ThreadId};
 use zeron_proto::orchestration_mcp::{
-    DelegateTaskInput, DelegateTaskResult, TaskCancelInput, TaskCancelResult, TaskStatusInput,
-    TaskStatusResult,
+    DelegateTaskInput, DelegateTaskResult, OrchestratorMcpFailure, OrchestratorMcpFailureCode,
+    OrchestratorMcpFailureTag, TaskCancelInput, TaskCancelResult, TaskStatusInput, TaskStatusResult,
 };
 use zeron_proto::provider_instance::ProviderInstanceId;
 use zeron_proto::{InteractionMode, RuntimeMode};
@@ -10,35 +13,39 @@ use zeron_proto::{InteractionMode, RuntimeMode};
 #[derive(Debug, Clone)]
 pub struct CallerScope {
     pub thread_id: ThreadId,
-    pub run_id: Option<RunId>,
+    pub run_id: RunId,
+    /// Host-local authenticated MCP session identity (not a native thread ID).
     pub session_id: String,
     pub project_id: ProjectId,
-    pub workspace_root: String,
+    pub workspace_root: PathBuf,
     pub runtime_mode: RuntimeMode,
     pub interaction_mode: InteractionMode,
     pub provider_instance_id: ProviderInstanceId,
 }
 
-/// T3 public failure family, never an arbitrary backend/debug string.
+/// The exact T3 orchestration failure family. Transport/framework validation
+/// errors are owned by the MCP layer rather than flattened into this family.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct ToolError {
-    pub code: zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode,
+    pub code: OrchestratorMcpFailureCode,
     pub message: String,
 }
 
 impl ToolError {
-    pub fn unavailable() -> Self {
+    pub fn new(code: OrchestratorMcpFailureCode, message: impl Into<String>) -> Self {
         Self {
-            code: zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode::OrchestrationError,
-            message: "The operation could not be completed.".into(),
+            code,
+            message: message.into(),
         }
     }
 
-    pub fn wire(&self) -> serde_json::Value {
-        serde_json::json!({
-            "_tag": "OrchestratorMcpFailure", "code": self.code, "message": self.message
-        })
+    pub fn into_failure(self) -> OrchestratorMcpFailure {
+        OrchestratorMcpFailure {
+            _tag: OrchestratorMcpFailureTag::OrchestratorMcpFailure,
+            code: self.code,
+            message: self.message,
+        }
     }
 }
 
@@ -59,31 +66,4 @@ pub trait OrchestratorService: Send + Sync + 'static {
         caller: CallerScope,
         input: TaskCancelInput,
     ) -> Result<TaskCancelResult, ToolError>;
-}
-
-pub struct UnavailableOrchestratorService;
-
-#[async_trait::async_trait]
-impl OrchestratorService for UnavailableOrchestratorService {
-    async fn delegate_task(
-        &self,
-        _: CallerScope,
-        _: DelegateTaskInput,
-    ) -> Result<DelegateTaskResult, ToolError> {
-        Err(ToolError::unavailable())
-    }
-    async fn task_status(
-        &self,
-        _: CallerScope,
-        _: TaskStatusInput,
-    ) -> Result<TaskStatusResult, ToolError> {
-        Err(ToolError::unavailable())
-    }
-    async fn task_cancel(
-        &self,
-        _: CallerScope,
-        _: TaskCancelInput,
-    ) -> Result<TaskCancelResult, ToolError> {
-        Err(ToolError::unavailable())
-    }
 }
