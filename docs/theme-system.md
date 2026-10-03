@@ -2,7 +2,7 @@
 
 Zeron themes are complete, source-neutral `ThemeVariant` values owned by the
 `zeron-theme` crate. Runtime components consume only Zeron semantic roles. VS
-Code workbench ids and TextMate selectors stop at the source compiler.
+Code workbench ids, T3 role names, and TextMate selectors stop at the source compiler.
 
 ## Runtime model
 
@@ -41,7 +41,7 @@ Windows using their in-app renderers. Windows uses the bounded Direct3D
 `BackdropBlur` implementation; native window Acrylic remains independent.
 The preference remains portable even where a particular surface cannot honor blur.
 
-The built-in registry contains 30 variants across 19 families:
+The built-in registry contains 32 variants across 20 families:
 
 - Zeron Light and Dark
 - VS Code Light+ and Dark+
@@ -62,6 +62,7 @@ The built-in registry contains 30 variants across 19 families:
 - Shades of Purple
 - Cobalt2
 - Andromeda
+- Claude Light and Dark (user-authored warm palette; opaque recommended)
 
 Every bundled variant records source URL, exact upstream revision, license, and
 a SHA-256 hash of the resolved curated definition.
@@ -72,6 +73,94 @@ turning the page into a grid of bespoke buttons. Accent remains a compact
 right-aligned swatch control; its three-tone first swatch means “Theme default.”
 Glass is an adjacent conventional settings row with a compact
 `Theme default` / `Frosted` / `Opaque` selector.
+
+## Optional semantic roles
+
+`ThemeColors` accepts serde-defaulted optional `action`, `onAction`,
+`actionHover`, `controlHover`, `sidebarHover`, `sidebarSelected`,
+`sidebarActive`, `placeholder`, `composerOutline`, `messageSurface`
+(`message` is also accepted), `messageForeground`, `codeBackground`,
+`codeForeground`, `iconMuted`, `accentSurface`, `dangerSurface`,
+`warningSurface`, `link`, and `muted` overrides. Absent roles are omitted
+when saving, so existing native libraries still load and round-trip unchanged.
+
+The UI exposes snake-case accessors on `Theme`: `action()`, `on_action()`,
+`action_hover()`, `control_hover()`, `sidebar_hover()`, `sidebar_selected()`,
+`sidebar_active()`, `placeholder()`, `composer_outline()`, `message_surface()`,
+`message_foreground()`, `code_background()`, `code_foreground()`, `icon_muted()`,
+`accent_surface()`, `danger_surface()`, `warning_surface()`, `link()`, and
+`muted()`. Without overrides these preserve the legacy solid/on-solid,
+element-hover, faint-text, border, user-bubble wash, body/code text, accent,
+notice-tint, and raised-surface derivations. They do not change existing
+transcript or chrome call sites; those migrate separately.
+
+The intentional exception is the row-state wash retune: hover is 4.5% light /
+5% dark, selected 6.5% / 7.5%, and frost-active 8% / 9%. Opaque themes can
+author all three sidebar tiers; forced frost uses the three translucent tiers.
+`wash(alpha)` still honors its explicit alpha. Floating-card selection and
+user-bubble recipes remain unchanged.
+
+Claude preserves the palette from `crates/theme/tests/fixtures/claude.json`
+(a read-only-source copy, not a link into live T3 data). The adapter maps
+`surfaceRaised` to the composer input, `messageSurface` to raised/message
+surfaces, `updateForeground` to links, terminal selection to accent selection,
+and the dark composer outline to input 30% over canvas (`#31302d`).
+The builtin adds a curated warm/desaturated ANSI16 palette; imported T3 files
+retain Zeron ANSI16 because T3 v1 does not define it.
+
+## T3 role-file import
+
+Appearance's existing import/link dialog also detects T3 JSON:
+`{version: 1, name, appearance, colors, variants: {dark: {...}}}`.
+One file produces one family with both light and dark variants. Partial
+variants override the base color record; unknown roles and invalid colors are
+reported without hiding usable roles. Unsupported versions are rejected.
+Snapshots and linked-file reloads use the same library path as VS Code imports.
+No source files are rewritten, and no T3 runtime dependency is introduced.
+
+`Color` supports CSS hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`),
+legacy comma and modern space/slash `rgb()` / `rgba()`, percentages,
+and `oklch()` with percent lightness/chroma, alpha, and hue units
+(`deg`, `rad`, `grad`, `turn`). Nonfinite and malformed values are rejected.
+Resolved colors serialize as canonical hex.
+
+T3 imports flatten alpha foundations, harden foregrounds for their mapped
+surfaces, and report every repair. Syntax is absent from T3 role files, so
+they inherit the hand-mapped Pierre palette with a 3:1 floor on code/diff
+surfaces. Source provenance uses `format: "t3-theme-v1"`.
+
+```bash
+cargo run -p zeron-theme --bin zeron-theme-import -- \
+  --format t3 --input /path/to/claude.json \
+  --output /tmp/claude.zeron.json --report /tmp/claude.report.json \
+  --family-id t3-claude
+```
+
+T3 mode emits a complete `ThemeFamily` plus per-variant reports; VS Code mode
+continues emitting one variant. Source URL/revision/license can be supplied
+explicitly; T3 mode defaults to the local path, `local`, and `User supplied`.
+
+## Syntax and installed typography
+
+Settings → Appearance → **Syntax colours: Theme | Pierre** is independent of
+workbench theme, accent, and fonts. The absent (`null`) preference chooses
+Pierre for the Claude family and Theme elsewhere; an explicit choice persists
+across theme switches. Changing it invalidates paint/style caches, not parser
+results or text geometry. See [syntax-highlighting.md](syntax-highlighting.md).
+
+Anthropic Sans Variable is an installed-only choice. It is never bundled,
+downloaded, or selected when absent. On the Mac used for this implementation,
+both the native GPUI catalog and Latin-metrics filter accepted the family.
+The pinned GPUI/CoreText backend resolved NORMAL (400), MEDIUM (500), and
+SEMIBOLD (600) to distinct native faces (FontIds 0, 8, 12), with increasing
+`m` advances (1741.97, 1761.99, 1787.99 font units). No static-weight map is
+needed on that configuration. This is not a Linux/Windows variable-font claim.
+Repeat the isolated native probe after changing GPUI or font installations:
+
+```bash
+cargo test -p zeron-ui --lib native_anthropic_variable_weights -- \
+  --ignored --test-threads=1 --nocapture
+```
 
 ## VS Code import
 
@@ -151,6 +240,9 @@ sources are local files and folders compiled into resolved data.
 
 `ThemeRegistry::validate` checks unique ids, provenance, text contrast,
 interaction contrast, on-accent contrast, and terminal foreground contrast.
+Supplied semantic foregrounds also check on-action/message/code at 4.5:1,
+placeholder/icon at 3:1, and links at 4.5:1. Absent overrides do not introduce
+new gates for older palettes.
 Issues are classified as structural or contrast so callers cannot accidentally
 treat a repairable quality finding as corrupt data. Tests also exercise every
 preset against both appearances and adverse frosted backdrops.
