@@ -780,6 +780,24 @@ fn modal_with(
 /// listener — `fade_key` must be unique app-wide and stable across frames
 /// (the id string is a good choice).
 pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) -> gpui::Div {
+    menu_row_with_owner(theme, active, fade_key.into(), None)
+}
+
+pub fn menu_row_owned(
+    owner: gpui::EntityId,
+    theme: &Theme,
+    active: bool,
+    fade_key: impl Into<SharedString>,
+) -> gpui::Div {
+    menu_row_with_owner(theme, active, fade_key.into(), Some(owner))
+}
+
+fn menu_row_with_owner(
+    theme: &Theme,
+    active: bool,
+    fade_key: SharedString,
+    owner: Option<gpui::EntityId>,
+) -> gpui::Div {
     let row = div()
         .flex()
         .flex_row()
@@ -794,22 +812,25 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         row.bg(crate::theme::card_selected_bg())
             .text_color(theme.text)
     } else {
-        let fade_key = fade_key.into();
+        let blend = |from, to| match owner {
+            Some(owner) => motion::hover_blend_owned(owner, &fade_key, from, to),
+            None => motion::hover_blend(&fade_key, from, to),
+        };
         let mut row = row
-            .text_color(motion::hover_blend(
-                &fade_key,
-                theme.text.opacity(0.9),
-                theme.text,
-            ))
-            .bg(motion::hover_blend(
-                &fade_key,
+            .text_color(blend(theme.text.opacity(0.9), theme.text))
+            .bg(blend(
                 crate::theme::wash(0.0),
                 crate::theme::card_selected_bg(),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
-        row.interactivity()
-            .on_hover(motion::hover_listener(fade_key));
+        if let Some(owner) = owner {
+            row.interactivity()
+                .on_hover(motion::hover_listener_owned(owner, fade_key));
+        } else {
+            row.interactivity()
+                .on_hover(motion::hover_listener(fade_key));
+        }
         row
     }
 }
@@ -825,6 +846,22 @@ pub fn menu_row_nav(
     fade_key: impl Into<SharedString>,
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
+    if !selected && highlighted {
+        row.bg(crate::theme::card_selected_bg())
+            .text_color(theme.text)
+    } else {
+        row
+    }
+}
+
+pub fn menu_row_nav_owned(
+    owner: gpui::EntityId,
+    theme: &Theme,
+    selected: bool,
+    highlighted: bool,
+    fade_key: impl Into<SharedString>,
+) -> gpui::Div {
+    let row = menu_row_owned(owner, theme, selected, fade_key);
     if !selected && highlighted {
         row.bg(crate::theme::card_selected_bg())
             .text_color(theme.text)
