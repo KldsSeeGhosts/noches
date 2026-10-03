@@ -79,6 +79,15 @@ function emit(name,s,module=moduleOf(name)) {
     return;
   }
   emitted.set(name,s);
+  const sharedPolicyTypes = {
+    RuntimeMode: "RuntimeMode",
+    ProviderInteractionMode: "InteractionMode as ProviderInteractionMode",
+    ProviderApprovalDecision: "PermissionDecision as ProviderApprovalDecision",
+  };
+  if (Object.hasOwn(sharedPolicyTypes, name)) {
+    output[module].push(`pub use crate::runtime_policy::${sharedPolicyTypes[name]};\n`);
+    return;
+  }
   s=simplify(s);
   let text;
   const isId = (name.endsWith("Id") || name === "CheckpointRef" || name === "ProviderDriverKind") && s.kind === "string";
@@ -144,8 +153,8 @@ function emit(name,s,module=moduleOf(name)) {
       }
     }
   }
-  if (["RuntimeMode","ProviderInteractionMode","ProviderApprovalDecision","ProviderApprovalOption"].includes(name))
-    text="// TODO(merge): move to runtime_policy; re-export here after orch/runtime-policy lands.\n"+text;
+  if (name === "ProviderApprovalOption")
+    text="/// T3 wire approval option. Host-local callback IDs and scopes live in\n/// runtime_policy::PermissionOption, not this generated contract.\n"+text;
   output[module].push(text);
 }
 for(const name of Object.keys(defs).sort()) emit(name,defs[name]);

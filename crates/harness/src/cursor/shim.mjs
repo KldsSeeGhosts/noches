@@ -488,11 +488,16 @@ async function start(msg) {
   const options = {
     model,
     ...(msg.mcpServers && Object.keys(msg.mcpServers).length ? { mcpServers: msg.mcpServers } : {}),
+    mode: msg.interactionMode === "plan" ? "plan" : "agent",
     // askQuestion has no public answer channel in this SDK (SDKRequestMessage
     // carries only a request id) — a question would block the run forever.
     // generateImage has nowhere to land in a zeron session (ACP parity).
     disallowedTools: ["askQuestion", "generateImage"],
-    local,
+    local: {
+      ...local,
+      autoReview: msg.autoReview === true,
+      sandboxOptions: { enabled: msg.sandboxEnabled !== false },
+    },
   };
   try {
     // SDK startup validates the model via get_models. Rapid process resumes

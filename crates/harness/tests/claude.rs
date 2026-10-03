@@ -45,6 +45,8 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -60,6 +62,23 @@ fn controls(
     let token = CancellationToken::new();
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
+        request_permission: Box::new(move |request| {
+            let (tx, rx) = oneshot::channel();
+            let decision = if answer_label == "No" {
+                zeron_proto::PermissionDecision::Decline
+            } else {
+                zeron_proto::PermissionDecision::Accept
+            };
+            let _ = tx.send(
+                request
+                    .options
+                    .into_iter()
+                    .find(|o| o.decision == decision)
+                    .unwrap(),
+            );
+            zeron_harness::PermissionReceiver::new(rx, || {})
+        }),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -292,6 +311,18 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let seen = asked.clone();
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
+        request_permission: Box::new(|request| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(
+                request
+                    .options
+                    .into_iter()
+                    .find(|o| o.id == "allow-once")
+                    .unwrap(),
+            );
+            zeron_harness::PermissionReceiver::new(rx, || {})
+        }),
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();

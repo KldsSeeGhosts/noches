@@ -274,7 +274,12 @@ impl Tools {
             reasoning: args.reasoning,
             model_options: Default::default(),
             sandbox,
+            // This legacy tool explicitly promises constrained creation.
+            // It cannot inherit the unrestricted desktop session default.
+            runtime_mode: zeron_proto::RuntimeMode::ApprovalRequired,
+            interaction_mode: zeron_proto::InteractionMode::Default,
         };
+        self.require_runtime_policy(&device, &config).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let cwd = space
             .as_ref()
@@ -396,12 +401,48 @@ impl Tools {
     async fn queue(&self, chat: &Chat, command: SessionCommandPayload) -> anyhow::Result<Value> {
         self.zeron.device(Some(&chat.device_id)).await?;
         self.zeron.require_routing(&chat.device_id).await?;
+        if !matches!(command, SessionCommandPayload::Interrupt { .. })
+            && let Some(config) = &chat.config
+        {
+            self.require_runtime_policy(&chat.device_id, config).await?;
+        }
         self.zeron
             .call(
                 methods::QUEUE_COMMAND,
                 json!({"chatId":chat.id,"targetDeviceId":chat.device_id,"command":command}),
             )
             .await
+    }
+
+    async fn require_runtime_policy(
+        &self,
+        device: &str,
+        config: &ChatConfig,
+    ) -> anyhow::Result<()> {
+        if config.runtime_mode == zeron_proto::RuntimeMode::FullAccess
+            && config.interaction_mode == zeron_proto::InteractionMode::Default
+        {
+            return Ok(());
+        }
+        let capability = zeron_proto::capabilities::RUNTIME_POLICY_V1;
+        let info = self.zeron.call(methods::ENGINE_INFO, json!({})).await?;
+        ensure!(
+            info["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|c| c == capability)),
+            "Update the local engine to enforce this runtime mode"
+        );
+        if device != self.zeron.local_device().await? {
+            ensure!(
+                self.zeron
+                    .devices()
+                    .await?
+                    .iter()
+                    .any(|d| d.id == device && d.supports(capability)),
+                "Update the execution engine to enforce this runtime mode"
+            );
+        }
+        Ok(())
     }
 
     async fn wait(
@@ -480,6 +521,8 @@ fn run_request(config: &ChatConfig, cwd: &str, prompt: String) -> RunRequest {
         model_options: config.model_options.clone(),
         cwd: cwd.into(),
         sandbox: config.sandbox,
+        runtime_mode: config.runtime_mode,
+        interaction_mode: config.interaction_mode,
         auto_approve: false,
         resume: None,
         attachments: vec![],

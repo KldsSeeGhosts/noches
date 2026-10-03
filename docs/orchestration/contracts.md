@@ -94,12 +94,12 @@ Only upstream decoding defaults are inserted. For example, `enabled` and
 true defaults are service decisions, not extra codec fields.
 
 Runtime/interaction/approval ownership belongs to `orch/runtime-policy`.
-Because those types do not exist on this branch's base, the ORCH.md-permitted
-temporary definitions carry `TODO(merge): move to runtime_policy` comments.
-At integration, replace them with imports/re-exports from that branch;
-do not keep two authoritative runtime enums. `InteractionMode` aliases
-the exact upstream `ProviderInteractionMode`; crate-root re-exports provide
-the temporary shared entrypoint.
+`runtime_policy.rs` now owns the authoritative enums. The generated contracts
+and generator re-export `RuntimeMode`, `InteractionMode` (also under the
+upstream `ProviderInteractionMode` name), and `PermissionDecision` (under
+`ProviderApprovalDecision`) with identical T3 JSON. The generated
+`ProviderApprovalOption` retains its exact wire fields; the engine's live
+`PermissionOption` additionally owns callback IDs and scopes.
 
 ## Upstream ambiguities and easily missed boundaries
 

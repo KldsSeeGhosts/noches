@@ -36,7 +36,11 @@ for line in sys.stdin:
         ]:
             emit({"method": "session/update", "params": {"sessionId": "parent", "update": {
                 "sessionUpdate": kind, key: value}}})
-        emit({"id": ident, "result": {"sessionId": "parent"}})
+        emit({"id": ident, "result": {"sessionId": "parent", "modes": {
+            "availableModes": [{"id": "yolo", "name": "Full access"}]}}})
+    elif method == "session/set_mode":
+        assert frame["params"]["modeId"] == "yolo", frame
+        emit({"id": ident, "result": {}})
     elif method == "session/prompt":
         prompt = frame["params"]["prompt"][0]["text"]
         if prompt in ("wedge", "late-settle"):

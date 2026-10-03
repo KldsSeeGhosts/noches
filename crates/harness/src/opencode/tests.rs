@@ -74,6 +74,27 @@ async fn owned_mcp_registration_and_cleanup_match_both_wire_generations() {
         let mut child = Command::new("sleep");
         child.arg("60").kill_on_drop(true);
         server.child = Some(child.spawn().unwrap());
+        for runtime in zeron_proto::RuntimeMode::ALL {
+            server
+                .apply_policy("session", Some("/work"), runtime)
+                .await
+                .unwrap();
+            let (path, payload) = recorded.recv().await.unwrap();
+            assert!(path.starts_with(if protocol == Protocol::V2 {
+                "PATCH /api/session/session"
+            } else {
+                "PATCH /session/session"
+            }));
+            let key = if protocol == Protocol::V2 {
+                "permissions"
+            } else {
+                "permission"
+            };
+            assert_eq!(
+                payload[key],
+                crate::policy::opencode_rules(runtime, protocol == Protocol::V2)
+            );
+        }
         server
             .inject_mcp(&context, "session", Some("/work"))
             .await
@@ -96,6 +117,28 @@ async fn owned_mcp_registration_and_cleanup_match_both_wire_generations() {
             assert_eq!(payload["value"], "OpenCode session instructions");
         }
         assert_eq!(server.mcp_instructions, "OpenCode session instructions");
+        // Installing the scoped servers must not overwrite resumed authority.
+        server
+            .apply_policy(
+                "session",
+                Some("/work"),
+                zeron_proto::RuntimeMode::ApprovalRequired,
+            )
+            .await
+            .unwrap();
+        let (_, payload) = recorded.recv().await.unwrap();
+        let key = if protocol == Protocol::V2 {
+            "permissions"
+        } else {
+            "permission"
+        };
+        assert_eq!(
+            payload[key],
+            crate::policy::opencode_rules(
+                zeron_proto::RuntimeMode::ApprovalRequired,
+                protocol == Protocol::V2
+            )
+        );
         let guard = context.run_guard();
         server.shutdown(Duration::from_millis(50)).await;
         drop(guard);
@@ -299,6 +342,14 @@ impl TurnWire {
             event_tx,
             controls: RunControls {
                 mcp: Default::default(),
+                browser: None,
+                request_permission: Box::new(move |request| {
+                    let answer = answer.expect("fixture must not ask for permission");
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let decision = if answer {zeron_proto::PermissionDecision::Accept} else {zeron_proto::PermissionDecision::Decline};
+                    let _ = tx.send(request.options.into_iter().find(|o| o.decision == decision).unwrap());
+                    crate::PermissionReceiver::new(rx, || {})
+                }),
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -313,6 +364,7 @@ impl TurnWire {
 },
             request: serde_json::from_value({
                 let mut request = json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
+                request["runtimeMode"] = json!(if auto_approve {"full-access"} else {"approval-required"});
                 if let Some(fields) = overrides["request"].as_object() {
                     request
                         .as_object_mut()

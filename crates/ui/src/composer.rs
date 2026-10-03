@@ -40,6 +40,7 @@ use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
 mod dictation;
+mod permission;
 use dictation::{DictationHold, DictationInputEvent, DictationKey, HoldSource};
 
 // ---------------------------------------------------------------------------
@@ -4431,52 +4432,55 @@ impl Composer {
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
-        let input_events = cx.subscribe(&input, |this: &mut Self, _, event: &ComposerInputEvent, cx| match event {
-            ComposerInputEvent::Submitted => this.on_submit(cx),
-            ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
-            ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
-                this.on_input_edited(cx)
-            }
-            ComposerInputEvent::ViewportChanged => cx.notify(),
-            // The slash popup and the mention popup share the input's
-            // completion key routing; they are mutually exclusive by token
-            // shape (`/` at offset 0 vs `@` at a token boundary).
-            ComposerInputEvent::MentionNavigate(delta) => {
-                if this.slash.token.is_some() {
-                    this.move_slash(*delta, cx)
-                } else {
-                    this.move_mention(*delta, cx)
+        let input_events = cx.subscribe(
+            &input,
+            |this: &mut Self, _, event: &ComposerInputEvent, cx| match event {
+                ComposerInputEvent::Submitted => this.on_submit(cx),
+                ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
+                ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
+                    this.on_input_edited(cx)
                 }
-            }
-            ComposerInputEvent::MentionAccept => {
-                if this.slash.token.is_some() {
-                    this.accept_slash(cx)
-                } else {
-                    this.accept_mention(cx)
+                ComposerInputEvent::ViewportChanged => cx.notify(),
+                // The slash popup and the mention popup share the input's
+                // completion key routing; they are mutually exclusive by token
+                // shape (`/` at offset 0 vs `@` at a token boundary).
+                ComposerInputEvent::MentionNavigate(delta) => {
+                    if this.slash.token.is_some() {
+                        this.move_slash(*delta, cx)
+                    } else {
+                        this.move_mention(*delta, cx)
+                    }
                 }
-            }
-            ComposerInputEvent::MentionDismiss => {
-                if this.slash.token.is_some() {
-                    this.dismiss_slash(cx)
-                } else {
-                    this.dismiss_mention(cx)
+                ComposerInputEvent::MentionAccept => {
+                    if this.slash.token.is_some() {
+                        this.accept_slash(cx)
+                    } else {
+                        this.accept_mention(cx)
+                    }
                 }
-            }
-            ComposerInputEvent::PastedImages(images) => {
-                let images = images.clone();
-                this.stage_in_background(
-                    move || {
-                        images
-                            .into_iter()
-                            .map(attachments::stage_clipboard_image)
-                            .map(Ok)
-                            .collect()
-                    },
-                    cx,
-                );
-            }
-            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
-        });
+                ComposerInputEvent::MentionDismiss => {
+                    if this.slash.token.is_some() {
+                        this.dismiss_slash(cx)
+                    } else {
+                        this.dismiss_mention(cx)
+                    }
+                }
+                ComposerInputEvent::PastedImages(images) => {
+                    let images = images.clone();
+                    this.stage_in_background(
+                        move || {
+                            images
+                                .into_iter()
+                                .map(attachments::stage_clipboard_image)
+                                .map(Ok)
+                                .collect()
+                        },
+                        cx,
+                    );
+                }
+                ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            },
+        );
         cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
             if !crate::settings::current(cx).dictation_enabled {
                 this.input.update(cx, |input, _| input.cancel_dictation());
@@ -6348,7 +6352,10 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
-        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
             return;
         }
         if self.commit_queue_edit(cx) {
@@ -6388,7 +6395,10 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
-        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
             return;
         }
         if self.commit_queue_edit(cx) {
@@ -6465,6 +6475,16 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        if (resolved.runtime_mode != zeron_proto::RuntimeMode::FullAccess
+            || resolved.interaction_mode != zeron_proto::InteractionMode::Default)
+            && !self.state.read(cx).runtime_policy_supported(&device_id)
+        {
+            self.failure =
+                Some("Update the local and execution engines to enforce this runtime mode.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        }
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -6982,6 +7002,8 @@ impl Composer {
                         model_options: resolved.model_options.clone(),
                         cwd,
                         sandbox: SandboxLevel::WorkspaceWrite,
+                        runtime_mode: resolved.runtime_mode,
+                        interaction_mode: resolved.interaction_mode,
                         auto_approve: false,
                         resume: None,
                         attachments: attachment_paths,
@@ -7825,6 +7847,11 @@ impl Render for Composer {
                 ))
             });
 
+        if let Some(request) =
+            permission::pending_permission_request(self.target.transcript(self.state.read(cx)))
+        {
+            return container.child(self.render_permission(request, cx));
+        }
         if wizard_active {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
@@ -7852,18 +7879,15 @@ impl Render for Composer {
             self.render_todo_panel(queue_panel.is_some() || agents_tray.is_some(), window, cx),
             |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
         );
-        let container = container.when_some(
-            agents_tray,
-            |el, tray| {
-                el.child(motion::fade_quick(
-                    "composer-agents-tray",
-                    div()
-                        .mx(px(QUEUE_SIDE_INSET))
-                        .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
-                        .child(tray),
-                ))
-            },
-        );
+        let container = container.when_some(agents_tray, |el, tray| {
+            el.child(motion::fade_quick(
+                "composer-agents-tray",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                    .child(tray),
+            ))
+        });
         let container = container.when_some(queue_panel, |el, panel| {
             el.child(motion::fade_quick(
                 "composer-queue",

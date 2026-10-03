@@ -10,8 +10,11 @@ impl CodexHarness {
         source_thread: &str,
         cwd: &str,
         mcp: SessionMcpContext,
+        runtime_mode: zeron_proto::RuntimeMode,
+        interaction_mode: zeron_proto::InteractionMode,
     ) -> Result<String, HarnessError> {
         let _scope = mcp.run_guard();
+        let policy = crate::policy::compile(HarnessId::Codex, runtime_mode, interaction_mode)?;
         let executable = self.resolve_executable()?;
         let mut command = Command::new(&executable);
         command.arg("app-server");
@@ -41,8 +44,14 @@ impl CodexHarness {
             )
             .await?;
             client.notify("initialized", None);
-            let mut params =
-                json!({"threadId":source_thread,"config":mcp.codex_thread_overrides()});
+            // Forking does not start a turn. Install authority now; a later
+            // resume must also compile its own runtime/interaction policy.
+            let mut params = json!({
+                "threadId": source_thread,
+                "config": mcp.codex_thread_overrides(),
+                "approvalPolicy": policy.codex_approval,
+                "sandbox": sandbox_mode(policy.codex_sandbox),
+            });
             if !cwd.is_empty() {
                 params["cwd"] = cwd.into();
             }

@@ -1535,6 +1535,37 @@ impl RpcService for EngineRpc {
             && target != self.doc_host.device_id()
         {
             let target = target.to_string();
+            let chat_id = params.get("chatId").and_then(serde_json::Value::as_str);
+            let policy = if method == methods::QUEUE_COMMAND {
+                let command: SessionCommandPayload =
+                    parse_params(params.get("command").cloned().unwrap_or_default())?;
+                match command {
+                    SessionCommandPayload::Run { request, .. } => {
+                        Some((request.runtime_mode, request.interaction_mode))
+                    }
+                    SessionCommandPayload::Steer { .. }
+                    | SessionCommandPayload::RespondInput { .. } => chat_id
+                        .and_then(|id| self.doc_host.request_from_chat_row(id, ""))
+                        .map(|r| (r.runtime_mode, r.interaction_mode)),
+                    _ => None,
+                }
+            } else if matches!(
+                method,
+                methods::QUEUE_MESSAGE
+                    | methods::SEND_QUEUED_MESSAGE_NOW
+                    | methods::STEER_QUEUED_MESSAGE_NOW
+            ) {
+                chat_id
+                    .and_then(|id| self.doc_host.request_from_chat_row(id, ""))
+                    .map(|r| (r.runtime_mode, r.interaction_mode))
+            } else {
+                None
+            };
+            if let Some((runtime, interaction)) = policy {
+                self.doc_host
+                    .require_runtime_policy_device(&target, runtime, interaction)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+            }
             if matches!(
                 method,
                 methods::START_AGENT_LOGIN

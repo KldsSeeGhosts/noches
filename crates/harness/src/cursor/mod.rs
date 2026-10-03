@@ -265,7 +265,14 @@ impl Harness for CursorHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut controls = controls;
         let mcp_guard = controls.mcp.run_guard();
+        controls.bind_browser()?;
+        let policy = crate::policy::compile(
+            HarnessId::Cursor,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
         let lease = if self.executable.is_none() {
             Some(state::Lease::acquire(&state::state_root(), request.resume.as_deref()).await?)
         } else {
@@ -324,6 +331,10 @@ impl Harness for CursorHarness {
             // Typed parameter picks (thinking/context/effort/fast/…) — the
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
+            "runtimeMode": request.runtime_mode,
+            "interactionMode": request.interaction_mode,
+            "autoReview": policy.cursor_auto_review,
+            "sandboxEnabled": policy.cursor_sandbox,
             "resume": request.resume,
             "storeDir": lease.as_ref().and_then(|lease| lease.store_dir.as_ref()),
             "mcpServers": controls.mcp.cursor_servers(),
@@ -490,6 +501,8 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         mcp,
+        request_permission: _request_permission,
+        browser: _,
         request_input: _request_input,
         mut steering,
         interrupt,

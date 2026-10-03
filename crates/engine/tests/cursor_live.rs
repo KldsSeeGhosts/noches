@@ -80,6 +80,8 @@ fn start(core: &EngineCore, cwd: &std::path::Path, prompt: String) {
                     model_options: Default::default(),
                     cwd: cwd.to_str().unwrap().into(),
                     sandbox: SandboxLevel::DangerFullAccess,
+                    runtime_mode: Default::default(),
+                    interaction_mode: Default::default(),
                     auto_approve: true,
                     attachments: vec![],
                     worktree: None,

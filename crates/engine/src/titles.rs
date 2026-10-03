@@ -198,6 +198,8 @@ impl TitleGenerator {
                 model_options: serde_json::Map::new(),
                 cwd: scratch.path().to_string_lossy().into_owned(),
                 sandbox: SandboxLevel::ReadOnly,
+                runtime_mode: zeron_proto::RuntimeMode::ApprovalRequired,
+                interaction_mode: Default::default(),
                 auto_approve: false,
                 attachments: Vec::new(),
                 resume: None,
@@ -267,6 +269,8 @@ async fn collect_text(
     let _cancel_on_drop = interrupt.clone().drop_guard();
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
@@ -365,6 +369,8 @@ mod tests {
             model_options: Default::default(),
             cwd: String::new(),
             sandbox: SandboxLevel::ReadOnly,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: false,
             resume: None,
             attachments: vec![],

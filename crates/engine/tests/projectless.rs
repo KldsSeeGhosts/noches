@@ -290,6 +290,8 @@ async fn exercise_projectless(command_first: bool) {
                         model_options: Default::default(),
                         cwd: "~".into(),
                         sandbox: SandboxLevel::WorkspaceWrite,
+                        runtime_mode: Default::default(),
+                        interaction_mode: Default::default(),
                         auto_approve: true,
                         attachments: Vec::new(),
                         worktree: None,

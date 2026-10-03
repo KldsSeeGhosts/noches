@@ -327,6 +327,21 @@ fn modes_use_exact_t3_tags_and_ids_are_not_uuids() {
 }
 
 #[test]
+fn orchestration_and_runtime_policy_share_authoritative_types() {
+    for policy in zeron_proto::RuntimeMode::ALL {
+        let contract: orchestration::RuntimeMode = policy;
+        assert_eq!(contract, policy);
+        assert!(contract.permits(zeron_proto::RuntimeMode::ApprovalRequired));
+    }
+    let plan: orchestration::ProviderInteractionMode = zeron_proto::InteractionMode::Plan;
+    let alias: orchestration::InteractionMode = plan;
+    assert!(!alias.permits(zeron_proto::InteractionMode::Default));
+    let decision: orchestration::ProviderApprovalDecision =
+        zeron_proto::PermissionDecision::AcceptForSession;
+    assert_eq!(serde_json::to_value(decision).unwrap(), "acceptForSession");
+}
+
+#[test]
 fn upstream_provider_environment_defaults_are_not_invented() {
     let decoded: provider_instance::ProviderInstanceEnvironmentVariable =
         serde_json::from_value(json!({"name":"EXAMPLE"})).unwrap();

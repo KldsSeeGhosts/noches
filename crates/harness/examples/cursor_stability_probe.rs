@@ -21,8 +21,10 @@ async fn turn(
     let token = CancellationToken::new();
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
         steering,
         interrupt: token.clone(),
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(vec![]);
@@ -40,6 +42,8 @@ async fn turn(
         model_options: Default::default(),
         cwd: cwd.into(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: vec![],
         worktree: None,
@@ -140,8 +144,10 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let (tx, steering) = mpsc::channel(8);
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
         steering,
         interrupt: CancellationToken::new(),
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(vec![]);
@@ -161,6 +167,8 @@ async fn parked(harness: &CursorHarness, count: usize) {
         model_options: Default::default(),
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: vec![],
         worktree: None,
@@ -251,8 +259,10 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     let token = CancellationToken::new();
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
         steering,
         interrupt: token.clone(),
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(vec![]);
@@ -276,6 +286,8 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
         model_options: Default::default(),
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: vec![],
         worktree: None,
@@ -388,8 +400,10 @@ async fn history(harness: &CursorHarness, count: usize) {
     let (tx, steering) = mpsc::channel(8);
     let controls = RunControls {
         mcp: Default::default(),
+        browser: None,
         steering,
         interrupt: CancellationToken::new(),
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(vec![]);
@@ -410,6 +424,8 @@ async fn history(harness: &CursorHarness, count: usize) {
         model_options: Default::default(),
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: vec![],
         worktree: None,

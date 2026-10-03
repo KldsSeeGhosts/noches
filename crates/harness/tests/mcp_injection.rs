@@ -12,7 +12,9 @@ use zeron_harness::mcp::{McpServerEntry, SessionMcpContext};
 use zeron_harness::{
     AcpHarness, CancellationToken, ClaudeHarness, CodexHarness, CursorHarness, Harness, RunControls,
 };
-use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, InteractionMode, RunRequest, RuntimeMode, SandboxLevel,
+};
 
 struct LogCapture(Arc<Mutex<String>>);
 
@@ -84,6 +86,8 @@ fn request(resume: bool) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::ReadOnly,
         auto_approve: false,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: resume.then(|| "previous".into()),
@@ -91,6 +95,15 @@ fn request(resume: bool) -> RunRequest {
 }
 
 async fn fixture_adapter(harness: &dyn Harness, context: SessionMcpContext, resume: bool) {
+    fixture_adapter_mode(harness, context, resume, RuntimeMode::FullAccess).await;
+}
+
+async fn fixture_adapter_mode(
+    harness: &dyn Harness,
+    context: SessionMcpContext,
+    resume: bool,
+    mode: RuntimeMode,
+) {
     let logs = captured_logs();
     let revokes = Arc::new(AtomicUsize::new(0));
     let count = revokes.clone();
@@ -100,6 +113,8 @@ async fn fixture_adapter(harness: &dyn Harness, context: SessionMcpContext, resu
     let (_steer, steering) = mpsc::channel(1);
     let controls = RunControls {
         mcp: context.clone(),
+        browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         computer_use_socket: None,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
@@ -109,7 +124,9 @@ async fn fixture_adapter(harness: &dyn Harness, context: SessionMcpContext, resu
         steering,
         interrupt: CancellationToken::new(),
     };
-    let mut stream = harness.run(request(resume), controls).await.unwrap();
+    let mut request = request(resume);
+    request.runtime_mode = mode;
+    let mut stream = harness.run(request, controls).await.unwrap();
     let events = tokio::time::timeout(Duration::from_secs(10), async {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
@@ -138,6 +155,62 @@ async fn fixture_adapter(harness: &dyn Harness, context: SessionMcpContext, resu
     assert!(state.contains("MCP_CONFIG_OK"), "{state}");
     assert!(!state.contains("opaque-session-secret"), "{state}");
     assert!(state.contains("[redacted]"), "{state}");
+    let policy_text = events
+        .iter()
+        .find_map(|event| {
+            let text = match event {
+                AgentEvent::TextDelta { text } => text,
+                AgentEvent::Done {
+                    result: Some(text), ..
+                } => text,
+                _ => return None,
+            };
+            text.split_once("\nPOLICY_CONFIG:")
+                .map(|(_, policy)| policy)
+        })
+        .expect("MCP fixture must also report applied runtime policy");
+    let applied: serde_json::Value = serde_json::from_str(policy_text).unwrap();
+    let compiled =
+        zeron_harness::policy::compile(harness.id(), mode, InteractionMode::Default).unwrap();
+    match harness.id() {
+        HarnessId::ClaudeCode => {
+            assert_eq!(applied["permissionMode"], compiled.claude_permission_mode)
+        }
+        HarnessId::Codex => {
+            assert_eq!(applied["approvalPolicy"], compiled.codex_approval);
+            assert_eq!(
+                applied["sandbox"],
+                serde_json::to_value(compiled.codex_sandbox).unwrap()
+            );
+            assert_eq!(applied["approvalsReviewer"], compiled.codex_reviewer);
+        }
+        HarnessId::Cursor => {
+            assert_eq!(applied["runtimeMode"], serde_json::to_value(mode).unwrap());
+            assert_eq!(applied["autoReview"], compiled.cursor_auto_review);
+            assert_eq!(applied["sandboxEnabled"], compiled.cursor_sandbox);
+        }
+        HarnessId::Grok => assert_eq!(
+            applied["args"],
+            serde_json::json!(zeron_harness::policy::grok_args(mode))
+        ),
+        HarnessId::Antigravity => assert_eq!(
+            applied["mode"],
+            match mode {
+                RuntimeMode::FullAccess => "yolo",
+                RuntimeMode::AutoAcceptEdits => "auto_edit",
+                _ => "default",
+            }
+        ),
+        HarnessId::Devin | HarnessId::Hermes => assert_eq!(
+            applied["mode"],
+            match mode {
+                RuntimeMode::FullAccess => "bypassPermissions",
+                RuntimeMode::AutoAcceptEdits => "acceptEdits",
+                _ => "default",
+            }
+        ),
+        _ => panic!("unexpected fixture harness"),
+    }
     drop(stream);
     tokio::time::timeout(Duration::from_secs(3), async {
         while !context.is_revoked() {
@@ -174,13 +247,46 @@ async fn codex_start_and_resume_use_session_config() {
     let harness = CodexHarness::new().with_executable(&path);
     fixture_adapter(&harness, context(&path), false).await;
     fixture_adapter(&harness, context(&path), true).await;
-    let context = context(&path);
-    let id = harness
-        .fork_session_with_mcp("source", "", context.clone())
-        .await
-        .unwrap();
-    assert_eq!(id, "mcp-codex");
-    assert!(context.is_revoked());
+    for mode in RuntimeMode::ALL {
+        let context = context(&path);
+        let id = harness
+            .fork_session_with_mcp(
+                "source",
+                "",
+                context.clone(),
+                mode,
+                InteractionMode::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, "mcp-codex");
+        assert!(context.is_revoked());
+    }
+}
+
+#[tokio::test]
+async fn runtime_policy_and_mcp_injection_compose_on_start_and_resume() {
+    let (_dir, path) = fixture();
+    let adapters: Vec<Box<dyn Harness>> = vec![
+        Box::new(ClaudeHarness::new().with_executable(&path)),
+        Box::new(CodexHarness::new().with_executable(&path)),
+        Box::new(CursorHarness::new().with_executable(&path)),
+        Box::new(AcpHarness::grok().with_executable(&path)),
+        Box::new(AcpHarness::antigravity().with_executable(&path)),
+        Box::new(AcpHarness::hermes().with_executable(&path)),
+        Box::new(AcpHarness::devin().with_executable(&path)),
+    ];
+    for adapter in adapters {
+        for mode in RuntimeMode::ALL {
+            if zeron_harness::policy::compile(adapter.id(), mode, InteractionMode::Default).is_err()
+            {
+                continue;
+            }
+            for resume in [false, true] {
+                fixture_adapter_mode(adapter.as_ref(), context(&path), resume, mode).await;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -253,6 +359,8 @@ async fn startup_failure_revokes_each_adapter_scope() {
         let (_steer, steering) = mpsc::channel(1);
         let controls = RunControls {
             mcp: context.clone(),
+            browser: None,
+            request_permission: zeron_harness::refuse_permissions(),
             computer_use_socket: None,
             request_input: Box::new(|_| {
                 let (tx, rx) = oneshot::channel();
@@ -318,6 +426,8 @@ async fn live_codex_calls_injected_stdio_mcp() {
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         mcp: context.clone(),
+        browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         computer_use_socket: None,
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();

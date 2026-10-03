@@ -22,6 +22,9 @@ def report(config):
 def answer(message, result):
     emit({"jsonrpc": "2.0", "id": message["id"], "result": result})
 
+def with_policy(text, policy):
+    return text + "\nPOLICY_CONFIG:" + json.dumps(policy)
+
 
 if "--mcp" in sys.argv:
     for line in sys.stdin:
@@ -57,7 +60,9 @@ if "--mcp" in sys.argv:
 if "--input-format" in sys.argv:  # Claude CLI
     config_path = sys.argv[sys.argv.index("--mcp-config") + 1]
     config = json.load(open(config_path))["mcpServers"]
-    text = report(config)
+    text = with_policy(report(config), {
+        "permissionMode": sys.argv[sys.argv.index("--permission-mode") + 1]
+    })
     assert "--strict-mcp-config" not in sys.argv
     assert sys.argv[sys.argv.index("--append-system-prompt") + 1] == "SESSION_INSTRUCTIONS"
     assert "mcp__scope__echo" in sys.argv[sys.argv.index("--allowedTools") + 1]
@@ -73,10 +78,13 @@ if "--input-format" in sys.argv:  # Claude CLI
 
 config = None
 text = None
+policy = {"args": sys.argv[1:], "mode": None}
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("op") == "run":  # Cursor shim
-        text = report(message["mcpServers"])
+        text = with_policy(report(message["mcpServers"]), {
+            key: message[key] for key in ["runtimeMode", "autoReview", "sandboxEnabled"]
+        })
         assert message["instructions"] == "SESSION_INSTRUCTIONS"
         emit({"ev": "ready", "agentId": "mcp-cursor", "model": "fixture"})
         emit({"ev": "text", "text": text})
@@ -91,9 +99,15 @@ for line in sys.stdin:
         config = {key.removeprefix("mcp_servers."): value
                   for key, value in params["config"].items() if key.startswith("mcp_servers.")}
         text = report(config)
+        if method == "thread/fork":
+            assert params["approvalPolicy"] in ("never", "untrusted", "on-request")
+            assert params["sandbox"] in ("read-only", "workspace-write", "danger-full-access")
+        policy = {key: params[key] for key in ["approvalPolicy", "sandbox"]}
         assert params["developerInstructions"] == "SESSION_INSTRUCTIONS"
         answer(message, {"thread": {"id": "mcp-codex"}})
     elif method == "turn/start":
+        policy["approvalsReviewer"] = message["params"]["approvalsReviewer"]
+        text = with_policy(text, policy)
         answer(message, {"turn": {"id": "t-mcp"}})
         emit({"method": "item/agentMessage/delta", "params": {
             "threadId": "mcp-codex", "turnId": "t-mcp", "delta": text}})
@@ -113,8 +127,15 @@ for line in sys.stdin:
         text = "MCP_CONFIG_OK opaque-session-secret"
         print(text, file=sys.stderr, flush=True)
         session_id = message["params"].get("sessionId", "mcp-acp")
-        answer(message, {"sessionId": session_id})
+        answer(message, {"sessionId": session_id, "modes": {"availableModes": [
+            {"id": name, "name": name}
+            for name in ["default", "auto_edit", "acceptEdits", "yolo", "bypassPermissions"]
+        ]}})
+    elif method == "session/set_mode":
+        policy["mode"] = message["params"]["modeId"]
+        answer(message, {})
     elif method == "session/prompt":
+        text = with_policy(text, policy)
         assert "SESSION_INSTRUCTIONS" in json.dumps(message["params"]["prompt"])
         emit({"method": "session/update", "params": {"sessionId": session_id, "update": {
             "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}}})

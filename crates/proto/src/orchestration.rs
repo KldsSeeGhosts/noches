@@ -14949,22 +14949,10 @@ pub enum ProjectScriptIcon {
     Debug,
 }
 
-// TODO(merge): move to runtime_policy; re-export here after orch/runtime-policy lands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ProviderApprovalDecision {
-    #[serde(rename = "accept")]
-    Accept,
-    #[serde(rename = "acceptForSession")]
-    AcceptForSession,
-    #[serde(rename = "acceptAlways")]
-    AcceptAlways,
-    #[serde(rename = "decline")]
-    Decline,
-    #[serde(rename = "cancel")]
-    Cancel,
-}
+pub use crate::runtime_policy::PermissionDecision as ProviderApprovalDecision;
 
-// TODO(merge): move to runtime_policy; re-export here after orch/runtime-policy lands.
+/// T3 wire approval option. Host-local callback IDs and scopes live in
+/// runtime_policy::PermissionOption, not this generated contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderApprovalOption {
     #[serde(rename = "decision")]
@@ -14979,14 +14967,7 @@ pub struct ProviderApprovalOption {
     pub warning: Optional<TrimmedNonEmptyString>,
 }
 
-// TODO(merge): move to runtime_policy; re-export here after orch/runtime-policy lands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ProviderInteractionMode {
-    #[serde(rename = "default")]
-    Default,
-    #[serde(rename = "plan")]
-    Plan,
-}
+pub use crate::runtime_policy::InteractionMode as ProviderInteractionMode;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderReplayEntryExpectOutbound {
@@ -15512,18 +15493,7 @@ impl std::fmt::Display for RunId {
     }
 }
 
-// TODO(merge): move to runtime_policy; re-export here after orch/runtime-policy lands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum RuntimeMode {
-    #[serde(rename = "approval-required")]
-    ApprovalRequired,
-    #[serde(rename = "auto-accept-edits")]
-    AutoAcceptEdits,
-    #[serde(rename = "auto")]
-    Auto,
-    #[serde(rename = "full-access")]
-    FullAccess,
-}
+pub use crate::runtime_policy::RuntimeMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -16925,8 +16895,8 @@ pub enum Never {}
 pub type TaskId = NodeId;
 /// A queue entry is a queued Run, not a separately owned message lifecycle.
 pub type QueueEntry = OrchestrationV2Run;
-// TODO(merge): move to runtime_policy; re-export here.
-pub type InteractionMode = ProviderInteractionMode;
+/// Shared runtime-policy interaction mode, also exposed by its T3 wire name.
+pub use crate::runtime_policy::InteractionMode;
 
 /// Effect's JSON number codec preserves non-finite JS numbers as named strings.
 /// Plain serde f64 would serialize them as null and silently change the wire.

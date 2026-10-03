@@ -6,8 +6,8 @@ pub enum Never {}
 pub type TaskId = NodeId;
 /// A queue entry is a queued Run, not a separately owned message lifecycle.
 pub type QueueEntry = OrchestrationV2Run;
-// TODO(merge): move to runtime_policy; re-export here.
-pub type InteractionMode = ProviderInteractionMode;
+/// Shared runtime-policy interaction mode, also exposed by its T3 wire name.
+pub use crate::runtime_policy::InteractionMode;
 
 /// Effect's JSON number codec preserves non-finite JS numbers as named strings.
 /// Plain serde f64 would serialize them as null and silently change the wire.

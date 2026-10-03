@@ -200,6 +200,12 @@ pub enum MessagePart {
         #[serde(default)]
         resolved: bool,
     },
+    Permission {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        request: zeron_proto::PermissionRequest,
+    },
     Error {
         id: String,
         message: String,
@@ -214,6 +220,7 @@ impl MessagePart {
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
+            | MessagePart::Permission { id, .. }
             | MessagePart::Error { id, .. } => id,
         }
     }
@@ -239,6 +246,9 @@ impl MessagePart {
             }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
+            }
+            MessagePart::Permission { request, .. } => {
+                serde_json::to_vec(request).map_or(0, |v| v.len())
             }
             MessagePart::Image {
                 id,
@@ -403,6 +413,27 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
+        AgentEvent::PermissionRequested { request } => {
+            if !out.iter().any(
+                |p| matches!(p, MessagePart::Permission { request: r, .. } if r.id == request.id),
+            ) {
+                out.push(MessagePart::Permission {
+                    id: format!("permission-{}", request.id),
+                    request: request.clone(),
+                });
+            }
+        }
+        AgentEvent::PermissionUpdated { request } => {
+            for part in out.iter_mut() {
+                if let MessagePart::Permission {
+                    request: current, ..
+                } = part
+                    && current.id == request.id
+                {
+                    *current = request.clone();
+                }
+            }
+        }
         AgentEvent::Error { message } => {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
@@ -480,6 +511,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::ContextUsageSnapshot { .. }
         | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::RuntimePolicyConfigured { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
 }

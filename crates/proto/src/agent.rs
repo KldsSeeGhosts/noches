@@ -110,6 +110,11 @@ pub struct RunRequest {
     pub sandbox: SandboxLevel,
     #[serde(default)]
     pub auto_approve: bool,
+    /// Missing on legacy requests means the actual legacy full-access behavior.
+    #[serde(default)]
+    pub runtime_mode: crate::RuntimeMode,
+    #[serde(default)]
+    pub interaction_mode: crate::InteractionMode,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -382,9 +387,13 @@ pub struct ToolDiff {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub header: String,
+    #[serde(default)]
     pub question: String,
+    #[serde(default)]
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
@@ -497,6 +506,21 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     InputResolved {
         request_id: String,
+    },
+    PermissionRequested {
+        #[serde(default)]
+        request: crate::PermissionRequest,
+    },
+    PermissionUpdated {
+        #[serde(default)]
+        request: crate::PermissionRequest,
+    },
+    #[serde(rename_all = "camelCase")]
+    RuntimePolicyConfigured {
+        #[serde(default)]
+        runtime_mode: crate::RuntimeMode,
+        #[serde(default)]
+        interaction_mode: crate::InteractionMode,
     },
     /// A confirmed new assignment. When tagged as Subagent, this reopens the
     /// same child transcript even if the provider does not echo the user text.
