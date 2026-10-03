@@ -27,6 +27,8 @@ async fn pi_idle_crash_next_dispatch_loads_stored_session() {
             model_options: Default::default(),
             cwd: dir.path().display().to_string(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: true,
             attachments: Vec::new(),
             worktree: None,

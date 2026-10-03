@@ -25,6 +25,221 @@ use zeron_sync::DocsStore;
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
 
+#[tokio::test]
+async fn restricted_remote_runs_refuse_unknown_capability_before_writes_or_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: vec![] }));
+    let mut request = run_request("supervised");
+    request.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+    core.workspace
+        .create_chat(
+            CHAT,
+            None,
+            Some("old-host"),
+            Some(zeron_proto::ChatConfig {
+                harness: HarnessId::Mock,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                runtime_mode: request.runtime_mode,
+                interaction_mode: request.interaction_mode,
+            }),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let payload = SessionCommandPayload::Run {
+        request,
+        message_id: "restricted".into(),
+    };
+    assert!(core.doc_host.queue_command(CHAT, payload.clone()).is_err());
+    assert!(core.doc_host.queue_message(CHAT, "later", vec![]).is_err());
+    assert!(handle.doc().read_commands().unwrap().is_empty());
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let error = client
+        .call(
+            zeron_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({"chatId":CHAT,"targetDeviceId":"old-host","command":payload}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("runtime-policy-v1"), "{error}");
+    // Explicit support, not a version threshold, enables the request.
+    core.workspace.upsert_device_row(&zeron_proto::Device {
+        id: "old-host".into(),
+        name: "Updated host".into(),
+        platform: "linux".into(),
+        last_seen_at: None,
+        created_at: None,
+        version: None,
+        cursor_sdk_version: None,
+        capabilities: vec![zeron_proto::capabilities::RUNTIME_POLICY_V1.into()],
+    });
+    assert!(core.doc_host.queue_message(CHAT, "later", vec![]).is_ok());
+    core.shutdown().await;
+}
+
+struct PermissionHarness;
+#[async_trait]
+impl Harness for PermissionHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Permission fixture"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "fixture".into(),
+                tools: vec![],
+                cwd: request.cwd,
+                session_id: "permission-session".into(),
+                assistant_message_id: "approval-turn".into(),
+            }));
+            let receiver = (controls.request_permission)(zeron_proto::PermissionRequest::standard(
+                "Exec",
+                "cargo test",
+                true,
+            ));
+            let answer = tokio::select! {
+                answer = receiver.recv() => answer,
+                _ = controls.interrupt.cancelled() => zeron_proto::PermissionOption::default(),
+            };
+            let _ = tx.send(Ok(AgentEvent::TextDelta {
+                text: format!("decision:{:?}", answer.decision),
+            }));
+            let _ = tx.send(Ok(done(DoneStatus::Completed)));
+        });
+        Ok(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed())
+    }
+}
+
+#[tokio::test]
+async fn approval_command_round_trip_sets_awaiting_input_and_resolves_separately() {
+    for option in ["allow-once", "allow-session", "deny"] {
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble(dir.path(), Arc::new(PermissionHarness));
+        let handle = core.doc_host.open(CHAT).unwrap();
+        core.sessions
+            .dispatch(CHAT, HarnessId::Mock, run_request("approval"), None)
+            .await
+            .unwrap();
+        wait_for(
+            || {
+                core.sessions.session_status(CHAT).map(|s| s.status)
+                    == Some(SessionStatus::AwaitingInput)
+            },
+            "permission awaiting input",
+        )
+        .await;
+        // Wait for the coalesced CRDT write, not only the status broadcast.
+        wait_for(|| entries_now(&core).iter().any(|e| e.parts.iter().any(|p| matches!(p,MessagePart::Permission {request,..} if request.state==zeron_proto::RequestState::Pending))),"permission doc").await;
+        let request = entries_now(&core)
+            .iter()
+            .flat_map(|e| &e.parts)
+            .find_map(|p| match p {
+                MessagePart::Permission { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !core
+                .sessions
+                .respond_input(CHAT, &request.id, vec![])
+                .unwrap()
+        );
+        queue_as_viewer(
+            handle.doc(),
+            "permission-response",
+            SessionCommandPayload::RespondPermission {
+                request_id: request.id.clone(),
+                option_id: option.into(),
+            },
+        );
+        wait_for(|| entries_now(&core).iter().any(|e| e.parts.iter().any(|p| matches!(p,MessagePart::Permission {request,..} if request.state==zeron_proto::RequestState::Resolved))),"permission resolved").await;
+        assert!(
+            !core
+                .sessions
+                .respond_permission(CHAT, &request.id, "allow-once")
+                .unwrap()
+        );
+        assert!(
+            !entries_now(&core)
+                .iter()
+                .flat_map(|e| &e.parts)
+                .any(|p| matches!(p, MessagePart::Input { .. }))
+        );
+        core.sessions.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn interrupted_approval_expires_and_a_late_command_cannot_resume_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(PermissionHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("approval"), None)
+        .await
+        .unwrap();
+    wait_for(|| entries_now(&core).iter().any(|e| e.parts.iter().any(|p| matches!(p,MessagePart::Permission {request,..} if request.state==zeron_proto::RequestState::Pending))),"permission doc").await;
+    let request = entries_now(&core)
+        .iter()
+        .flat_map(|e| &e.parts)
+        .find_map(|p| match p {
+            MessagePart::Permission { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .unwrap();
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(|| entries_now(&core).iter().any(|e| e.parts.iter().any(|p| matches!(p,MessagePart::Permission {request,..} if request.state==zeron_proto::RequestState::Expired))),"permission expired").await;
+    queue_as_viewer(
+        handle.doc(),
+        "late-approval",
+        SessionCommandPayload::RespondPermission {
+            request_id: request.id,
+            option_id: "allow-once".into(),
+        },
+    );
+    wait_for(
+        || {
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "late-approval" && c.status == SessionCommandStatus::Rejected)
+        },
+        "late approval rejected",
+    )
+    .await;
+    assert_ne!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Working)
+    );
+    core.sessions.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn start_failure_lands_in_the_transcript() {
     struct FailsToStart;
@@ -94,6 +309,8 @@ fn run_request(prompt: &str) -> RunRequest {
         model_options: Default::default(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -436,9 +653,14 @@ async fn queued_run_command_executes_end_to_end() {
         Some((SessionCommandStatus::Applied, None))
     );
 
-    // Journal replay: the full script in order, terminal Done last.
+    // Journal replay: authority first, then the full script, terminal Done last.
     let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
-    assert_eq!(replay.len(), mock_script().len());
+    let event_count = mock_script().len() + 1;
+    assert_eq!(replay.len(), event_count);
+    assert!(matches!(
+        replay.first().map(|j| &j.event),
+        Some(AgentEvent::RuntimePolicyConfigured { .. })
+    ));
     assert!(matches!(
         replay.last().map(|j| &j.event),
         Some(AgentEvent::Done {
@@ -447,9 +669,9 @@ async fn queued_run_command_executes_end_to_end() {
         })
     ));
     let seqs: Vec<u64> = replay.iter().map(|j| j.seq).collect();
-    assert_eq!(seqs, (1..=mock_script().len() as u64).collect::<Vec<_>>());
+    assert_eq!(seqs, (1..=event_count as u64).collect::<Vec<_>>());
 
-    // The live broadcast delivered the same events.
+    // Authority is persisted before launch; the live broadcast delivers the script.
     let mut broadcast_count = 0usize;
     while let Ok(event) = live.try_recv() {
         assert!(event.seq >= 1);
@@ -2128,6 +2350,8 @@ async fn real_claude_sees_uploaded_image_inline() {
         model_options: Default::default(),
         cwd: cwd.to_string_lossy().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: false,
         attachments: vec![path],
         resume: None,

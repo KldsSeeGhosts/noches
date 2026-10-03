@@ -116,6 +116,8 @@ fn run_payload(message_id: &str, repo_path: &str, space_id: Option<&str>) -> Ses
             // Fallback for hosts that predate the spec: the repo's own folder.
             cwd: repo_path.into(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: true,
             attachments: Vec::new(),
             resume: None,

@@ -60,6 +60,8 @@ async fn check_persistence(
         model_options: Default::default(),
         cwd: dir.path().display().to_string(),
         sandbox: SandboxLevel::ReadOnly,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: vec![],
         worktree: None,

@@ -195,6 +195,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
+        MessagePart::Permission { id, request } => DocPartJson {
+            id: id.clone(),
+            kind: "permission".into(),
+            questions: Some(serde_json::to_value(request)?),
+            ..Default::default()
+        },
         MessagePart::Error { id, message } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
@@ -242,6 +248,16 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 .and_then(|q| serde_json::from_value(q).ok())
                 .unwrap_or_default(),
             resolved: p.resolved.unwrap_or(false),
+        },
+        "permission" => MessagePart::Permission {
+            id: p.id,
+            request: p
+                .questions
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(|| zeron_proto::PermissionRequest {
+                    state: zeron_proto::RequestState::Expired,
+                    ..Default::default()
+                }),
         },
         "error" => MessagePart::Error {
             id: p.id,
@@ -639,11 +655,46 @@ impl SessionDoc {
         Ok(false)
     }
 
-    /// Mark the input part carrying `request_id` resolved, wherever it lives
-    /// (input parts store the request id as their part id). The live-run path
-    /// resolves through the entry fold; this direct write is for answers to a
-    /// question whose run already died — no fold owns the entry anymore.
-    /// Returns `false` when no such part exists.
+    /// Update a permission lifecycle after restart, when no live fold owns it.
+    pub fn update_permission_request(
+        &self,
+        request: &zeron_proto::PermissionRequest,
+    ) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let id = format!("permission-{}", request.id);
+                let matches = matches!(part.get("id"), Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == id);
+                if matches {
+                    part.insert(
+                        "questions",
+                        loro_value_from_json(&serde_json::to_value(request)?),
+                    )?;
+                    self.doc.commit();
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve a content question whose run already died. Permissions never
+    /// use this continuation path.
     pub fn resolve_input(&self, request_id: &str) -> Result<bool, DocError> {
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
@@ -1444,6 +1495,37 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn permission_lifecycle_survives_crdt_snapshot_and_restart_expiration() {
+        let doc = SessionDoc::init("approval").unwrap();
+        let mut request = zeron_proto::PermissionRequest::standard("Bash", "ls", true);
+        request.id = "live-callback".into();
+        doc.push_message(&SessionMessageEntry {
+            id: "assistant".into(),
+            role: MessageRole::Assistant,
+            created_at: 0,
+            device_id: "host".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+            parts: vec![MessagePart::Permission {
+                id: "permission-live-callback".into(),
+                request: request.clone(),
+            }],
+        })
+        .unwrap();
+        let snapshot = LoroDoc::new();
+        snapshot.import(&doc.export_snapshot().unwrap()).unwrap();
+        let restored = SessionDoc::from_doc(snapshot);
+        assert_eq!(
+            restored.read_entries().unwrap(),
+            doc.read_entries().unwrap()
+        );
+        request.state = zeron_proto::RequestState::Expired;
+        assert!(restored.update_permission_request(&request).unwrap());
+        assert!(matches!(&restored.read_entries().unwrap()[0].parts[0],
+            MessagePart::Permission {request,..} if request.state == zeron_proto::RequestState::Expired));
     }
 
     #[test]

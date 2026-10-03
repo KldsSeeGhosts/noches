@@ -905,6 +905,8 @@ async fn target_device_id_routes_over_the_relay() {
             model_options: serde_json::Map::new(),
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: true,
             attachments: Vec::new(),
             worktree: None,

@@ -44,6 +44,8 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         model_options: Default::default(),
         cwd: cwd.into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -613,6 +615,50 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         journal
             .append(
                 CHAT,
+                &AgentEvent::RuntimePolicyConfigured {
+                    runtime_mode: zeron_proto::RuntimeMode::ApprovalRequired,
+                    interaction_mode: zeron_proto::InteractionMode::Plan,
+                },
+            )
+            .unwrap();
+        // A debounced workspace snapshot can lag behind the authority journal.
+        // Its old Full access value must not widen the revived supervised run.
+        let workspace = zeron_doc::WorkspaceDoc::new();
+        workspace
+            .upsert_chat(&zeron_proto::Chat {
+                id: CHAT.into(),
+                device_id: "dev-crash".into(),
+                title: None,
+                archived: false,
+                cwd: Some("/tmp".into()),
+                branch: None,
+                checkout_id: None,
+                source_context: None,
+                config: Some(zeron_proto::ChatConfig {
+                    harness: HarnessId::Mock,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    runtime_mode: zeron_proto::RuntimeMode::FullAccess,
+                    interaction_mode: zeron_proto::InteractionMode::Default,
+                }),
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: Some("hs-crash".into()),
+                room_gen: None,
+                harness_session_cwd: Some("/tmp".into()),
+                space_id: None,
+                last_seen_at: None,
+            })
+            .unwrap();
+        store
+            .save_snapshot("workspace2", &workspace.export_snapshot().unwrap())
+            .unwrap();
+        journal
+            .append(
+                CHAT,
                 &AgentEvent::SessionStarted {
                     harness: HarnessId::Mock,
                     model: "mock-1".into(),
@@ -680,6 +726,11 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         .iter()
         .find(|r| r.prompt == "long task")
         .expect("auto-resumed dispatch reached the harness");
+    assert_eq!(
+        revived.runtime_mode,
+        zeron_proto::RuntimeMode::ApprovalRequired
+    );
+    assert_eq!(revived.interaction_mode, zeron_proto::InteractionMode::Plan);
     assert_eq!(
         revived.resume.as_deref(),
         Some("hs-crash"),
@@ -847,6 +898,8 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         model_options: Default::default(),
         cwd: cwd.clone(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: false,
         attachments: Vec::new(),
         worktree: None,

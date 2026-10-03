@@ -16,6 +16,8 @@ struct World {
     sent: Mutex<Option<(String, Instant)>>,
     remote_queries: Mutex<Vec<Value>>,
     old: bool,
+    no_policy: bool,
+    no_remote_policy: bool,
     catalog_error: bool,
     never_reply: bool,
 }
@@ -31,11 +33,11 @@ impl RpcService for World {
         Ok(match method {
             methods::LOCAL_DEVICE => RpcReply::Value(json!({"deviceId":"local"})),
             methods::ENGINE_INFO => RpcReply::Value(
-                json!({"capabilities":if self.old {vec![]} else {vec!["mcp-session-routing-v1"]}}),
+                json!({"capabilities":if self.old {vec![]} else if self.no_policy {vec!["mcp-session-routing-v1"]} else {vec!["mcp-session-routing-v1","runtime-policy-v1"]}}),
             ),
             methods::WATCH_DEVICES => stream(json!([
-                {"id":"local","name":"Laptop","platform":"linux","lastSeenAt":null},
-                {"id":"remote","name":"Worker","platform":"linux","lastSeenAt":null}
+                {"id":"local","name":"Laptop","platform":"linux","lastSeenAt":null,"capabilities":["runtime-policy-v1"]},
+                {"id":"remote","name":"Worker","platform":"linux","lastSeenAt":null,"capabilities":if self.no_remote_policy {vec![]} else {vec!["runtime-policy-v1"]}}
             ])),
             methods::WATCH_SPACES => stream(json!([
                 {"id":"project-local","deviceId":"local","path":"/repo/repeated","createdAt":"2026-09-01T00:00:00Z","gitDetected":true},
@@ -153,6 +155,7 @@ async fn creation_uses_host_catalogs_and_preserves_approval_routing() {
     let request = &writes[1].1["command"]["request"];
     assert_eq!(request["autoApprove"], false);
     assert_eq!(request["sandbox"], "workspace-write");
+    assert_eq!(request["runtimeMode"], "approval-required");
     assert_eq!(request["cwd"], "/repo/repeated");
     assert_eq!(writes[1].1["targetDeviceId"], "remote");
     assert!(writes[0].1.get("parentChatId").is_none());
@@ -182,6 +185,23 @@ async fn old_callers_and_unreachable_catalogs_fail_before_writes() {
             error.contains(if old { "update" } else { "catalog unavailable" }),
             "{error}"
         );
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn restricted_creation_requires_policy_support_on_gateway_and_host() {
+    for remote in [false, true] {
+        let world = Arc::new(World {
+            no_policy: !remote,
+            no_remote_policy: remote,
+            ..Default::default()
+        });
+        let error = tools(world.clone())
+            .call("create_chat", json!({"device":"Worker","prompt":"do it"}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("enforce this runtime mode"), "{error}");
         assert!(world.writes.lock().unwrap().is_empty());
     }
 }
