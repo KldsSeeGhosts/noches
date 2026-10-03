@@ -36,7 +36,7 @@ permissions:
 
 concurrency:
   group: windows-tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Test binaries never ship, so skip the release profile's cross-crate LTO: it
 # re-optimizes every dependency at each test binary's link.
@@ -54,7 +54,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Locate Windows SDK shader compiler
@@ -63,7 +63,7 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           # Shares dependencies with the app job, which saves them.
@@ -81,21 +81,38 @@ jobs:
           $headlessResult = $LASTEXITCODE
           if ($nativeResult -ne 0 -or $headlessResult -ne 0) { exit 1 }
 
-  engine:
-    name: Harness and engine tests
+  harness:
+    name: Harness tests
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          # Pull requests restore dev's cache instead of evicting it.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          # Engine saves the core dependency graph on dev.
+          shared-key: windows-core
+          add-job-id-key: false
+          save-if: false
       - name: Native harness security and integration tests
         run: cargo test --release --locked -p zeron-harness --features native-fixture --lib --test codex_availability --test windows_native
+
+  engine:
+    name: Engine tests
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: windows-core
+          add-job-id-key: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - name: Engine tests (unit, catalog, login, auth)
         run: cargo test --release --locked -p zeron-engine --lib --test codex_catalog --test codex_login_resolution --test auth
 
@@ -104,7 +121,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Locate Windows SDK shader compiler
@@ -113,7 +130,7 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-on-failure: true
@@ -170,7 +187,7 @@ jobs:
         run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
       - name: Upload GUI test binaries
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-gui-binaries
           path: |
@@ -185,8 +202,8 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-gui-binaries
           path: target/release
@@ -196,7 +213,7 @@ jobs:
         run: ./scripts/test-windows-rendering.ps1
       - name: Upload GUI test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-native-probes
           path: |
