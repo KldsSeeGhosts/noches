@@ -1726,6 +1726,26 @@ impl Theme {
         self.ink(0.07)
     }
 
+    /// Glyph tone for tool rows and chevrons (T3 `icon-muted`): the quietest
+    /// legible neutral.
+    // TODO(D1): use theme.icon_muted
+    pub fn icon_muted(&self) -> Hsla {
+        self.text_faint
+    }
+
+    /// Hover plate under a Calm tool row (T3 `hover:bg-accent/20`): a whisper
+    /// of neutral ink.
+    // TODO(D1): use theme.accent_surface at 20%
+    pub fn row_hover_fill(&self) -> Hsla {
+        self.ink(0.06)
+    }
+
+    /// Plate behind expanded tool output (T3 `bg-muted/40`).
+    // TODO(D1): use theme.muted at 40%
+    pub fn detail_panel_fill(&self) -> Hsla {
+        self.ink(0.045)
+    }
+
     /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on dark).
     // TODO(D1): use theme.link
     pub fn link_text(&self) -> Hsla {

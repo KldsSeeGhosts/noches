@@ -286,6 +286,63 @@ impl AppearancePage {
         );
     }
 
+    /// "Transcript tool rows": the Calm | Tree picker. Each card previews its
+    /// look with a few mock rows; selection persists immediately and the open
+    /// transcripts remeasure on their next frame.
+    fn render_tool_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::settings::ToolRowStyle;
+        let current = crate::settings::transcript_tool_rows(cx);
+        let cards = ToolRowStyle::ALL
+            .into_iter()
+            .map(|style| {
+                widgets::option_card(
+                    theme,
+                    match style {
+                        ToolRowStyle::Calm => icons::CHECKLIST,
+                        ToolRowStyle::Tree => icons::WIDGET,
+                    },
+                    style.label(),
+                    style == current,
+                    tool_rows_preview(style, theme),
+                )
+                .id(SharedString::from(format!(
+                    "transcript-tool-rows-{}",
+                    style.label()
+                )))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |s| {
+                        s.transcript_tool_rows = style
+                    });
+                    cx.refresh_windows();
+                    cx.notify();
+                }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(widgets::field_label(theme, "Transcript tool rows"))
+                    .child(
+                        div()
+                            .max_w(px(520.0))
+                            .text_size(typography::ui_rems(12.0))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "Calm lists tool calls as a flat log. Tree keeps the connected \
+                                 rail with tinted icons.",
+                            ),
+                    ),
+            )
+            .child(widgets::option_card_row().children(cards))
+    }
+
     fn render_transcript_width(
         &self,
         theme: &Theme,
@@ -3373,6 +3430,7 @@ impl Render for AppearancePage {
             );
         }
         font_section = font_section.child(self.render_transcript_width(&theme, window, cx));
+        font_section = font_section.child(self.render_tool_rows(&theme, cx));
         for kind in FontKind::ALL {
             let (requested, effective) = (kind.requested(cx), kind.effective(cx));
             if requested != effective {
@@ -3463,6 +3521,86 @@ impl Render for AppearancePage {
             )
             .children(scrollbar)
             .children(modal)
+    }
+}
+
+/// A miniature of one tool-row look for its option card: glyph tiles and text
+/// bars standing in for rows (Calm: flat lines with a hover plate; Tree: a
+/// connected rail with elbows). Paints no backdrop, so the card's own rounded
+/// frame stays intact.
+fn tool_rows_preview(style: crate::settings::ToolRowStyle, theme: &Theme) -> AnyElement {
+    use crate::settings::ToolRowStyle;
+    let bar = |width: f32| {
+        div()
+            .h(px(6.0))
+            .w(px(width))
+            .rounded(px(3.0))
+            .bg(theme.text_muted.opacity(0.35))
+    };
+    let widths = [124.0, 92.0, 148.0];
+    match style {
+        ToolRowStyle::Calm => div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(4.0))
+            .px(px(18.0))
+            .children(widths.into_iter().enumerate().map(|(ix, width)| {
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .rounded(px(6.0))
+                    .when(ix == 1, |row| row.bg(theme.row_hover_fill()))
+                    .child(
+                        div()
+                            .size(px(10.0))
+                            .rounded(px(3.0))
+                            .bg(theme.icon_muted().opacity(0.8)),
+                    )
+                    .child(bar(width))
+            }))
+            .into_any_element(),
+        ToolRowStyle::Tree => div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(30.0))
+                    .top(px(30.0))
+                    .h(px(88.0))
+                    .w(px(1.0))
+                    .bg(theme.hairline(0.2)),
+            )
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(14.0))
+                    .pl(px(30.0))
+                    .children(widths.into_iter().map(|width| {
+                        div()
+                            .h(px(14.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().w(px(12.0)).h(px(1.0)).bg(theme.hairline(0.2)))
+                            .child(
+                                div()
+                                    .size(px(10.0))
+                                    .rounded(px(3.0))
+                                    .bg(theme.accent.opacity(0.7)),
+                            )
+                            .child(bar(width - 24.0))
+                    })),
+            )
+            .into_any_element(),
     }
 }
 
