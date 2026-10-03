@@ -12166,6 +12166,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeron-browser",
  "zeron-engine",
+ "zeron-mcp",
  "zeron-rpc",
  "zeron-ui",
  "zeron-update",
@@ -12229,6 +12230,7 @@ dependencies = [
  "zeron-browser",
  "zeron-doc",
  "zeron-harness",
+ "zeron-mcp",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",
@@ -12260,6 +12262,23 @@ dependencies = [
  "zeron-browser",
  "zeron-proto",
  "zip",
+]
+
+[[package]]
+name = "zeron-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "zeron-doc",
+ "zeron-proto",
+ "zeron-rpc",
 ]
 
 [[package]]
