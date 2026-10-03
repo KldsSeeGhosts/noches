@@ -8,6 +8,8 @@ pub mod projection;
 pub mod recovery;
 pub mod store;
 pub mod sync_publish;
+#[cfg(test)]
+mod tests;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
