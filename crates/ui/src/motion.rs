@@ -370,6 +370,12 @@ impl MotionSpec {
 pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
 /// Quick fade: 0.15s.
 pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+/// T3 `live-tool-shine`: the active tool label's highlight crosses the text in
+/// 2.2s (linear in time; Noches interpolates smoothly where T3 steps 30 times).
+pub const TOOL_SHIMMER_PERIOD: std::time::Duration = std::time::Duration::from_millis(2_200);
+/// Width of the shimmer crest in px - ABSOLUTE like T3's `4.5rem` gradient
+/// layer, not relative to the label, so a short and a long label sweep alike.
+pub const TOOL_SHIMMER_CREST_PX: f32 = 72.0;
 /// Transcript meta strip (timestamp, copy): T3's `transition-opacity
 /// duration-200` on message hover.
 pub const FADE_META: MotionSpec = MotionSpec::new(200, EASE_TAILWIND);

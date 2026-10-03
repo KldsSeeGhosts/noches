@@ -114,12 +114,13 @@ const TOOL_GROUP_HEADER_HEIGHT: f32 = 26.0;
 /// Compact rows retain the analytic heights used by row and group folds.
 const TOOL_TREE_ROW_HEIGHT: f32 = 32.0;
 const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_OUT);
-/// BoardUI task-list cadence: a slow light sweep keeps the active summary
-/// legible, while each newly appended row reveals quickly enough to read as a
-/// continuous log rather than a stack of discrete pop-ins.
-const TOOL_GROUP_SHIMMER_DURATION: Duration = Duration::from_millis(3_400);
-const TOOL_GROUP_SHIMMER_HALF_WIDTH: f32 = 0.36;
+/// T3 `live-tool-shine` cadence (see [`motion::TOOL_SHIMMER_PERIOD`]): a 72px
+/// crest crosses the active label every 2.2s. The sweep paints as 2px strips
+/// quantized to [`TOOL_SHIMMER_LEVELS`] tones so shaped lines repeat across
+/// strips and frames instead of shaping one line per strip per frame.
+const TOOL_GROUP_SHIMMER_DURATION: Duration = motion::TOOL_SHIMMER_PERIOD;
 const TOOL_GROUP_SHIMMER_STRIP_WIDTH: f32 = 2.0;
+const TOOL_SHIMMER_LEVELS: usize = 16;
 const TOOL_ROW_REVEAL: motion::MotionSpec = motion::MotionSpec::new(360, motion::EASE_OUT_EXPO);
 /// The connector draws briskly, then eases into the branch tip so its arrival
 /// remains visible without feeling mechanically linear.
@@ -1797,49 +1798,63 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 }
 
 fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Theme) -> AnyElement {
+    shimmer_label(
+        text,
+        shimmer_phase,
+        LabelSize::Px(TOOL_LABEL_SIZE),
+        TOOL_LABEL_LINE_HEIGHT,
+        theme,
+    )
+}
+
+/// Font size of a shimmering label, matching how the label's own text is
+/// sized so the overlay shapes at exactly the same size.
+#[derive(Clone, Copy)]
+enum LabelSize {
+    /// Absolute pixels (the Tree look's 12px tool text).
+    Px(f32),
+    /// Pixels at the 16px interface baseline, scaled by the UI font size.
+    Ui(f32),
+}
+
+impl LabelSize {
+    fn pixels(self, window: &Window) -> Pixels {
+        match self {
+            Self::Px(size) => px(size),
+            Self::Ui(size) => crate::typography::ui_rems(size).to_pixels(window.rem_size()),
+        }
+    }
+}
+
+/// A label that can carry the active-tool shimmer.
+///
+/// With no `shimmer_phase` (settled, or reduced motion) the text is returned
+/// as is and inherits its hover colors. While active, the label stays ONE
+/// normal text run - splitting it per character would split shaping/kerning
+/// and make the sweep hop a glyph at a time. An overlay repaints the intact
+/// shaped line through narrow moving clips: the native equivalent of CSS
+/// `background-clip: text` without duplicating accessible text.
+fn shimmer_label(
+    text: SharedString,
+    shimmer_phase: Option<f32>,
+    label_size: LabelSize,
+    line_height: f32,
+    theme: &Theme,
+) -> AnyElement {
     let Some(shimmer_phase) = shimmer_phase else {
-        // Keep the ordinary inherited hover color when the group is settled
-        // (and when reduced motion turns the active shimmer off).
         return text.into_any_element();
     };
-    // Keep the title as ONE normal text run. Splitting it per character copies
-    // the gradient stops, but also splits shaping/kerning and makes the sweep
-    // visibly hop one glyph at a time. The overlay repaints the intact shaped
-    // line through narrow moving clips, which is the native equivalent of
-    // CSS `background-clip: text` without duplicating accessible text.
     let overlay_text = text.clone();
     let overlay_font = gpui::font(theme.font_sans_fixed.clone());
     let base = theme.text_muted;
     let peak = theme.text;
     let overlay = canvas(
         move |bounds, window, _| {
-            let probe = window.text_system().shape_line(
-                overlay_text.clone(),
-                px(TOOL_LABEL_SIZE),
-                &[TextRun {
-                    len: overlay_text.len(),
-                    font: overlay_font.clone(),
-                    color: peak,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
-            let text_width = f32::from(probe.width()).min(f32::from(bounds.size.width));
-            let strip_count = (text_width / TOOL_GROUP_SHIMMER_STRIP_WIDTH).ceil() as usize;
-            let mut strips = Vec::with_capacity(strip_count);
-            for ix in 0..strip_count {
-                let left = ix as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH;
-                let right = ((ix + 1) as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH).min(text_width);
-                let x = (left + right) * 0.5 / text_width.max(1.0);
-                let amount = tool_title_shimmer_amount(x, shimmer_phase);
-                if amount <= 0.001 {
-                    continue;
-                }
-                let line = window.text_system().shape_line(
+            let font_size = label_size.pixels(window);
+            let shape = |amount: f32| {
+                window.text_system().shape_line(
                     overlay_text.clone(),
-                    px(TOOL_LABEL_SIZE),
+                    font_size,
                     &[TextRun {
                         len: overlay_text.len(),
                         font: overlay_font.clone(),
@@ -1849,13 +1864,32 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
                         strikethrough: None,
                     }],
                     None,
-                );
-                strips.push((left, right, line));
+                )
+            };
+            let text_width = f32::from(shape(1.0).width()).min(f32::from(bounds.size.width));
+            let strip_count = (text_width / TOOL_GROUP_SHIMMER_STRIP_WIDTH).ceil() as usize;
+            let mut levels: Vec<Option<gpui::ShapedLine>> = vec![None; TOOL_SHIMMER_LEVELS + 1];
+            let mut strips = Vec::new();
+            for ix in 0..strip_count {
+                let left = ix as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH;
+                let right = ((ix + 1) as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH).min(text_width);
+                let amount =
+                    tool_title_shimmer_amount((left + right) * 0.5, text_width, shimmer_phase);
+                let level = (amount * TOOL_SHIMMER_LEVELS as f32).round() as usize;
+                if level == 0 {
+                    continue;
+                }
+                levels[level]
+                    .get_or_insert_with(|| shape(level as f32 / TOOL_SHIMMER_LEVELS as f32));
+                strips.push((left, right, level));
             }
-            strips
+            (levels, strips)
         },
-        move |bounds, strips, window, cx| {
-            for (left, right, line) in strips {
+        move |bounds, (levels, strips), window, cx| {
+            for (left, right, level) in strips {
+                let Some(line) = &levels[level] else {
+                    continue;
+                };
                 let mask = ContentMask {
                     bounds: Bounds {
                         origin: point(bounds.origin.x + px(left), bounds.origin.y),
@@ -1863,10 +1897,9 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
                     },
                 };
                 window.with_content_mask(Some(mask), |window| {
-                    let line_height = px(TOOL_LABEL_LINE_HEIGHT);
                     let _ = line.paint(
                         bounds.origin,
-                        line_height,
+                        px(line_height),
                         TextAlign::Left,
                         None,
                         window,
@@ -2438,16 +2471,15 @@ fn tool_disclosure_progress(open: bool, fold: FoldState, now: Instant) -> f32 {
     if open { progress } else { 1.0 - progress }
 }
 
-/// BoardUI's measured recipe: a 300%-wide repeating gradient moves from 200%
-/// to -100%. Its 38→50→62% highlight maps to a 36%-of-title shoulder around
-/// each peak; adjacent copies sit three title-widths apart. Sampling this by
-/// x-coordinate lets the paint clips reproduce the continuous pattern.
-fn tool_title_shimmer_amount(x: f32, phase: f32) -> f32 {
-    let primary_center = -2.5 + phase.clamp(0.0, 1.0) * 6.0;
-    (-2..=2)
-        .map(|copy| primary_center + copy as f32 * 3.0)
-        .map(|center| (1.0 - (x - center).abs() / TOOL_GROUP_SHIMMER_HALF_WIDTH).clamp(0.0, 1.0))
-        .fold(0.0, f32::max)
+/// T3 `live-tool-shine`: a 72px-wide `transparent -> foreground -> transparent`
+/// layer slides from fully off the left edge to fully off the right edge, so
+/// the crest centre travels `-36px -> text_width + 36px` as `phase` runs
+/// 0 -> 1. The width is ABSOLUTE - a long label sweeps the same crest a short
+/// one does. Returns the 0..=1 peak mix at `x` (px from the label's left).
+fn tool_title_shimmer_amount(x: f32, text_width: f32, phase: f32) -> f32 {
+    let half = motion::TOOL_SHIMMER_CREST_PX * 0.5;
+    let center = -half + phase.clamp(0.0, 1.0) * (text_width + motion::TOOL_SHIMMER_CREST_PX);
+    (1.0 - (x - center).abs() / half).clamp(0.0, 1.0)
 }
 
 fn tool_title_shimmer_phase(start: Instant, now: Instant) -> f32 {
@@ -13459,19 +13491,33 @@ mod tests {
     }
 
     #[test]
-    fn tool_title_shimmer_crosses_the_title_without_a_loop_seam() {
-        assert_eq!(tool_title_shimmer_amount(0.5, 0.5), 1.0);
-        assert_eq!(tool_title_shimmer_amount(0.0, 0.5), 0.0);
-        assert_eq!(tool_title_shimmer_amount(1.0, 0.5), 0.0);
-        assert!(tool_title_shimmer_amount(0.3, 0.5) > 0.4);
-        assert!(tool_title_shimmer_amount(0.7, 0.5) > 0.4);
-        for x in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            assert_eq!(
-                tool_title_shimmer_amount(x, 0.0),
-                tool_title_shimmer_amount(x, 1.0),
-                "the repeating background must meet itself at x={x}"
-            );
+    fn tool_title_shimmer_is_a_72px_crest_that_enters_and_leaves_off_screen() {
+        let width = 200.0;
+        let half = motion::TOOL_SHIMMER_CREST_PX / 2.0;
+        assert_eq!(motion::TOOL_SHIMMER_CREST_PX, 72.0);
+        assert_eq!(motion::TOOL_SHIMMER_PERIOD, Duration::from_millis(2_200));
+        // Phase 0: the crest is fully off the left edge, phase 1: off the right,
+        // so the loop restart is invisible.
+        for x in [0.0, 50.0, 100.0, 200.0] {
+            assert_eq!(tool_title_shimmer_amount(x, width, 0.0), 0.0, "x={x}");
+            assert_eq!(tool_title_shimmer_amount(x, width, 1.0), 0.0, "x={x}");
         }
+        // Mid-sweep the crest sits on the label centre at full strength and
+        // fades linearly to nothing half a crest away.
+        assert_eq!(tool_title_shimmer_amount(width / 2.0, width, 0.5), 1.0);
+        assert_eq!(
+            tool_title_shimmer_amount(width / 2.0 + half, width, 0.5),
+            0.0
+        );
+        assert!(
+            (tool_title_shimmer_amount(width / 2.0 + half / 2.0, width, 0.5) - 0.5).abs() < 1e-4
+        );
+        // Absolute width: the same offset from the crest reads the same on a
+        // short and a long label.
+        let crest_at = |center: f32, width: f32| (center + half) / (width + 2.0 * half);
+        let short = tool_title_shimmer_amount(10.0 + 9.0, 60.0, crest_at(10.0, 60.0));
+        let long = tool_title_shimmer_amount(110.0 + 9.0, 160.0, crest_at(110.0, 160.0));
+        assert!((short - long).abs() < 1e-3, "{short} vs {long}");
 
         let start = Instant::now();
         assert_eq!(tool_title_shimmer_phase(start, start), 0.0);
