@@ -940,9 +940,10 @@ impl Shell {
     /// Hover fades for a divider (rendered from `pane/render.rs`, which
     /// cannot see Shell's private fields): suppressed while any divider drag
     /// is live so the strip never re-fades mid-drag.
-    pub(crate) fn note_divider_hover(&mut self, key: &str, hovered: bool) {
+    pub(crate) fn note_divider_hover(&mut self, key: &str, hovered: bool, cx: &mut Context<Self>) {
         if !self.divider_dragging {
-            crate::motion::set_hover(key, hovered, self.reduced_motion);
+            crate::motion::set_hover_owned(cx.entity_id(), key, hovered, self.reduced_motion);
+            cx.notify();
         }
     }
 

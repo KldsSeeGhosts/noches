@@ -31,9 +31,9 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement, Styled as _,
+    AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement,
+    Styled as _, div, px,
 };
 use zeron_workspace::{PaneId, PaneMode, TabId, ViewId};
 
@@ -209,6 +209,7 @@ pub(crate) fn pane_header(
     let control = |key: String, path: &'static str, label: &'static str| {
         controls::icon_button(
             key,
+            cx.entity_id(),
             theme,
             controls::Variant::Ghost,
             controls::Size::Xs,
@@ -335,9 +336,8 @@ pub(crate) fn pane_header(
         // live activity line already says it) so it only shows on unfocused
         // panes; Awaiting input / Failed stay visible everywhere.
         .when_some(
-            status_label(meta.state, theme).filter(|_| {
-                !(focused && matches!(meta.state, SessionState::Working))
-            }),
+            status_label(meta.state, theme)
+                .filter(|_| !(focused && matches!(meta.state, SessionState::Working))),
             |el, label| el.child(label),
         )
         .when_some(action_control, |el, action| el.child(action))
@@ -346,47 +346,43 @@ pub(crate) fn pane_header(
         .when(show_changes || closable, |row| {
             row.child(
                 div()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                // The right-pane toggle lives on the pane header - the
-                // window-wide chat header that used to carry it is gone.
-                // Shown only on the focused session-bound pane so idle
-                // panes stay quiet.
-                .when(show_changes, |el| {
-                    el.child(
-                        control(
-                            format!("pane-changes-{}", pane.0),
-                            icons::SIDEBAR_MINIMALISTIC,
-                            "Toggle right sidebar",
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    // The right-pane toggle lives on the pane header - the
+                    // window-wide chat header that used to carry it is gone.
+                    // Shown only on the focused session-bound pane so idle
+                    // panes stay quiet.
+                    .when(show_changes, |el| {
+                        el.child(
+                            control(
+                                format!("pane-changes-{}", pane.0),
+                                icons::SIDEBAR_MINIMALISTIC,
+                                "Toggle right sidebar",
+                            )
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_right_pane(cx);
+                            })),
                         )
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_right_pane(cx);
-                        })),
-                    )
-                })
-                .when(closable, |el| {
-                    el.child(
-                        control(
-                            format!("pane-close-{}", pane.0),
-                            icons::CLOSE,
-                            "Close pane",
+                    })
+                    .when(closable, |el| {
+                        el.child(
+                            control(format!("pane-close-{}", pane.0), icons::CLOSE, "Close pane")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    // The chip's own click must not double-fire
+                                    // through the pane's click-to-focus bubble path.
+                                    cx.stop_propagation();
+                                    this.close_workspace_pane(pane, cx);
+                                    window.prevent_default();
+                                    let _ = event;
+                                })),
                         )
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, event, window, cx| {
-                            // The chip's own click must not double-fire
-                            // through the pane's click-to-focus bubble path.
-                            cx.stop_propagation();
-                            this.close_workspace_pane(pane, cx);
-                            window.prevent_default();
-                            let _ = event;
-                        })),
-                    )
-                }),
+                    }),
             )
         })
         .into_any_element()
@@ -402,7 +398,11 @@ fn pane_title(
     theme: &Theme,
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
-    let color = if focused { theme.text } else { theme.text_muted };
+    let color = if focused {
+        theme.text
+    } else {
+        theme.text_muted
+    };
     let Some(chat) = chat else {
         return div()
             .flex_initial()
@@ -531,12 +531,20 @@ pub(crate) fn tab_strip(
                 .bg(if chip.active {
                     theme.wash(0.09)
                 } else {
-                    motion::hover_blend(&chip_hover_key, gpui::transparent_black(), theme.wash(0.07))
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
+                        &chip_hover_key,
+                        gpui::transparent_black(),
+                        theme.wash(0.07),
+                    )
                 })
                 .when(chip.active, |el| {
                     el.border_1().border_color(theme.hairline(0.09))
                 })
-                .on_hover(motion::hover_listener(chip_hover_key.clone()))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    chip_hover_key.clone(),
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.switch_workspace_tab(view, tab, cx);
                 }))
@@ -594,7 +602,10 @@ pub(crate) fn tab_strip(
                 // of the only view is an engine-guarded no-op).
                 .child(
                     div()
-                        .id(SharedString::from(format!("ws-tab-close-{}-{}", view.0, tab.0)))
+                        .id(SharedString::from(format!(
+                            "ws-tab-close-{}-{}",
+                            view.0, tab.0
+                        )))
                         .size(px(14.0))
                         .flex_none()
                         .flex()
@@ -605,17 +616,25 @@ pub(crate) fn tab_strip(
                         .role(gpui::Role::Button)
                         .aria_label("Close tab")
                         .tooltip(crate::tooltip::text("Close tab"))
-                        .bg(motion::hover_blend(
+                        .bg(motion::hover_blend_owned(
+                            cx.entity_id(),
                             &close_hover_key,
                             gpui::transparent_black(),
                             theme.wash(0.14),
                         ))
-                        .on_hover(motion::hover_listener(close_hover_key))
+                        .on_hover(motion::hover_listener_owned(
+                            cx.entity_id(),
+                            close_hover_key,
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_workspace_tab(view, tab, cx);
                         }))
-                        .child(icon(icons::CLOSE).size(px(11.0)).text_color(theme.text_muted)),
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(11.0))
+                                .text_color(theme.text_muted),
+                        ),
                 ),
         );
     }
@@ -626,6 +645,7 @@ pub(crate) fn tab_strip(
     strip = strip.child(
         controls::icon_button(
             plus_key,
+            cx.entity_id(),
             theme,
             controls::Variant::Ghost,
             controls::Size::Micro,
@@ -735,14 +755,26 @@ mod tests {
             tab_mark(PaneMode::Chat, Some("claude")).tint,
             Some(icons::claude_brand())
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("codex")).icon, Some(icons::OPENAI_MARK));
-        assert_eq!(tab_mark(PaneMode::Chat, Some("devin")).icon, Some(icons::DEVIN_MARK));
-        assert_eq!(tab_mark(PaneMode::Chat, Some("pi")).icon, Some(icons::PI_MARK));
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("codex")).icon,
+            Some(icons::OPENAI_MARK)
+        );
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("devin")).icon,
+            Some(icons::DEVIN_MARK)
+        );
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("pi")).icon,
+            Some(icons::PI_MARK)
+        );
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("opencode")).icon,
             Some(icons::OPENCODE_MARK)
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("cursor")).icon, Some(icons::CURSOR_MARK));
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("cursor")).icon,
+            Some(icons::CURSOR_MARK)
+        );
     }
 
     #[test]
@@ -751,7 +783,10 @@ mod tests {
         // was an illegible smudge; the composer's harness pick supplies the
         // real identity at render time). Terminal panes keep their glyph.
         assert_eq!(tab_mark(PaneMode::Chat, None).icon, None);
-        assert_eq!(tab_mark(PaneMode::Terminal, None).icon, Some(icons::TERMINAL));
+        assert_eq!(
+            tab_mark(PaneMode::Terminal, None).icon,
+            Some(icons::TERMINAL)
+        );
         assert_eq!(tab_mark(PaneMode::Chat, None).tint, None);
         // Unknown provider strings fall through to the mode mark, never panic.
         assert_eq!(tab_mark(PaneMode::Chat, Some("holographic")).icon, None);
@@ -761,7 +796,10 @@ mod tests {
     fn tool_picker_rows_advertise_the_real_entry_points() {
         use crate::pane::TOOL_PICKER_ROWS;
         let kinds: Vec<_> = TOOL_PICKER_ROWS.iter().map(|row| row.kind).collect();
-        assert_eq!(kinds, vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]);
+        assert_eq!(
+            kinds,
+            vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]
+        );
         assert!(TOOL_PICKER_ROWS.iter().all(|row| !row.label.is_empty()));
     }
 }

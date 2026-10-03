@@ -410,7 +410,10 @@ pub fn apply_keymap(
     gpui_base::init(cx);
     crate::composer::init(cx, composer_send_behavior);
     cx.bind_keys([KeyBinding::new(
-        &valid_or_default(&keymap.toggle_dictation, ShortcutId::ToggleDictation.default_combo()),
+        &valid_or_default(
+            &keymap.toggle_dictation,
+            ShortcutId::ToggleDictation.default_combo(),
+        ),
         crate::composer::ToggleDictation,
         Some("MessageComposer"),
     )]);
@@ -616,20 +619,45 @@ impl SettingsSection {
     /// page, in the terms a person would type.
     fn keywords(self) -> &'static [&'static str] {
         match self {
-            SettingsSection::Connections => &["sync", "sign in", "account", "cloud", "relay", "remote"],
+            SettingsSection::Connections => {
+                &["sync", "sign in", "account", "cloud", "relay", "remote"]
+            }
             SettingsSection::Devices => &["device", "machine", "computer", "rename", "remote"],
-            SettingsSection::Harnesses => &["harness", "model", "claude", "codex", "cursor", "opencode", "enable"],
+            SettingsSection::Harnesses => &[
+                "harness", "model", "claude", "codex", "cursor", "opencode", "enable",
+            ],
             SettingsSection::Agents => &["login", "usage", "limit", "provider", "cli", "api key"],
             SettingsSection::Appearance => &[
-                "theme", "color", "dark", "light", "font", "size", "width", "animation", "motion",
-                "panel", "accent", "syntax", "glass", "frost", "surface",
+                "theme",
+                "color",
+                "dark",
+                "light",
+                "font",
+                "size",
+                "width",
+                "animation",
+                "motion",
+                "panel",
+                "accent",
+                "syntax",
+                "glass",
+                "frost",
+                "surface",
             ],
             SettingsSection::Files => &["editor", "open", "link", "browser", "preview"],
             SettingsSection::Notifications => &["sound", "chime", "alert", "notify", "badge"],
             SettingsSection::Dictation => &["voice", "microphone", "speech", "audio", "transcribe"],
             SettingsSection::Shortcuts => &[
-                "keyboard", "keybinding", "hotkey", "send", "enter", "queue", "steer", "escape",
-                "follow-up", "working",
+                "keyboard",
+                "keybinding",
+                "hotkey",
+                "send",
+                "enter",
+                "queue",
+                "steer",
+                "escape",
+                "follow-up",
+                "working",
             ],
             SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
@@ -992,9 +1020,11 @@ fn sidebar_footer_button(
     glyph: &'static str,
     label: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
 ) -> gpui::Stateful<gpui::Div> {
     crate::controls::icon_button(
         id,
+        owner,
         theme,
         crate::controls::Variant::Ghost,
         crate::controls::Size::Sm,
@@ -1626,7 +1656,7 @@ struct SidebarPane {
 }
 
 impl Render for SidebarPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::transcript::record_view_frame("sidebar");
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
@@ -1638,6 +1668,7 @@ impl Render for SidebarPane {
                 Route::Chat => shell.render_chat_sidebar(&theme, cx),
             }
         });
+        motion::drive_hover_owner(cx.entity_id(), window);
         div().size_full().child(inner).into_any_element()
     }
 }
@@ -1736,6 +1767,8 @@ pub struct Shell {
     pub(super) archived_hover: Option<String>,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
+    sidebar_projection_cache: std::cell::RefCell<Option<spaces::SidebarProjectionCache>>,
+    sidebar_source_dirty: std::cell::Cell<bool>,
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2077,6 +2110,7 @@ impl Shell {
     }
 
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
@@ -2220,10 +2254,17 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
-        // Parent notifications carry presentation changes (session status,
-        // elapsed labels, menus); sibling animation/caret ticks do not.
+        // Only chrome actually consumed by a transcript invalidates its scene.
+        // Root hover/menu motion must not rebuild stationary content.
         let transcript_invalidation = cx.observe_self(|shell, cx| {
-            shell.transcript.update(cx, |_, cx| cx.notify());
+            shell
+                .transcript
+                .update(cx, |transcript, cx| transcript.refresh_chrome(cx));
+            for surfaces in shell.workspace.chat_surfaces.values() {
+                if let Some(transcript) = &surfaces.transcript {
+                    transcript.update(cx, |transcript, cx| transcript.refresh_chrome(cx));
+                }
+            }
         });
         let shell = cx.entity();
         let update_poll = cx.spawn(async move |this, cx| {
@@ -2242,9 +2283,12 @@ impl Shell {
                     .await;
             }
         });
-        let sidebar_pane = cx.new(|cx| SidebarPane {
-            shell: shell.downgrade(),
-            _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
+        let sidebar_pane = cx.new(|cx| {
+            motion::init_hover_owner(cx);
+            SidebarPane {
+                shell: shell.downgrade(),
+                _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
+            }
         });
         Self {
             voice: voice::VoiceUi::default(),
@@ -2280,6 +2324,8 @@ impl Shell {
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_projection_cache: std::cell::RefCell::new(None),
+            sidebar_source_dirty: std::cell::Cell::new(true),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             jump_hints: false,
@@ -2496,6 +2542,7 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.sidebar_source_dirty.set(true);
         self.sync_voice_context(cx);
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
@@ -5706,17 +5753,14 @@ impl Shell {
 
     fn tween_active(&self, tween: Option<WidthTween>) -> bool {
         tween.is_some_and(|tween| {
-            !self.reduced_motion
-                && self.tween_elapsed(tween.started) < RESIZE.wall()
+            !self.reduced_motion && self.tween_elapsed(tween.started) < RESIZE.wall()
         })
     }
 
     fn active_tween_endpoints(&self, tween: Option<WidthTween>) -> Option<(f32, f32)> {
         tween
             .filter(|transition| {
-                !self.reduced_motion
-                    && self.tween_elapsed(transition.started)
-                        < RESIZE.wall()
+                !self.reduced_motion && self.tween_elapsed(transition.started) < RESIZE.wall()
             })
             .map(|transition| (transition.from, transition.to))
     }
@@ -5963,6 +6007,7 @@ impl Shell {
                 "toggle-sidebar",
                 icons::SIDEBAR_MINIMALISTIC_LEFT,
                 &theme,
+                cx.entity_id(),
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
             .child(
@@ -5977,6 +6022,7 @@ impl Shell {
                         icons::ARROW_LEFT,
                         can_back,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.navigate_back(cx)),
                     ))
                     .child(nav_history_button(
@@ -5984,6 +6030,7 @@ impl Shell {
                         icons::ARROW_RIGHT,
                         can_forward,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
                     )),
             )
@@ -5996,6 +6043,7 @@ impl Shell {
                         "titlebar-new-session",
                         icons::PLUS,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                     ))
             }))
@@ -6401,7 +6449,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let query = input.read(cx).text().trim().to_lowercase();
-        let none = !query.is_empty() && !SettingsSection::ALL.iter().any(|s| s.visible_in_nav() && s.matches(&query));
+        let none = !query.is_empty()
+            && !SettingsSection::ALL
+                .iter()
+                .any(|s| s.visible_in_nav() && s.matches(&query));
         div()
             .flex()
             .flex_col()
@@ -6497,51 +6548,43 @@ impl Shell {
                             .pb(px(6.0))
                             .child(self.render_settings_search(&search, theme, cx)),
                     )
-                    .child(
-                        div().flex().flex_col().gap(px(2.0)).children(
-                            visible_sections
-                                .iter()
-                                .copied()
-                                .map(|item| {
-                                    let selected = item == section;
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "settings-nav-{}",
-                                            item.label()
-                                        )))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .rounded(px(8.0))
-                                        .px(px(Theme::SPACE_SM))
-                                        .py(px(6.0))
-                                        .text_size(crate::typography::ui_rems(13.0))
-                                        .when(selected, |el| {
-                                            // Same tokens as the main sidebar's session
-                                            // rows — the two sidebars must feel alike.
-                                            el.bg(theme.sidebar_active())
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                        })
-                                        .text_color(if selected {
-                                            theme.text
-                                        } else {
-                                            theme.text_muted
-                                        })
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(theme.sidebar_hover()).text_color(theme.text))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_settings(item, cx)
-                                        }))
-                                        .child(
-                                            icon(section_icon(item))
-                                                .size(px(16.0))
-                                                .text_color(theme.text_muted),
-                                        )
-                                        .child(SharedString::from(item.label()))
-                                }),
-                        ),
-                    ),
+                    .child(div().flex().flex_col().gap(px(2.0)).children(
+                        visible_sections.iter().copied().map(|item| {
+                            let selected = item == section;
+                            div()
+                                .id(SharedString::from(format!("settings-nav-{}", item.label())))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .rounded(px(8.0))
+                                .px(px(Theme::SPACE_SM))
+                                .py(px(6.0))
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .when(selected, |el| {
+                                    // Same tokens as the main sidebar's session
+                                    // rows — the two sidebars must feel alike.
+                                    el.bg(theme.sidebar_active())
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                })
+                                .text_color(if selected {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.sidebar_hover()).text_color(theme.text))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
+                                )
+                                .child(
+                                    icon(section_icon(item))
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from(item.label()))
+                        }),
+                    )),
             )
             .when_some(self.render_voice_bar(theme, cx), |el, bar| el.child(bar))
             // Back pinned to the bottom (zeron settings-sidebar.tsx).
@@ -6824,6 +6867,11 @@ impl Shell {
         // the wash and the title brighten ride the same 150ms blend. Three
         // fill tiers (R5 §2.4): hover < on screen in another pane < focused.
         let fade_key = format!("{row_id}-hover");
+        let hover_owner = if sidebar_row {
+            self.sidebar_pane.entity_id()
+        } else {
+            cx.entity_id()
+        };
         let tier = if selected {
             Some(theme.sidebar_active())
         } else if visible && sidebar_row {
@@ -6866,13 +6914,23 @@ impl Shell {
                 8.0
             }))
             .px(px(Theme::SPACE_SM))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
+            .text_color(motion::hover_blend_owned(
+                hover_owner,
+                &fade_key,
+                rest_text,
+                text,
+            ))
+            .bg(motion::hover_blend_owned(
+                hover_owner,
+                &fade_key,
+                rest_bg,
+                hover_bg,
+            ))
             .when(recede, |row| {
                 row.opacity(motion::lerp(
                     SIDEBAR_RECEDE_OPACITY,
                     1.0,
-                    motion::hover_t(&fade_key),
+                    motion::hover_t_owned(hover_owner, &fade_key),
                 ))
             })
             // No selection ring (user request) — the wash alone marks the
@@ -6881,18 +6939,18 @@ impl Shell {
             // time→Archive reveal (one listener - gpui allows a single
             // hover listener per element).
             .on_hover({
-                let fade_hover = motion::hover_listener(fade_key.clone());
+                let fade_hover = motion::hover_listener_owned(hover_owner, fade_key.clone());
                 let hover_id = row_id.clone();
                 cx.listener(move |this, hovered: &bool, window, cx| {
                     fade_hover(hovered, window, cx);
                     if *hovered {
                         if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
                             this.chat_status_hover = Some(hover_id.clone());
-                            cx.notify();
+                            gpui::App::notify(cx, hover_owner);
                         }
                     } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
                         this.chat_status_hover = None;
-                        cx.notify();
+                        gpui::App::notify(cx, hover_owner);
                     }
                 })
             })
@@ -7462,13 +7520,17 @@ impl Shell {
             .bg(if open {
                 theme.glass_hover()
             } else {
-                motion::hover_blend(
+                motion::hover_blend_owned(
+                    self.sidebar_pane.entity_id(),
                     "user-menu-trigger",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover().opacity(0.8),
                 )
             })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
+            .on_hover(motion::hover_listener_owned(
+                self.sidebar_pane.entity_id(),
+                "user-menu-trigger",
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
@@ -7534,26 +7596,44 @@ impl Shell {
                     }),
             )
             .child(
-                sidebar_footer_button("sidebar-voice", icons::MICROPHONE, "Voice", theme)
-                    .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.toggle_voice(window, cx);
-                    })),
+                sidebar_footer_button(
+                    "sidebar-voice",
+                    icons::MICROPHONE,
+                    "Voice",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_voice(window, cx);
+                })),
             )
             .child(
-                sidebar_footer_button("remote-control", icons::SMARTPHONE, "Remote control", theme)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_settings(SettingsSection::Connections, cx);
-                    })),
+                sidebar_footer_button(
+                    "remote-control",
+                    icons::SMARTPHONE,
+                    "Remote control",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_settings(SettingsSection::Connections, cx);
+                })),
             )
             .child(
-                sidebar_footer_button("sidebar-settings", icons::SETTINGS_GEAR, "Settings", theme)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_settings(SettingsSection::Devices, cx);
-                    })),
+                sidebar_footer_button(
+                    "sidebar-settings",
+                    icons::SETTINGS_GEAR,
+                    "Settings",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_settings(SettingsSection::Devices, cx);
+                })),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -8520,7 +8600,8 @@ impl Shell {
     {
         let theme = Theme::of(cx);
         let fade_key = format!("pane-resize-{id}");
-        let hover_highlight = motion::hover_blend(
+        let hover_highlight = motion::hover_blend_owned(
+            cx.entity_id(),
             &fade_key,
             theme.border_strong.opacity(0.0),
             theme.border_strong,
@@ -8546,7 +8627,7 @@ impl Shell {
             .flex_none()
             .occlude()
             .cursor_col_resize()
-            .on_hover(motion::hover_listener(fade_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), fade_key))
             // Codex-style seam feedback: the existing 1px panel border stays
             // visible at rest; hover adds a stronger center highlight that
             // fades back into that border toward both ends.
@@ -8584,23 +8665,33 @@ impl Shell {
             })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
                     if event.click_count == 2 {
                         reset(this, cx);
                         this.schedule_save(cx);
                         cx.notify();
                     }
                     this.finish_pane_resize(kind);
-                    motion::set_hover(&release_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(
+                        cx.entity_id(),
+                        &release_key,
+                        false,
+                        this.reduced_motion,
+                    );
+                    cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, _| {
+                cx.listener(move |this, _, _window, cx| {
                     this.finish_pane_resize(kind);
-                    motion::set_hover(&release_out_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(
+                        cx.entity_id(),
+                        &release_out_key,
+                        false,
+                        this.reduced_motion,
+                    );
+                    cx.notify();
                 }),
             )
     }
@@ -8712,6 +8803,14 @@ impl Shell {
         let outlet: AnyElement = if workspace_mode {
             self.render_workspace_outlet(cx)
         } else if has_selection || departing_transcript {
+            // Edge-fade paint state is inherited, not included in GPUI's
+            // cache key. Invalidate when its band changes (even if layout
+            // bounds happen to remain the same).
+            let bottom_band =
+                (self.bottom_stack.get() - term_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
+            let scene_fade_changed = self.transcript.update(cx, |transcript, cx| {
+                transcript.set_scene_fade_band(bottom_band, cx)
+            });
             div()
                 .relative()
                 .size_full()
@@ -8727,7 +8826,16 @@ impl Shell {
                         } else {
                             0.0
                         })
-                        .child(self.transcript.clone()),
+                        .child(crate::transcript_scene::scene(
+                            self.transcript.clone(),
+                            !scene_fade_changed
+                                && crate::transcript_scene::reusable(
+                                    dock_frame.active,
+                                    departing_transcript,
+                                    transcript_geometry_ready,
+                                    dock_frame.transcript(),
+                                ),
+                        )),
                 )
                 // A departing transcript is visual history, not an active
                 // interaction surface bound to the newly blank route.
@@ -9083,10 +9191,20 @@ impl Shell {
         let base = if glass {
             popover::surface_bg(&theme)
         } else {
-            motion::hover_blend(hover_key, theme.surface_raised, theme.surface_raised_hover)
+            motion::hover_blend_owned(
+                cx.entity_id(),
+                hover_key,
+                theme.surface_raised,
+                theme.surface_raised_hover,
+            )
         };
         let wash = if glass {
-            motion::hover_blend(hover_key, gpui::transparent_black(), theme.glass_hover())
+            motion::hover_blend_owned(
+                cx.entity_id(),
+                hover_key,
+                gpui::transparent_black(),
+                theme.glass_hover(),
+            )
         } else {
             gpui::transparent_black()
         };
@@ -9099,7 +9217,7 @@ impl Shell {
             .when(!glass, |el| el.shadow_md())
             .cursor_pointer()
             .bg(base)
-            .on_hover(motion::hover_listener(hover_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), hover_key))
             .on_click(cx.listener(move |_, _, _, cx| {
                 transcript.update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
             }))
@@ -9174,7 +9292,8 @@ impl Shell {
         }
         let border = Theme::of(cx).border;
         let handle_key = "pane-resize-terminal-resize";
-        let handle_hover = motion::hover_blend(
+        let handle_hover = motion::hover_blend_owned(
+            cx.entity_id(),
             handle_key,
             Theme::of(cx).border_strong.opacity(0.0),
             Theme::of(cx).border_strong,
@@ -9197,7 +9316,7 @@ impl Shell {
             .w_full()
             .flex_none()
             .cursor_row_resize()
-            .on_hover(motion::hover_listener(handle_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), handle_key))
             .child(
                 div()
                     .absolute()
@@ -9223,23 +9342,23 @@ impl Shell {
             })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     if event.click_count == 2 {
                         this.settings.terminal_height = TERMINAL_DEFAULT_HEIGHT;
                         this.schedule_save(cx);
                         cx.notify();
                     }
                     this.finish_pane_resize(PaneResizeKind::Terminal);
-                    motion::set_hover(handle_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), handle_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, window, _| {
+                cx.listener(|this, _, _window, cx| {
                     this.finish_pane_resize(PaneResizeKind::Terminal);
-                    motion::set_hover(handle_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), handle_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             );
 
@@ -9418,27 +9537,25 @@ impl Shell {
                         tab.title.clone(),
                     );
                     let theme = Theme::of(cx).clone();
-                    let (summary, mark) = {
+                    let (summaries, mark) = {
                         let state = self.state.read(cx);
-                        let summary = crate::subagents::summary_for_doc(
-                            crate::subagents::subagents_for(state, &parent_id),
-                            &parent_id,
-                            &doc_id,
-                        );
+                        let summaries = crate::subagents::subagents_for(state, &parent_id);
                         let mark = state
                             .chats
                             .iter()
                             .find(|chat| chat.id == parent_id)
                             .and_then(|chat| chat.config.as_ref())
                             .map(|config| crate::pickers::harness_brand_icon(config.harness));
-                        (summary, mark)
+                        (summaries, mark)
                     };
+                    let summary =
+                        crate::subagents::summary_for_doc(&summaries, &parent_id, &doc_id);
                     let banner_key = format!("{id}");
                     let banner = crate::subagents::child_thread_banner(
                         &crate::subagents::ChildBanner {
                             key: &banner_key,
                             title: &tab_title,
-                            summary: summary.as_ref(),
+                            summary,
                             mark,
                         },
                         Utc::now(),
@@ -9553,12 +9670,14 @@ impl Shell {
                             "expand-changes",
                             tabs::right_pane_expand_icon(self.right_pane_expanded),
                             &theme,
+                            cx.entity_id(),
                             cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                         ))
                         .child(header_icon_button(
                             "toggle-changes",
                             icons::CLOSE,
                             &theme,
+                            cx.entity_id(),
                             cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                         )),
                 )
@@ -10113,12 +10232,13 @@ impl Shell {
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(motion::hover_blend(
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 plus_fade,
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.11),
             ))
-            .on_hover(motion::hover_listener(plus_fade))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), plus_fade))
             .block_mouse_except_scroll()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -10751,6 +10871,7 @@ fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -10765,12 +10886,13 @@ fn window_control_button(
         .rounded(px(6.0))
         .cursor_pointer()
         // zeron window-controls.tsx: `transition-colors` — the wash fades.
-        .bg(motion::hover_blend(
+        .bg(motion::hover_blend_owned(
+            owner,
             &fade_key,
             theme.glass_hover().opacity(0.0),
             theme.glass_hover(),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener_owned(owner, fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
         // strip's event surface entirely. `.occlude()` (gpui
         // `HitboxBehavior::BlockMouse`) makes the window hit-test STOP at the
@@ -10906,6 +11028,7 @@ fn nav_history_button(
     icon_path: &'static str,
     enabled: bool,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     if !enabled {
@@ -10925,7 +11048,7 @@ fn nav_history_button(
             )
             .into_any_element();
     }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
+    window_control_button(id, icon_path, theme, owner, on_click).into_any_element()
 }
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
@@ -10934,6 +11057,7 @@ fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -10948,12 +11072,13 @@ fn header_icon_button(
         .rounded(px(6.0))
         .cursor_pointer()
         // zeron __root.tsx header buttons: `transition-colors`.
-        .bg(motion::hover_blend(
+        .bg(motion::hover_blend_owned(
+            owner,
             &fade_key,
             crate::theme::wash(0.0),
             crate::theme::wash(0.11),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener_owned(owner, fade_key))
         // Same occlusion + click-swallowing as [`window_control_button`]: this
         // button sits inside the chat header's titlebar drag region, so its
         // rect must be carved out of the strip's drag/double-click surface.
@@ -11606,8 +11731,18 @@ impl Render for Shell {
                 }
                 .child(self.render_titlebar_cluster(cx))
                 .children(overlays);
-                root.child(sidebar_tone)
-                    .child(motion::fade_in("phase-app", page))
+                root.child(sidebar_tone).child(page.with_animation(
+                    "phase-app",
+                    motion::FADE_IN.animation(),
+                    |page, t| {
+                        div()
+                            .size_full()
+                            .relative()
+                            .opacity(t)
+                            .top(px(4.0 * (1.0 - t)))
+                            .child(crate::transcript_scene::scope(t == 1.0, page))
+                    },
+                ))
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
@@ -11630,6 +11765,7 @@ impl Render for Shell {
         // scheduling `with_animation` would have requested). Hover color fades
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
+        motion::drive_hover_owner(cx.entity_id(), window);
         if self.motion_active.get() | motion::hover_fades_active() {
             window.request_animation_frame();
         }
@@ -14871,21 +15007,29 @@ mod settings_reopen_regressions {
         let dir = tempfile::tempdir().unwrap();
         init_settings_test(settings::UiSettings::default(), dir.path(), cx);
         let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
-        window.update(cx, |shell, _, cx| {
-            settings::update(SavePolicy::Immediate, cx, |s| {
-                s.dictation_enabled = true;
-                s.dictation_input = Some("USB microphone".into());
-            });
-            shell.settings.sidebar_width = 300.0;
-            shell.schedule_save(cx);
-            assert!(settings::current(cx).dictation_enabled);
-            assert_eq!(settings::current(cx).dictation_input.as_deref(), Some("USB microphone"));
-            settings::update(SavePolicy::Immediate, cx, |s| s.dictation_enabled = false);
-            shell.open_settings(SettingsSection::Appearance, cx);
-            shell.schedule_save(cx);
-            assert!(!settings::current(cx).dictation_enabled);
-            assert_eq!(settings::current(cx).dictation_input.as_deref(), Some("USB microphone"));
-        }).unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                settings::update(SavePolicy::Immediate, cx, |s| {
+                    s.dictation_enabled = true;
+                    s.dictation_input = Some("USB microphone".into());
+                });
+                shell.settings.sidebar_width = 300.0;
+                shell.schedule_save(cx);
+                assert!(settings::current(cx).dictation_enabled);
+                assert_eq!(
+                    settings::current(cx).dictation_input.as_deref(),
+                    Some("USB microphone")
+                );
+                settings::update(SavePolicy::Immediate, cx, |s| s.dictation_enabled = false);
+                shell.open_settings(SettingsSection::Appearance, cx);
+                shell.schedule_save(cx);
+                assert!(!settings::current(cx).dictation_enabled);
+                assert_eq!(
+                    settings::current(cx).dictation_input.as_deref(),
+                    Some("USB microphone")
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

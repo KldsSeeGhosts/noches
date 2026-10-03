@@ -50,6 +50,7 @@ use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
 use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::settings::ToolRowStyle;
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -114,12 +115,38 @@ const TOOL_GROUP_HEADER_HEIGHT: f32 = 26.0;
 /// Compact rows retain the analytic heights used by row and group folds.
 const TOOL_TREE_ROW_HEIGHT: f32 = 32.0;
 const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_OUT);
-/// BoardUI task-list cadence: a slow light sweep keeps the active summary
-/// legible, while each newly appended row reveals quickly enough to read as a
-/// continuous log rather than a stack of discrete pop-ins.
-const TOOL_GROUP_SHIMMER_DURATION: Duration = Duration::from_millis(3_400);
-const TOOL_GROUP_SHIMMER_HALF_WIDTH: f32 = 0.36;
+// Calm (T3 `WorkLog`) rows: flat 24px lines with a 16px glyph in a 24px cell,
+// 14px labels, an always-visible chevron, and details in a quiet panel under a
+// 28px (`ms-7`) indent. Heights stay analytic like the Tree rows: the group
+// fold and the virtualized list read these sums, never a measurement.
+const CALM_ROW_HEIGHT: f32 = 24.0;
+const CALM_ICON_CELL: f32 = 24.0;
+const CALM_ICON_SIZE: f32 = 16.0;
+const CALM_TEXT_SIZE: f32 = 14.0;
+/// The label's line box (T3 `leading-relaxed` at 14px); the 24px row centers it.
+const CALM_LINE_HEIGHT: f32 = 22.75;
+const CALM_ROW_GAP: f32 = 6.0;
+const CALM_ROW_RADIUS: f32 = 8.0;
+const CALM_ROW_PAD_X: f32 = 2.0;
+const CALM_CHEVRON_BOX: f32 = 16.0;
+const CALM_CHEVRON_SIZE: f32 = 12.0;
+const CALM_DETAIL_INDENT: f32 = 28.0;
+const CALM_PANEL_PAD_X: f32 = 12.0;
+const CALM_PANEL_PAD_Y: f32 = 8.0;
+/// Gap above each detail panel (T3 `mt-1`) and below the last one.
+const CALM_PANEL_GAP: f32 = 4.0;
+const CALM_DETAIL_BOTTOM: f32 = 4.0;
+/// T3 `transition-transform duration-200` on the chevron.
+const CALM_CHEVRON_TURN: motion::MotionSpec = motion::MotionSpec::new(200, motion::EASE_TAILWIND);
+/// Detail text line height as a multiple of the code size (T3 `leading-relaxed`).
+const CALM_DETAIL_LINE_RATIO: f32 = 1.625;
+/// T3 `live-tool-shine` cadence (see [`motion::TOOL_SHIMMER_PERIOD`]): a 72px
+/// crest crosses the active label every 2.2s. The sweep paints as 2px strips
+/// quantized to [`TOOL_SHIMMER_LEVELS`] tones so shaped lines repeat across
+/// strips and frames instead of shaping one line per strip per frame.
+const TOOL_GROUP_SHIMMER_DURATION: Duration = motion::TOOL_SHIMMER_PERIOD;
 const TOOL_GROUP_SHIMMER_STRIP_WIDTH: f32 = 2.0;
+const TOOL_SHIMMER_LEVELS: usize = 16;
 const TOOL_ROW_REVEAL: motion::MotionSpec = motion::MotionSpec::new(360, motion::EASE_OUT_EXPO);
 /// The connector draws briskly, then eases into the branch tip so its arrival
 /// remains visible without feeling mechanically linear.
@@ -161,17 +188,27 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-/// A user prompt renders at most this many wrapped lines until expanded. A
-/// pasted log or file drops into the transcript as one endless slab otherwise
-/// (user report) — past the cap the bubble clips and grows a chevron.
-pub const USER_COLLAPSED_LINES: usize = 5;
-/// The user bubble's line box.
-pub const USER_LINE_HEIGHT: f32 = 22.0;
+/// A user prompt past this many lines folds until expanded. A pasted log or
+/// file drops into the transcript as one endless slab otherwise (user report)
+/// — past the cap the bubble clips to [`USER_COLLAPSED_HEIGHT`], fades out
+/// over [`USER_FOLD_FADE_BAND`], and grows a "Show full message" button.
+/// T3's thresholds: more than 8 lines or 600 characters.
+pub const USER_COLLAPSED_LINES: usize = 8;
+/// Visible height of a folded prompt (T3 `max-h-44`). The last
+/// [`USER_FOLD_FADE_BAND`] px fade out instead of ending on a hard edge or a
+/// "..." line.
+pub const USER_COLLAPSED_HEIGHT: f32 = 176.0;
+/// Bottom fade of a folded prompt (T3's `mask-image` ramp, 1.75rem).
+pub const USER_FOLD_FADE_BAND: f32 = 28.0;
+/// The user bubble's line box (T3 `leading-relaxed` at 14px).
+pub const USER_LINE_HEIGHT: f32 = 22.75;
+/// The user bubble's padding on every side (T3 `p-3`).
+const USER_BUBBLE_PADDING: f32 = 12.0;
 /// Conservative first-frame soft-wrap proxy for the fixed-width long-prompt
 /// bubble. The final decision uses the wrapped `StyledText` layout, but this
 /// fallback lets clearly long prompts render their affordance immediately
 /// before that first layout has completed.
-pub const USER_COLLAPSE_CHARS: usize = 400;
+pub const USER_COLLAPSE_CHARS: usize = 600;
 /// Vertical separation before the plain expand/collapse link.
 const USER_TOGGLE_GAP: f32 = 8.0;
 /// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
@@ -743,6 +780,8 @@ pub enum ToolDetail {
         file: Arc<crate::changes::FileDiff>,
         old_text: Option<Arc<str>>,
         new_text: Option<Arc<str>>,
+        old_highlight_key: Option<DocumentHighlightKey>,
+        new_highlight_key: Option<DocumentHighlightKey>,
     },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
@@ -789,6 +828,12 @@ pub fn tool_detail(
         // has no such cap; it virtualizes per line.
         crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
         return Some(ToolDetail::Diff {
+            old_highlight_key: diff.old_text.as_deref().and_then(|source| {
+                zeron_syntax::language_for_path(file.old_path.as_deref().unwrap_or(&file.path))
+                    .map(|lang| DocumentHighlightKey::new(lang, source))
+            }),
+            new_highlight_key: zeron_syntax::language_for_path(&file.path)
+                .map(|lang| DocumentHighlightKey::new(lang, &diff.new_text)),
             file: Arc::new(file),
             old_text: diff.old_text.as_deref().map(Arc::from),
             new_text: Some(Arc::from(diff.new_text.as_str())),
@@ -1703,7 +1748,7 @@ fn part_prefix(id: &str) -> &str {
 /// part — matching the live row's internal spacing exactly, so the
 /// live→split handoff cannot shift a pixel. Tool groups get one larger global
 /// step on either boundary so their dense chip stack has room to breathe.
-pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
+pub fn top_gap_for(prev: Option<&Row>, row: &Row, tools: ToolRowStyle) -> f32 {
     if row.turn_start {
         return Theme::SPACE_LG;
     }
@@ -1712,11 +1757,24 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
         is_md(&p.kind) && is_md(&row.kind) && part_prefix(&p.id) == part_prefix(&row.id)
     });
     if same_part_markdown {
-        render::MD_BLOCK_GAP
+        // Headings take more air above (T3's margin collapse: 20px), the
+        // live row's own block spacing uses the same function.
+        let block = match &row.kind {
+            RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+                tree.blocks.get(*block_ix).map(|top| &top.block)
+            }
+            _ => None,
+        };
+        block.map_or(render::MD_BLOCK_GAP, render::block_gap_before)
     } else if matches!(row.kind, RowKind::ToolGroup { .. })
         || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
     {
-        Theme::SPACE_MD
+        // Calm rows are T3's flat log (work-log blocks sit 8px apart); the
+        // Tree rail keeps its roomier 12px.
+        match tools {
+            ToolRowStyle::Calm => Theme::SPACE_SM,
+            ToolRowStyle::Tree => Theme::SPACE_MD,
+        }
     } else {
         Theme::SPACE_SM
     }
@@ -1779,49 +1837,63 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 }
 
 fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Theme) -> AnyElement {
+    shimmer_label(
+        text,
+        shimmer_phase,
+        LabelSize::Px(TOOL_LABEL_SIZE),
+        TOOL_LABEL_LINE_HEIGHT,
+        theme,
+    )
+}
+
+/// Font size of a shimmering label, matching how the label's own text is
+/// sized so the overlay shapes at exactly the same size.
+#[derive(Clone, Copy)]
+enum LabelSize {
+    /// Absolute pixels (the Tree look's 12px tool text).
+    Px(f32),
+    /// Pixels at the 16px interface baseline, scaled by the UI font size.
+    Ui(f32),
+}
+
+impl LabelSize {
+    fn pixels(self, window: &Window) -> Pixels {
+        match self {
+            Self::Px(size) => px(size),
+            Self::Ui(size) => crate::typography::ui_rems(size).to_pixels(window.rem_size()),
+        }
+    }
+}
+
+/// A label that can carry the active-tool shimmer.
+///
+/// With no `shimmer_phase` (settled, or reduced motion) the text is returned
+/// as is and inherits its hover colors. While active, the label stays ONE
+/// normal text run - splitting it per character would split shaping/kerning
+/// and make the sweep hop a glyph at a time. An overlay repaints the intact
+/// shaped line through narrow moving clips: the native equivalent of CSS
+/// `background-clip: text` without duplicating accessible text.
+fn shimmer_label(
+    text: SharedString,
+    shimmer_phase: Option<f32>,
+    label_size: LabelSize,
+    line_height: f32,
+    theme: &Theme,
+) -> AnyElement {
     let Some(shimmer_phase) = shimmer_phase else {
-        // Keep the ordinary inherited hover color when the group is settled
-        // (and when reduced motion turns the active shimmer off).
         return text.into_any_element();
     };
-    // Keep the title as ONE normal text run. Splitting it per character copies
-    // the gradient stops, but also splits shaping/kerning and makes the sweep
-    // visibly hop one glyph at a time. The overlay repaints the intact shaped
-    // line through narrow moving clips, which is the native equivalent of
-    // CSS `background-clip: text` without duplicating accessible text.
     let overlay_text = text.clone();
     let overlay_font = gpui::font(theme.font_sans_fixed.clone());
     let base = theme.text_muted;
     let peak = theme.text;
     let overlay = canvas(
         move |bounds, window, _| {
-            let probe = window.text_system().shape_line(
-                overlay_text.clone(),
-                px(TOOL_LABEL_SIZE),
-                &[TextRun {
-                    len: overlay_text.len(),
-                    font: overlay_font.clone(),
-                    color: peak,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
-            let text_width = f32::from(probe.width()).min(f32::from(bounds.size.width));
-            let strip_count = (text_width / TOOL_GROUP_SHIMMER_STRIP_WIDTH).ceil() as usize;
-            let mut strips = Vec::with_capacity(strip_count);
-            for ix in 0..strip_count {
-                let left = ix as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH;
-                let right = ((ix + 1) as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH).min(text_width);
-                let x = (left + right) * 0.5 / text_width.max(1.0);
-                let amount = tool_title_shimmer_amount(x, shimmer_phase);
-                if amount <= 0.001 {
-                    continue;
-                }
-                let line = window.text_system().shape_line(
+            let font_size = label_size.pixels(window);
+            let shape = |amount: f32| {
+                window.text_system().shape_line(
                     overlay_text.clone(),
-                    px(TOOL_LABEL_SIZE),
+                    font_size,
                     &[TextRun {
                         len: overlay_text.len(),
                         font: overlay_font.clone(),
@@ -1831,13 +1903,32 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
                         strikethrough: None,
                     }],
                     None,
-                );
-                strips.push((left, right, line));
+                )
+            };
+            let text_width = f32::from(shape(1.0).width()).min(f32::from(bounds.size.width));
+            let strip_count = (text_width / TOOL_GROUP_SHIMMER_STRIP_WIDTH).ceil() as usize;
+            let mut levels: Vec<Option<gpui::ShapedLine>> = vec![None; TOOL_SHIMMER_LEVELS + 1];
+            let mut strips = Vec::new();
+            for ix in 0..strip_count {
+                let left = ix as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH;
+                let right = ((ix + 1) as f32 * TOOL_GROUP_SHIMMER_STRIP_WIDTH).min(text_width);
+                let amount =
+                    tool_title_shimmer_amount((left + right) * 0.5, text_width, shimmer_phase);
+                let level = (amount * TOOL_SHIMMER_LEVELS as f32).round() as usize;
+                if level == 0 {
+                    continue;
+                }
+                levels[level]
+                    .get_or_insert_with(|| shape(level as f32 / TOOL_SHIMMER_LEVELS as f32));
+                strips.push((left, right, level));
             }
-            strips
+            (levels, strips)
         },
-        move |bounds, strips, window, cx| {
-            for (left, right, line) in strips {
+        move |bounds, (levels, strips), window, cx| {
+            for (left, right, level) in strips {
+                let Some(line) = &levels[level] else {
+                    continue;
+                };
                 let mask = ContentMask {
                     bounds: Bounds {
                         origin: point(bounds.origin.x + px(left), bounds.origin.y),
@@ -1845,10 +1936,9 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
                     },
                 };
                 window.with_content_mask(Some(mask), |window| {
-                    let line_height = px(TOOL_LABEL_LINE_HEIGHT);
                     let _ = line.paint(
                         bounds.origin,
-                        line_height,
+                        px(line_height),
                         TextAlign::Left,
                         None,
                         window,
@@ -2059,12 +2149,11 @@ impl HighlightStore {
         &mut self,
         row_id: SharedString,
         block_ix: usize,
-        lang: Lang,
+        document_key: DocumentHighlightKey,
         code: &str,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
         let slot_key = (row_id.clone(), block_ix);
-        let document_key = DocumentHighlightKey::new(lang, code);
         if let Some(entry) = self.entries.get(&slot_key)
             && entry.key == document_key
         {
@@ -2086,6 +2175,7 @@ impl HighlightStore {
         }
         let code = code.to_string();
         let source_bytes = code.len();
+        let lang = document_key.language;
         let task = cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let document = cx
@@ -2407,29 +2497,39 @@ fn activity_branch_points(progress: f32) -> Vec<Point<f32>> {
     visible
 }
 
-fn tool_disclosure_progress(open: bool, fold: FoldState, now: Instant) -> f32 {
-    let Some(start) = fold.disclosure_at else {
+/// Chevron turn progress (0 closed .. 1 open) for a toggle at `start`.
+fn disclosure_progress_at(
+    open: bool,
+    start: Option<Instant>,
+    spec: motion::MotionSpec,
+    now: Instant,
+) -> f32 {
+    let Some(start) = start else {
         return if open { 1.0 } else { 0.0 };
     };
     let raw = now
         .checked_duration_since(start)
         .unwrap_or_default()
         .as_secs_f32()
-        / TOOL_FOLD.total().as_secs_f32();
-    let progress = TOOL_FOLD.curve.eval(raw);
+        / spec.total().as_secs_f32();
+    let progress = spec.curve.eval(raw);
     if open { progress } else { 1.0 - progress }
 }
 
-/// BoardUI's measured recipe: a 300%-wide repeating gradient moves from 200%
-/// to -100%. Its 38→50→62% highlight maps to a 36%-of-title shoulder around
-/// each peak; adjacent copies sit three title-widths apart. Sampling this by
-/// x-coordinate lets the paint clips reproduce the continuous pattern.
-fn tool_title_shimmer_amount(x: f32, phase: f32) -> f32 {
-    let primary_center = -2.5 + phase.clamp(0.0, 1.0) * 6.0;
-    (-2..=2)
-        .map(|copy| primary_center + copy as f32 * 3.0)
-        .map(|center| (1.0 - (x - center).abs() / TOOL_GROUP_SHIMMER_HALF_WIDTH).clamp(0.0, 1.0))
-        .fold(0.0, f32::max)
+/// Whether a toggle at `start` is still turning its chevron.
+fn disclosure_in_flight(start: Option<Instant>, spec: motion::MotionSpec, now: Instant) -> bool {
+    start.is_some_and(|start| now.checked_duration_since(start).unwrap_or_default() < spec.total())
+}
+
+/// T3 `live-tool-shine`: a 72px-wide `transparent -> foreground -> transparent`
+/// layer slides from fully off the left edge to fully off the right edge, so
+/// the crest centre travels `-36px -> text_width + 36px` as `phase` runs
+/// 0 -> 1. The width is ABSOLUTE - a long label sweeps the same crest a short
+/// one does. Returns the 0..=1 peak mix at `x` (px from the label's left).
+fn tool_title_shimmer_amount(x: f32, text_width: f32, phase: f32) -> f32 {
+    let half = motion::TOOL_SHIMMER_CREST_PX * 0.5;
+    let center = -half + phase.clamp(0.0, 1.0) * (text_width + motion::TOOL_SHIMMER_CREST_PX);
+    (1.0 - (x - center).abs() / half).clamp(0.0, 1.0)
 }
 
 fn tool_title_shimmer_phase(start: Instant, now: Instant) -> f32 {
@@ -2726,11 +2826,22 @@ impl SavedViewportCache {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptChrome {
+    working: bool,
+    sending: bool,
+    queued: bool,
+    undelivered: bool,
+    elapsed: i64,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
+    chrome: Option<TranscriptChrome>,
+    scene_fade_band: Option<u32>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
@@ -2846,6 +2957,9 @@ pub struct Transcript {
     /// identity, so the virtual list must explicitly discard cached heights.
     typography_generation: u32,
     content_width: f32,
+    /// The tool-row look this transcript last laid out with: changing it
+    /// changes analytic row heights, so the list remeasures.
+    tool_row_style: ToolRowStyle,
     /// Last global code-fence layout generation applied to this transcript.
     /// Each instance owns separate scroll handles and list measurements, so
     /// every one must reset itself after a global Fit-mode transition.
@@ -3070,7 +3184,10 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.refresh_chrome(cx);
+            this.sync(cx);
+        });
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
@@ -3103,6 +3220,8 @@ impl Transcript {
             list,
             rows: Vec::new(),
             last_source: None,
+            chrome: None,
+            scene_fade_band: None,
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
@@ -3140,6 +3259,7 @@ impl Transcript {
             rendered_rows: HashSet::new(),
             typography_generation: crate::typography::generation(cx),
             content_width: crate::settings::transcript_width(cx),
+            tool_row_style: crate::settings::transcript_tool_rows(cx),
             code_fences_generation: crate::settings::code_fences_generation(cx),
             highlights: HighlightStore::default(),
             show_jump_button: false,
@@ -4245,6 +4365,72 @@ impl Transcript {
         self.retain_on_deselect = true;
     }
 
+    pub(crate) fn set_scene_fade_band(&mut self, band: f32, cx: &mut Context<Self>) -> bool {
+        let band = Some(band.to_bits());
+        if self.scene_fade_band != band {
+            self.scene_fade_band = band;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// State updates can change the in-flow trailer without changing rows.
+    /// Also called by the shell's deadline heartbeat for fixed split chats.
+    pub(crate) fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
+        let key = self.chrome_key(chrono::Utc::now(), cx);
+        if self.chrome != Some(key) {
+            self.chrome = Some(key);
+            cx.notify();
+        }
+    }
+
+    fn chrome_key(&self, now: chrono::DateTime<chrono::Utc>, cx: &gpui::App) -> TranscriptChrome {
+        let state = self.state.read(cx);
+        let chat = self
+            .doc_override
+            .as_deref()
+            .or(state.selected_chat.as_deref());
+        let Some(chat) = chat else {
+            return TranscriptChrome::default();
+        };
+        if self.doc_override.is_some() && !self.interactive_override {
+            let live = self.doc_live
+                && state.sub_transcript(chat).last().is_some_and(|last| {
+                    last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User
+                });
+            return TranscriptChrome {
+                working: live,
+                elapsed: if live {
+                    state
+                        .sub_transcript(chat)
+                        .last()
+                        .map(|e| (now.timestamp_millis() - e.created_at).max(0) / 1000)
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                ..Default::default()
+            };
+        }
+        let working = state.indicator_for(chat, now) == crate::state::Indicator::Working;
+        let started = state.session_for(chat).and_then(|s| s.started_at);
+        let sending = working && sending_bridge(state.pending_send_started(chat, now), started);
+        TranscriptChrome {
+            working,
+            sending,
+            queued: sending && state.chat_delivery_degraded(chat, now),
+            undelivered: state.send_undelivered(chat, now),
+            elapsed: if working && !sending {
+                started
+                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+        }
+    }
+
     fn route_exit_pending(&self, cx: &gpui::App) -> bool {
         self.retain_on_deselect
             && self.doc_override.is_none()
@@ -5272,10 +5458,11 @@ impl Transcript {
         let expanded = fold.open.unwrap_or(false);
         let line_height =
             f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
-        let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
-        // Include the continuation line in the resize endpoints so removing
-        // it on expansion does not make the bubble jump by a line.
-        let collapsed_h = collapsed_text_h + line_height;
+        // A prompt folds past USER_COLLAPSED_LINES visual lines; the folded
+        // viewport is the fixed T3 height, so the resize endpoints are the
+        // clip and the full measured text.
+        let collapse_trigger_h = USER_COLLAPSED_LINES as f32 * line_height;
+        let collapsed_h = USER_COLLAPSED_HEIGHT;
         let measured_h = self
             .user_heights
             .entry(row_id.clone())
@@ -5283,7 +5470,7 @@ impl Transcript {
             .clone();
         let measured = measured_h.get();
         let collapsible = text.lines().count() > USER_COLLAPSED_LINES
-            || (measured > 0.0 && measured > collapsed_text_h + 0.5)
+            || (measured > 0.0 && measured > collapse_trigger_h + 0.5)
             || (measured == 0.0 && user_message_needs_collapse(&text));
         let full_h = measured_h.get().max(collapsed_h);
         if let Some(fold) = self.user_folds.get_mut(row_id) {
@@ -5353,25 +5540,29 @@ impl Transcript {
                 .toggled_at
                 .is_some_and(|at| at.elapsed() < Duration::from_millis(duration_ms + 200))
             && !motion::reduced_motion(cx);
-        let ellipsis = || div().h(px(line_height)).child("...");
+        // The folded edge ramps out like T3's `mask-image`: a per-glyph fade at
+        // the clip's bottom edge, not an overlay quad, so it holds over any
+        // bubble surface.
         let body: AnyElement = if animating {
             let from = fold.from;
             let to = if expanded { full_h } else { collapsed_h };
             let resize = user_resize_spec(full_h - collapsed_h);
-            let ellipsis_h = if expanded { 0.0 } else { line_height };
-            div()
-                .child(div().overflow_hidden().child(body).with_animation(
-                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
-                    resize.animation(),
-                    move |el, t| el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0))),
-                ))
-                .when(!expanded, |el| el.child(ellipsis()))
+            let clip = div().overflow_hidden().child(body).with_animation(
+                SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
+                resize.animation(),
+                move |el, t| el.h(px(motion::lerp(from, to, t).max(0.0))),
+            );
+            // Opening drops the fade at once; closing brings it back at once.
+            crate::edge_fade::edge_faded(USER_FOLD_FADE_BAND, false, !expanded, clip)
                 .into_any_element()
         } else if collapsible && !expanded {
-            div()
-                .child(div().h(px(collapsed_text_h)).overflow_hidden().child(body))
-                .child(ellipsis())
-                .into_any_element()
+            crate::edge_fade::edge_faded(
+                USER_FOLD_FADE_BAND,
+                false,
+                true,
+                div().h(px(collapsed_h)).overflow_hidden().child(body),
+            )
+            .into_any_element()
         } else {
             body.into_any_element()
         };
@@ -5392,8 +5583,9 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// A plain text link aligned with the message's left edge, following the
-    /// continuation ellipsis when collapsed. No pill, border, or button wash.
+    /// T3's ghost "Show full message" / "Show less" text button under the
+    /// text, aligned with the message's left edge. No chevron, pill or border;
+    /// hover tints the label.
     fn render_user_expander(
         &mut self,
         row_id: &SharedString,
@@ -5405,12 +5597,11 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle_key = row_id.clone();
-        let glyph = if expanded {
-            crate::icons::ALT_ARROW_UP
+        let label = if expanded {
+            "Show less"
         } else {
-            crate::icons::ALT_ARROW_DOWN
+            "Show full message"
         };
-        let label = if expanded { "Show less" } else { "Show more" };
         let button = div()
             .id(SharedString::from(format!("{row_id}-expander")))
             .group("user-message-toggle")
@@ -5424,18 +5615,12 @@ impl Transcript {
             .flex()
             .items_center()
             .gap(px(5.0))
-            .text_size(crate::typography::ui_rems(14.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.text_color(theme.text))
             .child(label)
-            .child(
-                crate::icons::icon(glyph)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
-            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_user_fold(
                     toggle_key.clone(),
@@ -6184,7 +6369,11 @@ impl Transcript {
                 Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
             }
         } else {
-            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
+            top_gap_for(
+                ix.checked_sub(1).and_then(|i| self.rows.get(i)),
+                &row,
+                self.tool_row_style,
+            )
         };
         // The last row must clear the composer/status stack the transcript
         // scrolls under PLUS the fade band above it, or the timestamp strip
@@ -6259,13 +6448,12 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(self.content_width * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
+                                .bg(theme.message_surface())
                                 .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
+                                .p(px(USER_BUBBLE_PADDING))
                                 .text_size(crate::typography::ui_rems(14.0))
                                 .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
-                                .text_color(theme.text)
+                                .text_color(theme.message_foreground())
                                 .when(pending, |el| el.opacity(0.65))
                                 .child(self.render_user_body(
                                     &row.id, ix, text, mentions, &theme, window, cx,
@@ -6434,10 +6622,16 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        let latest_assistant_strip = !is_user_row
+            && row.timestamp.is_some()
+            && !self
+                .rows
+                .get(ix + 1..)
+                .is_some_and(|rest| rest.iter().any(|later| later.timestamp.is_some()));
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
-                .text_color(theme.text_muted.opacity(0.55))
+                .text_color(theme.text_muted)
                 .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
             let copy = copy_text.map(|text| {
                 let entry_id = copy_entry_id.clone();
@@ -6491,11 +6685,20 @@ impl Transcript {
                 // text's first-character x, user label's right edge on the
                 // bubble's right edge (user-reported 4px drift).
                 .when(is_user_row, |el| el.justify_end())
-                .when(hovered, |el| {
-                    el.child(motion::fade_quick(
-                        SharedString::from(format!("meta-{}", row.id)),
-                        metadata,
-                    ))
+                .map(|el| {
+                    if latest_assistant_strip {
+                        // The newest settled reply keeps its strip on (T3's
+                        // `alwaysVisible` meta row); no fade, so scrolling it
+                        // back into view never replays one.
+                        el.child(metadata)
+                    } else if hovered {
+                        el.child(motion::fade_meta(
+                            SharedString::from(format!("meta-{}", row.id)),
+                            metadata,
+                        ))
+                    } else {
+                        el
+                    }
                 })
         });
         let entry_id = row.entry_id.clone();
@@ -6649,14 +6852,12 @@ impl Transcript {
             if only.is_some_and(|o| o != ix) {
                 continue;
             }
-            if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language
-                    .as_deref()
-                    .and_then(zeron_syntax::language_for_alias)
+            if let Block::CodeBlock { code, .. } = &top.block
+                && let Some(key) = top.code_highlight_key
             {
                 out.insert(
                     ix,
-                    self.highlights.request(row_id.clone(), ix, lang, code, cx),
+                    self.highlights.request(row_id.clone(), ix, key, code, cx),
                 );
             }
         }
@@ -6671,29 +6872,32 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Option<Arc<crate::changes::DiffHighlights>> {
         let ToolDetail::Diff {
-            file,
             old_text,
             new_text,
+            old_highlight_key,
+            new_highlight_key,
+            ..
         } = detail
         else {
             return None;
         };
         let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
         let old = match old_text {
-            Some(source) => {
-                let path = file.old_path.as_deref().unwrap_or(&file.path);
-                let lang = zeron_syntax::language_for_path(path)?;
-                Some(
-                    self.highlights
-                        .request(cache_row.clone(), 0, lang, source, cx)?,
-                )
-            }
+            Some(source) => Some(self.highlights.request(
+                cache_row.clone(),
+                0,
+                (*old_highlight_key)?,
+                source,
+                cx,
+            )?),
             None => None,
         };
         let new = match new_text {
             Some(source) => {
-                let lang = zeron_syntax::language_for_path(&file.path)?;
-                Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
+                Some(
+                    self.highlights
+                        .request(cache_row, 1, (*new_highlight_key)?, source, cx)?,
+                )
             }
             None => None,
         };
@@ -6713,7 +6917,10 @@ impl Transcript {
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         let collapses = tool_group_collapses(tools);
+        // Calm restyles ordinary tool groups only: subagent chips stay cards.
+        let calm = collapses && self.tool_row_style == ToolRowStyle::Calm;
         let arrival_pending = !cx.reduce_motion()
+            && !calm
             && self.tool_group_reveals.get(row_id).is_some_and(|reveal| {
                 reveal.starts.iter().flatten().any(|start| {
                     Instant::now()
@@ -6747,6 +6954,7 @@ impl Transcript {
                 && fold
                     .toggled_at
                     .is_some_and(|at| at.elapsed() < TOOL_FOLD.total()));
+        let tools_all = tools.as_slice();
         let tools = if body_visible { tools.as_slice() } else { &[] };
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
@@ -6874,12 +7082,17 @@ impl Transcript {
                     .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
-        let base_row_height = if collapses {
+        let base_row_height = if calm {
+            CALM_ROW_HEIGHT
+        } else if collapses {
             TOOL_TREE_ROW_HEIGHT
         } else {
             CHIP_HEIGHT
         };
+        let detail_line = theme.code_font_size * CALM_DETAIL_LINE_RATIO;
         let mut motion_active = false;
+        // Rows turning their chevrons keep the group's frame clock running.
+        let row_motion_active = Cell::new(false);
         let row_heights: Vec<f32> = details
             .iter()
             .zip(&invocations)
@@ -6887,7 +7100,15 @@ impl Transcript {
             .zip(&detail_opens)
             .zip(&detail_folds)
             .map(|((((detail, invocation), affordance), open), fold)| {
-                let target = if *open {
+                let target = if *open && calm {
+                    base_row_height
+                        + calm_detail_height(
+                            invocation.as_deref(),
+                            detail.as_deref(),
+                            affordance.is_some(),
+                            detail_line,
+                        )
+                } else if *open {
                     base_row_height
                         + invocation.as_deref().map_or(0.0, detail_height)
                         + detail.as_deref().map_or(0.0, detail_height)
@@ -6899,7 +7120,8 @@ impl Transcript {
                 } else {
                     base_row_height
                 };
-                if !cx.reduce_motion() {
+                // Calm details open instantly (T3 renders them conditionally).
+                if !cx.reduce_motion() && !calm {
                     if let Some(at) = fold.toggled_at {
                         let t = TOOL_FOLD
                             .curve
@@ -6918,6 +7140,8 @@ impl Transcript {
             })
             .collect();
         let reduce_motion = cx.reduce_motion();
+        // Calm rows simply appear (T3): no staggered reveal, no ribbons.
+        let instant_reveal = reduce_motion || calm;
         let now = Instant::now();
         let reveal_progress: Vec<f32> = (0..tools.len())
             .map(|ix| {
@@ -6927,7 +7151,7 @@ impl Transcript {
                     .and_then(|reveal| reveal.starts.get(ix))
                     .copied()
                     .flatten();
-                tool_row_reveal_progress(start, now, reduce_motion)
+                tool_row_reveal_progress(start, now, instant_reveal)
             })
             .collect();
         let connector_progress: Vec<f32> = (0..tools.len())
@@ -6938,7 +7162,7 @@ impl Transcript {
                     .and_then(|reveal| reveal.starts.get(ix))
                     .copied()
                     .flatten();
-                tool_connector_reveal_progress(start, now, reduce_motion)
+                tool_connector_reveal_progress(start, now, instant_reveal)
             })
             .collect();
         let header_reveal = tool_row_reveal_progress(
@@ -6946,7 +7170,7 @@ impl Transcript {
                 .get(row_id)
                 .and_then(|reveal| reveal.header_started_at),
             now,
-            reduce_motion,
+            instant_reveal,
         );
         if header_reveal < 1.0
             || reveal_progress.iter().any(|progress| *progress < 1.0)
@@ -6954,7 +7178,8 @@ impl Transcript {
         {
             motion_active = true;
         }
-        let revealed_height = CHIPS_TOP_PAD
+        let chips_top_pad = if calm { 0.0 } else { CHIPS_TOP_PAD };
+        let revealed_height = chips_top_pad
             + row_heights
                 .iter()
                 .zip(&reveal_progress)
@@ -6971,13 +7196,38 @@ impl Transcript {
         } else {
             None
         };
+        let disclosure_spec = if calm { CALM_CHEVRON_TURN } else { TOOL_FOLD };
         let disclosure_progress = if reduce_motion {
             if open { 1.0 } else { 0.0 }
         } else {
-            tool_disclosure_progress(open, fold, now)
+            let progress = disclosure_progress_at(open, fold.disclosure_at, disclosure_spec, now);
+            if calm && disclosure_in_flight(fold.disclosure_at, disclosure_spec, now) {
+                motion_active = true;
+            }
+            progress
         };
 
         let toggle_id = row_id.clone();
+        let mut calm_group_header: Option<AnyElement> = None;
+        if calm {
+            let on_toggle = cx.listener({
+                let toggle_id = toggle_id.clone();
+                move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_fold(toggle_id.clone(), viewport_height, effective_auto_open);
+                    cx.notify();
+                }
+            });
+            calm_group_header = Some(calm_group_header_row(
+                SharedString::from(format!("{row_id}-hdr")),
+                summary.clone(),
+                group_summary_icon(tools_all),
+                disclosure_progress,
+                shimmer_phase,
+                theme,
+                on_toggle,
+            ));
+        }
         // A quiet summary sits above the activity rail; its chevron occupies
         // the same gutter as the rounded task-tree elbows below it.
         let header = div()
@@ -7034,7 +7284,7 @@ impl Transcript {
             );
 
         let chips = div()
-            .pt(px(CHIPS_TOP_PAD))
+            .pt(px(chips_top_pad))
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
@@ -7074,6 +7324,79 @@ impl Transcript {
                 }
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
+                if calm {
+                    let key = SharedString::from(format!("{row_id}#d{ix}"));
+                    let expandable = detail.is_some() || invocation.is_some();
+                    let open = detail_opens[ix];
+                    let dfold = detail_folds[ix];
+                    let toggle_key = key.clone();
+                    let on_toggle = cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let entry = this.tool_details.entry(toggle_key.clone()).or_default();
+                        let currently_open = entry.open.unwrap_or(open);
+                        entry.open = Some(!currently_open);
+                        entry.epoch += 1;
+                        entry.toggled_at = Some(Instant::now());
+                        cx.notify();
+                    });
+                    let affordance =
+                        affordances[ix]
+                            .clone()
+                            .map(|ChipAffordance { blob_ref, label }| {
+                                let loading = matches!(
+                                    self.blob_details.get(&blob_ref),
+                                    Some(BlobFetch::Loading(_))
+                                );
+                                let mut row = div()
+                                    .id(SharedString::from(format!("{key}-blob")))
+                                    .h(px(BLOB_AFFORDANCE_HEIGHT))
+                                    .flex_none()
+                                    .pl(px(CALM_DETAIL_INDENT))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(TOOL_TEXT_SIZE))
+                                    .text_color(theme.text_faint)
+                                    .child(label);
+                                if !loading {
+                                    row = row
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(theme.text_muted))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                            cx.notify();
+                                        }));
+                                }
+                                row.into_any_element()
+                            });
+                    let chevron_progress = if reduce_motion {
+                        if open { 1.0 } else { 0.0 }
+                    } else {
+                        disclosure_progress_at(open, dfold.toggled_at, CALM_CHEVRON_TURN, now)
+                    };
+                    if !reduce_motion
+                        && disclosure_in_flight(dfold.toggled_at, CALM_CHEVRON_TURN, now)
+                    {
+                        row_motion_active.set(true);
+                    }
+                    let live = !tool.resolved && !tool.is_error;
+                    return calm_tool_row(
+                        CalmRow {
+                            tool,
+                            key,
+                            open,
+                            expandable,
+                            chevron_progress,
+                            shimmer_phase: shimmer_phase.filter(|_| live),
+                            invocation,
+                            detail,
+                            highlights: detail_highlights[ix].clone(),
+                            affordance,
+                            detail_line,
+                        },
+                        theme,
+                        on_toggle,
+                    );
+                }
                 if detail.is_none() && invocation.is_none() {
                     return reveal_tool_row(
                         tool_chip(
@@ -7229,6 +7552,7 @@ impl Transcript {
             }));
 
         let chips = chips.into_any_element();
+        motion_active |= row_motion_active.get();
 
         // Evaluate the group on the same clock as its disclosure. This also
         // gives completion a gentle close after the last arrival finishes,
@@ -7271,11 +7595,14 @@ impl Transcript {
             // retain their explicit mono/diff typography below this boundary.
             .font_family(theme.font_sans_fixed.clone())
             .when(collapses, |el| {
-                el.child(reveal_tool_row(
-                    header.into_any_element(),
-                    TOOL_GROUP_HEADER_HEIGHT,
-                    header_reveal,
-                ))
+                el.child(match calm_group_header {
+                    Some(header) => header,
+                    None => reveal_tool_row(
+                        header.into_any_element(),
+                        TOOL_GROUP_HEADER_HEIGHT,
+                        header_reveal,
+                    ),
+                })
             })
             .child(body)
             .when(motion_active, |group| {
@@ -7323,7 +7650,7 @@ fn user_bubble_text(
     let body_run = |len: usize| TextRun {
         len,
         font: gpui::font(theme.font_sans.clone()),
-        color: theme.text,
+        color: theme.message_foreground(),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -7331,7 +7658,7 @@ fn user_bubble_text(
     let chip_run = |len: usize| TextRun {
         len,
         font: gpui::font(theme.font_mono.clone()),
-        color: theme.code_text,
+        color: theme.message_foreground(),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -7350,7 +7677,7 @@ fn user_bubble_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    let wash = theme.code_wash;
+    let wash = theme.code_chip_fill();
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
     let underlay = canvas(
@@ -7610,7 +7937,7 @@ fn detail_body(
                     .min_w_0()
                     .flex()
                     .items_center();
-                let Some((text, runs)) = thought_line_text(line, theme) else {
+                let Some((text, runs)) = thought_line_text(line, theme.text_faint, theme) else {
                     return row; // blank separator row
                 };
                 row.child(
@@ -7642,7 +7969,11 @@ fn more_lines_row(truncated_by: usize, theme: &Theme) -> gpui::Div {
 /// Shape one flattened thought line into gpui text runs — the detail-body
 /// palette: faint foreground prose, semibold for bold, mono for code,
 /// underlined links (NOT clickable — a thought is a record, not a surface).
-fn thought_line_text(line: &[InlineRun], theme: &Theme) -> Option<(SharedString, Vec<TextRun>)> {
+fn thought_line_text(
+    line: &[InlineRun],
+    color: gpui::Hsla,
+    theme: &Theme,
+) -> Option<(SharedString, Vec<TextRun>)> {
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
     for run in line {
@@ -7663,16 +7994,16 @@ fn thought_line_text(line: &[InlineRun], theme: &Theme) -> Option<(SharedString,
         runs.push(TextRun {
             len: run.text.len(),
             font: f,
-            color: theme.text_faint,
+            color,
             background_color: None,
             underline: run.style.link.is_some().then_some(gpui::UnderlineStyle {
-                color: Some(theme.text_faint),
+                color: Some(color),
                 thickness: px(1.0),
                 wavy: false,
             }),
             strikethrough: run.style.strikethrough.then_some(gpui::StrikethroughStyle {
                 thickness: px(1.0),
-                color: Some(theme.text_faint),
+                color: Some(color),
             }),
         });
         text.push_str(&run.text);
@@ -8295,6 +8626,437 @@ fn subagent_chip(
         .into_any_element()
 }
 
+// ---------------------------------------------------------------------------
+// Calm (T3) tool rows
+// ---------------------------------------------------------------------------
+
+/// A Calm line's click handler.
+type CalmClick = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>;
+
+/// Everything one Calm tool row needs besides the theme and its click handler.
+struct CalmRow<'a> {
+    tool: &'a ToolItem,
+    /// `{row}#d{ix}` - the detail toggle's state key and the row's element id.
+    key: SharedString,
+    open: bool,
+    /// Whether a click has anything to open (a detail or full invocation).
+    expandable: bool,
+    /// Chevron turn: 0 closed .. 1 open.
+    chevron_progress: f32,
+    /// Live shimmer on the label while the call is still running.
+    shimmer_phase: Option<f32>,
+    invocation: Option<Arc<ToolDetail>>,
+    detail: Option<Arc<ToolDetail>>,
+    highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    /// The "Show full output" row, already wired and indented.
+    affordance: Option<AnyElement>,
+    /// Detail text line height (code size x 1.625).
+    detail_line: f32,
+}
+
+/// Height of a Calm row's open detail region: each panel (4px above it), the
+/// optional fetch affordance, and a 4px tail. Zero when nothing is open.
+/// Analytic like every tool height: the fold and the virtual list read it.
+fn calm_detail_height(
+    invocation: Option<&ToolDetail>,
+    detail: Option<&ToolDetail>,
+    affordance: bool,
+    line: f32,
+) -> f32 {
+    let panels: f32 = [invocation, detail]
+        .into_iter()
+        .flatten()
+        .map(|detail| CALM_PANEL_GAP + calm_panel_height(detail, line))
+        .sum();
+    if panels == 0.0 && !affordance {
+        return 0.0;
+    }
+    panels
+        + if affordance {
+            BLOB_AFFORDANCE_HEIGHT
+        } else {
+            0.0
+        }
+        + CALM_DETAIL_BOTTOM
+}
+
+/// One Calm detail panel: text panels are `lines x line + 2 x 8px`; diffs
+/// keep the changes pane's own analytic body height.
+fn calm_panel_height(detail: &ToolDetail, line: f32) -> f32 {
+    let text_rows = |rows: usize| rows as f32 * line + 2.0 * CALM_PANEL_PAD_Y;
+    match detail {
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => text_rows(lines.len() + usize::from(*truncated_by > 0)),
+        ToolDetail::Thought {
+            lines,
+            truncated_by,
+        } => text_rows(lines.len() + usize::from(*truncated_by > 0)),
+        ToolDetail::Stats { stats } => text_rows(stats.len()),
+        ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+    }
+}
+
+/// The glyph beside a group summary, chosen by what the group did: a uniform
+/// group wears its tools' glyph, a mixed one the generic tool mark.
+fn group_summary_icon(tools: &[ToolItem]) -> &'static str {
+    let glyph = |tool: &ToolItem| {
+        if tool.is_thought {
+            crate::icons::CHAT_ROUND_LINE
+        } else {
+            tool_icon_path(&tool.call)
+        }
+    };
+    match tools.first().map(glyph) {
+        Some(first) if tools.iter().all(|tool| glyph(tool) == first) => first,
+        _ => crate::icons::WIDGET,
+    }
+}
+
+/// First non-blank line of a thought, as plain text (T3 shows it after the
+/// "Thinking"/"Thought" prefix).
+fn thought_preview(tool: &ToolItem) -> Option<String> {
+    let ToolDetail::Thought { lines, .. } = tool.detail.as_deref()? else {
+        return None;
+    };
+    lines.iter().find_map(|line| {
+        let text: String = line.iter().map(|run| run.text.as_str()).collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    })
+}
+
+/// A Calm row's one-line label: the verb and its detail as one muted run (T3
+/// `secondary-label`), so a running call shimmers as a single shaped line.
+fn calm_row_label(tool: &ToolItem) -> SharedString {
+    if tool.is_thought {
+        let prefix = if tool.resolved { "Thought" } else { "Thinking" };
+        return match thought_preview(tool) {
+            Some(preview) => format!("{prefix} · {preview}").into(),
+            None => prefix.into(),
+        };
+    }
+    let (label, detail) = tool_chip_content(&tool.call);
+    // File actions name the file, not its whole path.
+    let detail = match &tool.call {
+        ToolCall::ReadFile { path }
+        | ToolCall::WriteFile { path, .. }
+        | ToolCall::EditFile { path, .. }
+        | ToolCall::ApplyPatch { path: Some(path) } => file_badge_name(path).to_owned(),
+        _ => detail,
+    };
+    if detail.is_empty() {
+        SharedString::from(label)
+    } else {
+        format!("{label} {detail}").into()
+    }
+}
+
+/// The trailing disclosure chevron: 12px in a 16px box, `icon_muted` at 70%,
+/// turning 90 degrees as the row opens. Present on every Calm row so labels
+/// never shift; an unexpandable row leaves the box empty.
+fn calm_chevron(progress: f32, visible: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .size(px(CALM_CHEVRON_BOX))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(visible, |boxed| {
+            boxed.child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(CALM_CHEVRON_SIZE))
+                    .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                        -std::f32::consts::FRAC_PI_2 * (1.0 - progress),
+                    )))
+                    .text_color(theme.icon_muted().opacity(0.7)),
+            )
+        })
+}
+
+/// The 24px line shared by Calm group headers and tool rows: glyph cell,
+/// label, optional failure tag, chevron. Hovering an interactive line fades
+/// in the row plate.
+fn calm_line(
+    id: SharedString,
+    glyph: &'static str,
+    glyph_color: gpui::Hsla,
+    label: AnyElement,
+    failed: bool,
+    chevron: gpui::Div,
+    on_click: Option<CalmClick>,
+    theme: &Theme,
+) -> AnyElement {
+    let fade_key = id.to_string();
+    div()
+        .id(id)
+        .h(px(CALM_ROW_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(CALM_ROW_GAP))
+        .px(px(CALM_ROW_PAD_X))
+        .rounded(px(CALM_ROW_RADIUS))
+        .text_size(px(CALM_TEXT_SIZE))
+        .line_height(px(CALM_LINE_HEIGHT))
+        .when_some(on_click, |line, on_click| {
+            line.cursor_pointer()
+                .role(gpui::Role::Button)
+                .bg(motion::hover_blend(
+                    &fade_key,
+                    gpui::transparent_black(),
+                    theme.row_hover_fill(),
+                ))
+                .on_hover(motion::hover_listener(fade_key.clone()))
+                .on_click(move |event, window, cx| on_click(event, window, cx))
+        })
+        .child(
+            div()
+                .size(px(CALM_ICON_CELL))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(glyph)
+                        .size(px(CALM_ICON_SIZE))
+                        .text_color(glyph_color),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(CALM_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .truncate()
+                .text_color(theme.text_muted)
+                .child(label),
+        )
+        .when(failed, |line| {
+            // Reserved failure tag, as in the Tree look: quiet mono danger.
+            line.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.danger.opacity(0.9))
+                    .child("failed"),
+            )
+        })
+        .child(chevron)
+        .into_any_element()
+}
+
+/// The Calm group header: the summary as the first row of the log.
+fn calm_group_header_row(
+    id: SharedString,
+    summary: SharedString,
+    glyph: &'static str,
+    progress: f32,
+    shimmer_phase: Option<f32>,
+    theme: &Theme,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    calm_line(
+        id,
+        glyph,
+        theme.icon_muted(),
+        shimmer_label(
+            summary,
+            shimmer_phase,
+            LabelSize::Px(CALM_TEXT_SIZE),
+            CALM_LINE_HEIGHT,
+            theme,
+        ),
+        false,
+        calm_chevron(progress, true, theme),
+        Some(Box::new(on_toggle)),
+        theme,
+    )
+}
+
+/// One Calm tool row with its open detail panels beneath.
+fn calm_tool_row(
+    row: CalmRow,
+    theme: &Theme,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let CalmRow {
+        tool,
+        key,
+        open,
+        expandable,
+        chevron_progress,
+        shimmer_phase,
+        invocation,
+        detail,
+        highlights,
+        affordance,
+        detail_line,
+    } = row;
+    let failed = tool.is_error;
+    let glyph = if tool.is_thought {
+        crate::icons::CHAT_ROUND_LINE
+    } else {
+        tool_icon_path(&tool.call)
+    };
+    // One muted glyph tone for every family (no per-family hue in this look);
+    // a failure softens to danger at 60% beside its reserved tag.
+    let glyph_color = if failed {
+        theme.danger.opacity(0.6)
+    } else {
+        theme.icon_muted()
+    };
+    let line = calm_line(
+        key,
+        glyph,
+        glyph_color,
+        shimmer_label(
+            calm_row_label(tool),
+            shimmer_phase,
+            LabelSize::Px(CALM_TEXT_SIZE),
+            CALM_LINE_HEIGHT,
+            theme,
+        ),
+        failed,
+        calm_chevron(chevron_progress, expandable, theme),
+        expandable.then(|| Box::new(on_toggle) as CalmClick),
+        theme,
+    );
+    let mut column = div().w_full().flex_none().flex().flex_col().child(line);
+    if open {
+        for (detail, highlights) in [(invocation, None), (detail, highlights)] {
+            let Some(detail) = detail else { continue };
+            column = column.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .pl(px(CALM_DETAIL_INDENT))
+                    .mt(px(CALM_PANEL_GAP))
+                    .child(calm_detail_panel(&detail, highlights, theme, detail_line)),
+            );
+        }
+        column = column.children(affordance);
+        column = column.child(div().h(px(CALM_DETAIL_BOTTOM)).flex_none());
+    }
+    column.into_any_element()
+}
+
+/// A Calm detail panel: output, thought and stat lines sit in a quiet 8px-radius
+/// plate (T3 `bg-muted/40`, `px-3 py-2`) in the code face at the code size;
+/// diffs keep the changes pane's own body, clipped to the same radius.
+fn calm_detail_panel(
+    detail: &ToolDetail,
+    highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    theme: &Theme,
+    line: f32,
+) -> AnyElement {
+    if let ToolDetail::Diff { file, .. } = detail {
+        return div()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(px(CALM_ROW_RADIUS))
+            .child(crate::changes::render_file_body_with_syntax(
+                file, highlights, theme,
+            ))
+            .into_any_element();
+    }
+    let row = || div().h(px(line)).w_full().min_w_0().flex().items_center();
+    let more = |truncated_by: usize| {
+        row()
+            .text_color(theme.text_faint)
+            .child(SharedString::from(format!("… {truncated_by} more lines")))
+    };
+    let panel = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(CALM_ROW_RADIUS))
+        .bg(theme.detail_panel_fill())
+        .px(px(CALM_PANEL_PAD_X))
+        .py(px(CALM_PANEL_PAD_Y))
+        .text_size(px(theme.code_font_size))
+        .text_color(theme.text_muted);
+    match detail {
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => {
+            panel
+                .font_family(theme.font_mono.clone())
+                .children(lines.iter().map(|text| {
+                    row().child(div().w_full().min_w_0().truncate().child(text.clone()))
+                }))
+                .when(*truncated_by > 0, |panel| panel.child(more(*truncated_by)))
+                .into_any_element()
+        }
+        ToolDetail::Thought {
+            lines,
+            truncated_by,
+        } => panel
+            .children(lines.iter().map(|runs| {
+                let Some((text, runs)) = thought_line_text(runs, theme.text_muted, theme) else {
+                    return row(); // blank separator row
+                };
+                row().child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .child(StyledText::new(text).with_runs(runs)),
+                )
+            }))
+            .when(*truncated_by > 0, |panel| panel.child(more(*truncated_by)))
+            .into_any_element(),
+        ToolDetail::Stats { stats } => panel
+            .font_family(theme.font_mono.clone())
+            .children(stats.iter().map(|stat| {
+                row()
+                    .gap(px(8.0))
+                    .child(
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(&stat.path),
+                            theme.appearance,
+                        )
+                        .size(px(14.0))
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(stat.path.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{}", stat.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("−{}", stat.deletions))),
+                    )
+            }))
+            .into_any_element(),
+        ToolDetail::Diff { .. } => unreachable!("diffs return above"),
+    }
+}
+
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     let mut acc: Vec<u8> = Vec::with_capacity(entry.parts.len() * 8 + 16);
     acc.extend_from_slice(entry.id.as_bytes());
@@ -8357,6 +9119,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_trace::transcript_render(cx.entity_id());
         if record_view_frame("transcript") {
             tracing::warn!(
                 distance = self.distance_from_bottom(),
@@ -8396,6 +9159,19 @@ impl Render for Transcript {
             // The outer list viewport may not resize when only max-width
             // changes. Invalidate virtual row heights explicitly, retaining
             // their anchors and all live animation/provenance state.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            if self.own_turn.is_some() {
+                self.own_turn_kick = true;
+            }
+        }
+        let tool_row_style = crate::settings::transcript_tool_rows(cx);
+        if self.tool_row_style != tool_row_style {
+            self.tool_row_style = tool_row_style;
+            // Row geometry differs per look (24px Calm rows vs the 32px Tree
+            // rail), so every cached tool-group height is stale.
             self.list.remeasure();
             if self.pinned {
                 self.wake_spring();
@@ -8630,6 +9406,8 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("transcript_scene_tests.rs");
+    include!("highlight_key_tests.rs");
 
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {
@@ -9371,8 +10149,14 @@ mod tests {
             toggled_at: Some(now),
             ..Default::default()
         };
-        assert_eq!(tool_disclosure_progress(true, fold, now), 1.0);
-        assert_eq!(tool_disclosure_progress(false, fold, now), 0.0);
+        assert_eq!(
+            disclosure_progress_at(true, fold.disclosure_at, TOOL_FOLD, now),
+            1.0
+        );
+        assert_eq!(
+            disclosure_progress_at(false, fold.disclosure_at, TOOL_FOLD, now),
+            0.0
+        );
     }
 
     #[test]
@@ -10557,13 +11341,49 @@ mod tests {
         // Rows: t0.0, t0.1, t0.2 (three MD blocks), g0, t1.0.
         assert_eq!(rows.len(), 5);
         // Sibling markdown blocks from the same part: md block gap.
-        assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
-        assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
-        // Markdown → tool group and tool group → next part: larger boundary.
-        assert_eq!(top_gap_for(Some(&rows[2]), &rows[3]), Theme::SPACE_MD);
-        assert_eq!(top_gap_for(Some(&rows[3]), &rows[4]), Theme::SPACE_MD);
-        // Turn starts get the turn gap regardless.
-        assert_eq!(top_gap_for(None, &rows[0]), Theme::SPACE_LG);
+        for look in ToolRowStyle::ALL {
+            assert_eq!(
+                top_gap_for(Some(&rows[0]), &rows[1], look),
+                render::MD_BLOCK_GAP
+            );
+            assert_eq!(
+                top_gap_for(Some(&rows[1]), &rows[2], look),
+                render::MD_BLOCK_GAP
+            );
+            // Turn starts get the turn gap regardless.
+            assert_eq!(top_gap_for(None, &rows[0], look), Theme::SPACE_LG);
+        }
+        // Markdown → tool group and tool group → next part: Calm's flat log
+        // sits 8px off its neighbours, the Tree rail keeps 12px.
+        for (look, gap) in [
+            (ToolRowStyle::Calm, Theme::SPACE_SM),
+            (ToolRowStyle::Tree, Theme::SPACE_MD),
+        ] {
+            assert_eq!(top_gap_for(Some(&rows[2]), &rows[3], look), gap);
+            assert_eq!(top_gap_for(Some(&rows[3]), &rows[4], look), gap);
+        }
+    }
+
+    #[test]
+    fn heading_rows_open_with_heading_air_in_live_and_split_rows() {
+        // T3's margin collapse: a heading takes 20px above, the block after it
+        // the ordinary 10.4px. Live and settled rows share `top_gap_for`, so
+        // the live->split handoff cannot move a pixel.
+        let text = "intro para\n\n## Section\n\nbody para";
+        for status in [MessageStatus::Complete, MessageStatus::Streaming] {
+            let entry = assistant("mh", status, vec![text_part("t0", text)]);
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 3);
+            let look = ToolRowStyle::default();
+            assert_eq!(
+                top_gap_for(Some(&rows[0]), &rows[1], look),
+                render::MD_HEADING_TOP_GAP
+            );
+            assert_eq!(
+                top_gap_for(Some(&rows[1]), &rows[2], look),
+                render::MD_BLOCK_GAP
+            );
+        }
     }
 
     #[test]
@@ -10587,6 +11407,77 @@ mod tests {
         };
         assert_eq!(tools.len(), 2);
         assert!(rows[0].turn_start && !rows[1].turn_start);
+    }
+
+    fn calm_tools(entry_id: &str, parts: Vec<MessagePart>) -> Vec<ToolItem> {
+        let entry = assistant(entry_id, MessageStatus::Complete, parts);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("group expected")
+        };
+        tools.as_ref().clone()
+    }
+
+    #[test]
+    fn calm_rows_are_24px_flat_lines_and_details_sum_analytically() {
+        assert_eq!(CALM_ROW_HEIGHT, 24.0);
+        assert!(CALM_ROW_HEIGHT < TOOL_TREE_ROW_HEIGHT);
+        let line = 13.0 * CALM_DETAIL_LINE_RATIO;
+        assert!((line - 21.125).abs() < 1e-4);
+        let output = |lines: usize, truncated_by: usize| ToolDetail::Output {
+            lines: vec!["x".into(); lines],
+            truncated_by,
+        };
+        // Nothing open: no height at all.
+        assert_eq!(calm_detail_height(None, None, false, line), 0.0);
+        // One output panel: 4px above + 3 lines + 2 x 8px padding + 4px tail.
+        let three = output(3, 0);
+        assert!(
+            (calm_detail_height(None, Some(&three), false, line)
+                - (CALM_PANEL_GAP + 3.0 * line + 2.0 * CALM_PANEL_PAD_Y + CALM_DETAIL_BOTTOM))
+                .abs()
+                < 1e-4
+        );
+        // A counted tail adds one row; the invocation adds a second panel;
+        // the fetch affordance adds its 24px lane.
+        let cut = output(24, 5);
+        let full = calm_detail_height(Some(&three), Some(&cut), true, line);
+        let expected = (CALM_PANEL_GAP + 3.0 * line + 16.0)
+            + (CALM_PANEL_GAP + 25.0 * line + 16.0)
+            + BLOB_AFFORDANCE_HEIGHT
+            + CALM_DETAIL_BOTTOM;
+        assert!((full - expected).abs() < 1e-3, "{full} vs {expected}");
+    }
+
+    #[test]
+    fn calm_labels_icons_and_thought_previews() {
+        let tools = calm_tools("mc", vec![tool_part("a", "ls"), tool_part("b", "pwd")]);
+        // Uniform groups wear their tools' glyph; mixed ones the generic mark.
+        assert_eq!(group_summary_icon(&tools), crate::icons::TERMINAL);
+        let mut mixed = tools.clone();
+        mixed[1].call = ToolCall::ReadFile {
+            path: "a/b.rs".into(),
+        };
+        assert_eq!(group_summary_icon(&mixed), crate::icons::WIDGET);
+        // File actions name the file, not the path.
+        assert!(calm_row_label(&mixed[1]).ends_with("b.rs"));
+        assert!(!calm_row_label(&mixed[1]).contains("a/b.rs"));
+
+        let thought = thought_item(
+            "th",
+            &parse_full("The user wants a *fix*.\n\nSecond paragraph."),
+            true,
+        );
+        assert_eq!(
+            thought_preview(&thought).as_deref(),
+            Some("The user wants a fix.")
+        );
+        assert_eq!(
+            calm_row_label(&thought).as_ref(),
+            "Thinking · The user wants a fix."
+        );
+        let settled = thought_item("th", &parse_full("Plan first."), false);
+        assert_eq!(calm_row_label(&settled).as_ref(), "Thought · Plan first.");
     }
 
     fn agent_part(id: &str, description: &str) -> MessagePart {
@@ -12562,13 +13453,7 @@ mod tests {
                 let before = transcript.read(cx).list.max_offset_for_scrollbar();
                 let toggle = |this: &mut Transcript, cx: &mut Context<Transcript>| {
                     let full_h = this.user_heights["prompt"].get();
-                    this.toggle_user_fold(
-                        "prompt".into(),
-                        0,
-                        USER_LINE_HEIGHT * (USER_COLLAPSED_LINES + 1) as f32,
-                        full_h,
-                        true,
-                    );
+                    this.toggle_user_fold("prompt".into(), 0, USER_COLLAPSED_HEIGHT, full_h, true);
                     this.user_folds.get_mut("prompt").unwrap().toggled_at =
                         Some(Instant::now() - Duration::from_secs(5));
                     cx.notify();
@@ -12719,8 +13604,12 @@ mod tests {
     #[test]
     fn long_prompts_collapse_and_short_ones_do_not() {
         assert!(!user_message_needs_collapse("short message"));
-        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
-        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        // T3 folds past 8 lines or 600 characters.
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5\n6\n7\n8"));
+        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6\n7\n8\n9"));
+        assert_eq!((USER_COLLAPSED_LINES, USER_COLLAPSE_CHARS), (8, 600));
+        assert_eq!(USER_COLLAPSED_HEIGHT, 176.0);
         assert!(
             !user_message_needs_collapse(&"x".repeat(240)),
             "ordinary two- or three-line prose must not grow a toggle"
@@ -12901,6 +13790,7 @@ mod tests {
             file,
             old_text,
             new_text,
+            ..
         }) = tool_detail(None, Some(&diff), None)
         else {
             panic!("expected diff detail");
@@ -12938,6 +13828,7 @@ mod tests {
             file,
             old_text,
             new_text,
+            ..
         }) = tool_detail(None, Some(&created), None)
         else {
             panic!("expected diff detail");
@@ -13427,19 +14318,33 @@ mod tests {
     }
 
     #[test]
-    fn tool_title_shimmer_crosses_the_title_without_a_loop_seam() {
-        assert_eq!(tool_title_shimmer_amount(0.5, 0.5), 1.0);
-        assert_eq!(tool_title_shimmer_amount(0.0, 0.5), 0.0);
-        assert_eq!(tool_title_shimmer_amount(1.0, 0.5), 0.0);
-        assert!(tool_title_shimmer_amount(0.3, 0.5) > 0.4);
-        assert!(tool_title_shimmer_amount(0.7, 0.5) > 0.4);
-        for x in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            assert_eq!(
-                tool_title_shimmer_amount(x, 0.0),
-                tool_title_shimmer_amount(x, 1.0),
-                "the repeating background must meet itself at x={x}"
-            );
+    fn tool_title_shimmer_is_a_72px_crest_that_enters_and_leaves_off_screen() {
+        let width = 200.0;
+        let half = motion::TOOL_SHIMMER_CREST_PX / 2.0;
+        assert_eq!(motion::TOOL_SHIMMER_CREST_PX, 72.0);
+        assert_eq!(motion::TOOL_SHIMMER_PERIOD, Duration::from_millis(2_200));
+        // Phase 0: the crest is fully off the left edge, phase 1: off the right,
+        // so the loop restart is invisible.
+        for x in [0.0, 50.0, 100.0, 200.0] {
+            assert_eq!(tool_title_shimmer_amount(x, width, 0.0), 0.0, "x={x}");
+            assert_eq!(tool_title_shimmer_amount(x, width, 1.0), 0.0, "x={x}");
         }
+        // Mid-sweep the crest sits on the label centre at full strength and
+        // fades linearly to nothing half a crest away.
+        assert_eq!(tool_title_shimmer_amount(width / 2.0, width, 0.5), 1.0);
+        assert_eq!(
+            tool_title_shimmer_amount(width / 2.0 + half, width, 0.5),
+            0.0
+        );
+        assert!(
+            (tool_title_shimmer_amount(width / 2.0 + half / 2.0, width, 0.5) - 0.5).abs() < 1e-4
+        );
+        // Absolute width: the same offset from the crest reads the same on a
+        // short and a long label.
+        let crest_at = |center: f32, width: f32| (center + half) / (width + 2.0 * half);
+        let short = tool_title_shimmer_amount(10.0 + 9.0, 60.0, crest_at(10.0, 60.0));
+        let long = tool_title_shimmer_amount(110.0 + 9.0, 160.0, crest_at(110.0, 160.0));
+        assert!((short - long).abs() < 1e-3, "{short} vs {long}");
 
         let start = Instant::now();
         assert_eq!(tool_title_shimmer_phase(start, start), 0.0);

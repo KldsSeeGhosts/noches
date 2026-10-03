@@ -96,6 +96,7 @@ impl ShortcutsPage {
         appshot_destination: AppshotDestination,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::motion::init_hover_owner(cx);
         cx.on_release(|_, _| crate::appshots::set_recording(false))
             .detach();
         Self {
@@ -506,7 +507,9 @@ fn group(id: ShortcutId) -> &'static str {
 /// `SHORTCUT_DEFINITIONS` descriptions, verbatim).
 fn description(id: ShortcutId) -> &'static str {
     match id {
-        ShortcutId::ToggleDictation => "Hold to record on-device dictation, release to transcribe into this draft.",
+        ShortcutId::ToggleDictation => {
+            "Hold to record on-device dictation, release to transcribe into this draft."
+        }
         ShortcutId::CaptureAppshot => {
             "Capture the focused application from anywhere on your desktop."
         }
@@ -538,6 +541,7 @@ impl Render for ShortcutsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.appshot_capabilities = crate::appshots::capabilities();
         if self.appshots_page {
+            crate::motion::clear_hover_owner(cx.entity_id());
             if std::mem::take(&mut self.appshots_focus_pending) {
                 window.focus(&self.focus, cx);
             }
@@ -691,7 +695,11 @@ impl Render for ShortcutsPage {
         // typography choices): the composer reads it live, and the shell's
         // `sync_independent_settings` keeps its own copy from clobbering it.
         let follow_up = crate::settings::current(cx).follow_up_behavior;
-        let modifier_chord = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+        let modifier_chord = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
         let follow_up_row = widgets::section_card(&theme).child(
             widgets::card_row(&theme, true)
                 .min_h(px(84.0))
@@ -715,7 +723,7 @@ impl Render for ShortcutsPage {
                         ),
                 )
                 .when(follow_up != FollowUpBehavior::default(), |row| {
-                    row.child(widgets::reset_button(&theme, "composer-follow-up-reset").on_click(
+                    row.child(widgets::reset_button(&theme, "composer-follow-up-reset", cx.entity_id()).on_click(
                         cx.listener(|_, _, _, cx| {
                             crate::settings::update(
                                 crate::settings::SavePolicy::Immediate,
@@ -820,6 +828,7 @@ impl Render for ShortcutsPage {
         };
 
         let scrollbar = self.render_scrollbar(&theme, cx);
+        crate::motion::drive_hover_owner(cx.entity_id(), window);
         div()
             .id("shortcuts-page-host")
             .relative()

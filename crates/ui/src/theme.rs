@@ -43,6 +43,14 @@ use zeron_theme::{
     ThemeColors, ThemeRegistry, ThemeVariant,
 };
 
+type PreviewKey = (Appearance, String, AccentSelection, SurfacePreference);
+thread_local! {
+    static PREVIEW_THEMES: std::cell::RefCell<(u64, std::collections::HashMap<PreviewKey, Theme>)>
+        = std::cell::RefCell::new((u64::MAX, Default::default()));
+    static TINT_ALPHAS: std::cell::RefCell<std::collections::HashMap<[u32; 17], f32>>
+        = std::cell::RefCell::new(Default::default());
+}
+
 /// User-selectable accent family. A choice is one color identity, not a
 /// miniature multi-hue theme: every interactive accent role stays on the same
 /// authored hue in both appearances.
@@ -792,7 +800,7 @@ impl TerminalColors {
             Appearance::Dark => "zeron-dark",
             Appearance::Light => "zeron-light",
         };
-        let registry = ThemeRegistry::active();
+        let (_, registry) = ThemeRegistry::snapshot();
         Self::from_variant(registry.variant(id).expect("Zeron terminal palette exists"))
     }
 }
@@ -845,7 +853,7 @@ impl Theme {
     /// to the bottom.
     pub const TRANSCRIPT_FADE_BAND: f32 = 24.0;
     /// Message bubble corner radius.
-    pub const BUBBLE_RADIUS: f32 = 16.0;
+    pub const BUBBLE_RADIUS: f32 = 18.0;
     /// Panel / card corner radius.
     pub const PANEL_RADIUS: f32 = 10.0;
     /// Small control radius (buttons, chips).
@@ -889,16 +897,43 @@ impl Theme {
     /// whose blurred content can otherwise invalidate an imported palette's
     /// original solid-background assumptions.
     fn contrast_checked_tint_alpha(&self, tint: Hsla, base: f32, backdrop: Hsla) -> f32 {
-        for step in 0..=20 {
-            let alpha = base + (1.0 - base) * step as f32 / 20.0;
-            let composite = flatten(tint.opacity(alpha), backdrop);
-            if painted_contrast(self.text, composite) >= 4.5
-                && painted_contrast(self.text_muted, composite) >= 3.0
-            {
-                return alpha;
-            }
+        // Key the actual immutable tokens, also honoring public-token
+        // overrides and popup text alpha without stale contrast results.
+        let mut key = [0; 17];
+        for (index, color) in [tint, backdrop, self.text, self.text_muted]
+            .into_iter()
+            .enumerate()
+        {
+            key[index * 4..index * 4 + 4].copy_from_slice(&[
+                color.h.to_bits(),
+                color.s.to_bits(),
+                color.l.to_bits(),
+                color.a.to_bits(),
+            ]);
         }
-        1.0
+        key[16] = base.to_bits();
+        TINT_ALPHAS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(alpha) = cache.get(&key) {
+                return *alpha;
+            }
+            let mut resolved = 1.0;
+            for step in 0..=20 {
+                let alpha = base + (1.0 - base) * step as f32 / 20.0;
+                let composite = flatten(tint.opacity(alpha), backdrop);
+                if painted_contrast(self.text, composite) >= 4.5
+                    && painted_contrast(self.text_muted, composite) >= 3.0
+                {
+                    resolved = alpha;
+                    break;
+                }
+            }
+            if cache.len() >= 512 {
+                cache.clear();
+            }
+            cache.insert(key, resolved);
+            resolved
+        })
     }
 
     fn adverse_backdrop(&self) -> Hsla {
@@ -1308,7 +1343,21 @@ impl Theme {
         accent_selection: AccentSelection,
         surface_preference: SurfacePreference,
     ) -> Self {
-        let registry = ThemeRegistry::active();
+        let (generation, registry) = ThemeRegistry::snapshot();
+        let key = (
+            appearance,
+            variant_id.to_owned(),
+            accent_selection,
+            surface_preference,
+        );
+        if let Some(theme) = PREVIEW_THEMES.with(|cache| {
+            let cache = cache.borrow();
+            (cache.0 == generation)
+                .then(|| cache.1.get(&key).cloned())
+                .flatten()
+        }) {
+            return theme;
+        }
         let fallback_id = match appearance {
             Appearance::Dark => "zeron-dark",
             Appearance::Light => "zeron-light",
@@ -1318,7 +1367,20 @@ impl Theme {
             .filter(|variant| model_appearance(variant.appearance) == appearance)
             .or_else(|| registry.variant(fallback_id))
             .expect("the built-in registry contains both Zeron appearances");
-        Self::from_variant(variant, accent_selection, surface_preference)
+        let theme = Self::from_variant(variant, accent_selection, surface_preference);
+        PREVIEW_THEMES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.0 != generation {
+                *cache = (generation, Default::default());
+            }
+            // Bound stale selections/config combinations even without a
+            // library mutation. Each page's warm sample set remains reusable.
+            if cache.1.len() >= 2048 {
+                cache.1.clear();
+            }
+            cache.1.insert(key, theme.clone());
+        });
+        theme
     }
 
     pub(crate) fn from_variant(
@@ -1704,6 +1766,71 @@ impl Theme {
     }
 }
 
+/// Transcript tokens: each reads the theme's optional role when it carries one
+/// (an imported T3 theme such as Claude) and otherwise derives a neutral
+/// equivalent from the base roles, so built-in themes stay quiet.
+impl Theme {
+    /// The explicit override of an optional role, if the theme set one.
+    fn explicit(&self, role: impl FnOnce(&ThemeColors) -> Option<ModelColor>) -> Option<Hsla> {
+        self.optional_colors
+            .as_ref()
+            .and_then(role)
+            .map(model_color)
+    }
+
+    /// Assistant body copy: the text tone at 80% over the canvas (T3 renders
+    /// prose as `text-foreground/80`), flattened to an opaque tone so the chip
+    /// and veil layers never double-darken it. Headings and strong runs stay
+    /// at full [`Self::text`].
+    pub fn prose_text(&self) -> Hsla {
+        flatten(self.text.opacity(0.80), self.bg)
+    }
+
+    /// Inline-code chip fill (T3 `--muted` behind `code`): the theme's `muted`
+    /// role when it has one, else a quiet neutral plate from the ink ladder.
+    pub fn code_chip_fill(&self) -> Hsla {
+        self.explicit(|c| c.muted).unwrap_or_else(|| self.ink(0.07))
+    }
+
+    /// Hover plate under a Calm tool row (T3 `hover:bg-accent/20`): the
+    /// `accent_surface` role at 20% when the theme has one, else a whisper of
+    /// neutral ink (the accent-wash fallback would tint every built-in theme).
+    pub fn row_hover_fill(&self) -> Hsla {
+        match self.explicit(|c| c.accent_surface) {
+            Some(surface) => surface.opacity(0.2),
+            None => self.ink(0.06),
+        }
+    }
+
+    /// Plate behind expanded tool output (T3 `bg-muted/40`): the `muted` role
+    /// at 40% when the theme has one, else neutral ink.
+    pub fn detail_panel_fill(&self) -> Hsla {
+        match self.explicit(|c| c.muted) {
+            Some(muted) => muted.opacity(0.4),
+            None => self.ink(0.045),
+        }
+    }
+
+    /// Fence surface (T3 `code-background`): the theme's role when it has one,
+    /// else the quiet ink plate fences have always sat on.
+    pub fn code_surface(&self) -> Hsla {
+        self.explicit(|c| c.code_background)
+            .unwrap_or_else(|| self.ink(0.035))
+    }
+
+    /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on
+    /// dark). A deliberate product decision, not a missing role: links keep
+    /// T3's blue rather than the accent (the [`Self::link`] fallback) or an
+    /// imported theme's `updateForeground`.
+    pub fn link_text(&self) -> Hsla {
+        gpui::rgb(match self.appearance {
+            Appearance::Light => 0x1447e6,
+            Appearance::Dark => 0x51a2ff,
+        })
+        .into()
+    }
+}
+
 fn scrollbar_thumb_colors(theme: &Theme) -> (Hsla, Hsla, Hsla) {
     (
         theme.text.opacity(0.30),
@@ -2077,6 +2204,63 @@ pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_preview_palettes_match_direct_resolution() {
+        for family in &ThemeRegistry::builtin().families {
+            for variant in &family.variants {
+                for surface in [
+                    SurfacePreference::ThemeDefault,
+                    SurfacePreference::Opaque,
+                    SurfacePreference::Frosted,
+                ] {
+                    for accent in [
+                        AccentSelection::ThemeDefault,
+                        AccentSelection::Preset(AccentPreset::Orange),
+                    ] {
+                        let direct = Theme::from_variant(variant, accent, surface);
+                        for _ in 0..2 {
+                            let cached = Theme::for_selection(
+                                model_appearance(variant.appearance),
+                                &variant.id,
+                                accent,
+                                surface,
+                            );
+                            assert_eq!(format!("{cached:?}"), format!("{direct:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_glass_contrast_matches_the_original_scalar_search() {
+        for mut theme in [Theme::dark(), Theme::light()] {
+            theme.surface_treatment = SurfaceTreatment::Frosted;
+            for tint in [theme.surface, theme.surface_overlay, theme.input_bg] {
+                for base in [0.30, 0.50, 0.80, 0.85] {
+                    let backdrop = theme.adverse_backdrop();
+                    let expected = (0..=20)
+                        .map(|step| base + (1.0 - base) * step as f32 / 20.0)
+                        .find(|alpha| {
+                            let composite = flatten(tint.opacity(*alpha), backdrop);
+                            painted_contrast(theme.text, composite) >= 4.5
+                                && painted_contrast(theme.text_muted, composite) >= 3.0
+                        })
+                        .unwrap_or(1.0);
+                    assert_eq!(
+                        theme.contrast_checked_tint_alpha(tint, base, backdrop),
+                        expected
+                    );
+                    assert_eq!(
+                        theme.contrast_checked_tint_alpha(tint, base, backdrop),
+                        expected
+                    );
+                }
+            }
+        }
+    }
 
     fn srgb_u8(c: [f32; 3]) -> [u8; 3] {
         [
@@ -3179,6 +3363,6 @@ mod tests {
     fn layout_numbers_match_zeron() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
-        assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+        assert_eq!(Theme::BUBBLE_RADIUS, 18.0);
     }
 }

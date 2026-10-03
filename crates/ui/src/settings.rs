@@ -225,6 +225,13 @@ pub fn transcript_width(cx: &App) -> f32 {
         .unwrap_or(TRANSCRIPT_WIDTH_DEFAULT)
 }
 
+/// The selected transcript tool-row look (Calm until settings load).
+pub fn transcript_tool_rows(cx: &App) -> ToolRowStyle {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.transcript_tool_rows)
+        .unwrap_or_default()
+}
+
 pub fn set_transcript_width(width: f32, cx: &mut App) {
     if update(SavePolicy::Debounced, cx, |settings| {
         settings.transcript_width = normalize_transcript_width(width);
@@ -472,6 +479,31 @@ pub enum GitHistoryAuthorDisplay {
     #[default]
     Avatar,
     Name,
+}
+
+/// How transcript tool calls draw their rows.
+///
+/// `Calm` is T3's flat log: 24px rows, a muted 16px glyph, an always-visible
+/// chevron, and details in a quiet panel. `Tree` is the earlier BoardUI task
+/// tree: a 48px rail with ribbons and elbows, tinted icons, and a staggered
+/// reveal. Both keep Noches' inline diffs and live shimmer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolRowStyle {
+    #[default]
+    Calm,
+    Tree,
+}
+
+impl ToolRowStyle {
+    pub const ALL: [Self; 2] = [Self::Calm, Self::Tree];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calm => "Calm",
+            Self::Tree => "Tree",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,6 +788,8 @@ pub struct UiSettings {
     pub code_fences_fit_content: bool,
     /// Maximum conversation width in logical pixels; composer width is independent.
     pub transcript_width: f32,
+    /// Transcript tool rows: T3's flat Calm log (default) or the Tree rail.
+    pub transcript_tool_rows: ToolRowStyle,
     /// Open a normal web-link activation in the session Browser. Explicit
     /// context-menu actions remain available regardless of this preference.
     pub open_web_links_in_zeron: bool,
@@ -838,6 +872,7 @@ impl Default for UiSettings {
             diff_wrap: false,
             code_fences_fit_content: false,
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
+            transcript_tool_rows: ToolRowStyle::default(),
             open_web_links_in_zeron: true,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
@@ -2141,6 +2176,7 @@ mod tests {
             diff_wrap: true,
             code_fences_fit_content: true,
             transcript_width: 960.0,
+            transcript_tool_rows: ToolRowStyle::Tree,
             open_web_links_in_zeron: false,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
@@ -2434,6 +2470,32 @@ mod tests {
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
         std::fs::write(UiSettings::path(dir.path()), "{not json").unwrap();
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+    }
+
+    #[test]
+    fn tool_rows_default_to_calm_and_round_trip_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        // Settings written before the option existed load as Calm.
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).transcript_tool_rows,
+            ToolRowStyle::Calm
+        );
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"transcriptToolRows": "tree"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).transcript_tool_rows,
+            ToolRowStyle::Tree
+        );
+        let json = serde_json::to_string(&UiSettings {
+            transcript_tool_rows: ToolRowStyle::Tree,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(json.contains(r#""transcriptToolRows":"tree""#), "{json}");
     }
 
     #[test]

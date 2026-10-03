@@ -2,14 +2,18 @@
 //!
 //! One vocabulary for chrome controls: `Xs / Sm / Md` sizes crossed with
 //! `Ghost / Outline / Primary / Destructive` variants, text or icon-only.
-//! Hover rides [`motion::hover_blend`] keyed by the control's id, so a caller
-//! must NOT attach its own `.on_hover` (gpui keeps one listener per element)
-//! and passes ids that are unique and stable across frames.
+//! Hover rides [`motion::hover_blend_owned`] keyed by the render owner's
+//! entity and the control's id. Callers initialize and drive that owner with
+//! [`motion::init_hover_owner`] / [`motion::drive_hover_owner`], pass ids that
+//! are unique and stable within it, and must NOT attach another `.on_hover`
+//! (gpui keeps one listener per element).
 //!
 //! Colour comes from [`Theme`]'s role accessors so the primary action takes the theme's
 //! `action` role once D1 lands and stays monochrome until then.
 
-use gpui::{Div, FontWeight, Hsla, SharedString, Stateful, div, hsla, point, prelude::*, px};
+use gpui::{
+    Div, EntityId, FontWeight, Hsla, SharedString, Stateful, div, hsla, point, prelude::*, px,
+};
 
 use crate::elevation;
 use crate::icons::{self, icon};
@@ -149,6 +153,7 @@ fn plate_shadows(variant: Variant) -> Vec<gpui::BoxShadow> {
 
 fn frame(
     id: SharedString,
+    owner: EntityId,
     theme: &Theme,
     variant: Variant,
     size: Size,
@@ -164,8 +169,8 @@ fn frame(
         .justify_center()
         .rounded(px(size.radius()))
         .cursor_pointer()
-        .bg(motion::hover_blend(&id, p.rest_bg, p.hover_bg))
-        .text_color(motion::hover_blend(&id, p.rest_fg, p.hover_fg))
+        .bg(motion::hover_blend_owned(owner, &id, p.rest_bg, p.hover_bg))
+        .text_color(motion::hover_blend_owned(owner, &id, p.rest_fg, p.hover_fg))
         .active(|s| s.bg(p.pressed_bg))
         .focus_visible(|s| s.shadow(elevation::focus_ring(theme)));
     let shadows = plate_shadows(variant);
@@ -175,7 +180,8 @@ fn frame(
     if let Some(border) = p.border {
         el = el.border_1().border_color(border);
     }
-    el.interactivity().on_hover(motion::hover_listener(id));
+    el.interactivity()
+        .on_hover(motion::hover_listener_owned(owner, id));
     (el, p)
 }
 
@@ -183,12 +189,13 @@ fn frame(
 /// [`with_icon`].
 pub fn button(
     id: impl Into<SharedString>,
+    owner: EntityId,
     theme: &Theme,
     variant: Variant,
     size: Size,
     label: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    let (el, _) = frame(id.into(), theme, variant, size);
+    let (el, _) = frame(id.into(), owner, theme, variant, size);
     el.h(px(size.height()))
         .px(px(size.pad_x()))
         .gap(px(6.0))
@@ -204,6 +211,7 @@ pub fn button(
 /// [`crate::tooltip::text`] at the call site when the glyph is not obvious.
 pub fn icon_button(
     id: impl Into<SharedString>,
+    owner: EntityId,
     theme: &Theme,
     variant: Variant,
     size: Size,
@@ -211,8 +219,8 @@ pub fn icon_button(
     label: &'static str,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
-    let (el, p) = frame(id.clone(), theme, variant, size);
-    let tint = motion::hover_blend(&id, p.rest_fg, p.hover_fg);
+    let (el, p) = frame(id.clone(), owner, theme, variant, size);
+    let tint = motion::hover_blend_owned(owner, &id, p.rest_fg, p.hover_fg);
     el.size(px(size.height()))
         .aria_label(label)
         .child(icon(glyph).size(px(size.icon())).text_color(tint))
@@ -239,8 +247,16 @@ pub fn kbd(theme: &Theme, label: impl Into<SharedString>) -> Div {
 }
 
 /// Close affordance for dialogs and banners: a ghost `Xs` icon button.
-pub fn close_button(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
-    icon_button(id, theme, Variant::Ghost, Size::Xs, icons::CLOSE, "Close")
+pub fn close_button(id: impl Into<SharedString>, owner: EntityId, theme: &Theme) -> Stateful<Div> {
+    icon_button(
+        id,
+        owner,
+        theme,
+        Variant::Ghost,
+        Size::Xs,
+        icons::CLOSE,
+        "Close",
+    )
 }
 
 #[cfg(test)]

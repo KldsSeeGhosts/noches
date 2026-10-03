@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::prelude::*;
@@ -56,6 +57,68 @@ pub struct SubagentSummary {
     pub doc_ref: Option<SharedString>,
     /// Sits in the chat's latest turn (after the last user entry).
     pub latest_turn: bool,
+}
+
+/// One update-owned presentation shared by all consumers. Subsets retain only
+/// indices into the same immutable summaries; render does no history work.
+#[derive(Debug, Default)]
+pub(crate) struct SubagentPresentation {
+    summaries: Arc<[SubagentSummary]>,
+    tray: Vec<usize>,
+    running: Vec<usize>,
+}
+
+impl std::ops::Deref for SubagentPresentation {
+    type Target = [SubagentSummary];
+    fn deref(&self) -> &Self::Target {
+        &self.summaries
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SubagentSubset<'a> {
+    summaries: &'a [SubagentSummary],
+    indices: &'a [usize],
+}
+
+impl SubagentSubset<'_> {
+    fn iter(&self) -> impl ExactSizeIterator<Item = &SubagentSummary> {
+        self.indices.iter().map(|&ix| &self.summaries[ix])
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.indices.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
+impl SubagentPresentation {
+    fn new(summaries: Vec<SubagentSummary>) -> Self {
+        let tray = summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.latest_turn || s.status == SubagentPhase::Running)
+            .map(|(ix, _)| ix)
+            .collect();
+        let running = summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.status == SubagentPhase::Running)
+            .map(|(ix, _)| ix)
+            .collect();
+        Self {
+            summaries: summaries.into(),
+            tray,
+            running,
+        }
+    }
+    pub(crate) fn running(&self) -> SubagentSubset<'_> {
+        SubagentSubset {
+            summaries: &self.summaries,
+            indices: &self.running,
+        }
+    }
 }
 
 impl SubagentSummary {
@@ -129,8 +192,9 @@ fn spawn_title(call: &ToolCall) -> SharedString {
 /// First meaningful line of a result, capped at 120 chars.
 fn one_line(text: &str) -> Option<SharedString> {
     let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
-    let mut out: String = line.chars().take(120).collect();
-    if line.chars().count() > 120 {
+    let mut chars = line.chars();
+    let mut out: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     Some(SharedString::from(out))
@@ -161,7 +225,22 @@ pub fn result_doc_id(chat_id: &str, part_id: &str) -> String {
 /// selects nothing - that is the "transcript loaded" gate the sidebar uses.
 ///
 /// Order: running first (oldest first), then finished (newest first).
-pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
+pub(crate) fn subagents_for(state: &AppState, chat_id: &str) -> Arc<SubagentPresentation> {
+    crate::perf_trace::subagent_cache_hit();
+    state
+        .subagent_presentations
+        .get(chat_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            static EMPTY: OnceLock<Arc<SubagentPresentation>> = OnceLock::new();
+            EMPTY
+                .get_or_init(|| Arc::new(SubagentPresentation::default()))
+                .clone()
+        })
+}
+
+fn derive_subagents(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
+    crate::perf_trace::subagent_scan();
     let entries: &[SessionMessageEntry] = if state.selected_chat.as_deref() == Some(chat_id) {
         &state.transcript
     } else {
@@ -256,7 +335,6 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
                     .or_else(|| {
                         state
                             .subagent_finished_obs
-                            .borrow()
                             .get(&part_key(chat_id, id))
                             .and_then(|ms| millis(*ms))
                     })
@@ -275,6 +353,10 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
             });
         }
     }
+    out
+}
+
+fn sort_summaries(out: &mut [SubagentSummary]) {
     out.sort_by(|a, b| {
         let bucket = |s: &SubagentSummary| !s.status.active();
         bucket(a).cmp(&bucket(b)).then_with(|| {
@@ -285,34 +367,84 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
             }
         })
     });
-    // Record first-observation finish times so terminal agents without a
-    // loaded doc still stop their elapsed clock somewhere stable. Only keys
-    // this session has seen ACTIVE qualify - after a restart a terminal
-    // agent's real finish time is gone, and stamping "now" would render a
-    // bogus multi-minute elapsed for a seconds-long agent.
-    let mut active = state.subagent_active_obs.borrow_mut();
-    let mut obs = state.subagent_finished_obs.borrow_mut();
-    for s in &out {
-        let key = part_key(chat_id, &s.id);
-        if s.status.active() {
-            active.insert(key);
-        } else if s.finished.is_none() && active.contains(&key) {
-            obs.entry(key).or_insert_with(|| Utc::now().timestamp_millis());
+}
+
+impl AppState {
+    /// Runs only on a doc update, never from a selector/render. Child-doc
+    /// changes rebuild only parents that actually reference that document.
+    pub(crate) fn refresh_subagents(&mut self, doc_id: &str) {
+        let parents = self
+            .subagent_parents
+            .get(doc_id)
+            .cloned()
+            .unwrap_or_default();
+        self.prepare_subagents(doc_id);
+        for parent in parents {
+            if parent != doc_id {
+                self.prepare_subagents(&parent);
+            }
         }
     }
-    out
+
+    pub(crate) fn prune_subagent_presentations(&mut self) {
+        let retained: HashSet<_> = self
+            .subagent_presentations
+            .keys()
+            .filter(|id| self.subagent_source_retained(id))
+            .cloned()
+            .collect();
+        self.subagent_presentations
+            .retain(|id, _| retained.contains(id));
+        self.subagent_parents.retain(|_, parents| {
+            parents.retain(|parent| self.subagent_presentations.contains_key(parent));
+            !parents.is_empty()
+        });
+    }
+
+    fn prepare_subagents(&mut self, chat_id: &str) {
+        let mut summaries = derive_subagents(self, chat_id);
+        // Only agents observed active in this app lifetime get an inferred
+        // finish time. A terminal replay after restart never stamps "now".
+        let now = Utc::now().timestamp_millis();
+        for summary in &mut summaries {
+            let key = part_key(chat_id, &summary.id);
+            if summary.status.active() {
+                self.subagent_active_obs.insert(key);
+            } else if summary.finished.is_none() && self.subagent_active_obs.contains(&key) {
+                summary.finished = millis(*self.subagent_finished_obs.entry(key).or_insert(now));
+            }
+        }
+        sort_summaries(&mut summaries);
+        if let Some(previous) = self.subagent_presentations.get(chat_id) {
+            for doc in previous.iter().filter_map(|s| s.doc_ref.as_deref()) {
+                if let Some(parents) = self.subagent_parents.get_mut(doc) {
+                    parents.remove(chat_id);
+                    if parents.is_empty() {
+                        self.subagent_parents.remove(doc);
+                    }
+                }
+            }
+        }
+        for doc in summaries.iter().filter_map(|s| s.doc_ref.as_deref()) {
+            self.subagent_parents
+                .entry(doc.to_owned())
+                .or_default()
+                .insert(chat_id.to_owned());
+        }
+        self.subagent_presentations.insert(
+            chat_id.to_owned(),
+            Arc::new(SubagentPresentation::new(summaries)),
+        );
+    }
 }
 
 /// The tray's visible subset: the latest turn's subagents, plus anything
 /// still live from earlier turns.
-pub fn strip_visible(summaries: &[SubagentSummary]) -> Vec<SubagentSummary> {
-    summaries
-        .iter()
-        // Earlier turns only carry agents we KNOW are live: a detached
-        // `Started` spawn never reports back, so it must not pin the strip.
-        .filter(|s| s.latest_turn || s.status == SubagentPhase::Running)
-        .cloned()
-        .collect()
+pub(crate) fn strip_visible(summaries: &SubagentPresentation) -> SubagentSubset<'_> {
+    SubagentSubset {
+        summaries: &summaries.summaries,
+        indices: &summaries.tray,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,12 +495,12 @@ pub fn status_glyph(
 
 /// The summary behind an open child thread: its spawned doc, or (for
 /// doc-less harnesses) the synthetic result doc of the spawn call.
-pub fn summary_for_doc(
-    summaries: Vec<SubagentSummary>,
+pub fn summary_for_doc<'a>(
+    summaries: &'a [SubagentSummary],
     parent_chat_id: &str,
     doc_id: &str,
-) -> Option<SubagentSummary> {
-    summaries.into_iter().find(|s| {
+) -> Option<&'a SubagentSummary> {
+    summaries.iter().find(|s| {
         s.doc_ref.as_deref() == Some(doc_id) || result_doc_id(parent_chat_id, &s.id) == doc_id
     })
 }
@@ -475,6 +607,7 @@ pub fn child_thread_banner(
         .child(
             crate::controls::button(
                 format!("child-banner-parent-{}", banner.key),
+                view,
                 theme,
                 crate::controls::Variant::Ghost,
                 crate::controls::Size::Xs,
@@ -511,10 +644,10 @@ fn pill_width(title_chars: usize) -> f32 {
 /// How many leading pills fit `width` (the tray's inner width), keeping
 /// room for the leading label, the `+N` overflow pill and the trailing
 /// chevron.
-fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
+fn fitting(summaries: SubagentSubset<'_>, width: f32) -> usize {
     let mut used = 74.0 + 28.0 + PILL_GAP;
     let mut shown = 0usize;
-    for s in summaries {
+    for s in summaries.iter() {
         let left_after = summaries.len() - shown - 1;
         let reserve = if left_after > 0 { 44.0 } else { 0.0 };
         if used + pill_width(s.title.chars().count()) + reserve > width {
@@ -527,9 +660,9 @@ fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
 }
 
 /// The tray's pills that fit `width`; `+N` covers the remainder.
-pub fn tray_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSummary>, usize) {
+fn tray_layout(summaries: SubagentSubset<'_>, width: f32) -> (usize, usize) {
     let shown = fitting(summaries, width);
-    (summaries[..shown].to_vec(), summaries.len() - shown)
+    (shown, summaries.len() - shown)
 }
 
 /// The agents tray content row: `Agents {done}/{total}` label, fitted
@@ -544,7 +677,7 @@ pub fn tray_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSu
 #[allow(clippy::too_many_arguments)] // render fn; params are the tray's props
 pub fn agents_tray_row(
     chat_id: &str,
-    summaries: &[SubagentSummary],
+    summaries: SubagentSubset<'_>,
     inner_width: f32,
     panel_open: bool,
     seen: &HashSet<String>,
@@ -585,7 +718,7 @@ pub fn agents_tray_row(
                         .child(SharedString::from(format!("{done}/{}", summaries.len()))),
                 ),
         );
-    for s in shown {
+    for s in summaries.iter().take(shown) {
         let summary = s.clone();
         let chat = chat_id.to_string();
         let elapsed = s.elapsed(now);
@@ -712,7 +845,7 @@ pub const SIDEBAR_CHILD_PAD_BOTTOM: f32 = 4.0;
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar_children(
     chat_id: &str,
-    summaries: &[SubagentSummary],
+    summaries: SubagentSubset<'_>,
     now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
@@ -720,19 +853,15 @@ pub fn sidebar_children(
     open_panel: OpenPanel,
     cx: &Context<Shell>,
 ) -> AnyElement {
-    let running: Vec<&SubagentSummary> = summaries
-        .iter()
-        .filter(|s| s.status == SubagentPhase::Running)
-        .collect();
-    let more = running.len().saturating_sub(SIDEBAR_CHILD_MAX);
+    let more = summaries.len().saturating_sub(SIDEBAR_CHILD_MAX);
     let mut col = div()
         .w_full()
         .flex()
         .flex_col()
         .pt(px(SIDEBAR_CHILD_GAP))
         .pb(px(SIDEBAR_CHILD_PAD_BOTTOM));
-    for s in running.iter().take(SIDEBAR_CHILD_MAX) {
-        let summary = (*s).clone();
+    for s in summaries.iter().take(SIDEBAR_CHILD_MAX) {
+        let summary = s.clone();
         let chat = chat_id.to_string();
         let open = open.clone();
         col = col.child(
@@ -1027,7 +1156,8 @@ impl crate::composer::Composer {
             .target
             .chat_id(self.state.read(cx))
             .map(str::to_owned)?;
-        let summaries = strip_visible(&subagents_for(self.state.read(cx), &chat_id));
+        let presentation = subagents_for(self.state.read(cx), &chat_id);
+        let summaries = strip_visible(&presentation);
         if summaries.is_empty() {
             return None;
         }
@@ -1044,7 +1174,7 @@ impl crate::composer::Composer {
         let seen = std::mem::take(&mut self.subagent_seen);
         let row = agents_tray_row(
             &chat_id,
-            &summaries,
+            summaries,
             inner_width,
             panel_open,
             &seen,
@@ -1107,8 +1237,8 @@ mod tests {
     fn selector_orders_running_then_finished_and_tags_latest_turn() {
         let mut state = AppState::new();
         state.selected_chat = Some("c".into());
-        let mut done = spawn("a", true, Some(SubagentStatus::Done));
-        let mut running = spawn("b", false, Some(SubagentStatus::Running));
+        let done = spawn("a", true, Some(SubagentStatus::Done));
+        let running = spawn("b", false, Some(SubagentStatus::Running));
         let mut started = spawn("s", true, None);
         if let MessagePart::Tool { call, .. } = &mut started {
             *call = ToolCall::Unknown {
@@ -1116,7 +1246,7 @@ mod tests {
                 input: Some(serde_json::json!({"run_in_background": true})),
             };
         }
-        state.transcript = vec![
+        state.apply_transcript(vec![
             entry("u1", MessageRole::User, vec![]),
             entry(
                 "m1",
@@ -1125,7 +1255,7 @@ mod tests {
             ),
             entry("u2", MessageRole::User, vec![]),
             entry("m2", MessageRole::Assistant, vec![started]),
-        ];
+        ]);
         let out = subagents_for(&state, "c");
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].status, SubagentPhase::Running);
@@ -1141,18 +1271,18 @@ mod tests {
         let mut state = AppState::new();
         state.selected_chat = Some("c".into());
         // Unresolved in a streaming turn = Running; resolved with output = Done.
-        let mut unresolved = spawn("p1", false, None);
+        let unresolved = spawn("p1", false, None);
         let mut resolved = spawn("p2", true, None);
         if let MessagePart::Tool { output, .. } = &mut resolved {
             *output = Some("agent report: all green".into());
         }
         let mut live = entry("m", MessageRole::Assistant, vec![unresolved.clone()]);
         live.status = Some(MessageStatus::Streaming);
-        state.transcript = vec![
+        state.apply_transcript(vec![
             entry("u", MessageRole::User, vec![]),
             live,
             entry("m2", MessageRole::Assistant, vec![resolved]),
-        ];
+        ]);
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Running);
         assert_eq!(out[1].status, SubagentPhase::Done);
@@ -1166,7 +1296,7 @@ mod tests {
         let resolved_no_output = spawn("e", true, None);
         let mut live = entry("m", MessageRole::Assistant, vec![resolved_no_output]);
         live.status = Some(MessageStatus::Streaming);
-        state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
+        state.apply_transcript(vec![entry("u", MessageRole::User, vec![]), live]);
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Started);
     }
@@ -1178,20 +1308,20 @@ mod tests {
         // A settled agent first observed after an app restart (no doc, no
         // output): never stamp a finish time and never show a guessed
         // elapsed.
-        state.transcript = vec![
+        state.apply_transcript(vec![
             entry("u", MessageRole::User, vec![]),
             entry(
                 "m",
                 MessageRole::Assistant,
                 vec![spawn("a", true, Some(SubagentStatus::Done))],
             ),
-        ];
+        ]);
         let out = subagents_for(&state, "c");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, SubagentPhase::Done);
         assert!(out[0].finished.is_none());
         assert!(out[0].elapsed(Utc::now()).is_none());
-        assert!(state.subagent_finished_obs.borrow().is_empty());
+        assert!(state.subagent_finished_obs.is_empty());
 
         // The same agent seen Running first, then Done: the transition
         // stamps a finish observation and elapsed freezes.
@@ -1201,20 +1331,19 @@ mod tests {
             vec![spawn("a", false, Some(SubagentStatus::Running))],
         );
         live.status = Some(MessageStatus::Streaming);
-        state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
+        state.apply_transcript(vec![entry("u", MessageRole::User, vec![]), live]);
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Running);
 
-        state.transcript = vec![
+        state.apply_transcript(vec![
             entry("u", MessageRole::User, vec![]),
             entry(
                 "m",
                 MessageRole::Assistant,
                 vec![spawn("a", true, Some(SubagentStatus::Done))],
             ),
-        ];
-        // The terminal frame stamps the observation; the next read returns it.
-        subagents_for(&state, "c");
+        ]);
+        // Update handling stamps the observation, not the first render.
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Done);
         assert!(out[0].finished.is_some());
@@ -1237,14 +1366,146 @@ mod tests {
         };
         let all = vec![summary("a", Some("doc-a")), summary("b", None)];
         assert_eq!(
-            summary_for_doc(all.clone(), "chat", "doc-a").map(|s| s.id),
-            Some("a".into())
+            summary_for_doc(&all, "chat", "doc-a").map(|s| s.id.as_str()),
+            Some("a")
         );
         // A doc-less harness opens its synthetic result doc.
         assert_eq!(
-            summary_for_doc(all.clone(), "chat", &result_doc_id("chat", "b")).map(|s| s.id),
-            Some("b".into())
+            summary_for_doc(&all, "chat", &result_doc_id("chat", "b")).map(|s| s.id.as_str()),
+            Some("b")
         );
-        assert!(summary_for_doc(all, "chat", "elsewhere").is_none());
+        assert!(summary_for_doc(&all, "chat", "elsewhere").is_none());
+    }
+
+    #[test]
+    fn warm_picker_consumers_share_empty_and_nonempty_presentations_without_scans() {
+        for agents in [false, true] {
+            let mut state = AppState::new();
+            state.selected_chat = Some("c".into());
+            // 21 MB-class loaded history, including the important zero-agent
+            // case. This is an attribution test, not a native timing claim.
+            let text = "x".repeat(2_160);
+            let mut entries: Vec<_> = (0..10_000)
+                .map(|ix| {
+                    entry(
+                        &format!("m{ix}"),
+                        MessageRole::Assistant,
+                        vec![MessagePart::Text {
+                            id: format!("t{ix}"),
+                            text: text.clone(),
+                        }],
+                    )
+                })
+                .collect();
+            if agents {
+                entries.push(entry(
+                    "spawns",
+                    MessageRole::Assistant,
+                    vec![
+                        spawn("live", false, Some(SubagentStatus::Running)),
+                        spawn("finished", true, Some(SubagentStatus::Done)),
+                    ],
+                ));
+            }
+            state.apply_transcript(entries);
+            let before = crate::perf_trace::snapshot();
+            for _ in 0..300 {
+                let _ = derive_subagents(&state, "c");
+            }
+            let baseline = crate::perf_trace::snapshot().subagent_scans - before.subagent_scans;
+            let presentation = subagents_for(&state, "c");
+            let before = crate::perf_trace::snapshot();
+            // 50 open/close cycles, three consumers per frame.
+            for _ in 0..50 {
+                for _ in 0..2 {
+                    for _ in 0..3 {
+                        let hit = subagents_for(&state, "c");
+                        assert!(Arc::ptr_eq(&presentation, &hit));
+                        let _ = strip_visible(&hit).len();
+                        let _ = hit.running().len();
+                    }
+                }
+            }
+            let after = crate::perf_trace::snapshot();
+            assert_eq!(baseline, 300);
+            assert_eq!(after.subagent_scans - before.subagent_scans, 0);
+            assert_eq!(after.subagent_cache_hits - before.subagent_cache_hits, 300);
+            eprintln!(
+                "subagent evidence: agents={agents}, 50 cycles/3 consumers: history scans {baseline} -> 0, shared hits=300"
+            );
+            if agents {
+                assert!(std::ptr::eq(
+                    presentation.running().iter().next().unwrap(),
+                    &presentation[0],
+                ));
+                assert!(std::ptr::eq(
+                    strip_visible(&presentation).iter().next().unwrap(),
+                    &presentation[0],
+                ));
+            } else {
+                assert!(presentation.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn only_referenced_child_updates_invalidate_parent_presentation() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.apply_transcript(vec![entry(
+            "spawn",
+            MessageRole::Assistant,
+            vec![spawn("a", true, Some(SubagentStatus::Done))],
+        )]);
+        let before = subagents_for(&state, "c");
+        state.set_subagent_snapshot("unrelated".into(), vec![]);
+        assert!(Arc::ptr_eq(&before, &subagents_for(&state, "c")));
+        let mut child = entry(
+            "child",
+            MessageRole::Assistant,
+            vec![MessagePart::Text {
+                id: "result".into(),
+                text: "Child finished.".into(),
+            }],
+        );
+        child.created_at += 5_000;
+        state.set_subagent_snapshot("doc-1".into(), vec![child]);
+        let after = subagents_for(&state, "c");
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after[0].summary.as_deref(), Some("Child finished."));
+        assert!(after[0].finished.is_some());
+        state.unwatch_subagent_doc("doc-1");
+        assert!(subagents_for(&state, "c")[0].summary.is_none());
+    }
+
+    #[test]
+    fn finish_is_recorded_by_updates_even_without_any_render_or_selector() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.apply_transcript(vec![entry(
+            "spawn",
+            MessageRole::Assistant,
+            vec![spawn("a", false, Some(SubagentStatus::Running))],
+        )]);
+        state.apply_transcript(vec![entry(
+            "spawn",
+            MessageRole::Assistant,
+            vec![spawn("a", true, Some(SubagentStatus::Done))],
+        )]);
+        let finish = state.subagent_finished_obs["c/a"];
+        for _ in 0..10 {
+            assert_eq!(subagents_for(&state, "c")[0].finished, millis(finish));
+        }
+        assert_eq!(state.subagent_finished_obs.len(), 1);
+    }
+
+    #[test]
+    fn one_line_caps_unicode_and_preserves_meaningful_line_rules() {
+        assert_eq!(one_line("\n \n hello \n ignored").as_deref(), Some("hello"));
+        assert_eq!(one_line(&"é".repeat(120)).unwrap().chars().count(), 120);
+        assert_eq!(
+            one_line(&"é".repeat(1_000_000)).unwrap().chars().count(),
+            121
+        );
     }
 }

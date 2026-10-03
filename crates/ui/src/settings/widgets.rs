@@ -309,7 +309,9 @@ pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
         .px(px(20.0))
         .py(px(14.0))
         // Row dividers sit a step below the card edge (T3 `border-border/50`).
-        .when(!first, |el| el.border_t_1().border_color(theme.border.opacity(0.5)))
+        .when(!first, |el| {
+            el.border_t_1().border_color(theme.border.opacity(0.5))
+        })
         .hover(|s| s.bg(ink(0.015)))
         .flex()
         .flex_row()
@@ -432,9 +434,14 @@ pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
 /// Per-row "reset to default": a 28px restart glyph that only appears once the
 /// value differs from its default. Chain `.on_click(..)` on the result. `id`
 /// must be unique on the page.
-pub fn reset_button(theme: &Theme, id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+pub fn reset_button(
+    theme: &Theme,
+    id: impl Into<SharedString>,
+    owner: gpui::EntityId,
+) -> gpui::Stateful<gpui::Div> {
     crate::controls::icon_button(
         id,
+        owner,
         theme,
         crate::controls::Variant::Ghost,
         crate::controls::Size::Sm,
@@ -465,8 +472,7 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
 pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefinement {
-    s.bg(theme.control_hover())
-        .text_color(theme.text)
+    s.bg(theme.control_hover()).text_color(theme.text)
 }
 
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border

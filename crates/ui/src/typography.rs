@@ -122,7 +122,8 @@ pub const fn ui_rems(pixels_at_default: f32) -> Rems {
     rems(pixels_at_default / 16.0)
 }
 
-pub const CODE_FONT_SIZE_DEFAULT: f32 = 12.5;
+/// T3's fence size (`--font-size-code`), shared by diffs and editors.
+pub const CODE_FONT_SIZE_DEFAULT: f32 = 13.0;
 /// Installed-only: never bundle the proprietary face or select it when absent.
 pub const ANTHROPIC_SANS: &str = "Anthropic Sans Variable";
 pub const TERMINAL_FONT_SIZE_DEFAULT: f32 = 13.0;

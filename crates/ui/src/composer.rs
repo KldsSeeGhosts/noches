@@ -33,10 +33,10 @@ use zeron_rpc::{RpcError, methods};
 
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
+use crate::elevation;
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
-use crate::elevation;
 use crate::settings::{ComposerSendBehavior, FollowUpBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
@@ -4405,6 +4405,7 @@ impl Composer {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         cx.on_release(|this, cx| {
             this.input.update(cx, |input, _| input.cancel_dictation());
             this.release_queue_previews(cx);
@@ -4425,9 +4426,12 @@ impl Composer {
             }
         };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state - a pickers-side notify (refs
-        // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        // by the composer from picker state. Only semantic changes cross
+        // this boundary; model-popup animation samples belong to Pickers.
+        let pickers_observe = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::PickerPresentationChanged, cx| cx.notify(),
+        );
         let picker_focus = cx.subscribe(
             &pickers,
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
@@ -4436,52 +4440,55 @@ impl Composer {
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
-        let input_events = cx.subscribe(&input, |this: &mut Self, _, event: &ComposerInputEvent, cx| match event {
-            ComposerInputEvent::Submitted => this.on_submit(cx),
-            ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
-            ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
-                this.on_input_edited(cx)
-            }
-            ComposerInputEvent::ViewportChanged => cx.notify(),
-            // The slash popup and the mention popup share the input's
-            // completion key routing; they are mutually exclusive by token
-            // shape (`/` at offset 0 vs `@` at a token boundary).
-            ComposerInputEvent::MentionNavigate(delta) => {
-                if this.slash.token.is_some() {
-                    this.move_slash(*delta, cx)
-                } else {
-                    this.move_mention(*delta, cx)
+        let input_events = cx.subscribe(
+            &input,
+            |this: &mut Self, _, event: &ComposerInputEvent, cx| match event {
+                ComposerInputEvent::Submitted => this.on_submit(cx),
+                ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
+                ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
+                    this.on_input_edited(cx)
                 }
-            }
-            ComposerInputEvent::MentionAccept => {
-                if this.slash.token.is_some() {
-                    this.accept_slash(cx)
-                } else {
-                    this.accept_mention(cx)
+                ComposerInputEvent::ViewportChanged => cx.notify(),
+                // The slash popup and the mention popup share the input's
+                // completion key routing; they are mutually exclusive by token
+                // shape (`/` at offset 0 vs `@` at a token boundary).
+                ComposerInputEvent::MentionNavigate(delta) => {
+                    if this.slash.token.is_some() {
+                        this.move_slash(*delta, cx)
+                    } else {
+                        this.move_mention(*delta, cx)
+                    }
                 }
-            }
-            ComposerInputEvent::MentionDismiss => {
-                if this.slash.token.is_some() {
-                    this.dismiss_slash(cx)
-                } else {
-                    this.dismiss_mention(cx)
+                ComposerInputEvent::MentionAccept => {
+                    if this.slash.token.is_some() {
+                        this.accept_slash(cx)
+                    } else {
+                        this.accept_mention(cx)
+                    }
                 }
-            }
-            ComposerInputEvent::PastedImages(images) => {
-                let images = images.clone();
-                this.stage_in_background(
-                    move || {
-                        images
-                            .into_iter()
-                            .map(attachments::stage_clipboard_image)
-                            .map(Ok)
-                            .collect()
-                    },
-                    cx,
-                );
-            }
-            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
-        });
+                ComposerInputEvent::MentionDismiss => {
+                    if this.slash.token.is_some() {
+                        this.dismiss_slash(cx)
+                    } else {
+                        this.dismiss_mention(cx)
+                    }
+                }
+                ComposerInputEvent::PastedImages(images) => {
+                    let images = images.clone();
+                    this.stage_in_background(
+                        move || {
+                            images
+                                .into_iter()
+                                .map(attachments::stage_clipboard_image)
+                                .map(Ok)
+                                .collect()
+                        },
+                        cx,
+                    );
+                }
+                ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            },
+        );
         cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
             if !crate::settings::current(cx).dictation_enabled {
                 this.input.update(cx, |input, _| input.cancel_dictation());
@@ -6373,7 +6380,10 @@ impl Composer {
 
     /// Submit the draft; `alternate` swaps Queue and Steer for this send only.
     fn submit_with(&mut self, alternate: bool, cx: &mut Context<Self>) {
-        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
             return;
         }
         if self.commit_queue_edit(cx) {
@@ -6418,7 +6428,10 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
-        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
             return;
         }
         if self.commit_queue_edit(cx) {
@@ -7365,13 +7378,17 @@ impl Composer {
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
-                    motion::hover_blend(
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
                         &format!("wizard-option-{ix}"),
                         crate::theme::ink(0.025),
                         crate::theme::ink(0.06),
                     )
                 })
-                .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    format!("wizard-option-{ix}"),
+                ))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
                 .child(
@@ -7555,7 +7572,8 @@ impl Composer {
                 .size(px(28.0))
                 .flex_none()
                 .rounded_full()
-                .bg(motion::hover_blend(
+                .bg(motion::hover_blend_owned(
+                    cx.entity_id(),
                     &stop_key,
                     theme.danger_strong,
                     theme.danger_strong.opacity(0.88),
@@ -7565,7 +7583,7 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .on_hover(motion::hover_listener(stop_key))
+                .on_hover(motion::hover_listener_owned(cx.entity_id(), stop_key))
                 .tooltip(crate::tooltip::text("Stop"))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
                 .child(div().size(px(12.0)).rounded(px(2.5)).bg(gpui::white()))
@@ -7589,7 +7607,12 @@ impl Composer {
             .size(px(28.0))
             .flex_none()
             .rounded_full()
-            .bg(motion::hover_blend(&send_key, action, theme.action_hover()))
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
+                &send_key,
+                action,
+                theme.action_hover(),
+            ))
             .shadow(elevation::send_shadow(action))
             .flex()
             .items_center()
@@ -7597,7 +7620,7 @@ impl Composer {
             .when(blocked, |el| el.opacity(crate::controls::DISABLED_OPACITY))
             .when(!blocked, |el| {
                 el.cursor_pointer()
-                    .on_hover(motion::hover_listener(send_key))
+                    .on_hover(motion::hover_listener_owned(cx.entity_id(), send_key))
                     .active(|s| s.opacity(0.9))
                     .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                         // Cmd/Ctrl-click runs the other follow-up behaviour.
@@ -7628,15 +7651,19 @@ impl Composer {
         };
         let steerable = self.can_steer(cx);
         let (label, hint): (&'static str, Option<SharedString>) = match mode {
-            SendButtonMode::Queue if steerable => {
-                ("Queue for next turn", Some(format!("{modifier} steers").into()))
-            }
+            SendButtonMode::Queue if steerable => (
+                "Queue for next turn",
+                Some(format!("{modifier} steers").into()),
+            ),
             SendButtonMode::Queue => ("Queue for next turn", None),
             SendButtonMode::Steer => (
                 "Steer the running turn",
                 Some(format!("{modifier} queues").into()),
             ),
-            _ => ("Send", (behavior == ComposerSendBehavior::ModEnter).then(|| modifier.clone())),
+            _ => (
+                "Send",
+                (behavior == ComposerSendBehavior::ModEnter).then(|| modifier.clone()),
+            ),
         };
         let hint = hint.unwrap_or_default();
         move |window, cx| {
@@ -7949,18 +7976,15 @@ impl Render for Composer {
             self.render_todo_panel(queue_panel.is_some() || agents_tray.is_some(), window, cx),
             |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
         );
-        let container = container.when_some(
-            agents_tray,
-            |el, tray| {
-                el.child(motion::fade_quick(
-                    "composer-agents-tray",
-                    div()
-                        .mx(px(QUEUE_SIDE_INSET))
-                        .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
-                        .child(tray),
-                ))
-            },
-        );
+        let container = container.when_some(agents_tray, |el, tray| {
+            el.child(motion::fade_quick(
+                "composer-agents-tray",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                    .child(tray),
+            ))
+        });
         let container = container.when_some(queue_panel, |el, panel| {
             el.child(motion::fade_quick(
                 "composer-queue",
@@ -8168,12 +8192,16 @@ impl Render for Composer {
             .rounded_full()
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend(
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener(attach_hover_key))
+            .on_hover(motion::hover_listener_owned(
+                cx.entity_id(),
+                attach_hover_key,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -8583,6 +8611,7 @@ impl Render for Composer {
         } else {
             container
         };
+        motion::drive_hover_owner(cx.entity_id(), window);
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -8714,7 +8743,7 @@ mod tests {
                     room_gen: None,
                 }]);
                 state.selected_chat = Some("parent".into());
-                state.transcript = vec![SessionMessageEntry {
+                state.apply_transcript(vec![SessionMessageEntry {
                     id: "m1".into(),
                     role: MessageRole::Assistant,
                     parts: vec![MessagePart::Tool {
@@ -8739,7 +8768,7 @@ mod tests {
                     device_id: "dev".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
-                }];
+                }]);
                 cx.notify();
             });
             Host {
@@ -10359,14 +10388,32 @@ mod tests {
         use FollowUpBehavior::{Queue, Steer};
         let busy = SendButtonMode::Queue;
         // The configured behaviour, then the one-off alternate.
-        assert_eq!(follow_up_mode(busy, Queue, false, true), SendButtonMode::Queue);
-        assert_eq!(follow_up_mode(busy, Steer, false, true), SendButtonMode::Steer);
-        assert_eq!(follow_up_mode(busy, Queue, true, true), SendButtonMode::Steer);
-        assert_eq!(follow_up_mode(busy, Steer, true, true), SendButtonMode::Queue);
+        assert_eq!(
+            follow_up_mode(busy, Queue, false, true),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            follow_up_mode(busy, Steer, false, true),
+            SendButtonMode::Steer
+        );
+        assert_eq!(
+            follow_up_mode(busy, Queue, true, true),
+            SendButtonMode::Steer
+        );
+        assert_eq!(
+            follow_up_mode(busy, Steer, true, true),
+            SendButtonMode::Queue
+        );
         // A harness that cannot take mid-turn input (or a draft with
         // attachments) always queues, whichever way it was asked.
-        assert_eq!(follow_up_mode(busy, Steer, false, false), SendButtonMode::Queue);
-        assert_eq!(follow_up_mode(busy, Queue, true, false), SendButtonMode::Queue);
+        assert_eq!(
+            follow_up_mode(busy, Steer, false, false),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            follow_up_mode(busy, Queue, true, false),
+            SendButtonMode::Queue
+        );
         // Idle and stop never change.
         assert_eq!(
             follow_up_mode(SendButtonMode::Send, Steer, true, true),
