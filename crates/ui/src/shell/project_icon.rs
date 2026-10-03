@@ -357,6 +357,7 @@ fn project_icon_frame(
 /// A session's badge inputs, resolved where the space is already known.
 /// Carrying owned data keeps the per-card path from scanning `state.chats`
 /// and keeps borrowed state out of the call that needs `&mut Context`.
+#[derive(Clone)]
 pub(super) struct ProjectIconRequest {
     pub(super) chat_id: String,
     name: String,

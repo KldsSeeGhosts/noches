@@ -1753,6 +1753,8 @@ pub struct Shell {
     pub(super) archived_hover: Option<String>,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
+    sidebar_projection_cache: std::cell::RefCell<Option<spaces::SidebarProjectionCache>>,
+    sidebar_source_dirty: std::cell::Cell<bool>,
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2297,6 +2299,8 @@ impl Shell {
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_projection_cache: std::cell::RefCell::new(None),
+            sidebar_source_dirty: std::cell::Cell::new(true),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             jump_hints: false,
@@ -2511,6 +2515,7 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.sidebar_source_dirty.set(true);
         self.sync_voice_context(cx);
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
