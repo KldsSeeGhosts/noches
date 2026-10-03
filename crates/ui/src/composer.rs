@@ -1430,6 +1430,7 @@ fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
         KeyBinding::new("tab", MentionTab, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("shift-backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
@@ -1549,6 +1550,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     let palette = Some(PALETTE_SEARCH_CONTEXT);
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
+        KeyBinding::new("shift-backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
         KeyBinding::new("home", Home, palette),
         KeyBinding::new("end", End, palette),
@@ -4059,6 +4061,10 @@ pub(crate) struct ComposerDraftState {
     appshots: HashMap<String, Vec<CapturedAppshot>>,
 }
 
+fn composer_hover_key(action: &str, view: gpui::EntityId) -> SharedString {
+    format!("composer-{action}-{view}").into()
+}
+
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     /// The chat this instance serves (see [`ChatTarget`]).
@@ -4404,11 +4410,17 @@ impl Composer {
                 }
             }
             ComposerInputEvent::PastedImages(images) => {
-                let staged = images
-                    .iter()
-                    .map(|image| attachments::stage_clipboard_image(image.clone()))
-                    .collect();
-                this.add_staged(staged, cx);
+                let images = images.clone();
+                this.stage_in_background(
+                    move || {
+                        images
+                            .into_iter()
+                            .map(attachments::stage_clipboard_image)
+                            .map(Ok)
+                            .collect()
+                    },
+                    cx,
+                );
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
@@ -4813,40 +4825,65 @@ impl Composer {
         cx.notify();
     }
 
-    fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+    /// Run `stage` on the background executor — reading a file and converting
+    /// a BMP are too slow for the UI thread — and add what it staged to the
+    /// draft that is current now, even if the user has navigated away by the
+    /// time it finishes. Failures surface in that draft's failure notice.
+    fn stage_in_background(
+        &mut self,
+        stage: impl FnOnce() -> Vec<Result<StagedAttachment, String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.queue_edit_finishing {
             return;
         }
-        if staged.is_empty() {
-            return;
-        }
-        self.attachments
-            .entry(self.current_key.clone())
-            .or_default()
-            .extend(staged);
-        self.focus_pending = true;
-        cx.notify();
+        let key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let results = cx.background_executor().spawn(async move { stage() }).await;
+            this.update(cx, |this, cx| {
+                let mut staged = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(att) => staged.push(att),
+                        Err(message) => {
+                            this.failure = Some(message.into());
+                            this.failure_key = Some(key.clone());
+                        }
+                    }
+                }
+                if !staged.is_empty() {
+                    let current = this.current_key == key;
+                    if current
+                        && this.queue_edit_finishing
+                        && let Some((_, saved_attachments, _)) = &mut this.queue_edit_draft
+                    {
+                        saved_attachments.extend(staged);
+                    } else {
+                        this.attachments.entry(key).or_default().extend(staged);
+                    }
+                    this.focus_pending |= current && !this.queue_edit_finishing;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Stage image files (picker / drop / pasted paths). Non-images are
     /// skipped silently (matching the original's `image/*` filter); read
     /// failures and oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let mut staged = Vec::new();
-        for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
-                Err(message) => {
-                    self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
-                    cx.notify();
-                }
-            }
-        }
-        self.add_staged(staged, cx);
+        self.stage_in_background(
+            move || {
+                paths
+                    .iter()
+                    .filter(|path| attachments::format_by_extension(path).is_some())
+                    .map(|path| attachments::stage_file(path))
+                    .collect()
+            },
+            cx,
+        );
     }
 
     /// Add a file-tree or file-tab drop through the existing file-mention
@@ -7914,6 +7951,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let attach_hover_key = composer_hover_key("attach", cx.entity_id());
         // Attach button - opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -7929,11 +7967,11 @@ impl Render for Composer {
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
-                "composer-attach",
+                &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener("composer-attach"))
+            .on_hover(motion::hover_listener(attach_hover_key))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -8543,6 +8581,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn shift_backspace_deletes_text_and_selection_in_all_input_contexts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            init(cx, ComposerSendBehavior::default());
+        });
+        for context in [
+            GENERIC_COMPOSER_CONTEXT,
+            MESSAGE_COMPOSER_CONTEXT,
+            PALETTE_SEARCH_CONTEXT,
+        ] {
+            let handle = cx.add_window(|window, cx| {
+                let mut input = ComposerInput::with_context("", context, cx);
+                input.set_text("café", cx);
+                window.focus(&input.focus_handle, cx);
+                input
+            });
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            handle
+                .update(cx, |input, _, cx| {
+                    assert_eq!(input.text(), "caf", "{context}");
+                    input.set_text("hello world", cx);
+                    input.move_to(6, cx);
+                    input.select_to(11, cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            handle
+                .update(cx, |input, _, cx| {
+                    assert_eq!(input.text(), "hello ", "{context}");
+                    input.set_text("", cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            assert_eq!(
+                handle
+                    .read_with(cx, |input, _| input.text().to_owned())
+                    .unwrap(),
+                ""
+            );
+        }
+    }
+
+    #[gpui::test]
     fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8684,11 +8770,96 @@ mod tests {
                 composer.add_paths(vec![image_path], cx);
             })
             .unwrap();
+        cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear();
             assert!(input.read(cx).focus_handle.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn staged_files_land_in_the_draft_they_were_added_to(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let bmp = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&bmp).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![bmp, dir.path().join("notes.txt")], cx);
+                // Staging runs in the background; navigating meanwhile must
+                // not move the attachment into the other chat's draft.
+                composer.current_key = "chat-b".into();
+                composer.focus_pending = false;
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let names: Vec<_> = composer.attachments["chat-a"]
+                    .iter()
+                    .map(|att| att.name.as_str())
+                    .collect();
+                assert_eq!(names, ["shot.png"]);
+                assert!(!composer.attachments.contains_key("chat-b"));
+                assert!(
+                    !composer.focus_pending,
+                    "staging must not focus another draft"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_keeps_failures_with_the_original_draft(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let broken = dir.path().join("broken.bmp");
+        std::fs::write(&broken, b"BM not a bitmap").unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![broken], cx);
+                composer.current_key = "chat-b".into();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                assert_eq!(composer.failure_key.as_deref(), Some("chat-a"));
+                assert_eq!(
+                    composer.failure.as_deref(),
+                    Some("broken.bmp is not a valid image.")
+                );
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_during_queue_finish_preserves_the_displaced_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (dir, handle) = composer_focus_window(cx);
+        let image = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&image).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.add_paths(vec![image], cx);
+                composer.queue_edit_finishing = true;
+                composer.queue_edit_draft = Some(("draft".into(), vec![], vec![]));
+                composer.focus_pending = false;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let (_, saved, _) = composer.queue_edit_draft.as_ref().unwrap();
+                assert_eq!(saved[0].name, "shot.png");
+                assert!(composer.attachments.is_empty());
+                assert!(!composer.focus_pending);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -10177,6 +10348,24 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[gpui::test]
+    fn attachment_hover_fades_are_scoped_to_each_composer(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let selected = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pane = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
+        let selected_key = composer_hover_key("attach", selected.entity_id());
+        let pane_key = composer_hover_key("attach", pane.entity_id());
+        assert_ne!(selected_key, pane_key);
+        motion::set_hover(&selected_key, true, true);
+        assert_eq!(motion::hover_t(&selected_key), 1.0);
+        assert_eq!(motion::hover_t(&pane_key), 0.0);
+        motion::set_hover(&pane_key, true, true);
+        motion::set_hover(&selected_key, false, true);
+        assert_eq!(motion::hover_t(&selected_key), 0.0);
+        assert_eq!(motion::hover_t(&pane_key), 1.0);
+        motion::set_hover(&pane_key, false, true);
     }
 
     #[gpui::test]
