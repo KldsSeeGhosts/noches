@@ -23,9 +23,11 @@ impl HttpStub {
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (tx, requests) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            let initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let tx = tx.clone();
+                let initialized = initialized.clone();
                 tokio::spawn(async move {
                     let mut socket = BufReader::new(socket);
                     let mut first = String::new();
@@ -62,8 +64,10 @@ impl HttpStub {
                             "mcp-session-id: http-session\r\n",
                         )
                     } else if method == "notifications/initialized" {
+                        initialized.store(true, std::sync::atomic::Ordering::SeqCst);
                         ("202 Accepted", "application/json", String::new(), "")
                     } else if method == "tools/list" {
+                        assert!(initialized.load(std::sync::atomic::Ordering::SeqCst));
                         let result = json!({"jsonrpc":"2.0","id":message["id"],"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}});
                         (
                             "200 OK",
@@ -83,6 +87,7 @@ impl HttpStub {
                             "",
                         )
                     } else {
+                        assert!(initialized.load(std::sync::atomic::Ordering::SeqCst));
                         (
                             "200 OK",
                             "application/json",

@@ -408,9 +408,12 @@ async fn run_http_bridge(peer: HttpPeer) -> Result<(), HarnessError> {
             }
         };
         let id = message.get("id").cloned();
-        // Initialize must finish before accepting the next request: headers
-        // negotiated by it belong to all following HTTP traffic.
-        if message["method"] == "initialize" {
+        // Complete both handshake messages before later requests: negotiated
+        // headers and the initialized notification belong to subsequent traffic.
+        if matches!(
+            message["method"].as_str(),
+            Some("initialize" | "notifications/initialized")
+        ) {
             if let Err(error) = peer.request(message, &tx).await {
                 let _ = tx.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})).await;
             }
