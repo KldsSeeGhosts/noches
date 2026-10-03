@@ -35,7 +35,7 @@
         <string>__IPC_PORT__</string>
     </dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Noches uses your microphone during voice calls with GPT-Live.</string>
+    <string>Noches uses your microphone for on-device dictation and voice calls with GPT-Live, only when you start them.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

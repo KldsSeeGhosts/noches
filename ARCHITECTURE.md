@@ -154,6 +154,8 @@ zeron/
                                  # validation, provenance, and local VS Code compiler
     ui/           zeron-ui       # gpui app: shell, sidebar, conversation, composer,
                                  # terminal view, diff pane, settings, animation kit
+    voice/        noches-voice   # existing networked GPT-Live call and app tools
+    dictation/    zeron-voice    # opt-in local Parakeet capture/inference; no RPC or sync
   apps/
     zeron/                       # the binary (headed default, `headless` subcommand)
   edge/                          # TypeScript Worker + DOs (ported from zeron/apps/edge,
