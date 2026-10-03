@@ -8608,7 +8608,7 @@ mod tests {
                     assert_eq!(input.text(), "caf", "{context}");
                     input.set_text("hello world", cx);
                     input.move_to(6, cx);
-                    input.extend_selection(11, cx);
+                    input.select_to(11, cx);
                 })
                 .unwrap();
             cx.simulate_keystrokes(handle.into(), "shift-backspace");

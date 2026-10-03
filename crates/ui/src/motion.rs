@@ -879,8 +879,7 @@ mod tests {
         });
 
         cx.update(|cx| set_reduced_motion(cx, false));
-        let animated = cx.add_window(|_, _| Loaders);
-        cx.update_window(animated.into(), |_, window, cx| window.draw(cx).clear())
+        cx.update_window(reduced.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         cx.update(|cx| {
             assert_eq!(
