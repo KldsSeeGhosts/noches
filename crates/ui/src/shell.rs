@@ -2231,10 +2231,15 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
-        // Parent notifications carry presentation changes (session status,
-        // elapsed labels, menus); sibling animation/caret ticks do not.
+        // Only chrome actually consumed by a transcript invalidates its scene.
+        // Root hover/menu motion must not rebuild stationary content.
         let transcript_invalidation = cx.observe_self(|shell, cx| {
-            shell.transcript.update(cx, |_, cx| cx.notify());
+            shell.transcript.update(cx, |transcript, cx| transcript.refresh_chrome(cx));
+            for surfaces in shell.workspace.chat_surfaces.values() {
+                if let Some(transcript) = &surfaces.transcript {
+                    transcript.update(cx, |transcript, cx| transcript.refresh_chrome(cx));
+                }
+            }
         });
         let shell = cx.entity();
         let update_poll = cx.spawn(async move |this, cx| {
@@ -8656,6 +8661,13 @@ impl Shell {
         let outlet: AnyElement = if workspace_mode {
             self.render_workspace_outlet(cx)
         } else if has_selection || departing_transcript {
+            // Edge-fade paint state is inherited, not included in GPUI's
+            // cache key. Invalidate when its band changes (even if layout
+            // bounds happen to remain the same).
+            let bottom_band = (self.bottom_stack.get() - term_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
+            self.transcript.update(cx, |transcript, cx| {
+                transcript.set_scene_fade_band(bottom_band, cx);
+            });
             div()
                 .relative()
                 .size_full()
@@ -8671,7 +8683,15 @@ impl Shell {
                         } else {
                             0.0
                         })
-                        .child(self.transcript.clone()),
+                        .child(crate::transcript_scene::scene(
+                            self.transcript.clone(),
+                            crate::transcript_scene::reusable(
+                                dock_frame.active,
+                                departing_transcript,
+                                transcript_geometry_ready,
+                                dock_frame.transcript(),
+                            ),
+                        )),
                 )
                 // A departing transcript is visual history, not an active
                 // interaction surface bound to the newly blank route.

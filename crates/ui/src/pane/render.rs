@@ -678,7 +678,7 @@ fn pane_body(
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(transcript.clone())
+                    .child(crate::transcript_scene::scene(transcript.clone(), true))
                     .into_any_element(),
                 None => div().flex_1().min_w_0().min_h_0().into_any_element(),
             };

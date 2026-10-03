@@ -65,6 +65,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod tool_palette;
 pub mod transcript;
+mod transcript_scene;
 pub mod typography;
 mod workspace_links;
 pub mod workspace_layout_store;

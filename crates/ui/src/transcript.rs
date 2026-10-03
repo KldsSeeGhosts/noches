@@ -2726,11 +2726,22 @@ impl SavedViewportCache {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptChrome {
+    working: bool,
+    sending: bool,
+    queued: bool,
+    undelivered: bool,
+    elapsed: i64,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
+    chrome: Option<TranscriptChrome>,
+    scene_fade_band: Option<u32>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
@@ -3070,7 +3081,10 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.refresh_chrome(cx);
+            this.sync(cx);
+        });
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
@@ -3103,6 +3117,8 @@ impl Transcript {
             list,
             rows: Vec::new(),
             last_source: None,
+            chrome: None,
+            scene_fade_band: None,
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
@@ -4243,6 +4259,56 @@ impl Transcript {
 
     pub(crate) fn retain_for_route_exit(&mut self) {
         self.retain_on_deselect = true;
+    }
+
+    pub(crate) fn set_scene_fade_band(&mut self, band: f32, cx: &mut Context<Self>) {
+        let band = Some(band.to_bits());
+        if self.scene_fade_band != band {
+            self.scene_fade_band = band;
+            cx.notify();
+        }
+    }
+
+    /// State updates can change the in-flow trailer without changing rows.
+    /// Also called by the shell's deadline heartbeat for fixed split chats.
+    pub(crate) fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
+        let key = self.chrome_key(chrono::Utc::now(), cx);
+        if self.chrome != Some(key) {
+            self.chrome = Some(key);
+            cx.notify();
+        }
+    }
+
+    fn chrome_key(&self, now: chrono::DateTime<chrono::Utc>, cx: &gpui::App) -> TranscriptChrome {
+        let state = self.state.read(cx);
+        let chat = self.doc_override.as_deref().or(state.selected_chat.as_deref());
+        let Some(chat) = chat else { return TranscriptChrome::default() };
+        if self.doc_override.is_some() && !self.interactive_override {
+            let live = self.doc_live && state.sub_transcript(chat).last().is_some_and(|last| {
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User
+            });
+            return TranscriptChrome {
+                working: live,
+                elapsed: if live {
+                    state.sub_transcript(chat).last()
+                        .map(|e| (now.timestamp_millis() - e.created_at).max(0) / 1000)
+                        .unwrap_or(0)
+                } else { 0 },
+                ..Default::default()
+            };
+        }
+        let working = state.indicator_for(chat, now) == crate::state::Indicator::Working;
+        let started = state.session_for(chat).and_then(|s| s.started_at);
+        let sending = working && sending_bridge(state.pending_send_started(chat, now), started);
+        TranscriptChrome {
+            working,
+            sending,
+            queued: sending && state.chat_delivery_degraded(chat, now),
+            undelivered: state.send_undelivered(chat, now),
+            elapsed: if working && !sending {
+                started.map(|t| now.signed_duration_since(t).num_seconds().max(0)).unwrap_or(0)
+            } else { 0 },
+        }
     }
 
     fn route_exit_pending(&self, cx: &gpui::App) -> bool {
@@ -8631,6 +8697,7 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("transcript_scene_tests.rs");
 
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {
