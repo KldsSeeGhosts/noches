@@ -14,7 +14,7 @@ fn scope() -> InvocationScope {
             interaction_mode: zeron_proto::InteractionMode::Default,
             provider_instance_id: "mock".into(),
         },
-        selection: serde_json::from_value(json!({"instanceId":"mock","model":"mock"})).unwrap(),
+        selection: serde_json::from_value(json!({"instanceId":"mock","model":"mock-1"})).unwrap(),
         capabilities: ["orchestration", "worktree", "pull-requests"]
             .into_iter()
             .map(str::to_owned)

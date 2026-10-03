@@ -378,6 +378,23 @@ impl Harness for ClaudeHarness {
         Ok(static_models())
     }
 
+    async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
+        let executable = self.resolve_executable()?;
+        let mut command = tokio::process::Command::new(&executable);
+        crate::compose_child_environment(&mut command, &executable);
+        command
+            .args(["auth", "status", "--json"])
+            .kill_on_drop(true);
+        let output = match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
+            Ok(Ok(output)) => output,
+            _ => return Ok(None),
+        };
+        // Consume just the public readiness bit, never persist/log the output.
+        Ok(serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|status| status["loggedIn"].as_bool()))
+    }
+
     /// Slash commands from the CLI's `initialize` control-request handshake —
     /// the same channel the Claude Agent SDK's `query()` opens. The response
     /// carries every command with description + argument hint and involves no
