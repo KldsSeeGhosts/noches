@@ -15,6 +15,48 @@ pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
 
+fn todo_script() -> Vec<AgentEvent> {
+    const STEPS: [&str; 8] = [
+        "Read the fold path in crates/doc",
+        "Add the status field to TodoItem",
+        "Map in-progress in every normalizer",
+        "Write the fold-window view model",
+        "Render the todo tray above the composer",
+        "Remember open state per chat",
+        "Run the unit tests",
+        "Write the design note",
+    ];
+    let mut events = Vec::new();
+    for active in 0..=STEPS.len() {
+        let items = STEPS
+            .iter()
+            .enumerate()
+            .map(|(ix, text)| {
+                let status = match ix.cmp(&active) {
+                    std::cmp::Ordering::Less => zeron_proto::TodoStatus::Completed,
+                    std::cmp::Ordering::Equal => zeron_proto::TodoStatus::InProgress,
+                    std::cmp::Ordering::Greater => zeron_proto::TodoStatus::Pending,
+                };
+                zeron_proto::TodoItem::new(*text, status)
+            })
+            .collect();
+        events.push(AgentEvent::ToolCall {
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: zeron_proto::ToolCall::Todo { items },
+        });
+        events.push(AgentEvent::ToolResult {
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        });
+        events.push(AgentEvent::TextDelta {
+            text: format!("Checklist update {} written.\n\n", active + 1),
+        });
+    }
+    events
+}
+
 /// The scripted question set for the `ZERON_MOCK_QUESTION` variant (exercises
 /// the QuestionPanel end-to-end: single-select page, multi-select page).
 fn question_script() -> Vec<UserInputQuestion> {
@@ -746,14 +788,14 @@ impl Harness for MockHarness {
                         "mix-todo",
                         ToolCall::Todo {
                             items: vec![
-                                zeron_proto::TodoItem {
-                                    text: "type kind-other tools by title".into(),
-                                    done: true,
-                                },
-                                zeron_proto::TodoItem {
-                                    text: "tint icons by tool family".into(),
-                                    done: false,
-                                },
+                                zeron_proto::TodoItem::new(
+                                    "type kind-other tools by title",
+                                    zeron_proto::TodoStatus::Completed,
+                                ),
+                                zeron_proto::TodoItem::new(
+                                    "tint icons by tool family",
+                                    zeron_proto::TodoStatus::Pending,
+                                ),
                             ],
                         },
                     ),
@@ -799,6 +841,13 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Pace the eight-item checklist with ZERON_MOCK_DELAY_MS for panel QA.
+        let todo_events = std::env::var("ZERON_MOCK_TODO")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0")
+            .then(todo_script)
+            .into_iter()
+            .flatten();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
@@ -809,6 +858,7 @@ impl Harness for MockHarness {
             .chain(subagent_events)
             .chain(agent_events)
             .chain(tool_mix_events)
+            .chain(todo_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
@@ -883,5 +933,38 @@ impl Harness for MockHarness {
                 event
             })
             .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checklist_script_advances_one_step_then_completes() {
+        let lists: Vec<_> = todo_script()
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCall {
+                    id,
+                    call: zeron_proto::ToolCall::Todo { items },
+                } => {
+                    assert_eq!(id, zeron_proto::LIVE_PLAN_TOOL_ID);
+                    Some(items)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists.len(), 9);
+        for (active, items) in lists.iter().enumerate() {
+            assert_eq!(items.len(), 8);
+            assert_eq!(items.iter().filter(|item| item.done).count(), active);
+            assert_eq!(
+                items
+                    .iter()
+                    .position(|item| item.status() == zeron_proto::TodoStatus::InProgress),
+                (active < 8).then_some(active),
+            );
+        }
     }
 }

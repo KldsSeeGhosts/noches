@@ -141,6 +141,19 @@ final class CompanionTranscriptTests: XCTestCase {
         XCTAssertEqual(ToolFamily.of(call("thinking", ["text": "hmm"])), .neutral)
     }
 
+    func testTodoStatusIsAdditiveForCompanionAndCloudChips() throws {
+        let message = try hostMessage(#"{"id":"m","role":"assistant","parts":[{"id":"t","kind":"tool","call":{"kind":"todo","items":[{"text":"read","done":true},{"text":"fix","done":false,"status":"inProgress"},{"text":"test","done":false,"status":"future-status"}]},"isError":false,"resolved":true}]}"#)
+        let tool = message.parts[0].renderedCall()
+        XCTAssertEqual(tool.chipLabel, "Todo")
+        XCTAssertEqual(tool.chipDetail, "1/3 done")
+        let cloudTodo = call("todo", ["items": [
+            #"["text": "read", "done": true]"#,
+            #"["text": "fix", "done": false, "status": "inProgress"]"#,
+            #"["text": "test", "done": false, "status": "future-status"]"#,
+        ]])
+        XCTAssertEqual(cloudTodo.chipDetail, "1/3 done")
+    }
+
     func testSubagentDerivationAndOrdering() throws {
         let messages = [
             try hostMessage(#"{"id":"u1","role":"user","parts":[]}"#),

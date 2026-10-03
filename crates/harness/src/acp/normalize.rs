@@ -48,7 +48,7 @@ impl ToolShapes {
         merged
     }
 }
-use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, SlashCommand, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -437,13 +437,14 @@ fn well_known_typed(
                                 .or_else(|| e.get("text"))
                                 .or_else(|| e.get("task"))
                                 .and_then(Value::as_str)?;
-                            Some(TodoItem {
-                                text: text.to_owned(),
-                                done: matches!(
-                                    e.get("status").and_then(Value::as_str),
-                                    Some("completed" | "done")
-                                ) || e.get("done").and_then(Value::as_bool) == Some(true),
-                            })
+                            let status = if e.get("done").and_then(Value::as_bool) == Some(true) {
+                                TodoStatus::Completed
+                            } else {
+                                TodoStatus::parse(
+                                    e.get("status").and_then(Value::as_str).unwrap_or(""),
+                                )
+                            };
+                            Some(TodoItem::new(text, status))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -519,9 +520,11 @@ pub(crate) fn map_update(update: &Value, shapes: &mut ToolShapes) -> Vec<AgentEv
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|e| TodoItem {
-                    text: str_field(e, "content"),
-                    done: e.get("status").and_then(Value::as_str) == Some("completed"),
+                .map(|e| {
+                    TodoItem::new(
+                        str_field(e, "content"),
+                        TodoStatus::parse(e.get("status").and_then(Value::as_str).unwrap_or("")),
+                    )
                 })
                 .collect();
             // The plan has no wire id; a stable synthetic id makes every
@@ -775,15 +778,47 @@ mod tests {
                 id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
                 call: ToolCall::Todo {
                     items: vec![
-                        TodoItem {
-                            text: "read code".into(),
-                            done: true
-                        },
-                        TodoItem {
-                            text: "write fix".into(),
-                            done: false
-                        },
+                        TodoItem::new("read code", TodoStatus::Completed),
+                        TodoItem::new("write fix", TodoStatus::InProgress),
                     ]
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn raw_todos_keep_status_and_done_through_partial_updates() {
+        let mut shapes = ToolShapes::default();
+        map_update(
+            &json!({
+                "sessionUpdate": "tool_call", "toolCallId": "todo-1",
+                "title": "todowrite", "kind": "other", "rawInput": {}
+            }),
+            &mut shapes,
+        );
+        let events = map_update(
+            &json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "todo-1",
+                "rawInput": { "todos": [
+                    { "content": "read", "done": true, "status": "in_progress" },
+                    { "text": "fix", "status": "in_progress" },
+                    { "task": "test", "status": "cancelled" },
+                    { "status": "completed" }
+                ]},
+                "status": "completed"
+            }),
+            &mut shapes,
+        );
+        assert_eq!(
+            events[0],
+            AgentEvent::ToolCall {
+                id: "todo-1".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        TodoItem::new("read", TodoStatus::Completed),
+                        TodoItem::new("fix", TodoStatus::InProgress),
+                        TodoItem::new("test", TodoStatus::Pending),
+                    ],
                 },
             }
         );

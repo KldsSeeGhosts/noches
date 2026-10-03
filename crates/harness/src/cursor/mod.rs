@@ -49,7 +49,7 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SteeringMode, TodoItem, ToolCall,
+    RunRequest, SteeringMode, TodoItem, TodoStatus, ToolCall,
 };
 
 use crate::process::{Child, ChildStdin, Command, Stdio};
@@ -760,15 +760,19 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|t| TodoItem {
-                    text: t
-                        .get("content")
-                        .or_else(|| t.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .into(),
-                    done: t.get("status").and_then(Value::as_str) == Some("completed")
-                        || t.get("completed").and_then(Value::as_bool) == Some(true),
+                .map(|t| {
+                    let status = if t.get("completed").and_then(Value::as_bool) == Some(true) {
+                        TodoStatus::Completed
+                    } else {
+                        TodoStatus::parse(t.get("status").and_then(Value::as_str).unwrap_or(""))
+                    };
+                    TodoItem::new(
+                        t.get("content")
+                            .or_else(|| t.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        status,
+                    )
                 })
                 .collect(),
         },
@@ -1010,6 +1014,29 @@ mod tests {
                     text: "sub says".into()
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn todos_preserve_status_and_legacy_completion() {
+        assert_eq!(
+            decode_tool(
+                "updateTodos",
+                &serde_json::json!({"todos": [
+                    {"content": "read", "completed": true, "status": "in_progress"},
+                    {"text": "fix", "status": "inProgress"},
+                    {"text": "test", "status": "cancelled"},
+                    {"text": "missing"}
+                ]})
+            ),
+            ToolCall::Todo {
+                items: vec![
+                    TodoItem::new("read", TodoStatus::Completed),
+                    TodoItem::new("fix", TodoStatus::InProgress),
+                    TodoItem::new("test", TodoStatus::Pending),
+                    TodoItem::new("missing", TodoStatus::Pending),
+                ],
+            }
         );
     }
 }
