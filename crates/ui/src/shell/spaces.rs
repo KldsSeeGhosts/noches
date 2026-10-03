@@ -15,6 +15,9 @@ use crate::status_palette::SessionState;
 use gpui::{FocusHandle, Window};
 use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
+const ARCHIVED_INITIAL_ROWS: usize = 10;
+const ARCHIVED_PAGE_ROWS: usize = 25;
+
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
@@ -624,6 +627,73 @@ impl popover::ScrollRailHost for Shell {
 }
 
 impl Shell {
+    pub(super) fn reveal_sidebar_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        let active = sidebar_rows(self.state.read(cx), &self.settings, Utc::now())
+            .into_iter()
+            .find(|row| row.chat.id == chat_id);
+        let mut reveal = None;
+        if let Some(row) = active {
+            // Needs-you and running rows float outside the collapsible groups.
+            if row.section == SidebarSection::Rest {
+                if let Some((device, space)) = row.group {
+                    let key = format!("device:{device}:{space}");
+                    if self.sidebar_collapsed_groups.remove(&key) {
+                        reveal = Some(format!("group:{key}"));
+                    }
+                }
+            }
+        } else if let Some(index) = self
+            .archived_sidebar_chats(cx)
+            .iter()
+            .position(|chat| chat.id == chat_id)
+        {
+            if self.archived_open != Some(true) {
+                self.archived_open = Some(true);
+                reveal = Some("archived".into());
+            }
+            if index >= self.archived_shown.max(ARCHIVED_INITIAL_ROWS) {
+                self.archived_shown = ARCHIVED_INITIAL_ROWS
+                    + (index + 1 - ARCHIVED_INITIAL_ROWS).div_ceil(ARCHIVED_PAGE_ROWS)
+                        * ARCHIVED_PAGE_ROWS;
+            }
+        } else {
+            self.sidebar_notice = Some("Clear the project filter to rename this session".into());
+            return false;
+        }
+        if let Some(key) = reveal {
+            self.sidebar_reveal_motions.insert(key);
+            self.sidebar_prev_order.clear();
+            self.sidebar_resort.clear();
+            self.sidebar_new_keys.clear();
+        }
+        if self.settings.sidebar_collapsed {
+            self.toggle_sidebar(cx);
+        }
+        cx.notify();
+        true
+    }
+
+    fn begin_queued_sidebar_reveal(&mut self, key: &str, open: bool, height: f32) {
+        if open && self.sidebar_reveal_motions.remove(key) {
+            self.begin_sidebar_disclosure_motion(key, 0.0, height);
+        }
+    }
+
+    fn archived_sidebar_chats(&self, cx: &App) -> Vec<zeron_proto::Chat> {
+        let filter = self.settings.space_filter.as_deref();
+        let mut rows: Vec<_> = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .filter(|chat| chat.archived)
+            .filter(|chat| filter.is_none_or(|id| chat.space_id.as_deref() == Some(id)))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        rows
+    }
+
     pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
@@ -1686,6 +1756,7 @@ impl Shell {
                             .map(|(_, height, _)| *height)
                             .sum::<f32>()
                         + SIDEBAR_LIST_GAP * row_count.saturating_sub(1) as f32;
+                    self.begin_queued_sidebar_reveal(&motion_key, !collapsed, body_height);
                     let label = if collapsed {
                         format!("{label} ({row_count})")
                     } else {
@@ -1965,24 +2036,11 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        const INITIAL: usize = 10;
-        const PAGE: usize = 25;
+        const INITIAL: usize = ARCHIVED_INITIAL_ROWS;
+        const PAGE: usize = ARCHIVED_PAGE_ROWS;
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let mut rows: Vec<zeron_proto::Chat> = {
-            let state = self.state.read(cx);
-            state
-                .chats
-                .iter()
-                .filter(|c| c.archived)
-                .filter(|chat| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .cloned()
-                .collect()
-        };
-        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        let rows = self.archived_sidebar_chats(cx);
         if rows.is_empty() {
             return None;
         }
@@ -2013,6 +2071,7 @@ impl Shell {
             } else {
                 0.0
             };
+        self.begin_queued_sidebar_reveal("archived", open, body_height);
         // Header (t3code settled-shelf toggle): muted 12px label, a hairline
         // filling the middle, chevron flipping open/closed. The count only
         // shows while collapsed — expanded, the rows speak for themselves.
@@ -2111,6 +2170,11 @@ impl Shell {
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("archived-{id}")))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("archived-{id}")
+                        })
+                        .relative()
                         .h(px(36.0))
                         .flex()
                         .flex_row()
@@ -2132,9 +2196,14 @@ impl Shell {
                                 cx.notify();
                             }
                         }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_chat(open_id.clone(), cx);
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            if event.click_count() >= 2 {
+                                this.open_rename_chat(open_id.clone(), cx);
+                            } else {
+                                this.open_chat(open_id.clone(), cx);
+                            }
                         }))
+                        .children(self.rename_row_reveal(&id, cx))
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -2160,8 +2229,18 @@ impl Shell {
                                     }),
                             )
                         })
-                        .child(
-                            div()
+                        .child(match self.rename_input_for(&id) {
+                            Some(input) => chat_rename::chat_title_editor(
+                                format!("chat-title-editor-{id}").into(),
+                                input,
+                                theme,
+                            ),
+                            None => div()
+                                .id(SharedString::from(format!("chat-title-{id}")))
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("chat-title-{id}")
+                                })
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
@@ -2171,8 +2250,9 @@ impl Shell {
                                 } else {
                                     theme.text.opacity(0.55)
                                 })
-                                .child(title),
-                        )
+                                .child(title)
+                                .into_any_element(),
+                        })
                         .child(right),
                 );
             }
