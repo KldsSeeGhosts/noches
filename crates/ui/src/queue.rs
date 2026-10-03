@@ -1476,6 +1476,9 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
+        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+            return true;
+        }
         let text = self.input.read(cx).text().trim().to_string();
         if text.is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
             self.finish_queue_edit("discard", None, cx);
@@ -1490,6 +1493,7 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
+        self.input.update(cx, |input, _| input.cancel_dictation());
         self.finish_queue_edit("cancel", None, cx);
         true
     }
@@ -1500,6 +1504,7 @@ impl Composer {
     }
 
     fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, _| input.cancel_dictation());
         self.editing_queued = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
@@ -1558,6 +1563,7 @@ impl Composer {
         });
         self.queue_edit_finishing = true;
         self.input.update(cx, |input, cx| {
+            input.cancel_dictation();
             input.read_only = true;
             cx.notify();
         });

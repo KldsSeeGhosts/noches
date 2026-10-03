@@ -286,6 +286,8 @@ impl SettingsStore {
 }
 
 pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    let data_dir = data_dir.into();
+    crate::dictation::init(data_dir.clone(), cx);
     cx.set_global(SettingsStore {
         current: settings,
         data_dir: data_dir.into(),
@@ -607,6 +609,9 @@ impl WindowGeometry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub dictation_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dictation_input: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -751,6 +756,8 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            dictation_enabled: false,
+            dictation_input: None,
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -842,6 +849,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 /// rather than panicking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    ToggleDictation,
     CaptureAppshot,
     SaveFile,
     BrowserReload,
@@ -863,7 +871,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 18 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -892,6 +900,7 @@ impl ShortcutId {
         ShortcutId::SplitViewRight,
         ShortcutId::SplitViewDown,
         ShortcutId::CloseSplitView,
+        ShortcutId::ToggleDictation,
     ];
 
     pub fn available(self) -> bool {
@@ -901,6 +910,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::ToggleDictation => "Hold to dictate",
             ShortcutId::CaptureAppshot => "Capture Appshot",
             ShortcutId::SaveFile => "Save file",
             ShortcutId::BrowserReload => "Reload browser page",
@@ -931,6 +941,8 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
+            // Cmd/Ctrl+D belongs to Noches' split-pane workspace.
+            ShortcutId::ToggleDictation => "mod-alt-r",
             ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
             ShortcutId::CaptureAppshot => "mod-alt-space",
             ShortcutId::SaveFile => "mod-s",
@@ -984,6 +996,7 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub toggle_dictation: String,
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
     pub capture_appshot: String,
     pub save_file: String,
@@ -1015,6 +1028,7 @@ pub struct KeymapConfig {
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            toggle_dictation: ShortcutId::ToggleDictation.default_combo().into(),
             capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
             save_file: ShortcutId::SaveFile.default_combo().into(),
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
@@ -1040,6 +1054,7 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::ToggleDictation => &self.toggle_dictation,
             ShortcutId::CaptureAppshot => &self.capture_appshot,
             ShortcutId::SaveFile => &self.save_file,
             ShortcutId::BrowserReload => &self.browser_reload,
@@ -1067,6 +1082,7 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::ToggleDictation => self.toggle_dictation = combo,
             ShortcutId::CaptureAppshot => self.capture_appshot = combo,
             ShortcutId::SaveFile => self.save_file = combo,
             ShortcutId::BrowserReload => self.browser_reload = combo,
@@ -2010,6 +2026,8 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            dictation_enabled: false,
+            dictation_input: Some("USB microphone".into()),
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
