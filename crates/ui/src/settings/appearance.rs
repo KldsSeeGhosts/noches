@@ -322,6 +322,19 @@ impl AppearancePage {
                             ),
                     ),
             )
+            .when(current != 0, |row| {
+                row.child(widgets::reset_button(theme, "panel-animation-reset").on_click(
+                    cx.listener(|_, _, _, cx| {
+                        crate::motion::set_panel_animation_ms(0);
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Immediate,
+                            cx,
+                            |settings| settings.panel_animation_ms = 0,
+                        );
+                        cx.notify();
+                    }),
+                ))
+            })
             .child(
                 div()
                     .id("panel-animation-steps")

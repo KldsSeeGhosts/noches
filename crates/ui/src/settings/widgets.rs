@@ -284,13 +284,16 @@ pub fn option_card(
         )
 }
 
+/// Settings group radius (T3 `rounded-xl` at the 16px interface size).
+const SECTION_CARD_RADIUS: f32 = 14.0;
+
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
 /// — the card tone, thinned to a translucent tint over glass so the card
 /// reads as frost instead of a solid slab ([`Theme::card_glass_bg`]).
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))
-        .rounded(px(12.0))
+        .rounded(px(SECTION_CARD_RADIUS))
         .border_1()
         .border_color(theme.border)
         .bg(theme.card_glass_bg())
@@ -305,7 +308,8 @@ pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
     div()
         .px(px(20.0))
         .py(px(14.0))
-        .when(!first, |el| el.border_t_1().border_color(theme.border))
+        // Row dividers sit a step below the card edge (T3 `border-border/50`).
+        .when(!first, |el| el.border_t_1().border_color(theme.border.opacity(0.5)))
         .hover(|s| s.bg(ink(0.015)))
         .flex()
         .flex_row()
@@ -412,7 +416,7 @@ pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
         .w(px(32.0))
         .h(px(18.0))
         .rounded_full()
-        .bg(if on { theme.text } else { ink(0.15) })
+        .bg(if on { theme.action() } else { ink(0.15) })
         .relative()
         .child(
             div()
@@ -421,8 +425,23 @@ pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
                 .left(px(if on { 16.0 } else { 2.0 }))
                 .size(px(14.0))
                 .rounded_full()
-                .bg(if on { theme.on_solid } else { ink(0.7) }),
+                .bg(if on { theme.on_action() } else { ink(0.7) }),
         )
+}
+
+/// Per-row "reset to default": a 28px restart glyph that only appears once the
+/// value differs from its default. Chain `.on_click(..)` on the result. `id`
+/// must be unique on the page.
+pub fn reset_button(theme: &Theme, id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    crate::controls::icon_button(
+        id,
+        theme,
+        crate::controls::Variant::Ghost,
+        crate::controls::Size::Sm,
+        crate::icons::RESTART,
+        "Reset to default",
+    )
+    .tooltip(crate::tooltip::text("Reset to default"))
 }
 
 /// A small quiet ghost action (`rounded-lg px-2.5 py-1.5 text-[12px]

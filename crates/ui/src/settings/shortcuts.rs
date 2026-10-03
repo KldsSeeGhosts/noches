@@ -714,6 +714,18 @@ impl Render for ShortcutsPage {
                                 ))),
                         ),
                 )
+                .when(follow_up != FollowUpBehavior::default(), |row| {
+                    row.child(widgets::reset_button(&theme, "composer-follow-up-reset").on_click(
+                        cx.listener(|_, _, _, cx| {
+                            crate::settings::update(
+                                crate::settings::SavePolicy::Immediate,
+                                cx,
+                                |settings| settings.follow_up_behavior = FollowUpBehavior::default(),
+                            );
+                            cx.notify();
+                        }),
+                    ))
+                })
                 .child(
                     div()
                         .id("composer-follow-up-behavior")

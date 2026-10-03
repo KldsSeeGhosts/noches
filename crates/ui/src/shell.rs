@@ -612,6 +612,41 @@ impl SettingsSection {
         }
     }
 
+    /// Words a settings search matches besides the label: what lives on the
+    /// page, in the terms a person would type.
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            SettingsSection::Connections => &["sync", "sign in", "account", "cloud", "relay", "remote"],
+            SettingsSection::Devices => &["device", "machine", "computer", "rename", "remote"],
+            SettingsSection::Harnesses => &["harness", "model", "claude", "codex", "cursor", "opencode", "enable"],
+            SettingsSection::Agents => &["login", "usage", "limit", "provider", "cli", "api key"],
+            SettingsSection::Appearance => &[
+                "theme", "color", "dark", "light", "font", "size", "width", "animation", "motion",
+                "panel", "accent", "syntax", "glass", "frost", "surface",
+            ],
+            SettingsSection::Files => &["editor", "open", "link", "browser", "preview"],
+            SettingsSection::Notifications => &["sound", "chime", "alert", "notify", "badge"],
+            SettingsSection::Dictation => &["voice", "microphone", "speech", "audio", "transcribe"],
+            SettingsSection::Shortcuts => &[
+                "keyboard", "keybinding", "hotkey", "send", "enter", "queue", "steer", "escape",
+                "follow-up", "working",
+            ],
+            SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
+            SettingsSection::Archived => &["archive", "restore", "history", "delete"],
+            SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
+        }
+    }
+
+    /// Whether `query` (already lowercased and trimmed) finds this section.
+    /// Every word must appear in the label or a keyword; an empty query finds
+    /// everything.
+    pub(crate) fn matches(self, query: &str) -> bool {
+        let label = self.label().to_lowercase();
+        query.split_whitespace().all(|word| {
+            label.contains(word) || self.keywords().iter().any(|keyword| keyword.contains(word))
+        })
+    }
+
     /// Where a generic "open Settings" lands for a remembered section: a
     /// section this build does not show (Appshots off-desktop) falls back to
     /// the first nav entry.
@@ -1793,6 +1828,8 @@ pub struct Shell {
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     chat_rename: Option<ChatRename>,
+    /// The settings sidebar's search field, created on first use.
+    settings_search: Option<(Entity<ComposerInput>, Subscription)>,
     /// The pending thread-menu open from a pane-header title click.
     header_title_menu_task: Option<gpui::Task<()>>,
     /// Chat id awaiting delete confirmation.
@@ -2297,6 +2334,7 @@ impl Shell {
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
             chat_rename: None,
+            settings_search: None,
             header_title_menu_task: None,
             delete_confirm: None,
             discard_working_tree: None,
@@ -6322,6 +6360,80 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The settings search field, created on first use. Typing refilters the
+    /// nav; Enter opens the first match.
+    fn settings_search_input(&mut self, cx: &mut Context<Self>) -> Entity<ComposerInput> {
+        if let Some((input, _)) = &self.settings_search {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            ComposerInput::new("Search settings", cx)
+                .with_single_line()
+                .with_text_metrics(13.0, 17.0)
+                .with_accessibility_role(gpui::Role::SearchInput)
+        });
+        let events = cx.subscribe(&input, |this: &mut Shell, input, event, cx| match event {
+            ComposerInputEvent::Edited => cx.notify(),
+            ComposerInputEvent::Submitted => {
+                let query = input.read(cx).text().trim().to_lowercase();
+                if let Some(first) = SettingsSection::ALL
+                    .into_iter()
+                    .find(|item| item.visible_in_nav() && item.matches(&query))
+                {
+                    this.open_settings(first, cx);
+                }
+            }
+            _ => {}
+        });
+        self.settings_search = Some((input.clone(), events));
+        input
+    }
+
+    /// The nav's search field: icon + input in a 32px rounded box, with a quiet
+    /// "no match" line under it when the query finds nothing.
+    fn render_settings_search(
+        &self,
+        input: &Entity<ComposerInput>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query = input.read(cx).text().trim().to_lowercase();
+        let none = !query.is_empty() && !SettingsSection::ALL.iter().any(|s| s.visible_in_nav() && s.matches(&query));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("settings-search")
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(crate::theme::ink(0.04))
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .child(
+                        icon(icons::MAGNIFER)
+                            .size(px(14.0))
+                            .text_color(theme.icon_muted()),
+                    )
+                    .child(div().flex_1().min_w_0().child(input.clone())),
+            )
+            .when(none, |el| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child("No settings match"),
+                )
+            })
+            .into_any_element()
+    }
+
     /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
     /// strip, "Settings" heading, icon section rows styled like session rows,
     /// and a Back row pinned to the bottom.
@@ -6345,6 +6457,12 @@ impl Shell {
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Updates => icons::RESTART,
         };
+        let search = self.settings_search_input(cx);
+        let query = search.read(cx).text().trim().to_lowercase();
+        let visible_sections: Vec<SettingsSection> = SettingsSection::ALL
+            .into_iter()
+            .filter(|item| item.visible_in_nav() && item.matches(&query))
+            .collect();
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
         // the sidebar's right edge (user-reported). Device identity lives on
@@ -6371,13 +6489,16 @@ impl Shell {
                             .child(SharedString::from("Settings")),
                     )
                     .child(
+                        div()
+                            .px(px(Theme::SPACE_SM))
+                            .pb(px(6.0))
+                            .child(self.render_settings_search(&search, theme, cx)),
+                    )
+                    .child(
                         div().flex().flex_col().gap(px(2.0)).children(
-                            SettingsSection::ALL
-                                .into_iter()
-                                .filter(|item| {
-                                    *item != SettingsSection::Appshots
-                                        || crate::appshots::is_desktop()
-                                })
+                            visible_sections
+                                .iter()
+                                .copied()
                                 .map(|item| {
                                     let selected = item == section;
                                     div()
@@ -6396,7 +6517,7 @@ impl Shell {
                                         .when(selected, |el| {
                                             // Same tokens as the main sidebar's session
                                             // rows — the two sidebars must feel alike.
-                                            el.bg(crate::theme::glass_selected_bg())
+                                            el.bg(theme.sidebar_active())
                                                 .font_weight(gpui::FontWeight::MEDIUM)
                                         })
                                         .text_color(if selected {
@@ -6405,7 +6526,7 @@ impl Shell {
                                             theme.text_muted
                                         })
                                         .cursor_pointer()
-                                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                                        .hover(|s| s.bg(theme.sidebar_hover()).text_color(theme.text))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.open_settings(item, cx)
                                         }))
@@ -14616,6 +14737,26 @@ mod settings_reopen_regressions {
             },
             cx,
         )
+    }
+
+    #[test]
+    fn settings_search_matches_labels_and_keywords_word_by_word() {
+        // Empty finds everything; a label or a page keyword finds its section.
+        assert!(SettingsSection::ALL.iter().all(|s| s.matches("")));
+        assert!(SettingsSection::Appearance.matches("appear"));
+        assert!(SettingsSection::Appearance.matches("font"));
+        assert!(SettingsSection::Shortcuts.matches("steer"));
+        assert!(!SettingsSection::Shortcuts.matches("font"));
+        // Every word has to land, in any order.
+        assert!(SettingsSection::Appearance.matches("panel animation"));
+        assert!(SettingsSection::Appearance.matches("animation panel"));
+        assert!(!SettingsSection::Appearance.matches("panel steer"));
+        // A query only some sections know narrows the nav to those.
+        let hits: Vec<_> = SettingsSection::ALL
+            .into_iter()
+            .filter(|s| s.matches("sound"))
+            .collect();
+        assert_eq!(hits, vec![SettingsSection::Notifications]);
     }
 
     #[test]
