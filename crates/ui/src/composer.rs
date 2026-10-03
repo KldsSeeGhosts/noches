@@ -36,7 +36,7 @@ use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
-use crate::roles;
+use crate::elevation;
 use crate::settings::{ComposerSendBehavior, FollowUpBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
@@ -3798,7 +3798,7 @@ impl Render for ComposerInput {
             theme
         };
         let text_color = if self.content.is_empty() {
-            roles::placeholder(theme)
+            theme.placeholder()
         } else {
             theme.text
         };
@@ -7560,7 +7560,7 @@ impl Composer {
                     theme.danger_strong,
                     theme.danger_strong.opacity(0.88),
                 ))
-                .shadow(roles::send_shadow(theme.danger_strong))
+                .shadow(elevation::send_shadow(theme.danger_strong))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -7574,7 +7574,7 @@ impl Composer {
         // Share the submission guard with Enter, including pending edits and
         // the new-session runnable-agent check.
         let blocked = self.send_blocked(cx);
-        let action = roles::action(theme);
+        let action = theme.action();
         let send_key = composer_hover_key("send", cx.entity_id());
         let (glyph, glyph_size) = match mode {
             SendButtonMode::Queue => (crate::icons::LIST_ADD, 16.0),
@@ -7589,8 +7589,8 @@ impl Composer {
             .size(px(28.0))
             .flex_none()
             .rounded_full()
-            .bg(motion::hover_blend(&send_key, action, roles::action_hover(theme)))
-            .shadow(roles::send_shadow(action))
+            .bg(motion::hover_blend(&send_key, action, theme.action_hover()))
+            .shadow(elevation::send_shadow(action))
             .flex()
             .items_center()
             .justify_center()
@@ -7608,7 +7608,7 @@ impl Composer {
             .child(
                 crate::icons::icon(glyph)
                     .size(px(glyph_size))
-                    .text_color(roles::on_action(theme)),
+                    .text_color(theme.on_action()),
             )
             .into_any_element()
     }
@@ -7702,7 +7702,7 @@ impl Render for Composer {
                 style.font_family = theme.font_sans.clone();
                 style.font_size = crate::typography::ui_rems(INPUT_TEXT_SIZE).into();
                 style.color = if input.content.is_empty() {
-                    roles::placeholder(&theme)
+                    theme.placeholder()
                 } else {
                     theme.text
                 };
@@ -8199,7 +8199,7 @@ impl Render for Composer {
                 crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
             }
         } else {
-            roles::composer_outline(&theme)
+            theme.composer_outline()
         };
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
@@ -8221,7 +8221,7 @@ impl Render for Composer {
             .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
             .when(!theme.is_frost(), |el| {
                 el.bg(theme.input_glass_bg())
-                    .shadow(roles::composer_shadow(&theme))
+                    .shadow(elevation::composer_shadow(&theme))
             });
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the

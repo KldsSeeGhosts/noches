@@ -327,7 +327,7 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .border_color(theme.border)
         .rounded(px(CARD_RADIUS))
         .when(!theme.is_frost(), |el| {
-            el.shadow(crate::roles::menu_shadow(theme))
+            el.shadow(crate::elevation::menu_shadow(theme))
         })
         .bg(surface_bg(theme))
         .p(px(CARD_INSET))
@@ -811,7 +811,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .bg(motion::hover_blend(
                 &fade_key,
                 crate::theme::wash(0.0),
-                crate::roles::control_hover(theme),
+                theme.control_hover(),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -833,7 +833,7 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(crate::roles::control_hover(theme))
+        row.bg(theme.control_hover())
             .text_color(theme.text)
     } else {
         row
@@ -930,7 +930,7 @@ pub fn palette_search_icon(theme: &Theme) -> gpui::Div {
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
 /// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
 /// chips ("⌘K", "esc").
-pub fn key_cap(_theme: &Theme) -> gpui::Div {
+pub fn key_cap(theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))
         .px(px(5.0))
@@ -940,7 +940,7 @@ pub fn key_cap(_theme: &Theme) -> gpui::Div {
         .items_center()
         .justify_center()
         .gap(px(4.0))
-        .bg(crate::roles::secondary_fill())
+        .bg(theme.muted())
 }
 
 /// The tiny verb after a key-cap.
@@ -1029,7 +1029,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .px(px(5.0))
         .py(px(1.0))
         .rounded(px(5.0))
-        .bg(crate::roles::secondary_fill())
+        .bg(theme.muted())
         .text_size(crate::typography::ui_rems(10.0))
         .font_family(theme.font_mono.clone())
         .text_color(theme.text_muted)
@@ -1081,7 +1081,7 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| {
-            el.shadow(crate::roles::dialog_shadow(theme))
+            el.shadow(crate::elevation::dialog_shadow(theme))
         })
         .flex()
         .flex_col()
@@ -1159,7 +1159,7 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
-            crate::roles::control_hover(theme),
+            theme.control_hover(),
         ))
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
@@ -1170,16 +1170,16 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
 
 /// Primary button (`btnPrimary`): the action plate with a top highlight.
 pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
-    let hover = crate::roles::action_hover(theme);
+    let hover = theme.action_hover();
     div()
         .px(px(12.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(crate::roles::action(theme))
-        .shadow(crate::roles::plate_highlight())
+        .bg(theme.action())
+        .shadow(crate::elevation::plate_highlight())
         .text_size(crate::typography::ui_rems(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(crate::roles::on_action(theme))
+        .text_color(theme.on_action())
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
         .child(SharedString::from(label.to_string()))
@@ -1192,7 +1192,7 @@ pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
         .py(px(6.0))
         .rounded(px(8.0))
         .bg(theme.danger_strong)
-        .shadow(crate::roles::plate_highlight())
+        .shadow(crate::elevation::plate_highlight())
         .text_size(crate::typography::ui_rems(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(gpui::white())

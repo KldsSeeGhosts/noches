@@ -60,7 +60,6 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
-use crate::roles;
 use crate::status_palette::SessionState;
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -6698,9 +6697,9 @@ impl Shell {
         // fill tiers (R5 §2.4): hover < on screen in another pane < focused.
         let fade_key = format!("{row_id}-hover");
         let tier = if selected {
-            Some(roles::sidebar_active(theme))
+            Some(theme.sidebar_active())
         } else if visible && sidebar_row {
-            Some(roles::sidebar_selected(theme))
+            Some(theme.sidebar_selected())
         } else {
             None
         };
@@ -6708,7 +6707,7 @@ impl Shell {
         // A tiered row must NOT drift toward the hover wash: the tiers are the
         // heavier fills, and blending toward the lighter hover visibly dimmed
         // the active row under the pointer (user report).
-        let hover_bg = tier.unwrap_or_else(|| roles::sidebar_hover(theme));
+        let hover_bg = tier.unwrap_or_else(|| theme.sidebar_hover());
         // Background work recedes: a running row that is not on screen sits
         // at 70% until the pointer reaches it.
         let recede = session == SessionState::Working && !selected && !visible && sidebar_row;

@@ -446,7 +446,7 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
 pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefinement {
-    s.bg(crate::roles::control_hover(theme))
+    s.bg(theme.control_hover())
         .text_color(theme.text)
 }
 

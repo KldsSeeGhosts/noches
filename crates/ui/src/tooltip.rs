@@ -51,7 +51,7 @@ pub fn surface(theme: &Theme) -> Div {
         .text_size(crate::typography::ui_rems(TEXT_SIZE))
         .text_color(theme.text)
         .when(!theme.is_frost(), |card| {
-            card.shadow(crate::roles::tooltip_shadow(theme))
+            card.shadow(crate::elevation::tooltip_shadow(theme))
         })
 }
 

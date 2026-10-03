@@ -1,98 +1,25 @@
-//! Chrome colour roles that the theme model does not carry yet.
+//! Elevation recipes and interaction fills the theme roles do not cover.
 //!
-//! D1 (theme foundation) adds these as real `ThemeColors` roles. Until that
-//! lands each one is derived here from today's tokens, so chrome code asks for
-//! the *role* and the swap is one line per helper (`// TODO(D1)` marks it).
-//! Nothing outside this module should reach for the underlying token to mean
-//! "the action colour", "the control hover fill", and so on.
+//! Colour roles (action, control hover, sidebar tiers, placeholder, composer
+//! outline, ...) live on [`Theme`]; this module holds the shadow stacks
+//! (R5 §2.7), the focus ring and the pressed fill that chrome shares.
 
 use gpui::{BoxShadow, Hsla, hsla, point, px};
 
 use crate::motion::mix;
-use crate::theme::{Appearance, Theme, ink, wash};
+use crate::theme::{Appearance, Theme};
 
-/// Fill of the primary action (send, primary button, switch on).
-pub(crate) fn action(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.action
-    theme.solid
-}
-
-/// Label/icon colour on top of [`action`].
-pub(crate) fn on_action(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.on_action
-    theme.on_solid
-}
-
-/// Hover plate of the primary action.
-pub(crate) fn action_hover(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.action_hover
-    mix(action(theme), theme.bg, 0.14)
-}
-
-/// Hover fill for ghost/outline controls and highlighted menu rows.
-pub(crate) fn control_hover(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.control_hover
-    theme.element_hover
-}
-
-/// Sidebar row fill under the pointer.
-pub(crate) fn sidebar_hover(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.sidebar_hover
-    theme.glass_hover()
-}
-
-/// Sidebar row on screen in a pane that is not the focused one. One step
-/// heavier than hover so the two never read as the same fill (R5 §2.4).
-pub(crate) fn sidebar_selected(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.sidebar_selected
-    step_up(sidebar_hover(theme), 1.45, theme)
-}
-
-/// The focused (open) sidebar row: the heaviest tier.
-pub(crate) fn sidebar_active(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.sidebar_active
-    step_up(sidebar_hover(theme), 1.8, theme)
-}
-
-/// Scale a translucent wash by `factor` (capped so rows never turn into
-/// plates); an opaque theme hover mixes toward the text colour instead.
-fn step_up(base: Hsla, factor: f32, theme: &Theme) -> Hsla {
-    if base.a < 0.99 {
+/// Pressed fill for ghost/outline controls: one step past the hover fill.
+pub(crate) fn control_pressed(theme: &Theme) -> Hsla {
+    let hover = theme.control_hover();
+    if hover.a < 0.99 {
         Hsla {
-            a: (base.a * factor).min(0.30),
-            ..base
+            a: (hover.a * 1.6).min(0.30),
+            ..hover
         }
     } else {
-        mix(base, theme.text, 0.05 * factor)
+        mix(hover, theme.text, 0.06)
     }
-}
-
-/// Pressed fill for ghost/outline controls: one step past hover.
-pub(crate) fn control_pressed(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.control_hover darkened/lightened
-    match theme.appearance {
-        Appearance::Dark => wash(0.16),
-        Appearance::Light => wash(0.10),
-    }
-}
-
-/// Plate behind a keyboard-key chip (`kbd`) and quiet badges.
-pub(crate) fn secondary_fill() -> Hsla {
-    // TODO(D1): theme.secondary
-    ink(0.06)
-}
-
-/// Placeholder text. The shared `text_faint` is the AA-checked placeholder
-/// tone today; the Claude family tunes it separately from icon-muted.
-pub(crate) fn placeholder(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.placeholder
-    theme.text_faint
-}
-
-/// Outline of the composer plate.
-pub(crate) fn composer_outline(theme: &Theme) -> Hsla {
-    // TODO(D1): theme.composer_outline
-    theme.border
 }
 
 /// Inset focus ring: an edge-only accent line, so it costs no layout and never
@@ -218,21 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_tiers_step_up_from_hover() {
+    fn pressed_is_heavier_than_hover() {
         for theme in [Theme::dark(), Theme::light()] {
-            let (h, s, a) = (
-                sidebar_hover(&theme),
-                sidebar_selected(&theme),
-                sidebar_active(&theme),
-            );
-            assert!(h.a < s.a && s.a < a.a, "{h:?} {s:?} {a:?}");
-        }
-    }
-
-    #[test]
-    fn action_hover_moves_off_the_action_plate() {
-        for theme in [Theme::dark(), Theme::light()] {
-            assert_ne!(action(&theme), action_hover(&theme));
+            assert!(control_pressed(&theme).a > theme.control_hover().a);
         }
     }
 }

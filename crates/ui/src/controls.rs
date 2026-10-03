@@ -6,14 +6,14 @@
 //! must NOT attach its own `.on_hover` (gpui keeps one listener per element)
 //! and passes ids that are unique and stable across frames.
 //!
-//! Colour comes from [`crate::roles`] so the primary action takes the theme's
+//! Colour comes from [`Theme`]'s role accessors so the primary action takes the theme's
 //! `action` role once D1 lands and stays monochrome until then.
 
 use gpui::{Div, FontWeight, Hsla, SharedString, Stateful, div, hsla, point, prelude::*, px};
 
 use crate::icons::{self, icon};
 use crate::motion;
-use crate::roles;
+use crate::elevation;
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,26 +100,26 @@ fn palette(theme: &Theme, variant: Variant) -> Palette {
     match variant {
         Variant::Ghost => Palette {
             rest_bg: clear,
-            hover_bg: roles::control_hover(theme),
+            hover_bg: theme.control_hover(),
             rest_fg: theme.text_muted,
             hover_fg: theme.text,
-            pressed_bg: roles::control_pressed(theme),
+            pressed_bg: elevation::control_pressed(theme),
             border: None,
         },
         Variant::Outline => Palette {
             rest_bg: clear,
-            hover_bg: roles::control_hover(theme),
+            hover_bg: theme.control_hover(),
             rest_fg: theme.text,
             hover_fg: theme.text,
-            pressed_bg: roles::control_pressed(theme),
+            pressed_bg: elevation::control_pressed(theme),
             border: Some(theme.border_strong),
         },
         Variant::Primary => Palette {
-            rest_bg: roles::action(theme),
-            hover_bg: roles::action_hover(theme),
-            rest_fg: roles::on_action(theme),
-            hover_fg: roles::on_action(theme),
-            pressed_bg: roles::action_hover(theme),
+            rest_bg: theme.action(),
+            hover_bg: theme.action_hover(),
+            rest_fg: theme.on_action(),
+            hover_fg: theme.on_action(),
+            pressed_bg: theme.action_hover(),
             border: None,
         },
         Variant::Destructive => Palette {
@@ -167,7 +167,7 @@ fn frame(
         .bg(motion::hover_blend(&id, p.rest_bg, p.hover_bg))
         .text_color(motion::hover_blend(&id, p.rest_fg, p.hover_fg))
         .active(|s| s.bg(p.pressed_bg))
-        .focus_visible(|s| s.shadow(roles::focus_ring(theme)));
+        .focus_visible(|s| s.shadow(elevation::focus_ring(theme)));
     let shadows = plate_shadows(variant);
     if !shadows.is_empty() {
         el = el.shadow(shadows);
@@ -231,7 +231,7 @@ pub fn kbd(theme: &Theme, label: impl Into<SharedString>) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .bg(roles::secondary_fill())
+        .bg(theme.muted())
         .font_family(theme.font_mono.clone())
         .text_size(px(11.0))
         .text_color(theme.text_muted)
