@@ -4061,6 +4061,10 @@ pub(crate) struct ComposerDraftState {
     appshots: HashMap<String, Vec<CapturedAppshot>>,
 }
 
+fn composer_hover_key(action: &str, view: gpui::EntityId) -> SharedString {
+    format!("composer-{action}-{view}").into()
+}
+
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     /// The chat this instance serves (see [`ChatTarget`]).
@@ -7947,6 +7951,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let attach_hover_key = composer_hover_key("attach", cx.entity_id());
         // Attach button - opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -7962,11 +7967,11 @@ impl Render for Composer {
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
-                "composer-attach",
+                &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener("composer-attach"))
+            .on_hover(motion::hover_listener(attach_hover_key))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -10337,6 +10342,24 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[gpui::test]
+    fn attachment_hover_fades_are_scoped_to_each_composer(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let selected = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pane = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
+        let selected_key = composer_hover_key("attach", selected.entity_id());
+        let pane_key = composer_hover_key("attach", pane.entity_id());
+        assert_ne!(selected_key, pane_key);
+        motion::set_hover(&selected_key, true, true);
+        assert_eq!(motion::hover_t(&selected_key), 1.0);
+        assert_eq!(motion::hover_t(&pane_key), 0.0);
+        motion::set_hover(&pane_key, true, true);
+        motion::set_hover(&selected_key, false, true);
+        assert_eq!(motion::hover_t(&selected_key), 0.0);
+        assert_eq!(motion::hover_t(&pane_key), 1.0);
+        motion::set_hover(&pane_key, false, true);
     }
 
     #[gpui::test]
