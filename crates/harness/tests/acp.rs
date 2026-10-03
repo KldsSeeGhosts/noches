@@ -13,7 +13,7 @@ use zeron_harness::acp::SignInProgress;
 use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, SteeringMode,
-    TodoItem, ToolCall, UserInputAnswer,
+    TodoItem, TodoStatus, ToolCall, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -223,14 +223,8 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         id: "acp-plan".into(),
         call: ToolCall::Todo {
             items: vec![
-                TodoItem {
-                    text: "read".into(),
-                    done: true
-                },
-                TodoItem {
-                    text: "fix".into(),
-                    done: false
-                },
+                TodoItem::new("read", TodoStatus::Completed),
+                TodoItem::new("fix", TodoStatus::InProgress),
             ]
         },
     }));
