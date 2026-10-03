@@ -14,7 +14,9 @@
 //! registry, geometry and mouse listeners live in `render.rs`.
 
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 /// One element's slice of the selection, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,9 +48,23 @@ struct MdSelection {
     spans: Vec<Span>,
 }
 
+#[cfg(not(test))]
 fn state() -> &'static Mutex<Option<MdSelection>> {
     static STATE: OnceLock<Mutex<Option<MdSelection>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Each test runs on its own thread, so give it its own selection. Tests that
+/// merely click or render Markdown would otherwise begin, drag or clear the
+/// selection another test is asserting on, and only the tests that take
+/// `test_state_lock` were protected from each other.
+#[cfg(test)]
+fn state() -> &'static Mutex<Option<MdSelection>> {
+    thread_local! {
+        static STATE: &'static Mutex<Option<MdSelection>> =
+            Box::leak(Box::new(Mutex::new(None)));
+    }
+    STATE.with(|state| *state)
 }
 
 /// Selection state is process-global; tests that exercise its lifecycle must
