@@ -168,6 +168,8 @@ impl RunnerMcp for HostMcp {
 
 pub struct OrchestrationHost {
     pub bridge: Arc<RunnerBridge>,
+    /// The same service the MCP tools call; the UI's user-authority Stop uses it.
+    pub service: Arc<DelegationService>,
     stop: CancellationToken,
     workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -217,12 +219,11 @@ impl OrchestrationHost {
         // Recovery is SQL/lock-only; never block_on a provider/network future.
         // Complete it under InstanceLock before installing callable services.
         futures::executor::block_on(bridge.recover_mailbox())?;
-        sessions
-            .mcp_server()
-            .set_service(Arc::new(DelegationService {
-                kernel: kernel.clone(),
-                targets: catalog,
-            }));
+        let service = Arc::new(DelegationService {
+            kernel: kernel.clone(),
+            targets: catalog,
+        });
+        sessions.mcp_server().set_service(service.clone());
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
         let mut workers = bridge.spawn_workers(stop.clone());
@@ -253,6 +254,7 @@ impl OrchestrationHost {
         }));
         Ok(Self {
             bridge,
+            service,
             stop,
             workers: std::sync::Mutex::new(workers),
         })

@@ -590,6 +590,7 @@ enum MutateParams {
 
 pub struct EngineRpc {
     orchestration: Option<crate::orchestration::Store>,
+    delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -639,6 +640,7 @@ impl EngineRpc {
         };
         Self {
             orchestration: None,
+            delegation: None,
             sessions,
             doc_host,
             workspace,
@@ -662,6 +664,14 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    pub fn with_delegation(
+        mut self,
+        service: std::sync::Arc<crate::orchestration::task::DelegationService>,
+    ) -> Self {
+        self.delegation = Some(service);
         self
     }
 
@@ -1610,6 +1620,24 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())
+            }
+            methods::CANCEL_DELEGATED_TASK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    task_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let service = self
+                    .delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("delegated tasks are unavailable".into()))?;
+                let result = service
+                    .cancel_for_user(&p.chat_id.into(), p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.message))?;
+                RpcReply::value(&result)
             }
             methods::GET_ORCHESTRATION_STATE => {
                 let p: ChatParams = parse_params(params)?;

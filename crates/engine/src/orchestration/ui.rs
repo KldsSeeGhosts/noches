@@ -41,6 +41,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<Value> {
             "taskId":task["id"],"childThreadId":task["childThreadId"],"title":task["title"],
             "providerInstanceId":task["providerInstanceId"],"model":task["model"],
             "status":task["status"],"workState":work_state,"result":task["result"],
+            "startedAt":task["startedAt"],"completedAt":task["completedAt"],
             "latestResult":latest_result.or_else(|| task["result"].as_str().map(|s| json!(s))),
             "latestTerminalRunId":latest.map(|r| &r.id),
             "completionDelivery":task["completionDelivery"]

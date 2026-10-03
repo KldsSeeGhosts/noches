@@ -735,6 +735,48 @@ async fn cancel_active_is_request_then_disposal_not_terminal_confirmation() {
 }
 
 #[tokio::test]
+async fn user_stop_cancels_under_parent_authority_without_acknowledging_a_result() {
+    let fixture = Fixture::new();
+    let task = fixture.delegate("user stop").await;
+    let result = fixture
+        .service
+        .cancel_for_user(&fixture.caller.thread_id, task.task_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["status"],
+        "cancel_requested"
+    );
+    assert!(
+        fixture
+            .kernel()
+            .store
+            .effects()
+            .unwrap()
+            .iter()
+            .any(|effect| matches!(
+                effect.request,
+                super::effects::EffectRequest::ManagedRunInterrupt { .. }
+            ))
+    );
+    // A stranger's task id is refused, never cancelled.
+    let refused = fixture
+        .service
+        .cancel_for_user(&fixture.caller.thread_id, "node:missing".into())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, OrchestratorMcpFailureCode::TaskNotFound);
+    // And an unknown parent chat is a clean error.
+    assert!(
+        fixture
+            .service
+            .cancel_for_user(&"nope".into(), task.task_id.to_string())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn completion_coalescing_arrivals_during_delivery_and_stale_generation() {
     let fixture = Fixture::new();
     let a = fixture.delegate("a").await;

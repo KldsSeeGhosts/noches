@@ -36,6 +36,10 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
+    /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
+    /// `task_cancel` under host authority. Resolves on acceptance, not on the
+    /// terminal state, which `GetOrchestrationState` reports.
+    pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";

@@ -510,6 +510,9 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_orchestration(self.orchestration.store.clone())
         .with_previews(self.previews.clone());
+        if let Some(host) = &self.orchestration_host {
+            rpc = rpc.with_delegation(host.service.clone());
+        }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

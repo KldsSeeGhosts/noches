@@ -1320,6 +1320,56 @@ impl DelegationService {
             .unwrap_or(Ok(false))
     }
 
+    /// The signed-in user's Stop from the UI: `task_cancel` under the parent
+    /// chat's own authority. A user holds no provider session, so the scope is
+    /// rebuilt from the parent projection; `cancel` never needs an active run
+    /// and, unlike `task_status`, never acknowledges a result.
+    pub async fn cancel_for_user(
+        &self,
+        parent_id: &ThreadId,
+        task_id: String,
+    ) -> std::result::Result<TaskCancelResult, ToolError> {
+        let parent = self
+            .kernel
+            .store
+            .thread(parent_id)
+            .map_err(tool_error)?
+            .ok_or_else(|| {
+                ToolError::new(
+                    OrchestratorMcpFailureCode::ThreadNotFound,
+                    "Parent thread was not found.",
+                )
+            })?;
+        let caller = CallerScope {
+            thread_id: parent_id.clone(),
+            run_id: parent
+                .runs
+                .last()
+                .map(|run| run.id.clone())
+                .unwrap_or_else(|| RunId("run:user-stop".into())),
+            session_id: "user-ui".into(),
+            project_id: parent.thread.project_id.clone(),
+            workspace_root: parent
+                .thread
+                .worktree_path
+                .as_ref()
+                .map(|path| std::path::PathBuf::from(AsRef::<str>::as_ref(path)))
+                .unwrap_or_default(),
+            runtime_mode: parent.thread.runtime_mode,
+            interaction_mode: parent.thread.interaction_mode,
+            provider_instance_id: parent.thread.provider_instance_id.clone(),
+        };
+        self.task_cancel(
+            caller,
+            TaskCancelInput {
+                task_id,
+                reason: Optional::Present("Stopped from the app".into()),
+                client_request_id: Optional::Present(format!("ui:{}", uuid::Uuid::new_v4())),
+            },
+        )
+        .await
+    }
+
     /// P4 calls this only after its complete, direct-child terminal-result read;
     /// a partial read or thread_wait does not consume the result.
     pub async fn acknowledge_child_read(
