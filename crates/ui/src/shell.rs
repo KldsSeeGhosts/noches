@@ -997,7 +997,7 @@ pub(super) fn chat_row_height() -> f32 {
 
 /// Compact elapsed run time for the Working status slot: `45s`, `2m`,
 /// `1h 4m`, `3h`. Rounds down to whole units; negative input reads `0s`.
-pub(super) fn format_working_elapsed(total_seconds: i64) -> String {
+pub(crate) fn format_working_elapsed(total_seconds: i64) -> String {
     let seconds = total_seconds.max(0);
     if seconds < 60 {
         format!("{seconds}s")
@@ -1089,6 +1089,28 @@ impl SidebarSessionPointer {
             self.dragging = true;
         }
         self.dragging
+    }
+}
+
+impl Shell {
+    /// A left press on a sidebar row for `session_id`: arm the pointer drag
+    /// that can split it into a pane (shared by chat cards and delegated
+    /// child rows nested under them).
+    pub(crate) fn press_sidebar_session(
+        &mut self,
+        session_id: String,
+        origin: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_session_pointer.take().is_some() {
+            self.cancel_split_drag(cx);
+        }
+        self.sidebar_drag_suppressed_click = false;
+        self.sidebar_session_pointer = Some(SidebarSessionPointer {
+            session_id,
+            origin,
+            dragging: false,
+        });
     }
 }
 
@@ -1708,7 +1730,7 @@ pub struct Shell {
     sidebar_session_pointer: Option<SidebarSessionPointer>,
     /// Last mouse-up was a drag, so a row click delivered after it cannot
     /// navigate. Reset on the next left mouse-down (keyboard clicks remain live).
-    sidebar_drag_suppressed_click: bool,
+    pub(crate) sidebar_drag_suppressed_click: bool,
     /// Paint-time bounds of the single-pane dropzone or workspace outlet.
     sidebar_drop_outlet: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>,
     /// WS5: per-space layout persistence — `{data_dir}/workspace-layout.json`
@@ -1823,6 +1845,11 @@ pub struct Shell {
     /// Subagent keys (`{chat_id}/{part_id}` or doc id) whose thread the user
     /// already opened - the Done glyph goes neutral once seen.
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Per-chat Agents-panel state: Previous open/closed and lineage paging.
+    pub(crate) agents_ui: std::collections::HashMap<String, crate::subagents::PanelUi>,
+    /// The engine read API for delegated tasks (TODO(O-G): `ui-api.md`).
+    delegation_api: std::sync::Arc<dyn crate::delegation::DelegationApi>,
+    _delegation_sync: Task<()>,
     /// Per-chat sidebar child-row count last rendered - diffs kick the
     /// `sub:{chat}` disclosure tween that animates the card's growth.
     sidebar_sub_rows: std::collections::HashMap<String, usize>,
@@ -2104,6 +2131,10 @@ impl Shell {
                         this.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
                     }
                     ComposerEvent::ToggleAgentsPanel => this.toggle_agents_panel(cx),
+                    ComposerEvent::OpenChat { chat_id } => this.open_chat(chat_id.clone(), cx),
+                    ComposerEvent::StopDelegatedTask { task_id } => {
+                        this.stop_delegated_task(task_id.clone(), cx)
+                    }
                 }
             }
         })
@@ -2184,6 +2215,8 @@ impl Shell {
                     .await;
             }
         });
+        let delegation_api = crate::delegation::api_for_env();
+        let delegation_sync = Self::spawn_delegation_sync(&state, delegation_api.clone(), cx);
         let data_dir = boot.data_dir.clone();
         // Host IDs are untrusted pairing data: encode bytes rather than joining
         // a raw ID as a filesystem path. Local and remote projectless layouts
@@ -2471,6 +2504,9 @@ impl Shell {
             unfocused: cx.focus_handle(),
             activation_sub: None,
             _ticker: ticker,
+            agents_ui: Default::default(),
+            delegation_api,
+            _delegation_sync: delegation_sync,
             _state_observation: observation,
             _composer_events: composer_events,
             _transcript_events: transcript_events,
@@ -3894,6 +3930,15 @@ impl Shell {
         summary: crate::subagents::SubagentSummary,
         cx: &mut Context<Self>,
     ) {
+        // A delegated task is a real chat: open the child itself (read-only,
+        // with its banner), not a right-pane transcript tab.
+        if let Some(link) = summary.delegated.as_deref() {
+            self.subagent_seen
+                .borrow_mut()
+                .insert(link.child_chat_id.clone());
+            self.open_chat(link.child_chat_id.clone(), cx);
+            return;
+        }
         if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
             self.open_chat(chat_id.clone(), cx);
         }
@@ -3938,6 +3983,113 @@ impl Shell {
             .insert(format!("{chat_id}/{}", summary.id));
         let frozen = !summary.status.active();
         self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
+    }
+
+    /// The Agents panel's click behaviour for `chat_id`.
+    fn agents_panel_actions(&self, chat_id: String) -> crate::subagents::PanelActions {
+        let toggle_chat = chat_id.clone();
+        let more_chat = chat_id;
+        crate::subagents::PanelActions {
+            open: std::rc::Rc::new(|this, chat, summary, cx| {
+                this.open_subagent_summary(chat, summary, cx)
+            }),
+            open_chat: std::rc::Rc::new(|this, chat, cx| this.open_chat(chat, cx)),
+            stop: std::rc::Rc::new(|this, task_id, cx| this.stop_delegated_task(task_id, cx)),
+            toggle_previous: std::rc::Rc::new(move |this, cx| {
+                let ui = this.agents_ui.entry(toggle_chat.clone()).or_default();
+                ui.previous_open = !ui.previous_open;
+                cx.notify();
+            }),
+            show_more: std::rc::Rc::new(move |this, group, cx| {
+                this.agents_ui
+                    .entry(more_chat.clone())
+                    .or_default()
+                    .show_more(group);
+                cx.notify();
+            }),
+        }
+    }
+
+    /// Poll the delegation read API into the update-owned index. The cadence
+    /// follows the work: brisk while anything is active, slow when idle, and
+    /// backing off when the API is not served yet.
+    /// TODO(O-G): replace the poll with the ui-api watch stream.
+    fn spawn_delegation_sync(
+        state: &Entity<AppState>,
+        fallback: std::sync::Arc<dyn crate::delegation::DelegationApi>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let state = state.clone();
+        cx.spawn(async move |this, cx| {
+            let mut failures = 0u32;
+            loop {
+                // Stop with the window.
+                if this.update(cx, |_, _| ()).is_err() {
+                    break;
+                }
+                let api = crate::delegation::select_api(
+                    state.read_with(cx, |s, _| s.engine().cloned()),
+                    &fallback,
+                );
+                let result = crate::delegation::with_timeout(
+                    api.snapshot(),
+                    cx.background_executor(),
+                    Duration::from_secs(10),
+                )
+                .await;
+                let busy = match result {
+                    Ok(snapshot) => {
+                        failures = 0;
+                        let busy = snapshot.tasks.iter().any(|t| t.phase().active());
+                        state.update(cx, |state, cx| {
+                            if state.apply_delegation_snapshot(snapshot) {
+                                cx.notify();
+                            }
+                        });
+                        busy
+                    }
+                    Err(_) => {
+                        failures = failures.saturating_add(1);
+                        false
+                    }
+                };
+                let wait = match (failures, busy) {
+                    (0, true) => Duration::from_millis(1500),
+                    (0, false) => Duration::from_secs(5),
+                    (n, _) => Duration::from_secs(5 * u64::from(n.min(12))),
+                };
+                cx.background_executor().timer(wait).await;
+            }
+        })
+    }
+
+    /// Stop one delegated task (`task_cancel`). Acceptance flips the row to
+    /// "Stopping"; the terminal state arrives with the next snapshot.
+    pub(crate) fn stop_delegated_task(&mut self, task_id: String, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let call = crate::delegation::select_api(
+            self.state.read(cx).engine().cloned(),
+            &self.delegation_api,
+        )
+        .cancel_task(task_id.clone());
+        cx.spawn(async move |_, cx| {
+            let result = crate::delegation::with_timeout(
+                call,
+                cx.background_executor(),
+                Duration::from_secs(20),
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    state.update(cx, |state, cx| {
+                        state.mark_delegated_cancel_requested(&task_id);
+                        cx.notify();
+                    });
+                }
+                Err(error) => tracing::warn!(%task_id, %error, "task_cancel was not accepted"),
+            }
+        })
+        .detach();
     }
 
     /// Whether the Agents surface is the visible right-pane tab (the agents
@@ -6972,15 +7124,7 @@ impl Shell {
                 cx.listener({
                     let drag_id = id.clone();
                     move |this, event: &MouseDownEvent, _, cx| {
-                        if this.sidebar_session_pointer.take().is_some() {
-                            this.cancel_split_drag(cx);
-                        }
-                        this.sidebar_drag_suppressed_click = false;
-                        this.sidebar_session_pointer = Some(SidebarSessionPointer {
-                            session_id: drag_id.clone(),
-                            origin: event.position,
-                            dragging: false,
-                        });
+                        this.press_sidebar_session(drag_id.clone(), event.position, cx);
                     }
                 }),
             )
@@ -9558,7 +9702,6 @@ impl Shell {
                             summary,
                             mark,
                         },
-                        Utc::now(),
                         &theme,
                         cx.entity_id(),
                         cx.listener(move |this, _, _, cx| this.open_chat(parent_id.clone(), cx)),
@@ -9599,18 +9742,27 @@ impl Shell {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
                     let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
-                    let open: crate::subagents::OpenAgent =
-                        std::rc::Rc::new(|this, chat, summary, cx| {
-                            this.open_subagent_summary(chat, summary, cx)
-                        });
+                    let related = {
+                        let state = self.state.read(cx);
+                        crate::delegation::related_rows(&state.delegation, &chat_id, |id| {
+                            state
+                                .chats
+                                .iter()
+                                .find(|chat| chat.id == id)
+                                .and_then(|chat| chat.title.clone())
+                        })
+                    };
+                    let ui = self.agents_ui.get(&chat_id).cloned().unwrap_or_default();
+                    let actions = self.agents_panel_actions(chat_id.clone());
                     crate::subagents::agents_panel_body(
                         &chat_id,
+                        &related,
                         &summaries,
                         &self.subagent_seen.borrow(),
-                        Utc::now(),
+                        &ui,
                         &theme,
                         cx.entity_id(),
-                        open,
+                        &actions,
                         cx,
                     )
                 }

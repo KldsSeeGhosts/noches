@@ -191,6 +191,10 @@ fn sidebar_source_fingerprint(state: &AppState, now: chrono::DateTime<Utc>) -> u
             chat.config.as_ref().map(|config| config.harness),
         )
             .hash(&mut hash);
+        state
+            .delegation
+            .is_delegated_child(&chat.id)
+            .hash(&mut hash);
         crate::change_requests::conversation_branch(chat, &state.spaces).hash(&mut hash);
         (
             state.display_status_for(chat, now) as u8,
@@ -767,12 +771,12 @@ impl Shell {
 
     fn archived_sidebar_chats(&self, cx: &App) -> Vec<zeron_proto::Chat> {
         let filter = self.settings.space_filter.as_deref();
-        let mut rows: Vec<_> = self
-            .state
-            .read(cx)
+        let state = self.state.read(cx);
+        let mut rows: Vec<_> = state
             .chats
             .iter()
             .filter(|chat| chat.archived)
+            .filter(|chat| !state.delegation.is_delegated_child(&chat.id))
             .filter(|chat| filter.is_none_or(|id| chat.space_id.as_deref() == Some(id)))
             .cloned()
             .collect();
@@ -2100,7 +2104,12 @@ impl Shell {
         // Nested child rows: running subagents only, and only under cards
         // whose transcript is actually open (selected or pinned to a pane) -
         // the selector can only read loaded transcripts anyway.
-        let sub_summaries = if is_selected || pane_open.contains(&chat.id) {
+        // Delegated tasks come from the engine's read model, not a transcript,
+        // so a delegating card shows them whether or not it is open.
+        let sub_summaries = if is_selected
+            || pane_open.contains(&chat.id)
+            || self.state.read(cx).delegation.has_parent(&chat.id)
+        {
             Some(crate::subagents::subagents_for(
                 self.state.read(cx),
                 &chat.id,
@@ -2150,7 +2159,6 @@ impl Shell {
             let content = crate::subagents::sidebar_children(
                 &chat.id,
                 sub_summaries.as_ref().unwrap().running(),
-                now,
                 theme,
                 cx.entity_id(),
                 open,

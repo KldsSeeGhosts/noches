@@ -16,6 +16,7 @@ use gpui::{
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
 use zeron_proto::ToolCall;
 
+use crate::elapsed_label::{ClockSpec, elapsed_label};
 use crate::shell::Shell;
 use crate::state::AppState;
 use crate::status_palette::SessionState;
@@ -29,15 +30,37 @@ use crate::{icons, loaders, transcript};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentPhase {
     Running,
+    /// A delegated task whose own nested work is still open: alive, but not
+    /// pulsing (only work that is actually running pulses).
+    Waiting,
     Started,
     Done,
     Failed,
+    /// Cancelled or interrupted: settled without a result, neither success
+    /// nor failure.
+    Stopped,
 }
 
 impl SubagentPhase {
     pub fn active(self) -> bool {
-        matches!(self, Self::Running | Self::Started)
+        matches!(self, Self::Running | Self::Waiting | Self::Started)
     }
+}
+
+/// What distinguishes an app-owned delegated task from a native vendor
+/// subagent: it is a real chat the engine runs on its own, so rows open that
+/// chat, show its provider/model/workState and offer Stop.
+#[derive(Debug, Clone)]
+pub struct DelegatedLink {
+    pub task_id: String,
+    /// The real chat the task runs in.
+    pub child_chat_id: String,
+    pub harness: Option<zeron_proto::HarnessId>,
+    pub effort: Option<SharedString>,
+    pub work_state: crate::delegation::DelegatedWorkState,
+    pub cancellable: bool,
+    /// Stop accepted, terminal not yet confirmed.
+    pub stopping: bool,
 }
 
 /// One spawned subagent, reduced to what the tray/panel/sidebar draw.
@@ -57,6 +80,9 @@ pub struct SubagentSummary {
     pub doc_ref: Option<SharedString>,
     /// Sits in the chat's latest turn (after the last user entry).
     pub latest_turn: bool,
+    /// `Some` for an app-owned delegated task; native subagents are `None`
+    /// and stay observational.
+    pub delegated: Option<Arc<DelegatedLink>>,
 }
 
 /// One update-owned presentation shared by all consumers. Subsets retain only
@@ -98,13 +124,15 @@ impl SubagentPresentation {
         let tray = summaries
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.latest_turn || s.status == SubagentPhase::Running)
+            .filter(|(_, s)| {
+                s.latest_turn || matches!(s.status, SubagentPhase::Running | SubagentPhase::Waiting)
+            })
             .map(|(ix, _)| ix)
             .collect();
         let running = summaries
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.status == SubagentPhase::Running)
+            .filter(|(_, s)| matches!(s.status, SubagentPhase::Running | SubagentPhase::Waiting))
             .map(|(ix, _)| ix)
             .collect();
         Self {
@@ -126,16 +154,74 @@ impl SubagentSummary {
     /// Settled agents with no observed finish time show nothing rather
     /// than a guessed duration.
     pub fn elapsed(&self, now: DateTime<Utc>) -> Option<String> {
-        let started = self.started?;
-        let end = if self.status.active() {
-            now
-        } else {
-            self.finished?
-        };
-        Some(crate::shell::format_working_elapsed(
-            end.signed_duration_since(started).num_seconds(),
-        ))
+        self.clock().label(now)
     }
+
+    /// The self-ticking clock this row's elapsed label runs on.
+    pub fn clock(&self) -> ClockSpec {
+        ClockSpec {
+            started: self.started,
+            finished: self.finished,
+            active: self.status.active(),
+        }
+    }
+
+    /// Stop is offered: an active delegated task the engine can interrupt that
+    /// has not already been asked to.
+    pub fn stoppable(&self) -> Option<&DelegatedLink> {
+        self.delegated
+            .as_deref()
+            .filter(|link| self.status.active() && link.cancellable && !link.stopping)
+    }
+}
+
+/// The 12px provider mark for a delegated row: the harness brand, monochrome
+/// unless the brand carries its own tint. No mark for native subagents.
+fn provider_mark(link: &DelegatedLink, theme: &Theme) -> Option<AnyElement> {
+    let (mark, tint) = crate::pickers::harness_brand_icon(link.harness?);
+    Some(
+        icons::icon(mark)
+            .size(px(12.0))
+            .flex_none()
+            .text_color(tint.unwrap_or(theme.text_faint))
+            .into_any_element(),
+    )
+}
+
+/// The hover card for a delegated row (T3's `SubagentTooltipContent`): title,
+/// provider and model, workState with elapsed, then the latest result.
+fn delegated_tooltip(
+    summary: SubagentSummary,
+) -> impl Fn(&mut gpui::Window, &mut App) -> gpui::AnyView + 'static {
+    // Built per hover, so the elapsed it shows is the hover's, not the last
+    // frame's.
+    crate::tooltip::lines(move || {
+        let now = Utc::now();
+        let mut card = crate::tooltip::Lines::new(summary.title.clone());
+        if let Some(link) = summary.delegated.as_deref() {
+            let model = [summary.model.as_deref(), link.effort.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" \u{00b7} ");
+            if !model.is_empty() {
+                card = card.detail(model);
+            }
+            let mut state = if link.stopping {
+                "Stopping".to_owned()
+            } else {
+                link.work_state.label().to_owned()
+            };
+            if let Some(elapsed) = summary.elapsed(now) {
+                state = format!("{state} \u{00b7} {elapsed}");
+            }
+            card = card.detail(state);
+        }
+        if let Some(detail) = summary.summary.clone() {
+            card = card.detail(detail);
+        }
+        card
+    })
 }
 
 fn spawn_input(call: &ToolCall) -> Option<&serde_json::Value> {
@@ -350,10 +436,78 @@ fn derive_subagents(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
                 summary,
                 doc_ref,
                 latest_turn: ix >= last_user,
+                delegated: None,
             });
         }
     }
     out
+}
+
+/// The chat's delegated tasks as display summaries. Reads the update-owned
+/// delegation index and the chat's config; never a history beyond locating the
+/// last user turn (the tray's "latest turn" cut), and only from update.
+fn delegated_summaries(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
+    let tasks = state.delegation.tasks_for(chat_id);
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let entries: &[SessionMessageEntry] = if state.selected_chat.as_deref() == Some(chat_id) {
+        &state.transcript
+    } else {
+        state.sub_transcript(chat_id)
+    };
+    let last_user_ms = entries
+        .iter()
+        .rev()
+        .find(|e| e.role == MessageRole::User)
+        .map_or(0, |e| e.created_at);
+    tasks
+        .iter()
+        .map(|task| {
+            let child_config = state
+                .chats
+                .iter()
+                .find(|c| c.id == task.child_chat_id)
+                .and_then(|c| c.config.as_ref());
+            let model = task
+                .model
+                .clone()
+                .or_else(|| child_config.and_then(|c| c.model.clone()))
+                .map(|m| crate::pickers::chip_model_label(&m).to_owned());
+            let effort = task.effort.clone().or_else(|| {
+                child_config
+                    .and_then(|c| c.reasoning)
+                    .map(|level| crate::pickers::reasoning_label(level).to_owned())
+            });
+            let phase = task.phase();
+            let latest_turn = phase.active()
+                || task
+                    .completed_at
+                    .or(task.started_at)
+                    .is_some_and(|at| at.timestamp_millis() >= last_user_ms);
+            SubagentSummary {
+                id: task.task_id.clone(),
+                title: SharedString::from(task.title.clone()),
+                agent_type: None,
+                model: model.map(SharedString::from),
+                status: phase,
+                started: task.started_at,
+                finished: task.completed_at,
+                summary: task.detail(120).map(SharedString::from),
+                doc_ref: None,
+                latest_turn,
+                delegated: Some(Arc::new(DelegatedLink {
+                    task_id: task.task_id.clone(),
+                    child_chat_id: task.child_chat_id.clone(),
+                    harness: task.harness.or_else(|| child_config.map(|c| c.harness)),
+                    effort: effort.map(SharedString::from),
+                    work_state: task.work_state,
+                    cancellable: task.cancellable,
+                    stopping: state.delegation.cancel_requested(&task.task_id),
+                })),
+            }
+        })
+        .collect()
 }
 
 fn sort_summaries(out: &mut [SubagentSummary]) {
@@ -386,6 +540,49 @@ impl AppState {
         }
     }
 
+    /// Replace the delegation read model and rebuild only the presentations
+    /// whose tasks or links changed. Returns whether anything did, so the
+    /// caller notifies exactly once. Runs from the sync loop, never render.
+    pub(crate) fn apply_delegation_snapshot(
+        &mut self,
+        snapshot: crate::delegation::DelegationSnapshot,
+    ) -> bool {
+        let next = crate::delegation::DelegationIndex::build(snapshot, Some(&self.delegation));
+        let affected: HashSet<String> = self
+            .delegation
+            .parents()
+            .chain(next.parents())
+            .filter(|parent| {
+                self.delegation.tasks_for(parent) != next.tasks_for(parent)
+                    || self.delegation.forks_of(parent) != next.forks_of(parent)
+                    || self.delegation.cancel_requested_set() != next.cancel_requested_set()
+            })
+            .cloned()
+            .collect();
+        // A child's own parent link is part of its banner.
+        let links_changed = self.delegation.links_differ(&next);
+        self.delegation = next;
+        for parent in &affected {
+            self.prepare_subagents(parent);
+        }
+        self.prune_subagent_presentations();
+        links_changed || !affected.is_empty()
+    }
+
+    /// Record an accepted Stop (`cancel_requested`) so rows read "Stopping…"
+    /// until the snapshot reports a terminal state.
+    pub(crate) fn mark_delegated_cancel_requested(&mut self, task_id: &str) {
+        let parent = self
+            .delegation
+            .task_by_id(task_id)
+            .map(|task| task.parent_chat_id.clone());
+        if self.delegation.request_cancel(task_id)
+            && let Some(parent) = parent
+        {
+            self.prepare_subagents(&parent);
+        }
+    }
+
     pub(crate) fn prune_subagent_presentations(&mut self) {
         let retained: HashSet<_> = self
             .subagent_presentations
@@ -403,6 +600,7 @@ impl AppState {
 
     fn prepare_subagents(&mut self, chat_id: &str) {
         let mut summaries = derive_subagents(self, chat_id);
+        summaries.extend(delegated_summaries(self, chat_id));
         // Only agents observed active in this app lifetime get an inferred
         // finish time. A terminal replay after restart never stamps "now".
         let now = Utc::now().timestamp_millis();
@@ -452,7 +650,7 @@ pub(crate) fn strip_visible(summaries: &SubagentPresentation) -> SubagentSubset<
 // ---------------------------------------------------------------------------
 
 /// Equalizer Running, check Done (emerald until seen), danger triangle
-/// Failed, neutral dot Started.
+/// Failed, ring Waiting, stop mark Stopped, neutral dot Started.
 pub fn status_glyph(
     key: SharedString,
     phase: SubagentPhase,
@@ -479,6 +677,19 @@ pub fn status_glyph(
             .size(px(12.0))
             .flex_none()
             .text_color(theme.danger)
+            .into_any_element(),
+        // Alive but not pulsing: a static ring in the Working hue.
+        SubagentPhase::Waiting => div()
+            .size(px(8.0))
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(SessionState::Working.color(theme).unwrap())
+            .into_any_element(),
+        SubagentPhase::Stopped => icons::icon(icons::STOP)
+            .size(px(10.0))
+            .flex_none()
+            .text_color(theme.text_faint)
             .into_any_element(),
         SubagentPhase::Started => div()
             .size(px(4.0))
@@ -523,7 +734,6 @@ pub struct ChildBanner<'a> {
 /// to the parent. `open_parent` runs on the button.
 pub fn child_thread_banner(
     banner: &ChildBanner<'_>,
-    now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
     open_parent: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
@@ -535,7 +745,6 @@ pub fn child_thread_banner(
         .and_then(|s| s.model.clone())
         .unwrap_or_else(|| banner.title.clone());
     let status: Option<AnyElement> = summary.map(|s| {
-        let elapsed = s.elapsed(now);
         div()
             .flex_none()
             .flex()
@@ -550,30 +759,14 @@ pub fn child_thread_banner(
                 view,
                 cx,
             ))
-            .children(elapsed.map(|elapsed| {
-                div()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(elapsed))
-            }))
+            .child(elapsed_label(
+                format!("child-banner-clock-{}", banner.key),
+                s.clock(),
+                theme.text_muted,
+            ))
             .into_any_element()
     });
-    div()
-        .flex_none()
-        .m(px(12.0))
-        .h(px(CHILD_BANNER_HEIGHT))
-        .pl(px(16.0))
-        .pr(px(8.0))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .rounded(px(CHILD_BANNER_HEIGHT / 2.0))
-        .border_1()
-        .border_color(theme.composer_outline())
-        .bg(theme.input_glass_bg())
-        .text_size(crate::typography::ui_rems(13.0))
+    banner_frame(theme, 12.0)
         .child(
             icons::icon(mark)
                 .size(px(16.0))
@@ -618,6 +811,139 @@ pub fn child_thread_banner(
         .into_any_element()
 }
 
+/// The read-only pill both banners share: 44px, the composer's outline and
+/// glass, `margin` on every side.
+fn banner_frame(theme: &Theme, margin: f32) -> gpui::Div {
+    div()
+        .flex_none()
+        .m(px(margin))
+        .h(px(CHILD_BANNER_HEIGHT))
+        .pl(px(16.0))
+        .pr(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .rounded(px(CHILD_BANNER_HEIGHT / 2.0))
+        .border_1()
+        .border_color(theme.composer_outline())
+        .bg(theme.input_glass_bg())
+        .text_size(crate::typography::ui_rems(13.0))
+}
+
+/// The banner under a delegated child chat (T3's `ProviderSubagentBar`): the
+/// provider mark, model (medium), effort (muted), a self-ticking status,
+/// "Runs on its own", Stop while the task can take one, and a way back to
+/// the parent. The chat is read-only to the user; the engine runs it.
+pub fn delegated_child_banner(
+    key: &str,
+    model: &crate::delegation::ChildBannerModel,
+    theme: &Theme,
+    view: gpui::EntityId,
+    open_parent: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
+    stop: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let task = &model.task;
+    let phase = task.phase();
+    let (mark, tint) = model
+        .harness
+        .map_or((icons::BOT, None), crate::pickers::harness_brand_icon);
+    let clock = ClockSpec {
+        started: task.started_at,
+        finished: task.completed_at,
+        active: phase.active(),
+    };
+    let state_word = if model.stopping {
+        "Stopping\u{2026}"
+    } else {
+        task.work_state.label()
+    };
+    banner_frame(theme, 0.0)
+        .child(
+            icons::icon(mark)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(tint.unwrap_or(theme.text_muted)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(model.model.clone()),
+        )
+        .children(
+            model
+                .effort
+                .clone()
+                .map(|effort| div().flex_none().text_color(theme.text_muted).child(effort)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(status_glyph(
+                    SharedString::from(format!("delegated-banner-{key}")),
+                    phase,
+                    true,
+                    theme,
+                    view,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(state_word),
+                )
+                .child(elapsed_label(
+                    format!("delegated-banner-clock-{key}"),
+                    clock,
+                    theme.text_muted,
+                )),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_faint)
+                .child("Runs on its own"),
+        )
+        .when(model.can_stop, |el| {
+            el.child(
+                crate::controls::button(
+                    format!("delegated-banner-stop-{key}"),
+                    view,
+                    theme,
+                    crate::controls::Variant::Ghost,
+                    crate::controls::Size::Xs,
+                    "Stop",
+                )
+                .tooltip(crate::tooltip::text("Stop this task"))
+                .on_click(stop),
+            )
+        })
+        .child(
+            crate::controls::button(
+                format!("delegated-banner-parent-{key}"),
+                view,
+                theme,
+                crate::controls::Variant::Ghost,
+                crate::controls::Size::Xs,
+                "Open parent",
+            )
+            .tooltip(crate::tooltip::text(format!("Open {}", model.parent_title)))
+            .on_click(open_parent),
+        )
+        .into_any_element()
+}
+
 /// Banner height: the pill the composer morphs through, minus its action row.
 pub const CHILD_BANNER_HEIGHT: f32 = 44.0;
 
@@ -637,8 +963,24 @@ pub type OpenAgent = Rc<dyn Fn(&mut Shell, String, SubagentSummary, &mut Context
 /// `open_panel(chat_id)` - sidebar `+N more` → select chat + Agents tab.
 pub type OpenPanel = Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>;
 
-fn pill_width(title_chars: usize) -> f32 {
-    8.0 * 2.0 + 12.0 + 6.0 + title_chars.min(22) as f32 * 6.6 + 6.0 + 34.0
+fn pill_width(title_chars: usize, extras: f32) -> f32 {
+    8.0 * 2.0 + 12.0 + 6.0 + title_chars.min(22) as f32 * 6.6 + 6.0 + 34.0 + extras
+}
+
+/// Extra pill width a delegated row spends on its provider mark (12 + gap)
+/// and the Stop slot (14 + gap).
+fn pill_extras(summary: &SubagentSummary) -> f32 {
+    match summary.delegated.as_deref() {
+        None => 0.0,
+        Some(_) => {
+            12.0 + 6.0
+                + if summary.stoppable().is_some() {
+                    14.0 + 6.0
+                } else {
+                    0.0
+                }
+        }
+    }
 }
 
 /// How many leading pills fit `width` (the tray's inner width), keeping
@@ -650,10 +992,11 @@ fn fitting(summaries: SubagentSubset<'_>, width: f32) -> usize {
     for s in summaries.iter() {
         let left_after = summaries.len() - shown - 1;
         let reserve = if left_after > 0 { 44.0 } else { 0.0 };
-        if used + pill_width(s.title.chars().count()) + reserve > width {
+        let pill = pill_width(s.title.chars().count(), pill_extras(s));
+        if used + pill + reserve > width {
             break;
         }
-        used += pill_width(s.title.chars().count()) + PILL_GAP;
+        used += pill + PILL_GAP;
         shown += 1;
     }
     shown.min(summaries.len())
@@ -681,7 +1024,6 @@ pub fn agents_tray_row(
     inner_width: f32,
     panel_open: bool,
     seen: &HashSet<String>,
-    now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut Context<crate::composer::Composer>,
@@ -721,54 +1063,94 @@ pub fn agents_tray_row(
     for s in summaries.iter().take(shown) {
         let summary = s.clone();
         let chat = chat_id.to_string();
-        let elapsed = s.elapsed(now);
         let phase = s.status;
-        row = row.child(
-            div()
-                .id(SharedString::from(format!("agent-pill-{}", s.id)))
-                .h(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(8.0))
-                .rounded(px(12.0))
-                .bg(crate::theme::wash(0.06))
-                .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::wash(0.10)))
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(crate::composer::ComposerEvent::OpenSubagentSummary {
-                        chat_id: chat.clone(),
-                        summary: summary.clone(),
-                    });
-                }))
-                .child(status_glyph(
-                    SharedString::from(format!("agent-pill-glyph-{}", s.id)),
-                    phase,
-                    seen.contains(&s.id) || seen.contains(&part_key(chat_id, &s.id)),
-                    theme,
-                    view,
-                    cx,
-                ))
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w(px(150.0))
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.text_muted)
-                        .child(s.title.clone()),
-                )
-                .children(elapsed.map(|e| {
-                    div()
-                        .flex_none()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_faint)
-                        .child(e)
-                        .into_any_element()
-                })),
-        );
+        let pill_id = SharedString::from(format!("agent-pill-{}", s.id));
+        let group = SharedString::from(format!("agent-pill-group-{}", s.id));
+        let mark = s
+            .delegated
+            .as_deref()
+            .and_then(|link| provider_mark(link, theme));
+        let stopping = s.delegated.as_deref().is_some_and(|link| link.stopping);
+        let stop = s.stoppable().map(|link| link.task_id.clone());
+        let mut pill = div()
+            .id(pill_id)
+            .group(group.clone())
+            .h(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .rounded(px(12.0))
+            .bg(crate::theme::wash(0.06))
+            .cursor_pointer()
+            .hover(|s| s.bg(crate::theme::wash(0.10)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(crate::composer::ComposerEvent::OpenSubagentSummary {
+                    chat_id: chat.clone(),
+                    summary: summary.clone(),
+                });
+            }))
+            .child(status_glyph(
+                SharedString::from(format!("agent-pill-glyph-{}", s.id)),
+                phase,
+                seen.contains(&s.id) || seen.contains(&part_key(chat_id, &s.id)),
+                theme,
+                view,
+                cx,
+            ))
+            .children(mark)
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(150.0))
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(if stopping {
+                        theme.text_faint
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(s.title.clone()),
+            )
+            .child(elapsed_label(
+                format!("tray-clock-{chat_id}-{}", s.id),
+                s.clock(),
+                theme.text_faint,
+            ));
+        if s.delegated.is_some() {
+            pill = pill.tooltip(delegated_tooltip(s.clone()));
+        }
+        if let Some(task_id) = stop {
+            // Space is reserved; the glyph appears on pill hover so a tray of
+            // tasks does not read as a row of buttons.
+            pill = pill.child(
+                div()
+                    .id(SharedString::from(format!("agent-pill-stop-{}", s.id)))
+                    .size(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .hover(|style| style.bg(crate::theme::wash(0.12)))
+                    .tooltip(crate::tooltip::text("Stop task"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(crate::composer::ComposerEvent::StopDelegatedTask {
+                            task_id: task_id.clone(),
+                        });
+                    }))
+                    .child(
+                        icons::icon(icons::STOP)
+                            .size(px(8.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
+        }
+        row = row.child(pill);
     }
     if more > 0 {
         row = row.child(
@@ -846,7 +1228,6 @@ pub const SIDEBAR_CHILD_PAD_BOTTOM: f32 = 4.0;
 pub fn sidebar_children(
     chat_id: &str,
     summaries: SubagentSubset<'_>,
-    now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
     open: OpenAgent,
@@ -864,56 +1245,76 @@ pub fn sidebar_children(
         let summary = s.clone();
         let chat = chat_id.to_string();
         let open = open.clone();
-        col = col.child(
-            div()
-                .id(SharedString::from(format!("sub-child-{}", s.id)))
-                .h(px(SIDEBAR_CHILD_HEIGHT))
-                .w_full()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
+        // A delegated child is a real chat: its row opens it and drags to a
+        // split like any session row. Native subagents have no chat to drag.
+        let child_chat = s
+            .delegated
+            .as_deref()
+            .map(|link| link.child_chat_id.clone());
+        let mark = s
+            .delegated
+            .as_deref()
+            .and_then(|link| provider_mark(link, theme));
+        let mut row = div()
+            .id(SharedString::from(format!("sub-child-{}", s.id)))
+            .h(px(SIDEBAR_CHILD_HEIGHT))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if !this.sidebar_drag_suppressed_click {
                     open(this, chat.clone(), summary.clone(), cx);
-                }))
-                .child(
-                    div()
-                        .size(px(12.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(status_glyph(
-                            SharedString::from(format!("sub-glyph-{}", s.id)),
-                            s.status,
-                            true,
-                            theme,
-                            view,
-                            cx,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .line_height(px(SIDEBAR_CHILD_HEIGHT))
-                        .text_color(theme.text_muted)
-                        .child(s.title.clone()),
-                )
-                .children(s.elapsed(now).map(|elapsed| {
-                    div()
-                        .flex_none()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .line_height(px(SIDEBAR_CHILD_HEIGHT))
-                        .text_color(theme.text_faint)
-                        .child(elapsed)
-                        .into_any_element()
-                })),
+                }
+            }));
+        if let Some(child_chat) = child_chat {
+            row = row.on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.press_sidebar_session(child_chat.clone(), event.position, cx);
+                }),
+            );
+        }
+        if s.delegated.is_some() {
+            row = row.tooltip(delegated_tooltip(s.clone()));
+        }
+        col = col.child(
+            row.child(
+                div()
+                    .size(px(12.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(status_glyph(
+                        SharedString::from(format!("sub-glyph-{}", s.id)),
+                        s.status,
+                        true,
+                        theme,
+                        view,
+                        cx,
+                    )),
+            )
+            .children(mark)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .line_height(px(SIDEBAR_CHILD_HEIGHT))
+                    .text_color(theme.text_muted)
+                    .child(s.title.clone()),
+            )
+            .child(elapsed_label(
+                format!("sidebar-clock-{chat_id}-{}", s.id),
+                s.clock(),
+                theme.text_faint,
+            )),
         );
     }
     if more > 0 {
@@ -947,11 +1348,11 @@ pub fn sidebar_children(
 const AGENTS_ROW_HEIGHT: f32 = 44.0;
 const AGENTS_ROW_HEIGHT_BARE: f32 = 32.0;
 const AGENTS_SECTION_HEIGHT: f32 = 30.0;
+/// T3's relationship row: h 36.
+const RELATION_ROW_HEIGHT: f32 = 36.0;
 
-/// One 30px "Active" / "Done · N" header, 11.5px text_faint like the
-/// sidebar's own section labels. `dot` is the section's state hue (the
-/// sidebar's 6px section dot); settled sections carry none.
-fn agents_section(label: String, dot: Option<gpui::Hsla>, theme: &Theme) -> AnyElement {
+/// One section header: label (+ count while collapsed), optionally clickable.
+fn agents_section(label: String, dot: Option<gpui::Hsla>, theme: &Theme) -> gpui::Div {
     div()
         .h(px(AGENTS_SECTION_HEIGHT))
         .w_full()
@@ -964,24 +1365,388 @@ fn agents_section(label: String, dot: Option<gpui::Hsla>, theme: &Theme) -> AnyE
         .text_color(theme.text_faint)
         .children(dot.map(|hue| div().size(px(6.0)).flex_none().rounded_full().bg(hue)))
         .child(SharedString::from(label))
+}
+
+/// The three row groups the panel pages independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageGroup {
+    Related,
+    Active,
+    Previous,
+}
+
+/// Per-chat panel state owned by the shell: whether "Previous agents" is open
+/// and how many rows of each group are showing (T3: 6, then +12 a click).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelUi {
+    pub previous_open: bool,
+    shown: [usize; 3],
+}
+
+impl Default for PanelUi {
+    fn default() -> Self {
+        Self {
+            previous_open: false,
+            shown: [crate::delegation::LINEAGE_INITIAL; 3],
+        }
+    }
+}
+
+impl PanelUi {
+    fn slot(group: LineageGroup) -> usize {
+        match group {
+            LineageGroup::Related => 0,
+            LineageGroup::Active => 1,
+            LineageGroup::Previous => 2,
+        }
+    }
+
+    pub fn shown(&self, group: LineageGroup) -> usize {
+        self.shown[Self::slot(group)]
+    }
+
+    pub fn show_more(&mut self, group: LineageGroup) {
+        self.shown[Self::slot(group)] += crate::delegation::LINEAGE_PAGE;
+    }
+}
+
+/// What a panel click does, as shell callbacks (so the panel stays a pure
+/// element builder).
+#[derive(Clone)]
+pub struct PanelActions {
+    pub open: OpenAgent,
+    /// Navigate to a related chat (parent, fork).
+    pub open_chat: Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>,
+    /// `task_cancel` for one task.
+    pub stop: Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>,
+    pub toggle_previous: Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>,
+    pub show_more: Rc<dyn Fn(&mut Shell, LineageGroup, &mut Context<Shell>)>,
+}
+
+/// A parent / fork row (T3's non-agent relationship rows): relation glyph,
+/// title, relation word, hover arrow.
+fn relation_row(
+    row: &crate::delegation::RelationRow,
+    theme: &Theme,
+    actions: &PanelActions,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    use crate::delegation::{Relation, ThreadLinkKind};
+    let glyph = match row.relation {
+        Relation::Parent(ThreadLinkKind::Subagent) => icons::ALT_ARROW_LEFT,
+        Relation::Parent(ThreadLinkKind::Fork) | Relation::Fork => icons::GIT_BRANCH,
+    };
+    let chat = row.chat_id.clone();
+    let open_chat = actions.open_chat.clone();
+    div()
+        .id(SharedString::from(format!("relation-row-{}", row.chat_id)))
+        .group("relation-row")
+        .h(px(RELATION_ROW_HEIGHT))
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(Theme::SPACE_SM))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .hover(|el| el.bg(crate::theme::wash(0.06)))
+        .tooltip(crate::tooltip::text(format!(
+            "Open {} in this chat",
+            row.relation.label().to_lowercase()
+        )))
+        .on_click(cx.listener(move |this, _, _, cx| open_chat(this, chat.clone(), cx)))
+        .child(
+            icons::icon(glyph)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_faint),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::typography::ui_rems(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(row.title.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_faint)
+                .child(row.relation.label()),
+        )
         .into_any_element()
 }
 
-/// The right-pane inventory: every subagent the selector sees for `chat_id`
-/// (not just the strip-visible subset), Active first, each row clickable to
-/// the child thread.
+/// "Show N more" under a paged group.
+fn show_more_row(
+    group: LineageGroup,
+    hidden: usize,
+    theme: &Theme,
+    actions: &PanelActions,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    let show_more = actions.show_more.clone();
+    div()
+        .id(SharedString::from(format!("agents-show-more-{group:?}")))
+        .h(px(32.0))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(Theme::SPACE_SM))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(12.0))
+        .text_color(theme.text_faint)
+        .hover(|el| el.bg(crate::theme::wash(0.06)).text_color(theme.text_muted))
+        .on_click(cx.listener(move |this, _, _, cx| show_more(this, group, cx)))
+        .child(icons::icon(icons::PLUS).size(px(12.0)).flex_none())
+        .child(SharedString::from(format!(
+            "Show {} more",
+            hidden.min(crate::delegation::LINEAGE_PAGE)
+        )))
+        .into_any_element()
+}
+
+/// The panel's two agent groups and the counts its headers speak.
+#[derive(Debug)]
+pub(crate) struct AgentGroups<'a> {
+    pub active: Vec<&'a SubagentSummary>,
+    /// Settled agents. A delegated task still waiting on nested work is
+    /// active, whatever its own run did.
+    pub previous: Vec<&'a SubagentSummary>,
+    /// Pulsing work: only agents actually running.
+    pub running: usize,
+    pub failed: usize,
+}
+
+pub(crate) fn agent_groups(summaries: &[SubagentSummary]) -> AgentGroups<'_> {
+    let (active, previous): (Vec<_>, Vec<_>) = summaries.iter().partition(|s| s.status.active());
+    AgentGroups {
+        running: active
+            .iter()
+            .filter(|s| s.status == SubagentPhase::Running)
+            .count(),
+        failed: previous
+            .iter()
+            .filter(|s| s.status == SubagentPhase::Failed)
+            .count(),
+        active,
+        previous,
+    }
+}
+
+/// One agent row: native subagents (observational) and delegated tasks (real
+/// chats, with provider, workState and Stop) share the geometry.
+fn agent_row(
+    s: &SubagentSummary,
+    chat_id: &str,
+    seen: &HashSet<String>,
+    theme: &Theme,
+    view: gpui::EntityId,
+    actions: &PanelActions,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    let summary = s.clone();
+    let chat = chat_id.to_string();
+    let open = actions.open.clone();
+    let is_seen = seen.contains(&s.id)
+        || s.doc_ref
+            .as_ref()
+            .is_some_and(|d| seen.contains(d.as_str()))
+        || s.delegated
+            .as_deref()
+            .is_some_and(|link| seen.contains(&link.child_chat_id));
+    let link = s.delegated.as_deref();
+    // Right meta: `agent_type · model [· effort]` (mono 11px) - any part may
+    // be absent, and the dot is omitted when only one exists.
+    let meta = [
+        s.agent_type.as_deref(),
+        s.model.as_deref(),
+        link.and_then(|l| l.effort.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" \u{00b7} ");
+    // Line 2 (left): a delegated row leads with its workState word and the
+    // latest result after it; a native row is just its one-line summary.
+    let state_word: Option<SharedString> = link.map(|l| {
+        SharedString::from(if l.stopping {
+            "Stopping\u{2026}"
+        } else {
+            l.work_state.label()
+        })
+    });
+    let summary_line = s.summary.clone();
+    let line_two: SharedString = match (&state_word, &summary_line) {
+        (Some(word), Some(line)) => format!("{word} \u{00b7} {line}").into(),
+        (Some(word), None) => word.clone(),
+        (None, line) => line.clone().unwrap_or_default(),
+    };
+    // No summary and no meta (and no workState): the row collapses to the
+    // title-only 32px (a line-2 slot with nothing on either side).
+    let bare = summary_line.is_none() && meta.is_empty() && state_word.is_none();
+    let mark = link.and_then(|l| provider_mark(l, theme));
+    let mark_inset = if mark.is_some() { 12.0 + 8.0 } else { 0.0 };
+    let stop = s.stoppable().map(|l| l.task_id.clone());
+    let stop_action = actions.stop.clone();
+    let mut row = div()
+        .id(SharedString::from(format!("agents-row-{}", s.id)))
+        .h(px(if bare {
+            AGENTS_ROW_HEIGHT_BARE
+        } else {
+            AGENTS_ROW_HEIGHT
+        }))
+        .w_full()
+        .flex()
+        .flex_col()
+        .justify_center()
+        .px(px(Theme::SPACE_SM))
+        .cursor_pointer()
+        .hover(|el| el.bg(crate::theme::wash(0.06)))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            open(this, chat.clone(), summary.clone(), cx);
+        }));
+    if let Some(child_chat) = link.map(|l| l.child_chat_id.clone()) {
+        // A delegated child is a real chat: the row drags into a split.
+        row = row.on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                this.press_sidebar_session(child_chat.clone(), event.position, cx);
+            }),
+        );
+        row = row.tooltip(delegated_tooltip(s.clone()));
+    }
+    row
+        // Line 1 (18px): 12px glyph + 8px + (provider mark) + 13px title
+        // truncating, then Stop and the self-ticking mono elapsed.
+        .child(
+            div()
+                .w_full()
+                .h(px(18.0))
+                .flex()
+                .flex_row()
+                // Centered, not baseline: the glyph box has no text
+                // baseline, so baseline alignment dropped it below the
+                // title.
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .size(px(12.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(status_glyph(
+                            SharedString::from(format!("agents-glyph-{}", s.id)),
+                            s.status,
+                            is_seen,
+                            theme,
+                            view,
+                            cx,
+                        )),
+                )
+                .children(mark)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text)
+                        .child(s.title.clone()),
+                )
+                .children(stop.map(|task_id| {
+                    // A quiet 20px target with a small stop mark: the full
+                    // 14px glyph read as a black block next to 13px text.
+                    div()
+                        .id(SharedString::from(format!("agents-stop-{}", s.id)))
+                        .size(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(crate::theme::wash(0.10)))
+                        .tooltip(crate::tooltip::text("Stop task"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            stop_action(this, task_id.clone(), cx);
+                        }))
+                        .child(
+                            icons::icon(icons::STOP)
+                                .size(px(9.0))
+                                .text_color(theme.text_muted),
+                        )
+                }))
+                .child(elapsed_label(
+                    format!("panel-clock-{chat_id}-{}", s.id),
+                    s.clock(),
+                    theme.text_faint,
+                )),
+        )
+        // Line 2 (16px) starts at the title's x: workState + one-line
+        // summary truncating, `agent_type · model · effort` right-aligned.
+        // Either side may be absent (empty rows collapse above).
+        .when(!bare, |row| {
+            row.child(
+                div()
+                    .w_full()
+                    .h(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(12.0 + 8.0 + mark_inset))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(line_two),
+                    )
+                    .when(!meta.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(meta)),
+                        )
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+/// The right-pane inventory: lineage (parent, forks) first, then every agent
+/// the selector sees for `chat_id` (not just the strip-visible subset) -
+/// Active, then a collapsible Previous group - each clickable to its thread.
+/// Groups page 6 rows then +12 a click (T3's `ThreadRelationshipsControl`).
 #[allow(clippy::too_many_arguments)]
 pub fn agents_panel_body(
     chat_id: &str,
+    related: &[crate::delegation::RelationRow],
     summaries: &[SubagentSummary],
     seen: &HashSet<String>,
-    now: DateTime<Utc>,
+    ui: &PanelUi,
     theme: &Theme,
     view: gpui::EntityId,
-    open: OpenAgent,
+    actions: &PanelActions,
     cx: &Context<Shell>,
 ) -> AnyElement {
-    if summaries.is_empty() {
+    if summaries.is_empty() && related.is_empty() {
         return div()
             .size_full()
             .flex()
@@ -992,144 +1757,96 @@ pub fn agents_panel_body(
             .child("No agents yet")
             .into_any_element();
     }
-    let active: Vec<&SubagentSummary> = summaries.iter().filter(|s| s.status.active()).collect();
-    let done: Vec<&SubagentSummary> = summaries.iter().filter(|s| !s.status.active()).collect();
-    let row = |s: &SubagentSummary| -> AnyElement {
-        let summary = s.clone();
-        let chat = chat_id.to_string();
-        let open = open.clone();
-        let is_seen = seen.contains(&s.id)
-            || s.doc_ref
-                .as_ref()
-                .is_some_and(|d| seen.contains(d.as_str()));
-        // Right meta: `agent_type · model` (mono 11px) - either part may
-        // be absent, and the dot is omitted when only one exists.
-        let meta = [s.agent_type.as_deref(), s.model.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" \u{00b7} ");
-        let summary_line = s.summary.clone();
-        // No summary and no meta: the row collapses to the title-only
-        // 32px (a line-2 slot with nothing on either side).
-        let bare = summary_line.is_none() && meta.is_empty();
-        let elapsed = s.elapsed(now);
-        div()
-            .id(SharedString::from(format!("agents-row-{}", s.id)))
-            .h(px(if bare {
-                AGENTS_ROW_HEIGHT_BARE
-            } else {
-                AGENTS_ROW_HEIGHT
-            }))
-            .w_full()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .px(px(Theme::SPACE_SM))
-            .cursor_pointer()
-            .hover(|el| el.bg(crate::theme::wash(0.06)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                open(this, chat.clone(), summary.clone(), cx);
-            }))
-            // Line 1 (18px): 12px glyph + 8px + 13px title truncating,
-            // then the mono elapsed right-aligned on the title's baseline.
-            .child(
-                div()
-                    .w_full()
-                    .h(px(18.0))
-                    .flex()
-                    .flex_row()
-                    // Centered, not baseline: the glyph box has no text
-                    // baseline, so baseline alignment dropped it below the
-                    // title.
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .size(px(12.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(status_glyph(
-                                SharedString::from(format!("agents-glyph-{}", s.id)),
-                                s.status,
-                                is_seen,
-                                theme,
-                                view,
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .text_color(theme.text)
-                            .child(s.title.clone()),
-                    )
-                    .children(elapsed.map(|e| {
-                        div()
-                            .flex_none()
-                            .font_family(theme.font_mono.clone())
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.text_faint)
-                            .child(e)
-                            .into_any_element()
-                    })),
-            )
-            // Line 2 (16px) starts at the title's x: one-line summary
-            // truncating, `agent_type · model` right-aligned. Either side
-            // may be absent (empty rows collapse above).
-            .when(!bare, |row| {
-                row.child(
-                    div()
-                        .w_full()
-                        .h(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .pl(px(12.0 + 8.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(12.0))
-                                .text_color(theme.text_muted)
-                                .child(summary_line.unwrap_or_default()),
-                        )
-                        .when(!meta.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .font_family(theme.font_mono.clone())
-                                    .text_size(crate::typography::ui_rems(11.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(meta)),
-                            )
-                        }),
-                )
-            })
-            .into_any_element()
-    };
+    let AgentGroups {
+        active,
+        previous,
+        running,
+        failed,
+    } = agent_groups(summaries);
     let mut children: Vec<AnyElement> = Vec::new();
-    if !active.is_empty() {
-        children.push(agents_section(
-            "Active".into(),
-            SessionState::Working.color(theme),
-            theme,
-        ));
-        children.extend(active.iter().map(|s| row(s)));
+    if !related.is_empty() {
+        let (rows, hidden) =
+            crate::delegation::lineage_window(related, ui.shown(LineageGroup::Related));
+        children.push(agents_section("Lineage".into(), None, theme).into_any_element());
+        children.extend(rows.iter().map(|row| relation_row(row, theme, actions, cx)));
+        if hidden > 0 {
+            children.push(show_more_row(
+                LineageGroup::Related,
+                hidden,
+                theme,
+                actions,
+                cx,
+            ));
+        }
     }
-    if !done.is_empty() {
-        children.push(agents_section(
-            format!("Done \u{00b7} {}", done.len()),
-            None,
-            theme,
-        ));
-        children.extend(done.iter().map(|s| row(s)));
+    if !active.is_empty() {
+        let (rows, hidden) =
+            crate::delegation::lineage_window(&active, ui.shown(LineageGroup::Active));
+        // T3: `Lineage · N running`; the heading carries the live count.
+        let label = if running > 0 {
+            format!("Active \u{00b7} {running} running")
+        } else {
+            "Active".to_owned()
+        };
+        children.push(
+            agents_section(label, SessionState::Working.color(theme), theme).into_any_element(),
+        );
+        children.extend(
+            rows.iter()
+                .map(|s| agent_row(s, chat_id, seen, theme, view, actions, cx)),
+        );
+        if hidden > 0 {
+            children.push(show_more_row(
+                LineageGroup::Active,
+                hidden,
+                theme,
+                actions,
+                cx,
+            ));
+        }
+    }
+    if !previous.is_empty() {
+        let open = ui.previous_open;
+        let toggle = actions.toggle_previous.clone();
+        let mut label = format!("Previous agents \u{00b7} {}", previous.len());
+        if !open && failed > 0 {
+            label = format!("{label} \u{00b7} {failed} failed");
+        }
+        children.push(
+            agents_section(label, None, theme)
+                .id("agents-previous-toggle")
+                .cursor_pointer()
+                .hover(|el| el.text_color(theme.text_muted))
+                .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx)))
+                .child(div().flex_1())
+                .child(
+                    icons::icon(if open {
+                        icons::ALT_ARROW_DOWN
+                    } else {
+                        icons::ALT_ARROW_RIGHT
+                    })
+                    .size(px(11.0))
+                    .text_color(theme.text_faint),
+                )
+                .into_any_element(),
+        );
+        if open {
+            let (rows, hidden) =
+                crate::delegation::lineage_window(&previous, ui.shown(LineageGroup::Previous));
+            children.extend(
+                rows.iter()
+                    .map(|s| agent_row(s, chat_id, seen, theme, view, actions, cx)),
+            );
+            if hidden > 0 {
+                children.push(show_more_row(
+                    LineageGroup::Previous,
+                    hidden,
+                    theme,
+                    actions,
+                    cx,
+                ));
+            }
+        }
     }
     div()
         .id("agents-panel-rows")
@@ -1143,6 +1860,59 @@ pub fn agents_panel_body(
 }
 
 impl crate::composer::Composer {
+    /// The read-only banner when this composer's chat is a delegated child,
+    /// else `None` (an ordinary, sendable chat). Reads only the update-owned
+    /// delegation index.
+    pub(crate) fn render_delegated_child_banner(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (chat_id, model) = {
+            let state = self.state.read(cx);
+            let chat_id = self.target.chat_id(state)?.to_owned();
+            let link = state.delegation.link_for(&chat_id)?;
+            let title_of = |id: &str| {
+                state
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == id)
+                    .and_then(|chat| chat.title.clone())
+            };
+            let config = state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .and_then(|chat| chat.config.as_ref());
+            let model = crate::delegation::child_banner(
+                &state.delegation,
+                &chat_id,
+                title_of(&link.parent_chat_id),
+                config,
+            )?;
+            (chat_id, model)
+        };
+        let theme = Theme::of(cx).clone();
+        let parent = model.parent_chat_id.clone();
+        let task_id = model.task.task_id.clone();
+        Some(delegated_child_banner(
+            &chat_id,
+            &model,
+            &theme,
+            cx.entity_id(),
+            cx.listener(move |_, _, _, cx| {
+                cx.emit(crate::composer::ComposerEvent::OpenChat {
+                    chat_id: parent.clone(),
+                });
+            }),
+            cx.listener(move |_, _, _, cx| {
+                cx.emit(crate::composer::ComposerEvent::StopDelegatedTask {
+                    task_id: task_id.clone(),
+                });
+            }),
+            cx,
+        ))
+    }
+
     /// The agents tray: a queue-tray surface over this composer's chat, or
     /// `None` when nothing qualifies (no chat, or no visible subagents).
     /// `tucked` (queue tray rendered below) drops the tray's own radius:
@@ -1178,7 +1948,6 @@ impl crate::composer::Composer {
             inner_width,
             panel_open,
             &seen,
-            Utc::now(),
             &theme,
             cx.entity_id(),
             cx,
@@ -1363,6 +2132,7 @@ mod tests {
             summary: None,
             doc_ref: doc.map(|d| d.to_string().into()),
             latest_turn: true,
+            delegated: None,
         };
         let all = Arc::new(SubagentPresentation::new(vec![
             summary("a", Some("doc-a")),
@@ -1519,6 +2289,321 @@ mod tests {
         assert_eq!(
             one_line(&"é".repeat(1_000_000)).unwrap().chars().count(),
             121
+        );
+    }
+
+    // ---- delegated tasks (app-owned child chats) ----
+
+    use crate::delegation::{
+        DelegatedStatus as DS, DelegatedTask, DelegatedWorkState as DW, DelegationSnapshot,
+        ThreadLink, ThreadLinkKind,
+    };
+
+    fn delegated(id: &str, parent: &str, status: DS, work: DW) -> DelegatedTask {
+        let started = Utc::now() - chrono::TimeDelta::seconds(30);
+        DelegatedTask {
+            task_id: format!("task-{id}"),
+            parent_chat_id: parent.into(),
+            child_chat_id: format!("child-{id}"),
+            title: format!("Agent {id}"),
+            harness: Some(zeron_proto::HarnessId::Codex),
+            model: Some("openai/gpt-5".into()),
+            effort: Some("High".into()),
+            status,
+            work_state: work,
+            started_at: Some(started),
+            completed_at: status
+                .settled()
+                .then(|| started + chrono::TimeDelta::seconds(20)),
+            result: Some("All green".into()),
+            progress: None,
+            cancellable: !status.settled(),
+        }
+    }
+
+    fn snapshot(tasks: Vec<DelegatedTask>) -> DelegationSnapshot {
+        DelegationSnapshot {
+            tasks,
+            links: vec![],
+        }
+    }
+
+    #[test]
+    fn delegated_tasks_join_native_subagents_in_one_presentation() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        state.apply_transcript(vec![
+            entry("u", MessageRole::User, vec![]),
+            entry(
+                "m",
+                MessageRole::Assistant,
+                vec![spawn("native", false, Some(SubagentStatus::Running))],
+            ),
+        ]);
+        assert!(state.apply_delegation_snapshot(snapshot(vec![
+            delegated("run", "c", DS::Running, DW::Working),
+            delegated("wait", "c", DS::Completed, DW::WaitingForChildren),
+            delegated("done", "c", DS::Completed, DW::ResultAvailable),
+            delegated("stopped", "c", DS::Cancelled, DW::ResultAvailable),
+        ])));
+        let out = subagents_for(&state, "c");
+        let ids: Vec<_> = out.iter().map(|s| s.id.as_str()).collect();
+        // Active first (oldest start first), settled after.
+        assert_eq!(out.len(), 5);
+        assert!(ids[..3].contains(&"native") && ids[..3].contains(&"task-run"));
+        let by_id = |id: &str| out.iter().find(|s| s.id == id).unwrap();
+        assert!(
+            by_id("native").delegated.is_none(),
+            "native stays observational"
+        );
+        let run = by_id("task-run");
+        assert_eq!(run.status, SubagentPhase::Running);
+        assert_eq!(run.model.as_deref(), Some("gpt-5"));
+        let link = run.delegated.as_deref().unwrap();
+        assert_eq!(link.child_chat_id, "child-run");
+        assert_eq!(link.effort.as_deref(), Some("High"));
+        assert!(run.stoppable().is_some());
+        assert_eq!(by_id("task-wait").status, SubagentPhase::Waiting);
+        assert!(by_id("task-wait").status.active());
+        assert_eq!(by_id("task-done").status, SubagentPhase::Done);
+        assert_eq!(by_id("task-stopped").status, SubagentPhase::Stopped);
+        assert!(by_id("task-done").stoppable().is_none());
+        // Pulsing set: running work only; waiting work stays in the tray.
+        assert_eq!(out.running().len(), 3);
+        assert!(strip_visible(&out).iter().any(|s| s.id == "task-wait"));
+        let groups = agent_groups(&out);
+        assert_eq!((groups.active.len(), groups.previous.len()), (3, 2));
+        assert_eq!(groups.running, 2);
+    }
+
+    #[test]
+    fn model_and_effort_fall_back_to_the_child_chats_own_config() {
+        let mut state = AppState::new();
+        let mut child = zeron_proto::Chat {
+            id: "child-a".into(),
+            device_id: "dev".into(),
+            title: Some("Scout".into()),
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: Some(zeron_proto::ChatConfig {
+                harness: zeron_proto::HarnessId::ClaudeCode,
+                model: Some("anthropic/claude-opus".into()),
+                reasoning: Some(zeron_proto::ReasoningLevel::High),
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        child.title = Some("Scout".into());
+        state.apply_chats(vec![child]);
+        let mut task = delegated("a", "c", DS::Running, DW::Working);
+        task.model = None;
+        task.effort = None;
+        task.harness = None;
+        state.apply_delegation_snapshot(snapshot(vec![task]));
+        let out = subagents_for(&state, "c");
+        let link = out[0].delegated.as_deref().unwrap();
+        assert_eq!(out[0].model.as_deref(), Some("claude-opus"));
+        assert_eq!(link.effort.as_deref(), Some("High"));
+        assert_eq!(link.harness, Some(zeron_proto::HarnessId::ClaudeCode));
+    }
+
+    #[test]
+    fn applying_a_snapshot_rebuilds_only_changed_parents_and_never_scans_histories() {
+        let mut state = AppState::new();
+        state.apply_delegation_snapshot(snapshot(vec![
+            delegated("a", "p1", DS::Running, DW::Working),
+            delegated("b", "p2", DS::Running, DW::Working),
+        ]));
+        let p2_before = subagents_for(&state, "p2");
+        let before = crate::perf_trace::snapshot();
+        // Only p1's task changed: p2's presentation is the same allocation.
+        let mut changed = delegated("a", "p1", DS::Completed, DW::ResultAvailable);
+        changed.started_at = state.delegation.tasks_for("p1")[0].started_at;
+        changed.completed_at = changed
+            .started_at
+            .map(|s| s + chrono::TimeDelta::seconds(5));
+        let unchanged_b = state.delegation.tasks_for("p2")[0].clone();
+        assert!(state.apply_delegation_snapshot(snapshot(vec![changed, unchanged_b.clone()])));
+        assert!(Arc::ptr_eq(&p2_before, &subagents_for(&state, "p2")));
+        // Re-applying an identical snapshot is a no-op: nothing to notify.
+        let same = snapshot(vec![
+            state.delegation.tasks_for("p1")[0].clone(),
+            unchanged_b,
+        ]);
+        assert!(!state.apply_delegation_snapshot(same));
+        // Selecting is a cache hit, never a scan.
+        for _ in 0..10 {
+            let _ = subagents_for(&state, "p1");
+        }
+        let after = crate::perf_trace::snapshot();
+        assert_eq!(
+            after.subagent_scans - before.subagent_scans,
+            1,
+            "only p1 rebuilt"
+        );
+        assert!(after.subagent_cache_hits - before.subagent_cache_hits >= 10);
+    }
+
+    #[test]
+    fn stop_acceptance_reads_stopping_until_the_snapshot_settles_the_task() {
+        let mut state = AppState::new();
+        state.apply_delegation_snapshot(snapshot(vec![delegated(
+            "a",
+            "p",
+            DS::Running,
+            DW::Working,
+        )]));
+        assert!(subagents_for(&state, "p")[0].stoppable().is_some());
+        state.mark_delegated_cancel_requested("task-a");
+        let row = subagents_for(&state, "p")[0].clone();
+        assert!(row.delegated.as_deref().unwrap().stopping);
+        assert!(
+            row.stoppable().is_none(),
+            "no second Stop while one is in flight"
+        );
+        assert!(row.status.active(), "acceptance is not terminal");
+        // The engine settles it; the request is dropped with it.
+        state.apply_delegation_snapshot(snapshot(vec![delegated(
+            "a",
+            "p",
+            DS::Cancelled,
+            DW::ResultAvailable,
+        )]));
+        let row = subagents_for(&state, "p")[0].clone();
+        assert_eq!(row.status, SubagentPhase::Stopped);
+        assert!(!row.delegated.as_deref().unwrap().stopping);
+        // Unknown tasks cannot take a request.
+        state.mark_delegated_cancel_requested("task-missing");
+    }
+
+    #[test]
+    fn delegated_children_are_never_ordinary_sidebar_rows_but_stay_in_state() {
+        let mut state = AppState::new();
+        let mk = |id: &str| zeron_proto::Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        state.apply_chats(vec![mk("p"), mk("child-a"), mk("fork-1")]);
+        let visible = |s: &AppState| {
+            let mut ids = s.visible_chats().map(|c| c.id.clone()).collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        assert_eq!(visible(&state), ["child-a", "fork-1", "p"]);
+        state.apply_delegation_snapshot(DelegationSnapshot {
+            tasks: vec![delegated("a", "p", DS::Running, DW::Working)],
+            // A fork is an ordinary top-level thread with lineage.
+            links: vec![ThreadLink {
+                chat_id: "fork-1".into(),
+                parent_chat_id: "p".into(),
+                kind: ThreadLinkKind::Fork,
+            }],
+        });
+        assert_eq!(visible(&state), ["fork-1", "p"]);
+        // The child remains a real chat the panes and engine can address.
+        assert!(state.chats.iter().any(|c| c.id == "child-a"));
+        assert!(state.delegation.is_delegated_child("child-a"));
+        // Dropping the task returns it to the ordinary list.
+        state.apply_delegation_snapshot(DelegationSnapshot::default());
+        assert_eq!(visible(&state), ["child-a", "fork-1", "p"]);
+    }
+
+    #[test]
+    fn presentations_for_delegating_parents_survive_pruning_without_a_transcript() {
+        let mut state = AppState::new();
+        state.apply_delegation_snapshot(snapshot(vec![delegated(
+            "a",
+            "unopened",
+            DS::Running,
+            DW::Working,
+        )]));
+        state.prune_subagent_presentations();
+        assert_eq!(subagents_for(&state, "unopened").len(), 1);
+        state.apply_delegation_snapshot(DelegationSnapshot::default());
+        assert_eq!(subagents_for(&state, "unopened").len(), 0);
+    }
+
+    #[test]
+    fn row_clock_runs_while_active_and_freezes_at_finish() {
+        let mut state = AppState::new();
+        state.apply_delegation_snapshot(snapshot(vec![
+            delegated("live", "p", DS::Running, DW::Working),
+            delegated("done", "p", DS::Completed, DW::ResultAvailable),
+        ]));
+        let out = subagents_for(&state, "p");
+        let live = out.iter().find(|s| s.id == "task-live").unwrap();
+        let done = out.iter().find(|s| s.id == "task-done").unwrap();
+        assert!(live.clock().active && live.clock().next_change(Utc::now()).is_some());
+        assert!(!done.clock().active && done.clock().next_change(Utc::now()).is_none());
+        assert_eq!(
+            done.elapsed(Utc::now() + chrono::TimeDelta::hours(5))
+                .as_deref(),
+            Some("20s")
+        );
+    }
+
+    #[test]
+    fn tray_fitting_budgets_the_mark_and_stop_slot_of_delegated_pills() {
+        let mut state = AppState::new();
+        state.apply_delegation_snapshot(snapshot(vec![delegated(
+            "a",
+            "p",
+            DS::Running,
+            DW::Working,
+        )]));
+        let pres = subagents_for(&state, "p");
+        let row = &pres[0];
+        assert_eq!(pill_extras(row), 12.0 + 6.0 + 14.0 + 6.0);
+        let mut native = row.clone();
+        native.delegated = None;
+        assert_eq!(pill_extras(&native), 0.0);
+        let mut settled = row.clone();
+        settled.status = SubagentPhase::Done;
+        assert_eq!(
+            pill_extras(&settled),
+            12.0 + 6.0,
+            "no Stop slot once settled"
+        );
+    }
+
+    #[test]
+    fn panel_ui_pages_each_group_independently() {
+        let mut ui = PanelUi::default();
+        assert_eq!(ui.shown(LineageGroup::Active), 6);
+        ui.show_more(LineageGroup::Active);
+        assert_eq!(ui.shown(LineageGroup::Active), 18);
+        assert_eq!(ui.shown(LineageGroup::Previous), 6);
+        assert!(
+            !ui.previous_open,
+            "Previous agents starts collapsed, like T3"
         );
     }
 }
