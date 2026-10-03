@@ -14,7 +14,7 @@ fn scope() -> InvocationScope {
             interaction_mode: zeron_proto::InteractionMode::Default,
             provider_instance_id: "mock".into(),
         },
-        selection: serde_json::from_value(json!({"instanceId":"mock","model":"mock"})).unwrap(),
+        selection: serde_json::from_value(json!({"instanceId":"mock","model":"mock-1"})).unwrap(),
         capabilities: ["orchestration", "worktree", "pull-requests"]
             .into_iter()
             .map(str::to_owned)
@@ -628,4 +628,32 @@ async fn replacement_revocation_cannot_revoke_successor_and_debug_is_redacted() 
     assert!(!format!("{second:?}").contains(raw.strip_prefix("Bearer ").unwrap()));
     sessions.revoke_session_mcp("parent");
     assert!(server.credentials.resolve(&raw).is_none());
+}
+
+#[test]
+fn warm_scope_advance_is_exact_session_owned_not_all_tokens_for_a_thread() {
+    let registry = auth::CredentialRegistry::default();
+    let first = registry.issue(scope()).unwrap();
+    let other = registry.issue(scope()).unwrap();
+    let mut bound = registry.resolve(&first.authorization).unwrap();
+    let original = registry.resolve(&other.authorization).unwrap();
+    bound.caller.run_id = "next-logical-run".into();
+    registry.advance_session(bound);
+    assert_eq!(
+        registry
+            .resolve(&first.authorization)
+            .unwrap()
+            .caller
+            .run_id
+            .as_ref(),
+        "next-logical-run"
+    );
+    assert_eq!(
+        registry
+            .resolve(&other.authorization)
+            .unwrap()
+            .caller
+            .run_id,
+        original.caller.run_id
+    );
 }

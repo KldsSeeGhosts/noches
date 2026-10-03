@@ -629,6 +629,22 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.read_chats())?)
     }
 
+    pub fn orchestration_threads(&self) -> Vec<serde_json::Value> {
+        self.read(|doc| doc.orchestration_threads())
+    }
+
+    pub(crate) fn publish_orchestration_summary(
+        &self,
+        id: &str,
+        summary: serde_json::Value,
+    ) -> Result<(), EngineError> {
+        self.mutate(|doc| doc.set_chat_orchestration(id, summary))?;
+        // SQL must not acknowledge a patch that exists only in a debounce buffer.
+        let bytes = lock(&self.inner.reg).to_bytes()?;
+        self.inner.store.save_snapshot(REGISTRY_DOC_ID, &bytes)?;
+        Ok(())
+    }
+
     pub fn read_devices(&self) -> Result<Vec<Device>, EngineError> {
         Ok(self.read(|doc| doc.read_devices())?)
     }

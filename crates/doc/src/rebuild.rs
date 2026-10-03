@@ -56,6 +56,17 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
     if let Some(usage) = source.context_usage() {
         thin.update_context_usage(usage.tokens, usage.window)?;
     }
+    let orchestration = source.orchestration();
+    if let Some(owner) = orchestration["hostId"].as_str() {
+        thin.publish_orchestration(
+            owner,
+            orchestration["hostEpoch"].as_i64().unwrap_or(0),
+            orchestration["version"].as_i64().unwrap_or(0),
+            orchestration["batchId"].as_str().unwrap_or(""),
+            &orchestration["barrier"],
+            &orchestration["projection"],
+        )?;
+    }
     let mut sidecar = Vec::new();
     let entries = source.read_entries()?;
     let entry_count = entries.len();
@@ -139,6 +150,34 @@ mod tests {
     use crate::schema::{MessageRole, SessionMessageEntry};
     use crate::{MessageStatus, SessionCommandEntry, SessionCommandPayload};
     use zeron_proto::{ToolCall, ToolDiff};
+
+    #[test]
+    fn orchestration_survives_thin_rebuild_and_is_epoch_version_fenced() {
+        let source = SessionDoc::init("parent").unwrap();
+        let barrier = serde_json::json!([{"docId":"orchestration/thread/parent","version":4}]);
+        let projection =
+            serde_json::json!({"uiState":{"tasks":[{"taskId":"task","result":"PONG"}]}});
+        source
+            .publish_orchestration("host", 2, 4, "batch", &barrier, &projection)
+            .unwrap();
+        source
+            .publish_orchestration("host", 1, 99, "stale", &barrier, &serde_json::json!({}))
+            .unwrap();
+        source
+            .publish_orchestration("host", 2, 3, "stale", &barrier, &serde_json::json!({}))
+            .unwrap();
+        assert!(
+            source
+                .publish_orchestration("foreign", 3, 5, "foreign", &barrier, &projection)
+                .is_err()
+        );
+        let rebuilt = rebuild_thin_doc(&source).unwrap();
+        assert_eq!(rebuilt.doc.orchestration(), source.orchestration());
+        assert_eq!(
+            rebuild_thin_doc(&rebuilt.doc).unwrap().doc.orchestration(),
+            source.orchestration()
+        );
+    }
 
     /// ~4KB of varied output — repeated text would compress away inside the
     /// Loro snapshot and hide the size win the assertion checks.

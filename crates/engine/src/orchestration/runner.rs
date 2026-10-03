@@ -62,6 +62,28 @@ pub struct RunnerBridge {
 }
 
 impl RunnerBridge {
+    pub(crate) async fn observe_external(
+        &self,
+        thread: ThreadId,
+        run: OrchestrationV2Run,
+        capabilities: OrchestrationV2ProviderCapabilities,
+    ) -> Result<()> {
+        let (_, receiver) = self
+            .sessions
+            .subscribe(&thread.0, u64::MAX)
+            .map_err(|e| Error::Invariant(e.to_string()))?;
+        let bridge = self.clone();
+        let (accepted, _) = oneshot::channel();
+        tokio::spawn(async move {
+            if let Err(error) = bridge
+                .observe(thread, run, capabilities, receiver, accepted)
+                .await
+            {
+                tracing::error!(%error, "ordinary orchestration run observation failed");
+            }
+        });
+        Ok(())
+    }
     /// Call before legacy journal recovery, and before enabling V2 adoption.
     pub fn attach_recovery_gate(&self) {
         self.sessions
@@ -162,7 +184,11 @@ impl RunnerBridge {
                 let worker = EffectWorker::new(bridge.kernel.store.clone(),bridge,format!("delegation-{index}"));
                 loop {
                     if stop.is_cancelled() {break;}
-                    match worker.step(crate::now_ms()).await {
+                    let step = tokio::select! {
+                        _ = stop.cancelled() => break,
+                        step = worker.step(crate::now_ms()) => step,
+                    };
+                    match step {
                         Ok(true) => {}
                         Ok(false) => tokio::select! {
                             _ = stop.cancelled() => break,
@@ -274,10 +300,20 @@ impl RunnerBridge {
                 }
             }
         }
+        let reasoning_key = match harness.id() {
+            zeron_proto::HarnessId::ClaudeCode => "effort",
+            zeron_proto::HarnessId::Pi => "thinking",
+            _ => "reasoningEffort",
+        };
+        let reasoning = options
+            .get(reasoning_key)
+            .filter(|value| value.is_string())
+            .map(|value| serde_json::from_value::<zeron_proto::ReasoningLevel>(value.clone()))
+            .transpose()?;
         let config = ChatConfig {
             harness: harness.id(),
             model: Some(run.model_selection.model.clone()),
-            reasoning: None,
+            reasoning,
             model_options: options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
             runtime_mode: projection.thread.runtime_mode,
@@ -288,9 +324,12 @@ impl RunnerBridge {
                 &effect.thread_id.0,
                 parent_space.as_deref(),
                 Some(&self.device_id),
-                Some(config),
+                Some(config.clone()),
                 Some(cwd.into()),
             )
+            .map_err(|error| Error::Invariant(error.to_string()))?;
+        self.workspace
+            .set_chat_config(&effect.thread_id.0, &config)
             .map_err(|error| Error::Invariant(error.to_string()))?;
         self.workspace
             .rename_chat(&effect.thread_id.0, &projection.thread.title)
@@ -320,7 +359,7 @@ impl RunnerBridge {
             .and_then(|message| message["text"].as_str())
             .ok_or_else(|| Error::Invariant("Run input missing.".into()))?;
         let request: RunRequest = serde_json::from_value(json!({
-            "prompt":prompt,"harness":harness.id(),"model":run.model_selection.model,"reasoning":null,
+            "prompt":prompt,"harness":harness.id(),"model":run.model_selection.model,"reasoning":reasoning,
             "modelOptions":options,"cwd":cwd,"sandbox":"workspace-write","autoApprove":false,
             "runtimeMode":projection.thread.runtime_mode,"interactionMode":projection.thread.interaction_mode,"resume":null
         }))?;
@@ -723,6 +762,38 @@ pub(crate) fn plan_event(
     else {
         return Ok(());
     };
+    // Persistent drivers emit init once, then confirm later turns with native
+    // user/steer boundaries. Attach the retained actual session to this new
+    // logical attempt only upon that confirmation, not at mailbox enqueue.
+    if run.status == OrchestrationV2RunStatus::Starting
+        && matches!(
+            event,
+            AgentEvent::Steered { .. } | AgentEvent::UserMessage { .. }
+        )
+        && let Some(previous) = records(projection, "provider-thread")
+            .iter()
+            .find(|p| p["id"].as_str() == run.provider_thread_id.as_ref().map(|id| id.0.as_str()))
+        && let Some(native) = previous["nativeThreadRef"]["nativeId"].as_str()
+    {
+        return plan_event(
+            _conn,
+            projection,
+            command,
+            plan,
+            run_id,
+            attempt_id,
+            &AgentEvent::SessionStarted {
+                harness: zeron_proto::HarnessId::Mock, // not stored; driver is the exact binding above
+                model: run.model_selection.model.clone(),
+                tools: vec![],
+                cwd: projection.thread.worktree_path.clone().unwrap_or_default(),
+                session_id: native.into(),
+                assistant_message_id: String::new(),
+            },
+            capabilities,
+            now,
+        );
+    }
     let Some(attempt) = projection
         .attempts
         .iter()

@@ -170,6 +170,9 @@ impl ProviderInstanceRegistry {
                 .any(|warning| warning.harness == id)
             {
                 Authentication::Unknown
+            } else if id == HarnessId::ClaudeCode {
+                // OAuth slots do not enumerate API-key-backed Claude logins.
+                Authentication::Unknown
             } else {
                 Authentication::Unauthenticated
             };
@@ -256,7 +259,14 @@ impl ProviderInstanceRegistry {
         };
         for instance in &mut instances {
             if let Some(id) = instance.harness_id {
+                if instance.authentication == Authentication::Unknown {
+                    instance.authentication =
+                        state.authentication.get(&id).cloned().unwrap_or_default();
+                }
                 if let Some(d) = descriptors.iter().find(|d| d.id == id) {
+                    if id != HarnessId::Mock && instance.driver_kind != legacy_driver(id) {
+                        instance.adapter_registered = false;
+                    }
                     instance.installed = d.installed;
                     instance.enabled &= d.enabled.unwrap_or(d.installed) || id == HarnessId::Mock;
                 } else {
@@ -290,18 +300,45 @@ impl ProviderInstanceRegistry {
         harnesses: &HarnessRegistry,
         id: HarnessId,
     ) -> Result<Vec<Model>, zeron_harness::HarnessError> {
-        let models = harnesses.resolve(id)?.models().await?;
+        let harness = harnesses.resolve(id)?;
+        if let Ok(Some(authenticated)) = harness.authenticated().await {
+            self.set_authentication(
+                id,
+                if authenticated {
+                    Authentication::Authenticated
+                } else {
+                    Authentication::Unauthenticated
+                },
+            );
+        }
+        let models = harness.models().await?;
+        let enrolled = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .configured
+            .is_none();
+        let custom = if enrolled {
+            enrolled_models(id)
+        } else {
+            vec![]
+        };
+        let mut models: Vec<_> = models
+            .into_iter()
+            .map(|model| from_legacy_model(id, model))
+            .collect();
+        for model in custom {
+            if let Some(existing) = models.iter_mut().find(|entry| entry.id == model.id) {
+                *existing = model;
+            } else {
+                models.push(model);
+            }
+        }
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .discovered
-            .insert(
-                id,
-                models
-                    .into_iter()
-                    .map(|model| from_legacy_model(id, model))
-                    .collect(),
-            );
+            .insert(id, models);
         let snapshot = self.snapshot(harnesses);
         Ok(snapshot
             .into_iter()
@@ -418,19 +455,16 @@ impl ProviderInstanceRegistry {
                     format!("Provider {instance_id} has no model available for inheritance."),
                 )
             })?;
-        if let Some(requested) = requested_model
-            && !provider.models.is_empty()
-            && !provider.models.iter().any(|m| m.id == requested)
-        {
+        if !provider.models.is_empty() && !provider.models.iter().any(|m| m.id == model) {
             return Err(fail(
                 Code::ModelUnavailable,
-                format!("Model {requested} is not advertised by provider {instance_id}."),
+                format!("Model {model} is not advertised by provider {instance_id}."),
             ));
         }
         let options = target
             .and_then(|t| t.get("options"))
             .filter(|v| !v.is_null());
-        let normalized = options
+        let mut normalized = options
             .map(|v| normalize_contract("OrchestratorMcpTargetOptions", v.clone()))
             .transpose()
             .map_err(|_| {
@@ -439,6 +473,12 @@ impl ProviderInstanceRegistry {
                     "Invalid model option selections.".into(),
                 )
             })?;
+        if same_instance && model == inherited.model && normalized.is_none() {
+            normalized = inherited
+                .options
+                .as_ref()
+                .map(|options| serde_json::to_value(options).expect("model options"));
+        }
         if let Some(options) = &normalized {
             let descriptors = provider
                 .models
@@ -523,6 +563,75 @@ fn invalid_options(
         }
     }
     problems
+}
+
+/// Read installed CPA discovery metadata only; never run sync, fetch a catalog,
+/// copy templates/instructions, or read/persist inference credentials. Explicit
+/// provider-instances.json remains authoritative over this compatibility import.
+fn enrolled_models(id: HarnessId) -> Vec<CatalogModel> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return vec![];
+    };
+    let config_path = std::env::var_os("CPA_SYNC_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config/cpa-catalog/sync.json"));
+    let read = |path: &std::path::Path| -> Option<Value> {
+        if std::fs::metadata(path).ok()?.len() > 8 * 1024 * 1024 {
+            return None;
+        }
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    };
+    let Some(config) = read(&config_path) else {
+        return vec![];
+    };
+    let driver = match id {
+        HarnessId::Codex => "codex",
+        HarnessId::ClaudeCode => "claude",
+        _ => return vec![],
+    };
+    let Some(path) = config[driver]["path"].as_str() else {
+        return vec![];
+    };
+    let Some(metadata) = read(std::path::Path::new(path)) else {
+        return vec![];
+    };
+    enrolled_metadata_models(id, &metadata)
+}
+
+fn enrolled_metadata_models(id: HarnessId, metadata: &Value) -> Vec<CatalogModel> {
+    let rows = if id == HarnessId::Codex {
+        &metadata["models"]
+    } else {
+        &metadata["modelPicker"]["options"]
+    };
+    rows.as_array().into_iter().flatten().filter_map(|row| {
+        let model = row[if id == HarnessId::Codex { "slug" } else { "model" }].as_str()?;
+        if model.is_empty() || model.len() > 250 || model.chars().any(char::is_control) { return None; }
+        let mut options = vec![];
+        let mut reasoning_levels = vec![];
+        if id == HarnessId::Codex {
+            let choices: Vec<_> = row["supported_reasoning_levels"].as_array().into_iter().flatten()
+                .filter_map(|level| level["effort"].as_str()).map(|level| {
+                    if let Ok(parsed) = serde_json::from_value(json!(level)) { reasoning_levels.push(parsed); }
+                    json!({"id":level,"label":level,"isDefault":row["default_reasoning_level"] == level})
+                }).collect();
+            if !choices.is_empty() {
+                options.push(json!({"type":"select","id":"reasoningEffort","label":"Reasoning",
+                    "currentValue":row["default_reasoning_level"],"options":choices}));
+            }
+            let tiers: Vec<_> = row["service_tiers"].as_array().into_iter().flatten()
+                .filter_map(|tier| tier["id"].as_str().map(|id| json!({"id":id,"label":tier["name"].as_str().unwrap_or(id),
+                    "isDefault":row["default_service_tier"] == id}))).collect();
+            if !tiers.is_empty() {
+                options.push(json!({"type":"select","id":"serviceTier","label":"Service tier",
+                    "currentValue":row["default_service_tier"],"options":tiers}));
+            }
+        }
+        Some(CatalogModel { id:model.into(), label:row[if id == HarnessId::Codex { "display_name" } else { "label" }].as_str().map(str::to_owned),
+            options: if options.is_empty() { None } else { serde_json::from_value(json!(options)).ok() },
+            is_custom:true, reasoning_levels, description:None,
+            legacy_reasoning_option: (id == HarnessId::Codex).then(|| "reasoningEffort".into()) })
+    }).collect()
 }
 
 pub fn legacy_instance_id(id: HarnessId) -> ProviderInstanceId {
@@ -672,6 +781,35 @@ fn to_legacy_model(model: CatalogModel) -> Model {
 mod tests {
     use super::*;
     use zeron_harness::mock::MockHarness;
+
+    #[test]
+    fn installed_cpa_metadata_preserves_exact_ids_options_and_discards_templates() {
+        let models = enrolled_metadata_models(
+            HarnessId::Codex,
+            &json!({"models":[{
+                "slug":"opencode-go/deepseek-v4.1-flash","display_name":"CPA model",
+                "model_messages":{"instructions_template":"must not copy"},
+                "default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"}],
+                "default_service_tier":"priority","service_tiers":[{"id":"priority","name":"Fast"}]
+            }]}),
+        );
+        assert_eq!(models[0].id, "opencode-go/deepseek-v4.1-flash");
+        let model = serde_json::to_value(&models[0]).unwrap();
+        assert_eq!(model["options"][0]["id"], "reasoningEffort");
+        assert_eq!(model["options"][0]["currentValue"], "high");
+        assert_eq!(model["options"][1]["id"], "serviceTier");
+        assert!(!model.to_string().contains("must not copy"));
+        let claude = enrolled_metadata_models(
+            HarnessId::ClaudeCode,
+            &json!({"modelPicker":{"options":[
+                {"model":"cpa/claude-opus-5-5[1m]","label":"Opus"},
+                {"model":"claude-opus-5-5[1m]","label":"Other route"}
+            ]}}),
+        );
+        assert_eq!(claude[0].id, "cpa/claude-opus-5-5[1m]");
+        assert_eq!(claude[1].id, "claude-opus-5-5[1m]");
+        assert!(enrolled_metadata_models(HarnessId::Codex, &json!({"models":[]})).is_empty());
+    }
 
     fn registry() -> HarnessRegistry {
         let registry = HarnessRegistry::new();
@@ -910,6 +1048,55 @@ mod tests {
                 .resolve_target(&registry, &inherited, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inherited_models_and_options_are_revalidated_after_catalog_changes() {
+        let registry = registry();
+        let catalog = &registry.provider_instances;
+        catalog.configure(vec![instance("parent")]).unwrap();
+        let inherited: ModelSelection = serde_json::from_value(json!({
+            "instanceId":"parent","model":"removed-custom-model"
+        }))
+        .unwrap();
+        let invalid = catalog
+            .resolve_target(&registry, &inherited, None)
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(invalid.code).unwrap(),
+            "model_unavailable"
+        );
+        let inherited: ModelSelection = serde_json::from_value(json!({
+            "instanceId":"parent","model":"cpa/opencode-go/deepseek-v4.1-flash",
+            "options":[{"id":"reasoningEffort","value":"max"}]
+        }))
+        .unwrap();
+        let invalid = catalog
+            .resolve_target(&registry, &inherited, None)
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(invalid.code).unwrap(),
+            "invalid_request"
+        );
+        assert!(invalid.message.contains("reasoningEffort"));
+    }
+
+    #[test]
+    fn unknown_configured_auth_follows_discovery_but_explicit_auth_is_preserved() {
+        let registry = registry();
+        let catalog = &registry.provider_instances;
+        let mut unknown = instance("discoverable");
+        unknown.authentication = Authentication::Unknown;
+        catalog
+            .configure(vec![unknown, instance("explicit")])
+            .unwrap();
+        catalog.set_authentication(HarnessId::Mock, Authentication::Unauthenticated);
+        let snapshot = catalog.snapshot(&registry);
+        assert_eq!(snapshot[0].authentication, Authentication::Unauthenticated);
+        assert!(!snapshot[0].constraints().is_empty());
+        assert_eq!(snapshot[1].authentication, Authentication::Authenticated);
+        catalog.set_authentication(HarnessId::Mock, Authentication::Authenticated);
+        assert!(catalog.snapshot(&registry)[0].constraints().is_empty());
     }
 
     #[tokio::test]

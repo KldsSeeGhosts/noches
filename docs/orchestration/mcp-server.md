@@ -1,5 +1,13 @@
 # Engine-owned `t3-code` MCP and provider catalog (P2a/P2b)
 
+Integration update (`orch/wave2`): real engine bootstrap now installs the
+delegation service, scoped parent/child runner bindings, publisher and recovery.
+Startup readiness includes native Claude API-key auth, and the canonical
+catalog imports installed CPA discovery metadata read-only. See
+[ui-api.md](ui-api.md) and the passing production [live-e2e.md](live-e2e.md).
+Independent per-instance process/account lifecycles and the multi-instance
+composer selector remain deferred as described below.
+
 Baseline: T3 Code `v0.0.46-nightly.20261003.2632`, commit
 `f391794a35c604d57e166a3ab48d56fc6e4e469a`, Effect `4.0.0-rc.115`.
 Worktree/branch: `noches-wt/orch-mcp-server`, `orch/mcp-server`, based on

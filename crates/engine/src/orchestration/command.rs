@@ -39,6 +39,8 @@ pub enum Operation {
     },
     /// Trusted host startup only. Does not schedule restart continuations yet.
     Recover,
+    /// Trusted ordinary-session admission updates the next turn's binding.
+    SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
 }
 
@@ -92,6 +94,7 @@ impl Command {
             Operation::ReplaceAttempt { .. } => "kernel.attempt.replace".into(),
             Operation::Adopt { .. } => "kernel.thread.adopt".into(),
             Operation::Recover => "kernel.runtime.recover".into(),
+            Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
         })
     }
@@ -687,6 +690,12 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
                 .push(EffectRequest::ProviderTurnStart { run_id: run.id });
         }
         Operation::Recover => return super::recovery::plan(conn, command, &projection, now),
+        Operation::SessionBinding(thread) => {
+            if thread.id != projection.thread.id || thread.lineage != projection.thread.lineage {
+                return Err(refuse("Session binding cannot change ownership."));
+            }
+            plan.emit(command, "thread.metadata-updated", thread, now)?;
+        }
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
     }

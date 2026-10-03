@@ -5744,6 +5744,39 @@ impl DocHost {
         }
     }
 
+    /// Publication acknowledgment requires a successful durable snapshot, not
+    /// the best-effort/logging-only shutdown flush. Preserve chat2 cursor and
+    /// lineage rules, and keep snapshot I/O off async workers.
+    pub(crate) async fn persist_orchestration(
+        &self,
+        handle: Arc<ChatDocHandle>,
+    ) -> Result<(), EngineError> {
+        let store = self.inner.store.clone();
+        let permit = store.snapshot_writer.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if handle.retired.load(Ordering::Acquire) {
+                return Err(EngineError::Other(
+                    "Orchestration publication awaits current chat lineage.".into(),
+                ));
+            }
+            if let Some(persistence) = &handle.persistence {
+                persistence.flush_sync();
+                if !persistence.is_clean() {
+                    return Err(EngineError::Other(
+                        "Orchestration snapshot is not yet durable.".into(),
+                    ));
+                }
+            } else {
+                let bytes = handle.doc.export_snapshot()?;
+                store.save_snapshot(&handle.chat_id, &bytes)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| EngineError::Other(error.to_string()))?
+    }
+
     /// Close all account-scoped room memberships before graceful engine
     /// draining. Auth-aware join supervisors will not install a late client.
     pub fn disconnect_edge(&self) {

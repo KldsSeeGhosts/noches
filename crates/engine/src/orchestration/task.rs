@@ -294,6 +294,13 @@ pub enum TaskOperation {
         driver: ProviderDriverKind,
         message_id: MessageId,
     },
+    /// The ordinary sessions runtime already owns the provider start. Record
+    /// its exact logical run without scheduling a second process.
+    ExternalMessage {
+        prompt: String,
+        driver: ProviderDriverKind,
+        message_id: MessageId,
+    },
     CreationRecord {
         target_thread_id: ThreadId,
     },
@@ -325,7 +332,7 @@ impl TaskOperation {
             Self::Delivery(_) => "notification.delivery",
             Self::DrainQueue => "notification.queue.drain",
             Self::StopCohort { .. } => "delegated_task.cohort.stop",
-            Self::StartMessage { .. } => "message.dispatch",
+            Self::StartMessage { .. } | Self::ExternalMessage { .. } => "message.dispatch",
             Self::CreationRecord { .. } => "thread.created.record",
         }
     }
@@ -401,7 +408,7 @@ pub(crate) fn find_task(projection: &ThreadProjection, id: &NodeId) -> Result<Va
 
 /// Monitor and rolled-back runs do not count as work. Published results are
 /// handled separately; later runs may change progress without reopening a task.
-fn monitor_run(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {
+pub(crate) fn monitor_run(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {
     records(projection, "message").iter().any(|message| {
         message["runId"] == run.id.0 && message["notification"]["source"]["kind"] == "monitor"
     })
@@ -909,6 +916,11 @@ pub(crate) fn plan(
             prompt,
             driver,
             message_id,
+        }
+        | TaskOperation::ExternalMessage {
+            prompt,
+            driver,
+            message_id,
         } => {
             if active_run(&projection).is_some()
                 || projection.thread.archived_at.is_some()
@@ -923,7 +935,7 @@ pub(crate) fn plan(
                 .max()
                 .unwrap_or(0)
                 + 1;
-            let seed = execution_seed(
+            let mut seed = execution_seed(
                 &projection.thread,
                 ordinal,
                 &message_id.0,
@@ -931,7 +943,21 @@ pub(crate) fn plan(
                 &driver.0,
                 now,
             )?;
+            if matches!(operation, TaskOperation::ExternalMessage { .. })
+                && let Some(previous) = records(&projection, "provider-thread").iter().find(|p| {
+                    p["id"] == seed.provider_thread.id.0
+                        && p["providerInstanceId"] == seed.run.provider_instance_id.0
+                })
+            {
+                seed.provider_thread.provider_session_id =
+                    serde_json::from_value(previous["providerSessionId"].clone())?;
+                seed.provider_thread.native_thread_ref =
+                    serde_json::from_value(previous["nativeThreadRef"].clone())?;
+            }
             emit_execution(&mut plan, command, &command.thread_id, &seed, now)?;
+            if matches!(operation, TaskOperation::ExternalMessage { .. }) {
+                plan.routed_effects.clear();
+            }
             let initial = message(
                 &command.thread_id,
                 Some(&seed.run.id),

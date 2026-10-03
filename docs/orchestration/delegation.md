@@ -1,5 +1,11 @@
 # App-owned delegation, completion mailbox and runner bridge
 
+Integration update (`orch/wave2`): the production assembly seams described
+below are now wired in the real engine. See [ui-api.md](ui-api.md) for
+bootstrap/default/read APIs and [live-e2e.md](live-e2e.md) for the passing real
+headless Codex→Claude run. The historical ignored fixture below was not used
+as live evidence.
+
 Branch: `orch/delegation`, based on `orch/v2` (`1f56728a`). Upstream oracle:
 T3 `v0.0.46-nightly.20261003.2632` / `f391794a35c604d57e166a3ab48d56fc6e4e469a`.
 Scope: R3 P3a/P3b and the sessions runner bridge, using the foundation's

@@ -308,6 +308,12 @@ pub trait Harness: Send + Sync {
         self.deterministic_turn_end()
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// Credential-free native readiness probe. None means this adapter has no
+    /// authoritative probe; absence of an OAuth account is not proof that an
+    /// API-key-backed runtime is signed out.
+    async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
+        Ok(None)
+    }
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
