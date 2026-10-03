@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, Context, CursorStyle, Div, FontStyle, FontWeight, Hsla,
-    Render, SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point,
-    prelude::*, px, quad, size,
+    Render, SharedString, StyledText, TextRun, Window, canvas, div, font, point, prelude::*, px,
+    quad, size,
 };
 use zeron_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
@@ -26,11 +26,21 @@ use crate::theme::Theme;
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
-/// Gap between markdown blocks inside one message (zeron mdBlockGap).
-pub const MD_BLOCK_GAP: f32 = 12.0;
-/// Body text size / line height (zeron: 14px / 22px).
+/// Gap between markdown blocks inside one message (T3 `margin: .65rem 0` =
+/// 10.4px; adjacent vertical margins collapse, so it is a gap, not a pad).
+pub const MD_BLOCK_GAP: f32 = 10.4;
+/// Gap above a heading (T3 `margin-top: 1.25rem` = 20px, which wins the
+/// margin collapse against the .65rem block margin). The gap below a heading
+/// is the ordinary [`MD_BLOCK_GAP`]: its 8px bottom margin loses the same
+/// collapse against the next block's .65rem.
+pub const MD_HEADING_TOP_GAP: f32 = 20.0;
+/// Body text size / line height (T3: 14px with `leading-relaxed` 1.625).
 pub const MD_TEXT_SIZE: f32 = 14.0;
-pub const MD_LINE_HEIGHT: f32 = 22.0;
+pub const MD_LINE_HEIGHT: f32 = 22.75;
+/// List indent (T3 `padding-left: 1.25rem`). Markers hang inside it.
+const MD_LIST_INDENT: f32 = 20.0;
+/// Blockquote rail inset (T3 `padding-left: .8rem`).
+const MD_QUOTE_INSET: f32 = 12.8;
 /// Default code block metrics; the rendered size comes from the theme.
 pub const CODE_TEXT_SIZE: f32 = 12.5;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;
@@ -445,10 +455,9 @@ pub fn render_tree(
     div()
         .flex()
         .flex_col()
-        .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
             let document = highlight(ix);
-            render_block(
+            let block = render_block(
                 &top.block,
                 ix,
                 ix,
@@ -458,9 +467,26 @@ pub fn render_tree(
                 document
                     .as_deref()
                     .map(|document| document.lines.as_slice()),
-            )
+            );
+            // Each block opens its own gap (headings take more air above),
+            // the same numbers the transcript's row gaps use.
+            div()
+                .when(ix > 0, |el| el.mt(px(block_gap_before(&top.block))))
+                .child(block)
         }))
         .into_any_element()
+}
+
+/// Vertical gap that opens `block` when it follows a sibling block. Headings
+/// take [`MD_HEADING_TOP_GAP`]; everything else the ordinary
+/// [`MD_BLOCK_GAP`]. Transcript rows split from one message use this too, so
+/// a live reply and its split rows space identically.
+pub fn block_gap_before(block: &Block) -> f32 {
+    if matches!(block, Block::Heading { .. }) {
+        MD_HEADING_TOP_GAP
+    } else {
+        MD_BLOCK_GAP
+    }
 }
 
 fn quote_child_ix(ix: usize, child_ix: usize) -> usize {
@@ -512,8 +538,46 @@ pub fn render_block(
     window: &Window,
     highlight: CodeHighlight,
 ) -> AnyElement {
+    render_block_at(
+        block,
+        top_ix,
+        ix,
+        opts,
+        theme,
+        window,
+        highlight,
+        0,
+        Tone::Prose,
+    )
+}
+
+/// Which text tone a block's inline runs resolve to. Run colors are explicit
+/// (they override any inherited `text_color`), so a muted container such as a
+/// blockquote has to pick its tone at flatten time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tone {
+    /// Body copy: 80% prose tone; headings and strong runs at full text.
+    Prose,
+    /// Secondary copy (blockquotes): `text_muted`.
+    Muted,
+}
+
+/// [`render_block`] inside `list_depth` enclosing lists (marker glyph and
+/// nothing else depends on it).
+#[allow(clippy::too_many_arguments)]
+fn render_block_at(
+    block: &Block,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+    window: &Window,
+    highlight: CodeHighlight,
+    list_depth: usize,
+    tone: Tone,
+) -> AnyElement {
     match block {
-        Block::Paragraph { runs } => text_element(
+        Block::Paragraph { runs } => text_element_toned(
             runs,
             MD_TEXT_SIZE,
             MD_LINE_HEIGHT,
@@ -522,10 +586,11 @@ pub fn render_block(
             ix,
             opts,
             theme,
+            tone,
         ),
         Block::Heading { level, runs } => {
             let (size, line) = heading_metrics(*level);
-            text_element(runs, size, line, true, top_ix, ix, opts, theme)
+            text_element_toned(runs, size, line, true, top_ix, ix, opts, theme, tone)
         }
         Block::CodeBlock { language, code } => render_code_block(
             language.as_deref(),
@@ -537,22 +602,17 @@ pub fn render_block(
             highlight,
         ),
         Block::BlockQuote { children } => div()
-            // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // Neutral quote (T3): a 2px hairline rail, muted text, no fill and
+            // no accent - color encodes state, never decoration.
             .border_l_2()
-            .border_color(theme.accent.opacity(0.6))
-            .bg(theme.accent.opacity(0.05))
-            .rounded_tr(px(6.0))
-            .rounded_br(px(6.0))
-            .pl(px(12.0))
-            .pr(px(10.0))
-            .py(px(6.0))
+            .border_color(theme.border)
+            .pl(px(MD_QUOTE_INSET))
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(MD_BLOCK_GAP))
             .text_color(theme.text_muted)
             .children(children.iter().enumerate().map(|(ci, child)| {
-                render_block(
+                render_block_at(
                     child,
                     top_ix,
                     quote_child_ix(ix, ci),
@@ -560,6 +620,8 @@ pub fn render_block(
                     theme,
                     window,
                     None,
+                    list_depth,
+                    Tone::Muted,
                 )
             }))
             .into_any_element(),
@@ -571,9 +633,15 @@ pub fn render_block(
             .flex_col()
             .gap(px(4.0))
             .children(items.iter().enumerate().map(|(item_ix, item)| {
-                // Accent markers (the inline-code hue): ordered numbers as
-                // tinted text, unordered as a REAL 5px disc — the glyph "•"
-                // reads too small at 14px.
+                // Neutral markers in the prose tone (T3: list markers inherit
+                // the text color): ordered numbers as text, unordered as a
+                // REAL 5px glyph - the character "•" reads too small at 14px.
+                // Depth cycles disc -> circle -> square like CSS `list-style`.
+                let marker_color = if tone == Tone::Muted {
+                    theme.text_muted
+                } else {
+                    theme.prose_text()
+                };
                 let task = item
                     .first()
                     .and_then(|block| match block {
@@ -592,7 +660,7 @@ pub fn render_block(
                     };
                     div()
                         .flex_none()
-                        .min_w(px(18.0))
+                        .w(px(MD_LIST_INDENT))
                         .h(px(MD_LINE_HEIGHT))
                         .flex()
                         .items_center()
@@ -643,33 +711,32 @@ pub fn render_block(
                         .into_any_element()
                 } else {
                     match ordered_start {
+                        // Hang the numeral against the text like an outside
+                        // CSS marker: right-aligned in the indent, 5px short
+                        // of the text edge.
                         Some(start) => div()
                             .flex_none()
-                            .min_w(px(18.0))
+                            .w(px(MD_LIST_INDENT))
+                            .pr(px(5.0))
+                            .flex()
+                            .justify_end()
                             .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
                             .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT))
-                            .text_color(theme.accent)
+                            .text_color(marker_color)
                             .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                             .into_any_element(),
                         None => div()
                             .flex_none()
-                            .min_w(px(18.0))
-                            // Center the disc on the first text line's cap band.
+                            .w(px(MD_LIST_INDENT))
+                            // Center the glyph on the first text line's cap band.
                             .h(px(MD_LINE_HEIGHT))
                             .flex()
                             .items_center()
-                            .child(
-                                div()
-                                    .ml(px(1.0))
-                                    .w(px(5.0))
-                                    .h(px(5.0))
-                                    .rounded_full()
-                                    .bg(theme.accent),
-                            )
+                            .child(bullet_glyph(list_depth, marker_color))
                             .into_any_element(),
                     }
                 };
-                div().flex().flex_row().gap(px(8.0)).child(marker).child(
+                div().flex().flex_row().child(marker).child(
                     div()
                         .flex_1()
                         .min_w_0()
@@ -689,7 +756,7 @@ pub fn render_block(
                             } else {
                                 child
                             };
-                            render_block(
+                            render_block_at(
                                 child,
                                 top_ix,
                                 list_child_ix(ix, item_ix, ci),
@@ -697,6 +764,8 @@ pub fn render_block(
                                 theme,
                                 window,
                                 None,
+                                list_depth + 1,
+                                tone,
                             )
                         })),
                 )
@@ -715,14 +784,30 @@ pub fn render_block(
     }
 }
 
-/// Tight monochrome heading scale (zeron: h2 ≈ 16px semibold; headings step
-/// down quickly toward body size).
+/// Heading scale (T3 `.chat-markdown`: 20/18/16/14px at line-height 1.3, so a
+/// heading never reads as a body line with extra weight).
 fn heading_metrics(level: u8) -> (f32, f32) {
     match level {
-        1 => (19.0, 27.0),
-        2 => (16.0, 24.0),
-        3 => (15.0, 22.0),
-        _ => (14.0, 22.0),
+        1 => (20.0, 26.0),
+        2 => (18.0, 23.4),
+        3 => (16.0, 20.8),
+        _ => (14.0, 18.2),
+    }
+}
+
+/// Unordered marker: disc at depth 0, hollow circle at depth 1, square at
+/// depth 2+ (CSS `ul` -> `ul ul` -> `ul ul ul`).
+fn bullet_glyph(depth: usize, color: Hsla) -> Div {
+    let glyph = div().ml(px(8.0)).flex_none();
+    match depth % 3 {
+        0 => glyph.w(px(5.0)).h(px(5.0)).rounded_full().bg(color),
+        1 => glyph
+            .w(px(5.0))
+            .h(px(5.0))
+            .rounded_full()
+            .border_1()
+            .border_color(color),
+        _ => glyph.w(px(4.0)).h(px(4.0)).bg(color),
     }
 }
 
@@ -810,7 +895,15 @@ fn render_table(
                 out.push(None);
                 continue;
             };
-            let flat = flatten_cached(runs, weight, top_ix, table_cell_ix(ix, r, c), opts, theme);
+            let flat = flatten_cached(
+                runs,
+                weight,
+                Tone::Prose,
+                top_ix,
+                table_cell_ix(ix, r, c),
+                opts,
+                theme,
+            );
             if !flat.text.is_empty() {
                 // Intrinsic table proportions use the same bounded link presentation;
                 // each cell then resolves its exact width during measured layout.
@@ -957,6 +1050,20 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
 /// [`flatten_runs`] with an explicit base weight (table headers are 700 per
 /// zeron's `table.headerWeight`; strong runs never drop below semibold).
 fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
+    flatten_runs_toned(runs, theme, base_weight, Tone::Prose)
+}
+
+fn flatten_runs_toned(
+    runs: &[InlineRun],
+    theme: &Theme,
+    base_weight: FontWeight,
+    tone: Tone,
+) -> FlatText {
+    // Resolved once per block: body copy rides the 80% prose tone, headings
+    // and strong runs keep full text (T3 `text-foreground/80` body with
+    // `contrast-foreground` headings).
+    let prose = theme.prose_text();
+    let strong_prose = tone == Tone::Prose && base_weight.0 >= FontWeight::SEMIBOLD.0;
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
@@ -982,16 +1089,21 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (zeron's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
+        // Links take T3's info blue with no resting underline; the dotted
+        // hover underline is painted by the link overlay.
         let is_link = run.style.link.is_some();
-        // Inline code uses the spectrum's code tone; everything else
-        // stays the monochrome foreground.
+        // Inline code keeps the chip's own tone; everything else rides the
+        // block's tone.
         let color = if run.style.code {
             inline_code_text(theme)
-        } else {
+        } else if is_link {
+            theme.link_text()
+        } else if tone == Tone::Muted {
+            theme.text_muted
+        } else if strong_prose || run.style.bold {
             theme.text
+        } else {
+            prose
         };
         if run.style.code {
             // Merge adjacent code runs into one wash box (like links below).
@@ -1022,11 +1134,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // underlay (`code_wash_underlay`) — a run background here could
             // only be a square box.
             background_color: None,
-            underline: is_link.then_some(UnderlineStyle {
-                color: Some(theme.text_muted),
-                thickness: px(1.0),
-                wavy: false,
-            }),
+            underline: None,
             strikethrough: run.style.strikethrough.then_some(gpui::StrikethroughStyle {
                 thickness: px(1.0),
                 color: Some(theme.text_muted),
@@ -1048,6 +1156,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
 fn flatten_cached(
     runs: &[InlineRun],
     base_weight: FontWeight,
+    tone: Tone,
     top_ix: usize,
     ix: usize,
     opts: &RenderOptions,
@@ -1060,10 +1169,10 @@ fn flatten_cached(
             cache
                 .flats
                 .entry((opts.row_key.clone(), top_ix, ix))
-                .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
+                .or_insert_with(|| Rc::new(flatten_runs_toned(runs, theme, base_weight, tone)))
                 .clone()
         }
-        None => Rc::new(flatten_runs_weighted(runs, theme, base_weight)),
+        None => Rc::new(flatten_runs_toned(runs, theme, base_weight, tone)),
     }
 }
 
@@ -1720,6 +1829,31 @@ fn text_element(
     opts: &RenderOptions,
     theme: &Theme,
 ) -> AnyElement {
+    text_element_toned(
+        runs,
+        size,
+        line_height,
+        bold_default,
+        top_ix,
+        ix,
+        opts,
+        theme,
+        Tone::Prose,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_element_toned(
+    runs: &[InlineRun],
+    size: f32,
+    line_height: f32,
+    bold_default: bool,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+    tone: Tone,
+) -> AnyElement {
     if let Some(image_ui) = opts.media.as_ref().and_then(|media| media.image.as_ref()) {
         if runs.iter().any(|run| run.style.image.is_some()) {
             let mut elements = Vec::new();
@@ -1727,7 +1861,7 @@ fn text_element(
             for (index, run) in runs.iter().enumerate() {
                 if let Some(image) = &run.style.image {
                     if start < index {
-                        elements.push(text_element(
+                        elements.push(text_element_toned(
                             &runs[start..index],
                             size,
                             line_height,
@@ -1736,6 +1870,7 @@ fn text_element(
                             ix.wrapping_mul(4099).wrapping_add(start + 1000),
                             opts,
                             theme,
+                            tone,
                         ));
                     }
                     elements.push(image_ui(
@@ -1747,7 +1882,7 @@ fn text_element(
                 }
             }
             if start < runs.len() {
-                elements.push(text_element(
+                elements.push(text_element_toned(
                     &runs[start..],
                     size,
                     line_height,
@@ -1756,6 +1891,7 @@ fn text_element(
                     ix.wrapping_mul(4099).wrapping_add(start + 1000),
                     opts,
                     theme,
+                    tone,
                 ));
             }
             return div()
@@ -1776,7 +1912,7 @@ fn text_element(
             .flex()
             .flex_col()
             .children(lines.into_iter().enumerate().map(|(line_ix, text)| {
-                text_element(
+                text_element_toned(
                     &[InlineRun {
                         text,
                         style: style.clone(),
@@ -1788,6 +1924,7 @@ fn text_element(
                     ix.wrapping_mul(4099).wrapping_add(line_ix + 2000),
                     opts,
                     theme,
+                    tone,
                 )
             }))
             .into_any_element();
@@ -1797,7 +1934,7 @@ fn text_element(
     } else {
         FontWeight::NORMAL
     };
-    let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
+    let flat = flatten_cached(runs, weight, tone, top_ix, ix, opts, theme);
     let inner = flat_text_element(&flat, ix, opts, theme);
     let direct_file = opts
         .workspace_root
@@ -3480,11 +3617,59 @@ mod tests {
         );
         // Adjacent code runs merge into ONE wash box; separated ones don't.
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the violet tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead).
+        // Code text is the accent tint; the square run background is gone
+        // (the rounded wash is painted by the canvas underlay instead). Body
+        // copy rides the 80% prose tone.
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
-        assert_eq!(flat.runs[0].color, theme.text);
+        assert_eq!(flat.runs[0].color, theme.prose_text());
+    }
+
+    #[test]
+    fn prose_is_quiet_headings_and_strong_are_full_strength() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let prose = theme.prose_text();
+            assert_ne!(prose, theme.text);
+            // 80% of text over the canvas stays comfortably readable.
+            assert!(crate::theme::contrast_ratio(prose, theme.bg) >= 7.0);
+            let plain = |text: &str, bold: bool| InlineRun {
+                text: text.into(),
+                style: InlineStyle {
+                    bold,
+                    ..Default::default()
+                },
+            };
+            let body = flatten_runs(&[plain("a", false), plain("b", true)], &theme, false);
+            assert_eq!(body.runs[0].color, prose);
+            assert_eq!(body.runs[1].color, theme.text);
+            let heading = flatten_runs(&[plain("h", false)], &theme, true);
+            assert_eq!(heading.runs[0].color, theme.text);
+            let quote = flatten_runs_toned(
+                &[plain("q", false), plain("b", true)],
+                &theme,
+                FontWeight::NORMAL,
+                Tone::Muted,
+            );
+            assert!(quote.runs.iter().all(|run| run.color == theme.text_muted));
+        }
+    }
+
+    #[test]
+    fn headings_open_more_air_than_ordinary_blocks() {
+        let heading = Block::Heading {
+            level: 2,
+            runs: Vec::new(),
+        };
+        let paragraph = Block::Paragraph { runs: Vec::new() };
+        assert_eq!(block_gap_before(&heading), MD_HEADING_TOP_GAP);
+        assert_eq!(block_gap_before(&paragraph), MD_BLOCK_GAP);
+        assert!(MD_HEADING_TOP_GAP > MD_BLOCK_GAP);
+        // T3 scale: 20/18/16/14px at line-height 1.3.
+        for (level, size) in [(1u8, 20.0f32), (2, 18.0), (3, 16.0), (4, 14.0), (6, 14.0)] {
+            let (got, line) = heading_metrics(level);
+            assert_eq!(got, size);
+            assert!((line - size * 1.3).abs() < 0.01, "h{level} line {line}");
+        }
     }
 
     #[test]
@@ -3528,9 +3713,11 @@ mod tests {
         assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
-        // Links stay monochrome (foreground + underline), never accent-tinted.
-        assert_eq!(flat.runs[1].color, theme.text);
-        assert!(flat.runs[1].underline.is_some());
+        // Links take T3's info blue and rest without an underline (the dotted
+        // underline appears on hover); never accent-tinted.
+        assert_eq!(flat.runs[1].color, theme.link_text());
+        assert_ne!(flat.runs[1].color, theme.accent);
+        assert!(flat.runs[1].underline.is_none());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
     }
 

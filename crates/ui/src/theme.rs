@@ -845,7 +845,7 @@ impl Theme {
     /// to the bottom.
     pub const TRANSCRIPT_FADE_BAND: f32 = 24.0;
     /// Message bubble corner radius.
-    pub const BUBBLE_RADIUS: f32 = 16.0;
+    pub const BUBBLE_RADIUS: f32 = 18.0;
     /// Panel / card corner radius.
     pub const PANEL_RADIUS: f32 = 10.0;
     /// Small control radius (buttons, chips).
@@ -1701,6 +1701,32 @@ impl Theme {
             }
         }
         self
+    }
+}
+
+/// Transcript tokens derived from today's roles.
+///
+/// TODO(D1): each helper below derives the value D1's theme role will carry
+/// directly (`message`, `link`, `code_background`, `icon_muted`, ...); swap the
+/// body for the role field when the theme foundation lands.
+impl Theme {
+    /// Assistant body copy: the text tone at 80% over the canvas (T3 renders
+    /// prose as `text-foreground/80`), flattened to an opaque tone so the chip
+    /// and veil layers never double-darken it. Headings and strong runs stay
+    /// at full [`Self::text`].
+    // TODO(D1): use theme.message_text / keep derived
+    pub fn prose_text(&self) -> Hsla {
+        flatten(self.text.opacity(0.80), self.bg)
+    }
+
+    /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on dark).
+    // TODO(D1): use theme.link
+    pub fn link_text(&self) -> Hsla {
+        gpui::rgb(match self.appearance {
+            Appearance::Light => 0x1447e6,
+            Appearance::Dark => 0x51a2ff,
+        })
+        .into()
     }
 }
 
@@ -3179,6 +3205,6 @@ mod tests {
     fn layout_numbers_match_zeron() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
-        assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+        assert_eq!(Theme::BUBBLE_RADIUS, 18.0);
     }
 }

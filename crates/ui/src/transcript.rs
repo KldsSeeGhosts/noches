@@ -165,8 +165,10 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 /// pasted log or file drops into the transcript as one endless slab otherwise
 /// (user report) — past the cap the bubble clips and grows a chevron.
 pub const USER_COLLAPSED_LINES: usize = 5;
-/// The user bubble's line box.
-pub const USER_LINE_HEIGHT: f32 = 22.0;
+/// The user bubble's line box (T3 `leading-relaxed` at 14px).
+pub const USER_LINE_HEIGHT: f32 = 22.75;
+/// The user bubble's padding on every side (T3 `p-3`).
+const USER_BUBBLE_PADDING: f32 = 12.0;
 /// Conservative first-frame soft-wrap proxy for the fixed-width long-prompt
 /// bubble. The final decision uses the wrapped `StyledText` layout, but this
 /// fallback lets clearly long prompts render their affordance immediately
@@ -1712,7 +1714,15 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
         is_md(&p.kind) && is_md(&row.kind) && part_prefix(&p.id) == part_prefix(&row.id)
     });
     if same_part_markdown {
-        render::MD_BLOCK_GAP
+        // Headings take more air above (T3's margin collapse: 20px), the
+        // live row's own block spacing uses the same function.
+        let block = match &row.kind {
+            RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+                tree.blocks.get(*block_ix).map(|top| &top.block)
+            }
+            _ => None,
+        };
+        block.map_or(render::MD_BLOCK_GAP, render::block_gap_before)
     } else if matches!(row.kind, RowKind::ToolGroup { .. })
         || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
     {
@@ -6261,8 +6271,7 @@ impl Transcript {
                                 .max_w(px(self.content_width * 0.8))
                                 .bg(crate::theme::user_bubble_bg())
                                 .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
+                                .p(px(USER_BUBBLE_PADDING))
                                 .text_size(crate::typography::ui_rems(14.0))
                                 .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
                                 .text_color(theme.text)
@@ -6437,7 +6446,7 @@ impl Transcript {
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
-                .text_color(theme.text_muted.opacity(0.55))
+                .text_color(theme.text_muted)
                 .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
             let copy = copy_text.map(|text| {
                 let entry_id = copy_entry_id.clone();
@@ -6492,7 +6501,7 @@ impl Transcript {
                 // bubble's right edge (user-reported 4px drift).
                 .when(is_user_row, |el| el.justify_end())
                 .when(hovered, |el| {
-                    el.child(motion::fade_quick(
+                    el.child(motion::fade_meta(
                         SharedString::from(format!("meta-{}", row.id)),
                         metadata,
                     ))
@@ -10564,6 +10573,24 @@ mod tests {
         assert_eq!(top_gap_for(Some(&rows[3]), &rows[4]), Theme::SPACE_MD);
         // Turn starts get the turn gap regardless.
         assert_eq!(top_gap_for(None, &rows[0]), Theme::SPACE_LG);
+    }
+
+    #[test]
+    fn heading_rows_open_with_heading_air_in_live_and_split_rows() {
+        // T3's margin collapse: a heading takes 20px above, the block after it
+        // the ordinary 10.4px. Live and settled rows share `top_gap_for`, so
+        // the live->split handoff cannot move a pixel.
+        let text = "intro para\n\n## Section\n\nbody para";
+        for status in [MessageStatus::Complete, MessageStatus::Streaming] {
+            let entry = assistant("mh", status, vec![text_part("t0", text)]);
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                top_gap_for(Some(&rows[0]), &rows[1]),
+                render::MD_HEADING_TOP_GAP
+            );
+            assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
+        }
     }
 
     #[test]

@@ -148,8 +148,12 @@ impl Element for LinkRanges {
                     let pointer_focus_pending = menu_focus_pending.clone();
                     let keyboard_dismissed = state.dismissed.clone();
                     let keyboard_epoch = state.epoch.clone();
+                    let hover_group: gpui::SharedString =
+                        format!("link-hover-{index}-{part}-{}", state.epoch.get()).into();
                     let hit = div()
                         .id(format!("link-{index}-{part}-{}", state.epoch.get()))
+                        .group(hover_group.clone())
+                        .relative()
                         // Removing the builder cancels both visible tooltips
                         // and GPUI's delayed show task while the menu owns input.
                         .when(state.menu.borrow().is_none(), |hit| {
@@ -163,6 +167,21 @@ impl Element for LinkRanges {
                         .w(rect.size.width)
                         .h(rect.size.height)
                         .cursor_pointer()
+                        // T3: links rest without an underline and gain a
+                        // dotted one on hover or keyboard focus.
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(px(4.0))
+                                .h(px(1.0))
+                                .border_t_1()
+                                .border_dashed()
+                                .border_color(theme.link_text())
+                                .opacity(0.0)
+                                .group_hover(hover_group, |style| style.opacity(1.0)),
+                        )
                         .role(Role::Link)
                         .aria_label(target.label.clone())
                         .when(part == 0, |el| el.track_focus(&focus))
