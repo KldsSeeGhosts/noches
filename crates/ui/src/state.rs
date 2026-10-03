@@ -880,6 +880,9 @@ pub struct AppState {
     pub(crate) subagent_active_obs: HashSet<String>,
     pub(crate) subagent_presentations: HashMap<String, Arc<crate::subagents::SubagentPresentation>>,
     pub(crate) subagent_parents: HashMap<String, HashSet<String>>,
+    /// Delegated (app-owned) tasks and fork links, indexed on update by
+    /// [`Self::apply_delegation_snapshot`]; read by every subagent surface.
+    pub(crate) delegation: crate::delegation::DelegationIndex,
     /// Pending-message queues keyed by chat id for pane-fixed composers.
     /// Independent of `selected_chat`: a pane keeps reading its own queue
     /// while another chat is selected.
@@ -932,7 +935,10 @@ fn next_second_boundary(now: DateTime<Utc>) -> DateTime<Utc> {
 /// (`crate::shell::format_working_elapsed`'s granularity - keep in step).
 /// Always strictly after `now`, because the label at `now` derives from whole
 /// elapsed seconds. Pure.
-fn next_elapsed_label_change(started: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn next_elapsed_label_change(
+    started: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
     let elapsed = now.signed_duration_since(started).num_seconds().max(0);
     let next = if elapsed < 60 {
         elapsed + 1
@@ -1000,6 +1006,7 @@ impl AppState {
             subagent_active_obs: HashSet::new(),
             subagent_presentations: HashMap::new(),
             subagent_parents: HashMap::new(),
+            delegation: Default::default(),
             pane_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
             terminal_panels: HashMap::new(),
@@ -1677,6 +1684,7 @@ impl AppState {
 
     pub(crate) fn subagent_source_retained(&self, doc_id: &str) -> bool {
         self.selected_chat.as_deref() == Some(doc_id)
+            || self.delegation.has_parent(doc_id)
             || self.sub_transcripts.contains_key(doc_id)
             || self
                 .transcript_cache
@@ -1923,9 +1931,12 @@ impl AppState {
 
     // ---- queries ----
 
-    /// Non-archived chats in sidebar order.
+    /// Non-archived chats in sidebar order. Delegated children are real chats
+    /// but never ordinary rows: they live nested under their parent.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|c| !c.archived)
+        self.chats
+            .iter()
+            .filter(|c| !c.archived && !self.delegation.is_delegated_child(&c.id))
     }
 
     pub(crate) fn restore_composer_target(
