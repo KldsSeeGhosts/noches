@@ -1203,6 +1203,7 @@ impl AppState {
             self.queue.clear();
             self.queue_task = None;
         }
+        self.prune_subagent_presentations();
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
@@ -1650,7 +1651,10 @@ impl AppState {
     pub(crate) fn subagent_source_retained(&self, doc_id: &str) -> bool {
         self.selected_chat.as_deref() == Some(doc_id)
             || self.sub_transcripts.contains_key(doc_id)
-            || self.transcript_cache.iter().any(|cached| cached.chat_id == doc_id)
+            || self
+                .transcript_cache
+                .iter()
+                .any(|cached| cached.chat_id == doc_id)
     }
 
     /// A pane-fixed chat's pending-message queue (empty until its watch's

@@ -4269,12 +4269,14 @@ impl Transcript {
         self.retain_on_deselect = true;
     }
 
-    pub(crate) fn set_scene_fade_band(&mut self, band: f32, cx: &mut Context<Self>) {
+    pub(crate) fn set_scene_fade_band(&mut self, band: f32, cx: &mut Context<Self>) -> bool {
         let band = Some(band.to_bits());
         if self.scene_fade_band != band {
             self.scene_fade_band = band;
             cx.notify();
+            return true;
         }
+        false
     }
 
     /// State updates can change the in-flow trailer without changing rows.
@@ -4289,19 +4291,29 @@ impl Transcript {
 
     fn chrome_key(&self, now: chrono::DateTime<chrono::Utc>, cx: &gpui::App) -> TranscriptChrome {
         let state = self.state.read(cx);
-        let chat = self.doc_override.as_deref().or(state.selected_chat.as_deref());
-        let Some(chat) = chat else { return TranscriptChrome::default() };
+        let chat = self
+            .doc_override
+            .as_deref()
+            .or(state.selected_chat.as_deref());
+        let Some(chat) = chat else {
+            return TranscriptChrome::default();
+        };
         if self.doc_override.is_some() && !self.interactive_override {
-            let live = self.doc_live && state.sub_transcript(chat).last().is_some_and(|last| {
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User
-            });
+            let live = self.doc_live
+                && state.sub_transcript(chat).last().is_some_and(|last| {
+                    last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User
+                });
             return TranscriptChrome {
                 working: live,
                 elapsed: if live {
-                    state.sub_transcript(chat).last()
+                    state
+                        .sub_transcript(chat)
+                        .last()
                         .map(|e| (now.timestamp_millis() - e.created_at).max(0) / 1000)
                         .unwrap_or(0)
-                } else { 0 },
+                } else {
+                    0
+                },
                 ..Default::default()
             };
         }
@@ -4314,8 +4326,12 @@ impl Transcript {
             queued: sending && state.chat_delivery_degraded(chat, now),
             undelivered: state.send_undelivered(chat, now),
             elapsed: if working && !sending {
-                started.map(|t| now.signed_duration_since(t).num_seconds().max(0)).unwrap_or(0)
-            } else { 0 },
+                started
+                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
         }
     }
 
@@ -6754,17 +6770,21 @@ impl Transcript {
         };
         let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
         let old = match old_text {
-            Some(source) => {
-                Some(
-                    self.highlights
-                        .request(cache_row.clone(), 0, (*old_highlight_key)?, source, cx)?,
-                )
-            }
+            Some(source) => Some(self.highlights.request(
+                cache_row.clone(),
+                0,
+                (*old_highlight_key)?,
+                source,
+                cx,
+            )?),
             None => None,
         };
         let new = match new_text {
             Some(source) => {
-                Some(self.highlights.request(cache_row, 1, (*new_highlight_key)?, source, cx)?)
+                Some(
+                    self.highlights
+                        .request(cache_row, 1, (*new_highlight_key)?, source, cx)?,
+                )
             }
             None => None,
         };

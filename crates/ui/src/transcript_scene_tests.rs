@@ -11,21 +11,19 @@ mod scene_regressions {
 
     impl Render for Surface {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .flex()
-                .opacity(self.opacity)
-                .children(self.transcripts.iter().map(|transcript| {
+            let children = div().size_full().flex().children(self.transcripts.iter().map(|transcript| {
                     div()
                         .flex_1()
                         .min_w_0()
                         .h_full()
                         .child(crate::transcript_scene::scene(
                             transcript.clone(),
-                            crate::transcript_scene::reusable(false, false, true, self.opacity)
-                                && self.reuse,
+                            self.reuse,
                         ))
-                }))
+                }));
+            div().size_full().opacity(self.opacity).child(
+                crate::transcript_scene::scope(self.opacity == 1.0, children)
+            )
         }
     }
 

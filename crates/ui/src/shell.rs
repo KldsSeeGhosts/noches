@@ -2234,7 +2234,9 @@ impl Shell {
         // Only chrome actually consumed by a transcript invalidates its scene.
         // Root hover/menu motion must not rebuild stationary content.
         let transcript_invalidation = cx.observe_self(|shell, cx| {
-            shell.transcript.update(cx, |transcript, cx| transcript.refresh_chrome(cx));
+            shell
+                .transcript
+                .update(cx, |transcript, cx| transcript.refresh_chrome(cx));
             for surfaces in shell.workspace.chat_surfaces.values() {
                 if let Some(transcript) = &surfaces.transcript {
                     transcript.update(cx, |transcript, cx| transcript.refresh_chrome(cx));
@@ -8664,9 +8666,10 @@ impl Shell {
             // Edge-fade paint state is inherited, not included in GPUI's
             // cache key. Invalidate when its band changes (even if layout
             // bounds happen to remain the same).
-            let bottom_band = (self.bottom_stack.get() - term_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
-            self.transcript.update(cx, |transcript, cx| {
-                transcript.set_scene_fade_band(bottom_band, cx);
+            let bottom_band =
+                (self.bottom_stack.get() - term_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
+            let scene_fade_changed = self.transcript.update(cx, |transcript, cx| {
+                transcript.set_scene_fade_band(bottom_band, cx)
             });
             div()
                 .relative()
@@ -8685,12 +8688,13 @@ impl Shell {
                         })
                         .child(crate::transcript_scene::scene(
                             self.transcript.clone(),
-                            crate::transcript_scene::reusable(
-                                dock_frame.active,
-                                departing_transcript,
-                                transcript_geometry_ready,
-                                dock_frame.transcript(),
-                            ),
+                            !scene_fade_changed
+                                && crate::transcript_scene::reusable(
+                                    dock_frame.active,
+                                    departing_transcript,
+                                    transcript_geometry_ready,
+                                    dock_frame.transcript(),
+                                ),
                         )),
                 )
                 // A departing transcript is visual history, not an active
@@ -11542,8 +11546,18 @@ impl Render for Shell {
                 }
                 .child(self.render_titlebar_cluster(cx))
                 .children(overlays);
-                root.child(sidebar_tone)
-                    .child(motion::fade_in("phase-app", page))
+                root.child(sidebar_tone).child(page.with_animation(
+                    "phase-app",
+                    motion::FADE_IN.animation(),
+                    |page, t| {
+                        div()
+                            .size_full()
+                            .relative()
+                            .opacity(t)
+                            .top(px(4.0 * (1.0 - t)))
+                            .child(crate::transcript_scene::scope(t == 1.0, page))
+                    },
+                ))
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
