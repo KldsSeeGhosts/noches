@@ -1,0 +1,250 @@
+[
+  {
+    "accepted": true,
+    "encoded": {
+      "name": "EXAMPLE",
+      "sensitive": false,
+      "value": ""
+    },
+    "input": {
+      "name": "EXAMPLE"
+    },
+    "name": "ProviderInstanceEnvironmentVariable"
+  },
+  {
+    "accepted": true,
+    "encoded": [
+      {
+        "id": "effort",
+        "value": "high"
+      },
+      {
+        "id": "fastMode",
+        "value": true
+      }
+    ],
+    "input": {
+      " effort ": " high ",
+      "empty": "",
+      "fastMode": true,
+      "invalid": 42
+    },
+    "name": "ProviderOptionSelections"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "instanceId": "codex",
+      "model": "example",
+      "options": [
+        {
+          "id": "effort",
+          "value": "high"
+        }
+      ]
+    },
+    "input": {
+      "model": " example ",
+      "options": {
+        "effort": "high",
+        "invalid": null
+      },
+      "provider": "codex"
+    },
+    "name": "ModelSelection"
+  },
+  {
+    "accepted": true,
+    "encoded": [
+      {
+        "id": "effort",
+        "value": "high"
+      },
+      {
+        "id": "fastMode",
+        "value": true
+      }
+    ],
+    "input": {
+      "effort": "high",
+      "fastMode": true
+    },
+    "name": "OrchestratorMcpTargetOptions"
+  },
+  {
+    "accepted": false,
+    "errorTag": "SchemaError",
+    "input": {
+      "effort": 42
+    },
+    "name": "OrchestratorMcpTargetOptions"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "prompt": "hello",
+      "schedule": {
+        "everyMs": 60000,
+        "type": "interval"
+      }
+    },
+    "input": {
+      "prompt": " hello ",
+      "schedule": {
+        "everyMs": 60000,
+        "type": "interval"
+      }
+    },
+    "name": "OrchestratorMcpScheduleTaskInput"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "prompt": "hello",
+      "schedule": {
+        "everyMs": 60000,
+        "type": "interval"
+      }
+    },
+    "input": {
+      "prompt": "hello",
+      "schedule": "{\"type\":\"interval\",\"everyMs\":60000}"
+    },
+    "name": "OrchestratorMcpScheduleTaskInput"
+  },
+  {
+    "accepted": false,
+    "errorTag": "SchemaError",
+    "input": {
+      "prompt": "hello",
+      "schedule": {
+        "everyMs": 59999,
+        "type": "interval"
+      }
+    },
+    "name": "OrchestratorMcpScheduleTaskInput"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "prompt": "hello",
+      "schedule": {
+        "timeOfDay": "9:00",
+        "type": "fixed_time",
+        "weekdays": [
+          1,
+          2,
+          3
+        ]
+      }
+    },
+    "input": {
+      "prompt": "hello",
+      "schedule": {
+        "timeOfDay": "9:00",
+        "type": "fixed_time",
+        "weekdays": [
+          1,
+          2,
+          3
+        ]
+      }
+    },
+    "name": "OrchestratorMcpScheduleTaskInput"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "everyMs": 1,
+      "type": "interval"
+    },
+    "input": {
+      "everyMs": 1,
+      "type": "interval"
+    },
+    "name": "ScheduledTaskSchedule"
+  },
+  {
+    "accepted": false,
+    "errorTag": "SchemaError",
+    "input": {
+      "everyMs": 1,
+      "type": "interval"
+    },
+    "name": "ScheduledTaskUpsertSchedule"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "kind": "background_task",
+      "taskId": "task"
+    },
+    "input": {
+      "taskId": "task"
+    },
+    "name": "OrchestrationV2PendingBackgroundTask"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "description": "example",
+      "kind": "background_task",
+      "taskId": "task"
+    },
+    "input": {
+      "description": "example",
+      "kind": "future_kind",
+      "taskId": "task"
+    },
+    "name": "OrchestrationV2PendingBackgroundTask"
+  },
+  {
+    "accepted": false,
+    "errorTag": "SchemaError",
+    "input": {
+      "kind": "subagent"
+    },
+    "name": "OrchestrationV2PendingBackgroundTask"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "childThreadId": "child",
+      "kind": "background_task",
+      "work": "subagent"
+    },
+    "input": {
+      "childThreadId": "child",
+      "kind": "subagent"
+    },
+    "name": "OrchestrationV2NotificationSource"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "kind": "background_command"
+    },
+    "input": {
+      "kind": "command"
+    },
+    "name": "OrchestrationV2NotificationSource"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "kind": "background_task"
+    },
+    "input": {
+      "kind": "future_kind"
+    },
+    "name": "OrchestrationV2NotificationSource"
+  },
+  {
+    "accepted": true,
+    "encoded": {
+      "kind": "background_task"
+    },
+    "input": {},
+    "name": "OrchestrationV2NotificationSource"
+  }
+]
