@@ -129,6 +129,7 @@ enum Slot {
 }
 
 pub struct HarnessRegistry {
+    pub provider_instances: crate::provider_instances::ProviderInstanceRegistry,
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
     /// This device's enabled set; `None` inner value = the default set.
@@ -146,6 +147,7 @@ impl Default for HarnessRegistry {
 impl HarnessRegistry {
     pub fn new() -> Self {
         Self {
+            provider_instances: Default::default(),
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             prefs: Mutex::new(HarnessPrefsFile::default()),

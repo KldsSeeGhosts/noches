@@ -1626,12 +1626,10 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let harness = self
+                let models = self
                     .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                    .provider_instances
+                    .refresh(&self.registry, p.harness)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
@@ -2944,6 +2942,7 @@ impl RpcService for EngineRpc {
                     .list(p.force_usage.unwrap_or(false))
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.registry.provider_instances.apply_accounts(&snapshot);
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
@@ -2953,6 +2952,7 @@ impl RpcService for EngineRpc {
                     .activate(p.harness, &p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.registry.provider_instances.apply_accounts(&snapshot);
                 RpcReply::value(&snapshot)
             }
             methods::FORGET_AGENT_ACCOUNT => {
@@ -2962,6 +2962,7 @@ impl RpcService for EngineRpc {
                     .forget(p.harness, &p.account_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.registry.provider_instances.apply_accounts(&snapshot);
                 RpcReply::value(&snapshot)
             }
             methods::START_AGENT_LOGIN => {
@@ -2988,6 +2989,7 @@ impl RpcService for EngineRpc {
                     .complete_login(&p.login_id, &p.code)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.registry.provider_instances.apply_accounts(&snapshot);
                 RpcReply::value(&snapshot)
             }
             methods::POLL_AGENT_LOGIN => {
