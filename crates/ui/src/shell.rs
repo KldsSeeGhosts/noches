@@ -970,7 +970,8 @@ fn sidebar_footer_button(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .bg(motion::hover_blend_owned(owner,
+        .bg(motion::hover_blend_owned(
+            owner,
             &motion_key,
             crate::theme::wash(0.0),
             theme.glass_hover(),
@@ -979,11 +980,16 @@ fn sidebar_footer_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend_owned(owner,
-            &motion_key,
-            theme.text_muted,
-            theme.text,
-        )))
+        .child(
+            icon(glyph)
+                .size(px(15.0))
+                .text_color(motion::hover_blend_owned(
+                    owner,
+                    &motion_key,
+                    theme.text_muted,
+                    theme.text,
+                )),
+        )
 }
 
 /// Plain one-line tooltip for sidebar icon buttons.
@@ -5980,6 +5986,7 @@ impl Shell {
                 "toggle-sidebar",
                 icons::SIDEBAR_MINIMALISTIC_LEFT,
                 &theme,
+                cx.entity_id(),
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
             .child(
@@ -5994,6 +6001,7 @@ impl Shell {
                         icons::ARROW_LEFT,
                         can_back,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.navigate_back(cx)),
                     ))
                     .child(nav_history_button(
@@ -6001,6 +6009,7 @@ impl Shell {
                         icons::ARROW_RIGHT,
                         can_forward,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
                     )),
             )
@@ -6013,6 +6022,7 @@ impl Shell {
                         "titlebar-new-session",
                         icons::PLUS,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                     ))
             }))
@@ -6754,7 +6764,11 @@ impl Shell {
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("{row_id}-hover");
-        let hover_owner = if sidebar_row { self.sidebar_pane.entity_id() } else { cx.entity_id() };
+        let hover_owner = if sidebar_row {
+            self.sidebar_pane.entity_id()
+        } else {
+            cx.entity_id()
+        };
         let rest_bg = if selected {
             selected_wash
         } else {
@@ -6792,8 +6806,18 @@ impl Shell {
                 8.0
             }))
             .px(px(Theme::SPACE_SM))
-            .text_color(motion::hover_blend_owned(hover_owner, &fade_key, rest_text, text))
-            .bg(motion::hover_blend_owned(hover_owner, &fade_key, rest_bg, hover_bg))
+            .text_color(motion::hover_blend_owned(
+                hover_owner,
+                &fade_key,
+                rest_text,
+                text,
+            ))
+            .bg(motion::hover_blend_owned(
+                hover_owner,
+                &fade_key,
+                rest_bg,
+                hover_bg,
+            ))
             // No selection ring (user request) — the wash alone marks the
             // active row.
             // Row hover drives BOTH the wash blend and the corner's
@@ -7381,13 +7405,17 @@ impl Shell {
             .bg(if open {
                 theme.glass_hover()
             } else {
-                motion::hover_blend_owned(self.sidebar_pane.entity_id(),
+                motion::hover_blend_owned(
+                    self.sidebar_pane.entity_id(),
                     "user-menu-trigger",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover().opacity(0.8),
                 )
             })
-            .on_hover(motion::hover_listener_owned(self.sidebar_pane.entity_id(), "user-menu-trigger"))
+            .on_hover(motion::hover_listener_owned(
+                self.sidebar_pane.entity_id(),
+                "user-menu-trigger",
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
@@ -7453,26 +7481,44 @@ impl Shell {
                     }),
             )
             .child(
-                sidebar_footer_button("sidebar-voice", icons::MICROPHONE, "Voice", theme, self.sidebar_pane.entity_id())
-                    .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.toggle_voice(window, cx);
-                    })),
+                sidebar_footer_button(
+                    "sidebar-voice",
+                    icons::MICROPHONE,
+                    "Voice",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_voice(window, cx);
+                })),
             )
             .child(
-                sidebar_footer_button("remote-control", icons::SMARTPHONE, "Remote control", theme, self.sidebar_pane.entity_id())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_settings(SettingsSection::Connections, cx);
-                    })),
+                sidebar_footer_button(
+                    "remote-control",
+                    icons::SMARTPHONE,
+                    "Remote control",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_settings(SettingsSection::Connections, cx);
+                })),
             )
             .child(
-                sidebar_footer_button("sidebar-settings", icons::SETTINGS_GEAR, "Settings", theme, self.sidebar_pane.entity_id())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.open_settings(SettingsSection::Devices, cx);
-                    })),
+                sidebar_footer_button(
+                    "sidebar-settings",
+                    icons::SETTINGS_GEAR,
+                    "Settings",
+                    theme,
+                    self.sidebar_pane.entity_id(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_settings(SettingsSection::Devices, cx);
+                })),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -8476,7 +8522,8 @@ impl Shell {
     {
         let theme = Theme::of(cx);
         let fade_key = format!("pane-resize-{id}");
-        let hover_highlight = motion::hover_blend_owned(cx.entity_id(),
+        let hover_highlight = motion::hover_blend_owned(
+            cx.entity_id(),
             &fade_key,
             theme.border_strong.opacity(0.0),
             theme.border_strong,
@@ -8547,7 +8594,12 @@ impl Shell {
                         cx.notify();
                     }
                     this.finish_pane_resize(kind);
-                    motion::set_hover_owned(cx.entity_id(), &release_key, false, this.reduced_motion);
+                    motion::set_hover_owned(
+                        cx.entity_id(),
+                        &release_key,
+                        false,
+                        this.reduced_motion,
+                    );
                     cx.notify();
                 }),
             )
@@ -8555,7 +8607,12 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {
                     this.finish_pane_resize(kind);
-                    motion::set_hover_owned(cx.entity_id(), &release_out_key, false, this.reduced_motion);
+                    motion::set_hover_owned(
+                        cx.entity_id(),
+                        &release_out_key,
+                        false,
+                        this.reduced_motion,
+                    );
                     cx.notify();
                 }),
             )
@@ -9039,10 +9096,20 @@ impl Shell {
         let base = if glass {
             popover::surface_bg(&theme)
         } else {
-            motion::hover_blend(hover_key, theme.surface_raised, theme.surface_raised_hover)
+            motion::hover_blend_owned(
+                cx.entity_id(),
+                hover_key,
+                theme.surface_raised,
+                theme.surface_raised_hover,
+            )
         };
         let wash = if glass {
-            motion::hover_blend(hover_key, gpui::transparent_black(), theme.glass_hover())
+            motion::hover_blend_owned(
+                cx.entity_id(),
+                hover_key,
+                gpui::transparent_black(),
+                theme.glass_hover(),
+            )
         } else {
             gpui::transparent_black()
         };
@@ -9055,7 +9122,7 @@ impl Shell {
             .when(!glass, |el| el.shadow_md())
             .cursor_pointer()
             .bg(base)
-            .on_hover(motion::hover_listener(hover_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), hover_key))
             .on_click(cx.listener(move |_, _, _, cx| {
                 transcript.update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
             }))
@@ -9130,7 +9197,8 @@ impl Shell {
         }
         let border = Theme::of(cx).border;
         let handle_key = "pane-resize-terminal-resize";
-        let handle_hover = motion::hover_blend(
+        let handle_hover = motion::hover_blend_owned(
+            cx.entity_id(),
             handle_key,
             Theme::of(cx).border_strong.opacity(0.0),
             Theme::of(cx).border_strong,
@@ -9153,7 +9221,7 @@ impl Shell {
             .w_full()
             .flex_none()
             .cursor_row_resize()
-            .on_hover(motion::hover_listener(handle_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), handle_key))
             .child(
                 div()
                     .absolute()
@@ -9179,23 +9247,23 @@ impl Shell {
             })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     if event.click_count == 2 {
                         this.settings.terminal_height = TERMINAL_DEFAULT_HEIGHT;
                         this.schedule_save(cx);
                         cx.notify();
                     }
                     this.finish_pane_resize(PaneResizeKind::Terminal);
-                    motion::set_hover(handle_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), handle_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, window, _| {
+                cx.listener(|this, _, _window, cx| {
                     this.finish_pane_resize(PaneResizeKind::Terminal);
-                    motion::set_hover(handle_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), handle_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             );
 
@@ -9476,12 +9544,14 @@ impl Shell {
                             "expand-changes",
                             tabs::right_pane_expand_icon(self.right_pane_expanded),
                             &theme,
+                            cx.entity_id(),
                             cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                         ))
                         .child(header_icon_button(
                             "toggle-changes",
                             icons::CLOSE,
                             &theme,
+                            cx.entity_id(),
                             cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                         )),
                 )
@@ -10041,12 +10111,13 @@ impl Shell {
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(motion::hover_blend(
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 plus_fade,
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.11),
             ))
-            .on_hover(motion::hover_listener(plus_fade))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), plus_fade))
             .block_mouse_except_scroll()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -10679,6 +10750,7 @@ fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -10693,12 +10765,13 @@ fn window_control_button(
         .rounded(px(6.0))
         .cursor_pointer()
         // zeron window-controls.tsx: `transition-colors` — the wash fades.
-        .bg(motion::hover_blend(
+        .bg(motion::hover_blend_owned(
+            owner,
             &fade_key,
             theme.glass_hover().opacity(0.0),
             theme.glass_hover(),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener_owned(owner, fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
         // strip's event surface entirely. `.occlude()` (gpui
         // `HitboxBehavior::BlockMouse`) makes the window hit-test STOP at the
@@ -10834,6 +10907,7 @@ fn nav_history_button(
     icon_path: &'static str,
     enabled: bool,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     if !enabled {
@@ -10853,7 +10927,7 @@ fn nav_history_button(
             )
             .into_any_element();
     }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
+    window_control_button(id, icon_path, theme, owner, on_click).into_any_element()
 }
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
@@ -10862,6 +10936,7 @@ fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -10876,12 +10951,13 @@ fn header_icon_button(
         .rounded(px(6.0))
         .cursor_pointer()
         // zeron __root.tsx header buttons: `transition-colors`.
-        .bg(motion::hover_blend(
+        .bg(motion::hover_blend_owned(
+            owner,
             &fade_key,
             crate::theme::wash(0.0),
             crate::theme::wash(0.11),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener_owned(owner, fade_key))
         // Same occlusion + click-swallowing as [`window_control_button`]: this
         // button sits inside the chat header's titlebar drag region, so its
         // rect must be carved out of the strip's drag/double-click surface.

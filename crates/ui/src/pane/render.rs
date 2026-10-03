@@ -427,7 +427,7 @@ fn split_container(
         .min_w_0()
         .min_h_0()
         .child(split_child(w_first, first))
-        .child(divider_seam(theme, &hover_key, horizontal))
+        .child(divider_seam(cx.entity_id(), theme, &hover_key, horizontal))
         .child(split_child(w_second, second))
         .child(divider_hit_overlay(
             cx, &id, hover_key, horizontal, w_first, w_second, target,
@@ -451,8 +451,14 @@ fn split_container(
 /// The 1px visual seam in flex flow between two split children: `theme.border`
 /// at rest, blending to `theme.border_strong` while its hit strip is hovered
 /// (or latched during a live divider drag).
-fn divider_seam(theme: &Theme, hover_key: &SharedString, horizontal: bool) -> AnyElement {
-    let color = crate::motion::hover_blend(hover_key, theme.border, theme.border_strong);
+fn divider_seam(
+    owner: gpui::EntityId,
+    theme: &Theme,
+    hover_key: &SharedString,
+    horizontal: bool,
+) -> AnyElement {
+    let color =
+        crate::motion::hover_blend_owned(owner, hover_key, theme.border, theme.border_strong);
     div()
         .flex_none()
         .when(horizontal, |el| el.w(px(DIVIDER_SEAM_PX)).h_full())
@@ -501,8 +507,8 @@ fn divider_hit_overlay(
         // never re-fades mid-drag (hover churn reads as flicker). The shell
         // method owns the drag latch (Shell fields stay private to the shell
         // module tree).
-        .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
-            this.note_divider_hover(&hover_key, *hovered);
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            this.note_divider_hover(&hover_key, *hovered, cx);
         }))
         .on_mouse_down(
             MouseButton::Left,

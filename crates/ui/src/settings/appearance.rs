@@ -457,6 +457,7 @@ impl AppearancePage {
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
+        crate::motion::init_hover_owner(cx);
         // `PaletteSearch` binds text-editing keys only — arrows/Enter/Escape
         // stay unbound and bubble from the input to the menu card's own key
         // handler. `Submitted` never fires here, so Enter has exactly one path.
@@ -1799,25 +1800,31 @@ impl AppearancePage {
                 let active = family == effective;
                 let focused = family == selected;
                 let label = SharedString::from(family.label().to_owned());
-                popover::menu_row_nav(theme, active, focused, format!("{slug}-font-option-{ix}"))
-                    .id(SharedString::from(format!("{slug}-font-option-{ix}")))
-                    .when(available, |row| {
-                        row.on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_selected_font(kind, family.clone());
-                            this.commit_font(kind, cx);
-                        }))
-                    })
-                    .when(!available, |row| row.opacity(0.45))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(div().w(px(18.0)).flex_none().when(active, |slot| {
-                        slot.child(
-                            icons::icon(icons::CHECK)
-                                .size(px(14.0))
-                                .text_color(theme.accent),
-                        )
+                popover::menu_row_nav_owned(
+                    cx.entity_id(),
+                    theme,
+                    active,
+                    focused,
+                    format!("{slug}-font-option-{ix}"),
+                )
+                .id(SharedString::from(format!("{slug}-font-option-{ix}")))
+                .when(available, |row| {
+                    row.on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_selected_font(kind, family.clone());
+                        this.commit_font(kind, cx);
                     }))
-                    .into_any_element()
+                })
+                .when(!available, |row| row.opacity(0.45))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(div().w(px(18.0)).flex_none().when(active, |slot| {
+                    slot.child(
+                        icons::icon(icons::CHECK)
+                            .size(px(14.0))
+                            .text_color(theme.accent),
+                    )
+                }))
+                .into_any_element()
             })
             .collect();
 
@@ -1953,7 +1960,8 @@ impl AppearancePage {
             .iter()
             .enumerate()
             .map(|(ix, label)| {
-                popover::menu_row_nav(
+                popover::menu_row_nav_owned(
+                    cx.entity_id(),
                     theme,
                     ix == current,
                     ix == selected,
@@ -2157,7 +2165,8 @@ impl AppearancePage {
                                 AccentSelection::ThemeDefault,
                                 theme.surface_preference,
                             );
-                            popover::menu_row(
+                            popover::menu_row_owned(
+                                cx.entity_id(),
                                 theme,
                                 active,
                                 SharedString::from(format!(
@@ -3388,6 +3397,7 @@ impl Render for AppearancePage {
         }
 
         let scrollbar = popover::rail(self, "appearance-page-scrollbar", &theme, cx);
+        crate::motion::drive_hover_owner(cx.entity_id(), window);
         div()
             .id("appearance-page-host")
             .on_drag_move(cx.listener(

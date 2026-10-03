@@ -727,6 +727,12 @@ impl HoverFades {
         });
         active
     }
+
+    fn snap_to_targets(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.origin = entry.target;
+        }
+    }
 }
 
 thread_local! {
@@ -739,9 +745,15 @@ thread_local! {
 pub fn init_hover_owner<V: 'static>(cx: &mut gpui::Context<V>) {
     let owner = cx.entity_id();
     cx.on_release(move |_, _| {
-        OWNED_HOVER_FADES.with(|fades| fades.borrow_mut().remove(&owner));
+        clear_hover_owner(owner);
     })
     .detach();
+}
+
+/// Reset retained surfaces when their content unmounts or starts a fresh open.
+/// A hovered element can disappear without ever receiving its leave event.
+pub fn clear_hover_owner(owner: EntityId) {
+    OWNED_HOVER_FADES.with(|fades| fades.borrow_mut().remove(&owner));
 }
 
 pub fn set_hover_owned(owner: EntityId, key: &str, hovered: bool, reduced: bool) {
@@ -884,6 +896,14 @@ pub fn speed_scale() -> f32 {
 /// Global reduced-motion flag. gpui snaps every `with_animation` element when
 /// set (end state for oneshots, rest state for loops) and schedules no frames.
 pub fn set_reduced_motion(cx: &mut App, reduced: bool) {
+    if reduced {
+        HOVER_FADES.with(|fades| fades.borrow_mut().snap_to_targets());
+        OWNED_HOVER_FADES.with(|fades| {
+            for fades in fades.borrow_mut().values_mut() {
+                fades.snap_to_targets();
+            }
+        });
+    }
     cx.set_reduce_motion(reduced);
 }
 
@@ -1032,18 +1052,28 @@ mod tests {
         assert_eq!(hover_t_owned(first_id, "same-control"), 1.0);
         assert_eq!(hover_t_owned(second_id, "same-control"), 0.0);
         assert_eq!(second_notifications.get(), 0);
+        set_hover_owned(second_id, "same-control", true, true);
         // One owner's frame bookkeeping never ages another owner's entries.
         OWNED_HOVER_FADES.with(|fades| {
             let mut fades = fades.borrow_mut();
             assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
             assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
         });
+        assert_eq!(hover_t_owned(second_id, "same-control"), 1.0);
         first
             .update(cx, |_, window, cx| {
                 hover_listener_owned(first_id, "same-control")(&false, window, cx);
             })
             .unwrap();
         assert_eq!(hover_t_owned(first_id, "same-control"), 0.0);
+        cx.update(|cx| set_reduced_motion(cx, false));
+        set_hover_owned(first_id, "same-control", true, false);
+        cx.update(|cx| set_reduced_motion(cx, true));
+        assert_eq!(
+            hover_t_owned(first_id, "same-control"),
+            1.0,
+            "enabling reduced motion settles an in-flight fade"
+        );
     }
 
     fn assert_close(actual: f32, expected: f32, tol: f32, ctx: &str) {

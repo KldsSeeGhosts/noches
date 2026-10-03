@@ -615,8 +615,9 @@ struct ModelPopup {
 }
 
 impl Render for ModelPopup {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.pickers
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = self
+            .pickers
             .update(cx, |pickers, cx| {
                 if pickers.mounted_kind() != Some(PickerKind::HarnessModel) {
                     return gpui::Empty.into_any_element();
@@ -630,7 +631,9 @@ impl Render for ModelPopup {
                     popover::anchored_menu_above_end("model-popover", content, closing)
                 }
             })
-            .unwrap_or_else(|_| gpui::Empty.into_any_element())
+            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        motion::drive_hover_owner(cx.entity_id(), window);
+        content
     }
 }
 
@@ -726,6 +729,14 @@ pub struct Pickers {
 }
 
 impl Pickers {
+    fn popup_hover_owner(&self, cx: &Context<Self>) -> gpui::EntityId {
+        if self.mounted_kind() == Some(PickerKind::HarnessModel) {
+            self.model_popup.entity_id()
+        } else {
+            cx.entity_id()
+        }
+    }
+
     fn presentation_changed(&self, event: PickerPresentationChanged, cx: &mut Context<Self>) {
         cx.emit(event);
         cx.notify();
@@ -750,9 +761,12 @@ impl Pickers {
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
         motion::init_hover_owner(cx);
         let owner = cx.entity();
-        let model_popup = cx.new(|cx| ModelPopup {
-            pickers: owner.downgrade(),
-            _observe: cx.observe(&owner, |_, _, cx| cx.notify()),
+        let model_popup = cx.new(|cx| {
+            motion::init_hover_owner(cx);
+            ModelPopup {
+                pickers: owner.downgrade(),
+                _observe: cx.observe(&owner, |_, _, cx| cx.notify()),
+            }
         });
         // Footer popup bodies are still inline in Composer. Their keyboard,
         // scrollbar and load notifications must reach that owner, whereas
@@ -1329,10 +1343,14 @@ impl Pickers {
                     )
                     .await;
                 view.update(cx, |pickers, cx| {
+                    let model = pickers.mounted_kind() == Some(PickerKind::HarnessModel);
                     let footer = pickers
                         .mounted_kind()
                         .is_some_and(|kind| kind != PickerKind::HarnessModel);
                     pickers.open.finish_close();
+                    if model && pickers.mounted_kind().is_none() {
+                        motion::clear_hover_owner(pickers.model_popup.entity_id());
+                    }
                     if footer {
                         cx.emit(PickerPresentationChanged::Footer);
                     }
@@ -1391,6 +1409,9 @@ impl Pickers {
         let footer_was_mounted = self
             .mounted_kind()
             .is_some_and(|kind| kind != PickerKind::HarnessModel);
+        if kind == PickerKind::HarnessModel {
+            motion::clear_hover_owner(self.model_popup.entity_id());
+        }
         self.open.open(kind);
         if footer_was_mounted {
             cx.emit(PickerPresentationChanged::Footer);
@@ -2533,7 +2554,8 @@ impl Pickers {
                                 let label: SharedString = device.name.clone().into();
                                 let is_selected = effective.as_deref() == Some(device.id.as_str());
                                 let pick_id = device.id.clone();
-                                popover::menu_row_nav(
+                                popover::menu_row_nav_owned(
+                                    self.popup_hover_owner(cx),
                                     &theme,
                                     is_selected,
                                     ix == active,
@@ -2616,7 +2638,8 @@ impl Pickers {
                             let label: SharedString = space.display_name().to_string().into();
                             let is_selected = selected.as_deref() == Some(space.id.as_str());
                             let pick_id = space.id.clone();
-                            popover::menu_row_nav(
+                            popover::menu_row_nav_owned(
+                                self.popup_hover_owner(cx),
                                 &theme,
                                 is_selected,
                                 ix == active,
@@ -2632,7 +2655,8 @@ impl Pickers {
                 .children(scrollbar)
                 .into_any_element()
         };
-        let no_project = popover::menu_row_nav(
+        let no_project = popover::menu_row_nav_owned(
+            self.popup_hover_owner(cx),
             &theme,
             self.state.read(cx).no_project,
             active == no_project_index,
@@ -2654,25 +2678,31 @@ impl Pickers {
                 .child("Don't work in a project"),
         );
         // Action row under a hairline: mint a project.
-        let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
-            .id("project-new")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.dismiss(cx);
-                window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
-            }))
-            .child(
-                crate::icons::icon(crate::icons::PLUS)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from("New project…")),
-            );
+        let new_project = popover::menu_row_nav_owned(
+            self.popup_hover_owner(cx),
+            &theme,
+            false,
+            false,
+            "project-new".to_string(),
+        )
+        .id("project-new")
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.dismiss(cx);
+            window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
+        }))
+        .child(
+            crate::icons::icon(crate::icons::PLUS)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(SharedString::from("New project…")),
+        );
         div()
             .flex()
             .flex_col()
@@ -3598,7 +3628,8 @@ impl Pickers {
                                     };
                                     let is_switching =
                                         switching.as_deref() == Some(row.name.as_str());
-                                    popover::menu_row_nav(
+                                    popover::menu_row_nav_owned(
+                                        self.popup_hover_owner(cx),
                                         &theme,
                                         is_selected,
                                         ix == active,
@@ -3709,7 +3740,8 @@ impl Pickers {
                     .enumerate()
                     .map(|(ix, (kind, label, icon_path))| {
                         let is_selected = current == kind;
-                        popover::menu_row_nav(
+                        popover::menu_row_nav_owned(
+                            self.popup_hover_owner(cx),
                             &theme,
                             is_selected,
                             ix == active,
@@ -4453,7 +4485,8 @@ impl Pickers {
             let exit_id = id.clone();
             let exit_entity = cx.entity().downgrade();
             let entity = cx.entity().downgrade();
-            let mut row = popover::menu_row(
+            let mut row = popover::menu_row_owned(
+                self.popup_hover_owner(cx),
                 &theme,
                 open || self.active == base_index + ix,
                 format!("model-setting-{ix}"),
@@ -4578,7 +4611,8 @@ impl Pickers {
                             .gap(px(2.0))
                             .children(group.choices.iter().enumerate().map(
                                 |(choice_ix, choice)| {
-                                    popover::menu_row(
+                                    popover::menu_row_owned(
+                                        self.popup_hover_owner(cx),
                                         &theme,
                                         choice_ix == self.setting_active,
                                         format!("setting-choice-{ix}-{choice_ix}"),
@@ -5411,6 +5445,29 @@ mod tests {
             0,
             "popup samples stay on the popup entity"
         );
+    }
+
+    #[gpui::test]
+    fn model_surface_reopen_resets_hover_without_touching_trigger(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.open_model_menu(window, cx);
+                let popup = pickers.model_popup.entity_id();
+                let trigger = cx.entity_id();
+                motion::set_hover_owned(popup, "setting", true, true);
+                motion::set_hover_owned(trigger, "chip", true, true);
+                assert_eq!(motion::hover_t_owned(popup, "setting"), 1.0);
+                pickers.dismiss(cx);
+                pickers.open_model_menu(window, cx);
+                assert_eq!(motion::hover_t_owned(popup, "setting"), 0.0);
+                assert_eq!(motion::hover_t_owned(trigger, "chip"), 1.0);
+            })
+            .unwrap();
     }
 
     struct ModelShortcutHost {

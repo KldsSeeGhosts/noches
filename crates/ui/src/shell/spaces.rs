@@ -1326,7 +1326,8 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .text_size(crate::typography::ui_rems(12.0))
             // Rule 4: filters read NORMAL weight.
-            .text_color(motion::hover_blend(
+            .text_color(motion::hover_blend_owned(
+                self.sidebar_pane.entity_id(),
                 "spaces-filter",
                 theme.text_muted,
                 theme.text,
@@ -1334,13 +1335,17 @@ impl Shell {
             .bg(if open {
                 theme.glass_hover()
             } else {
-                motion::hover_blend(
+                motion::hover_blend_owned(
+                    self.sidebar_pane.entity_id(),
                     "spaces-filter",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover(),
                 )
             })
-            .on_hover(motion::hover_listener("spaces-filter"))
+            .on_hover(motion::hover_listener_owned(
+                self.sidebar_pane.entity_id(),
+                "spaces-filter",
+            ))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,

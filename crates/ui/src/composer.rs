@@ -7328,13 +7328,17 @@ impl Composer {
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
-                    motion::hover_blend_owned(cx.entity_id(),
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
                         &format!("wizard-option-{ix}"),
                         crate::theme::ink(0.025),
                         crate::theme::ink(0.06),
                     )
                 })
-                .on_hover(motion::hover_listener_owned(cx.entity_id(), format!("wizard-option-{ix}")))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    format!("wizard-option-{ix}"),
+                ))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
                 .child(
@@ -8075,12 +8079,16 @@ impl Render for Composer {
             .rounded_full()
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend_owned(cx.entity_id(),
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener_owned(cx.entity_id(), attach_hover_key))
+            .on_hover(motion::hover_listener_owned(
+                cx.entity_id(),
+                attach_hover_key,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
