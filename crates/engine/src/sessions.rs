@@ -163,6 +163,8 @@ struct Inner {
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     browser_root: OnceLock<std::path::PathBuf>,
+    /// Host-only bindings. Never serialized with a session or RunRequest.
+    session_mcp: Mutex<HashMap<String, zeron_harness::mcp::SessionMcpContext>>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
@@ -218,6 +220,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
+                session_mcp: Mutex::new(HashMap::new()),
                 turn_listener: OnceLock::new(),
                 computer_use,
             }),
@@ -292,6 +295,40 @@ impl SessionsEngine {
     /// Discover the desktop browser endpoint in this device's profile.
     pub fn set_browser_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.browser_root.set(root);
+    }
+
+    /// Injection seam for the later orchestration MCP service. Register on
+    /// the execution host before dispatch. The returned context can attach a
+    /// credential revoker; replacement/end/shutdown invokes it exactly once.
+    /// Runtime mutation is refused: a warm provider retains its original
+    /// config until it is stopped and restarted.
+    pub fn register_session_mcp(
+        &self,
+        session: &str,
+        entries: Vec<zeron_harness::mcp::McpServerEntry>,
+        instructions: String,
+    ) -> Result<zeron_harness::mcp::SessionMcpContext, zeron_harness::HarnessError> {
+        let runs = lock(&self.inner.runs);
+        if runs.contains_key(session) {
+            return Err(zeron_harness::HarnessError::Protocol(
+                "stop the active session before replacing its MCP registration".into(),
+            ));
+        }
+        let context =
+            zeron_harness::mcp::SessionMcpContext::new(entries, instructions, Vec::new())?;
+        let previous = lock(&self.inner.session_mcp).insert(session.into(), context.clone());
+        drop(runs);
+        if let Some(previous) = previous {
+            previous.revoke();
+        }
+        Ok(context)
+    }
+
+    pub fn revoke_session_mcp(&self, session: &str) {
+        let context = lock(&self.inner.session_mcp).remove(session);
+        if let Some(context) = context {
+            context.revoke();
+        }
     }
 
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
@@ -591,7 +628,7 @@ impl SessionsEngine {
             (None, None)
         };
         let controls = RunControls {
-            browser: None,
+            mcp: Default::default(),
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
@@ -923,6 +960,10 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        let contexts = std::mem::take(&mut *lock(&self.inner.session_mcp));
+        for context in contexts.into_values() {
+            context.revoke();
+        }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1027,6 +1068,8 @@ impl Inner {
     }
 
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        let event = zeron_harness::redact::redact_event(event.clone());
+        let event = &event;
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {
@@ -1621,6 +1664,16 @@ async fn drive_run(
     resume_state: RunResumeState,
     mut cua_bridge: Option<crate::computer_use::RunBridge>,
 ) {
+    let registered_mcp = lock(&inner.session_mcp)
+        .get(&chat_id)
+        .cloned()
+        .unwrap_or_default();
+    controls.mcp = registered_mcp.clone();
+    let _mcp_cleanup = SessionMcpCleanup {
+        inner: Arc::downgrade(&inner),
+        session: chat_id.clone(),
+        context: registered_mcp.clone(),
+    };
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
@@ -1660,8 +1713,12 @@ async fn drive_run(
                     socket,
                     session: chat_id.clone(),
                 };
-                request.prompt = format!("{}\n\n{}", connection.instructions(), request.prompt);
-                controls.browser = Some(connection);
+                match controls.mcp.with_browser(&connection) {
+                    Ok(context) => controls.mcp = context,
+                    Err(error) => {
+                        tracing::warn!(chat = %chat_id, %error, "browser MCP binding unavailable")
+                    }
+                }
             }
         }
     }
@@ -1672,7 +1729,7 @@ async fn drive_run(
     let mut stream = match started {
         Ok(stream) => stream,
         Err(err) => {
-            let message = err.to_string();
+            let message = zeron_harness::redact::redact_registered(&err.to_string());
             tracing::warn!(chat = %chat_id, harness = ?harness_id, error = %message, "run failed to start");
             // The live journal does not survive a transcript reload.
             let parts = [MessagePart::Error {
@@ -2026,7 +2083,11 @@ async fn drive_run(
 
             prepared_events.extend(
                 inner
-                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .prepare_generated_image(
+                        &chat_id,
+                        zeron_harness::redact::redact_event(raw_event),
+                        &mut seen_images,
+                    )
                     .await,
             );
             let Some(event) = prepared_events.pop_front() else {
@@ -2696,6 +2757,29 @@ async fn drive_run(
     }
 }
 
+/// Compare ownership before cleanup: an old task must not revoke/remove a
+/// replacement registration admitted for the same conversation.
+struct SessionMcpCleanup {
+    inner: std::sync::Weak<Inner>,
+    session: String,
+    context: zeron_harness::mcp::SessionMcpContext,
+}
+
+impl Drop for SessionMcpCleanup {
+    fn drop(&mut self) {
+        self.context.revoke();
+        if let Some(inner) = self.inner.upgrade() {
+            let mut bindings = lock(&inner.session_mcp);
+            if bindings
+                .get(&self.session)
+                .is_some_and(|c| c.same_registration(&self.context))
+            {
+                bindings.remove(&self.session);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2753,6 +2837,82 @@ mod tests {
     }
 
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    #[tokio::test]
+    async fn session_mcp_registry_is_host_local_redacted_and_ownership_checked() {
+        use super::*;
+        use zeron_harness::mcp::McpServerEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let entry = || {
+            McpServerEntry::http(
+                "scope",
+                "http://127.0.0.1:1234/mcp",
+                [(
+                    "Authorization".into(),
+                    "Bearer engine-mcp-private-credential".into(),
+                )]
+                .into(),
+            )
+        };
+        let old = sessions
+            .register_session_mcp("chat", vec![entry()], "instructions".into())
+            .unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        old.on_revoke(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        sessions.inner.publish(
+            "chat",
+            &AgentEvent::Error {
+                message: "echo engine-mcp-private-credential".into(),
+            },
+        );
+        let serialized = serde_json::to_string(&journal.replay("chat", 0).unwrap()).unwrap();
+        assert!(!serialized.contains("engine-mcp-private-credential"));
+        assert!(serialized.contains("[redacted]"));
+        let new = sessions
+            .register_session_mcp("chat", vec![entry()], "new instructions".into())
+            .unwrap();
+        assert!(old.is_revoked());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(SessionMcpCleanup {
+            inner: Arc::downgrade(&sessions.inner),
+            session: "chat".into(),
+            context: old,
+        });
+        assert!(
+            lock(&sessions.inner.session_mcp)
+                .get("chat")
+                .unwrap()
+                .same_registration(&new)
+        );
+        assert!(
+            !new.is_revoked(),
+            "old cleanup must not revoke a new registration"
+        );
+        sessions.shutdown().await;
+        assert!(new.is_revoked());
+        assert!(lock(&sessions.inner.session_mcp).is_empty());
+        assert!(
+            SessionsEngine::new(
+                "restarted".into(),
+                journal,
+                Arc::new(HarnessRegistry::new())
+            )
+            .inner
+            .session_mcp
+            .lock()
+            .unwrap()
+            .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn generated_image_failure_is_sanitized_even_inside_subagents() {
