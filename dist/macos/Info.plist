@@ -38,7 +38,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Noches uses your microphone during voice calls with GPT-Live.</string>
+    <string>Noches uses your microphone for on-device dictation and voice calls with GPT-Live, only when you start them.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <!-- Browser tabs load user-selected HTTP dev servers. Keep the exception

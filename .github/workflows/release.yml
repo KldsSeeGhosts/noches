@@ -40,8 +40,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -58,7 +58,7 @@ jobs:
       version: ${{ steps.identity.outputs.version }}
       build_attempt: ${{ steps.identity.outputs.build_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: identity
         env:
           NOCHES_SOURCE_BRANCH: ${{ github.base_ref || github.ref_name }}
@@ -79,7 +79,7 @@ jobs:
           - runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: System dependencies
         run: |
           sudo apt-get update -qq
@@ -90,7 +90,7 @@ jobs:
             libvulkan-dev pkg-config cmake ninja-build libnss3 libatk-bridge2.0-0 libgtk-3-0
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
@@ -108,7 +108,7 @@ jobs:
           NOCHES_COMMIT: ${{ github.sha }}
           NOCHES_BRIDGE_EPOCH: ${{ inputs.migration == 'bridge' && '0' || '' }}
         run: bash scripts/package-linux.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ runner.arch }}
           path: target/package/noches-*.tar.gz
@@ -125,9 +125,9 @@ jobs:
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
@@ -174,7 +174,7 @@ jobs:
           NOCHES_COMMIT: ${{ github.sha }}
           NOCHES_BRIDGE_EPOCH: ${{ inputs.migration == 'bridge' && '0' || '' }}
         run: bash scripts/package-macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ runner.arch }}
           path: |
@@ -200,8 +200,8 @@ jobs:
       NOCHES_RELEASE_MODE: ${{ inputs.migration || 'normal' }}
       NOCHES_MIGRATION_CONFIRM: ${{ inputs.confirm || '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true

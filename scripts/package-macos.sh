@@ -37,6 +37,8 @@ with open(sys.argv[2], 'wb') as f: plistlib.dump(info, f)
 PLIST
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
+cp "$ROOT/crates/dictation/NOTICE.md" "$APP/Contents/Resources/licenses/parakeet-v3.txt"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/licenses/"
 "$ROOT/scripts/build-chromium.sh" "$OUT_DIR/chromium" release
 mkdir -p "$APP/Contents/Frameworks"
 cp -R "$OUT_DIR/chromium/Noches Browser.app" "$APP/Contents/Frameworks/"

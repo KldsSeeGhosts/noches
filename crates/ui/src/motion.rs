@@ -832,6 +832,64 @@ pub fn reduced_motion(cx: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn reduced_motion_keeps_noches_activity_loaders_static(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Context, ParentElement as _, Render};
+
+        struct Loaders;
+        impl Render for Loaders {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = crate::theme::Theme::dark();
+                gpui::div()
+                    .child(crate::loaders::gradient_spinner(
+                        "working",
+                        &theme,
+                        2.5,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                    .child(crate::loaders::mini_glyph_spinner(
+                        "sidebar-working",
+                        2.0,
+                        theme.glyph,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                    .child(crate::loaders::mini_equalizer(
+                        "session-working",
+                        theme.text_muted,
+                        cx.entity_id(),
+                        cx,
+                    ))
+            }
+        }
+
+        cx.update(|cx| set_reduced_motion(cx, true));
+        let reduced = cx.add_window(|_, _| Loaders);
+        cx.update_window(reduced.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.update(|cx| {
+            assert!(
+                cx.try_global::<PulseClock>()
+                    .is_none_or(|clock| clock.leases.is_empty()),
+                "Noches' global reduce flag must stop activity and decorative animation"
+            );
+            let view = cx.new(|_| ());
+            assert_eq!(pulse_delta(&ZERON_PULSE, view.entity_id(), cx), 0.0);
+        });
+
+        cx.update(|cx| set_reduced_motion(cx, false));
+        cx.update_window(reduced.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                cx.global::<PulseClock>().leases.len(),
+                3,
+                "the transcript grid and cached sidebar loaders resume when reduction is off"
+            );
+        });
+    }
+
     #[test]
     fn pulse_stride_reestablishes_after_each_paint() {
         let now = Instant::now();

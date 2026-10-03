@@ -511,7 +511,10 @@ pub fn warning_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::D
 
 /// A one-line hover note for settings controls (reset times, icon-only
 /// actions), in the same frosted chip as the rest of the app's tooltips.
-pub struct TextTooltip(pub SharedString);
+pub struct TextTooltip {
+    text: SharedString,
+    above: bool,
+}
 
 impl gpui::Render for TextTooltip {
     fn render(
@@ -530,8 +533,19 @@ impl gpui::Render for TextTooltip {
             .bg(crate::popover::surface_bg(theme))
             .text_size(px(11.0))
             .text_color(theme.text_muted)
-            .child(self.0.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+            .child(self.text.clone());
+        let card = crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card);
+        if !self.above {
+            return card.into_any_element();
+        }
+        // Overflow upward so the chip doesn't cover the next sidebar row.
+        div()
+            .h(px(0.0))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .child(div().relative().bottom(px(20.0)).child(card))
+            .into_any_element()
     }
 }
 
@@ -540,5 +554,24 @@ pub fn text_tooltip(
     text: impl Into<SharedString>,
 ) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
     let text: SharedString = text.into();
-    move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            text: text.clone(),
+            above: false,
+        })
+        .into()
+    }
+}
+
+pub fn text_tooltip_above(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            text: text.clone(),
+            above: true,
+        })
+        .into()
+    }
 }

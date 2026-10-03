@@ -8,6 +8,7 @@ members = [
     "crates/proto",
     "crates/preview",
     "crates/browser",
+    "crates/mcp",
     "crates/chromium",
     "crates/doc",
     "crates/sync",
@@ -19,6 +20,7 @@ members = [
     "crates/syntax",
     "crates/workspace",
     "crates/voice",
+    "crates/dictation",
     "apps/zeron",
 ]
 
@@ -34,6 +36,7 @@ publish = false
 zeron-proto = { path = "crates/proto" }
 zeron-preview = { path = "crates/preview" }
 zeron-browser = { path = "crates/browser" }
+zeron-mcp = { path = "crates/mcp" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }

@@ -1673,6 +1673,23 @@ async fn drive_run(
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
+            tracing::warn!(chat = %chat_id, harness = ?harness_id, error = %message, "run failed to start");
+            // The live journal does not survive a transcript reload.
+            let parts = [MessagePart::Error {
+                id: "e0".into(),
+                message: message.clone(),
+            }];
+            if let Err(err) = finish_segment(
+                &doc,
+                None,
+                &new_id(),
+                &device_id,
+                now_ms(),
+                &parts,
+                MessageStatus::Complete,
+            ) {
+                tracing::warn!(chat = %chat_id, error = %err, "start failure entry failed");
+            }
             inner.publish(
                 &chat_id,
                 &AgentEvent::Error {

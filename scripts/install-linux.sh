@@ -23,6 +23,10 @@ if [[ -e "$root/$version" ]]; then
 else
   mv "$stage" "$root/$version"
 fi
+if ! "$root/$version/zeron" --version >/dev/null; then
+  echo 'Noches could not start. Install missing runtime libraries, including ALSA (libasound.so.2), then retry.' >&2
+  exit 1
+fi
 if [[ -L "$root/current" ]]; then
   ln -s "$(readlink "$root/current")" "$root/.previous-$$"
   mv -Tf "$root/.previous-$$" "$root/previous"

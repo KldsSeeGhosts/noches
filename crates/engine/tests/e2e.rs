@@ -25,6 +25,66 @@ use zeron_sync::DocsStore;
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
 
+#[tokio::test(flavor = "multi_thread")]
+async fn start_failure_lands_in_the_transcript() {
+    struct FailsToStart;
+    #[async_trait]
+    impl Harness for FailsToStart {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "FailsToStart"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            Err(HarnessError::Protocol("server never booted".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(FailsToStart));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-fails",
+        SessionCommandPayload::Run {
+            request: run_request("hello"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Errored),
+        "errored",
+    )
+    .await;
+    let entries = entries_now(&core);
+    let assistant = entries
+        .iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("assistant entry for the failed start");
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    assert!(matches!(
+        assistant.parts.as_slice(),
+        [MessagePart::Error { message, .. }] if message.contains("server never booted")
+    ));
+    core.sessions.shutdown().await;
+}
+
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),

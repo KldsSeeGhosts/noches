@@ -23,10 +23,14 @@ cd "$ROOT"
 cargo build --locked -p zeron
 
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DATA_DIR"
-install -m 755 "$ROOT/target/debug/zeron" "$CONTENTS/MacOS/zeron"
+TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+install -m 755 "$TARGET_DIR/debug/zeron" "$CONTENTS/MacOS/zeron"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/dist/macos/Info-dev.plist" >"$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.ZERON_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.ZERON_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info.plist"
+mkdir -p "$CONTENTS/Resources/licenses"
+cp "$ROOT/crates/dictation/NOTICE.md" "$CONTENTS/Resources/licenses/parakeet-v3.txt"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$CONTENTS/Resources/licenses/"
 
 # The default browser needs its runtime beside the app, including source builds.
 "$ROOT/scripts/build-chromium.sh" "$DEV_ROOT/chromium" debug

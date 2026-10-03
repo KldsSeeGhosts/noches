@@ -6,6 +6,11 @@ Noches is the macOS and Linux desktop fork of [Zeron](https://github.com/zeronsh
 
 Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity) locally by default, with optional multi-device sync.
 
+[On-device dictation](docs/reference/desktop-dictation.md) is opt-in in
+Settings → Dictation. Enabling it downloads a 670 MB Parakeet v3 model from
+Hugging Face. Audio stays local and text remains an editable draft until Send.
+Linux requires the system ALSA runtime, including for the shared headless binary.
+
 *English | [简体中文](README.zh-CN.md)*
 
 ![Zeron driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)

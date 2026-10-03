@@ -15,7 +15,7 @@ use zeron_harness::{
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -232,19 +232,29 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         diff: None,
     }));
 
+    // Live plan updates retain status; child plans never reach the parent.
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCall { call: ToolCall::Todo { items }, .. }
+            if items.iter().any(|item| item.text == "child-only")
+    )));
+    assert!(events.contains(&AgentEvent::ToolCall {
+        id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+        call: ToolCall::Todo {
+            items: vec![
+                TodoItem::new("read", TodoStatus::Completed),
+                TodoItem::new("fix", TodoStatus::InProgress),
+                TodoItem::new("test", TodoStatus::Pending),
+            ],
+        },
+    }));
     // Completion-only todoList still opens and closes the lifecycle.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "td1".into(),
         call: ToolCall::Todo {
             items: vec![
-                TodoItem {
-                    text: "a".into(),
-                    done: true
-                },
-                TodoItem {
-                    text: "b".into(),
-                    done: false
-                },
+                TodoItem::new("a", TodoStatus::Completed),
+                TodoItem::new("b", TodoStatus::Pending),
             ]
         },
     }));

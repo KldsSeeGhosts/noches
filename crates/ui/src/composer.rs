@@ -39,6 +39,8 @@ use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
+mod dictation;
+use dictation::{DictationHold, DictationInputEvent, DictationKey, HoldSource};
 
 // ---------------------------------------------------------------------------
 // Constants + pure decision logic
@@ -857,6 +859,7 @@ actions!(
         Undo,
         Redo,
         MentionTab,
+        ToggleDictation,
     ]
 );
 
@@ -1430,6 +1433,7 @@ fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
         KeyBinding::new("tab", MentionTab, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("shift-backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
@@ -1549,6 +1553,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     let palette = Some(PALETTE_SEARCH_CONTEXT);
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
+        KeyBinding::new("shift-backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
         KeyBinding::new("home", Home, palette),
         KeyBinding::new("end", End, palette),
@@ -1710,6 +1715,10 @@ pub struct ComposerInput {
     blink_anchor: Instant,
     /// Half-period repaint driver, alive only while the input is focused.
     blink_task: Option<Task<()>>,
+    dictation: crate::dictation::Dictation,
+    transcriber: Option<Box<dyn crate::dictation::Transcriber>>,
+    dictation_task: Option<Task<()>>,
+    dictation_key: Option<DictationKey>,
     // -- undo history --
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
@@ -1790,6 +1799,10 @@ impl ComposerInput {
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
             blink_task: None,
+            dictation: Default::default(),
+            transcriber: None,
+            dictation_task: None,
+            dictation_key: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit: None,
@@ -2030,6 +2043,7 @@ impl ComposerInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.invalidate_mention_tooltip();
         self.content = text.into();
         if self.single_line {
@@ -2192,6 +2206,7 @@ impl ComposerInput {
     /// Called with the range about to be replaced, BEFORE the content changes,
     /// so the pushed snapshot is the pre-edit state.
     fn record_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        self.cancel_dictation();
         let kind = if new_text.is_empty() {
             EditKind::Delete
         } else {
@@ -2230,6 +2245,7 @@ impl ComposerInput {
     }
 
     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.invalidate_mention_tooltip();
         self.content = snapshot.content;
         self.refresh_projection();
@@ -2246,6 +2262,9 @@ impl ComposerInput {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_dictation();
+        cx.emit(DictationInputEvent::Changed);
+        cx.notify();
         if self.read_only {
             return;
         }
@@ -2257,6 +2276,9 @@ impl ComposerInput {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_dictation();
+        cx.emit(DictationInputEvent::Changed);
+        cx.notify();
         if self.read_only {
             return;
         }
@@ -2278,6 +2300,7 @@ impl ComposerInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         let offset = self.projection.normalize_range(offset..offset).start;
         self.selected_range = offset..offset;
         self.follow_cursor = true;
@@ -2287,6 +2310,7 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         let offset = self.projection.normalize_range(offset..offset).start;
         if self.selection_reversed {
             self.selected_range.start = offset;
@@ -2457,6 +2481,10 @@ impl ComposerInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_text(cx);
+    }
+
+    pub(crate) fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
@@ -2667,6 +2695,13 @@ impl ComposerInput {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.dictation.phase.active() {
+            self.cancel_dictation();
+            cx.emit(DictationInputEvent::Changed);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if escape_dismisses_completion(&event.keystroke.key, self.mention_open) {
             cx.emit(ComposerInputEvent::MentionDismiss);
             cx.stop_propagation();
@@ -3254,6 +3289,7 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        self.cancel_dictation();
         let single_line_text;
         let new_text = if self.single_line {
             single_line_text = new_text.replace(['\r', '\n'], " ");
@@ -3298,6 +3334,7 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        self.cancel_dictation();
         let single_line_text;
         let new_text = if self.single_line {
             single_line_text = new_text.replace(['\r', '\n'], " ");
@@ -3806,6 +3843,9 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::message_newline_or_accept))
             .on_action(cx.listener(Self::modified_submit))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::toggle_dictation_action))
+            .on_key_up(cx.listener(Self::on_dictation_key_up))
+            .on_modifiers_changed(cx.listener(Self::on_dictation_modifiers))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_key_down(cx.listener(Self::on_key_down))
@@ -4035,9 +4075,10 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 ///
 /// Only pane-local, user-authored content is carried: the live input text,
 /// the per-chat-key draft/attachment/appshot maps, and the draft a queue
-/// edit displaced. Deliberately EXCLUDED - global or host-coupled, never the
-/// pane's property: the model/harness picker choices (agent identity is
-/// global), in-flight send/interrupt/mention/slash tasks, popup + lightbox
+/// edit displaced, plus explicit checklist choices. Deliberately EXCLUDED -
+/// global or host-coupled, never the pane's property: the model/harness picker
+/// choices (agent identity is global), in-flight send/interrupt/mention/slash
+/// tasks, popup + lightbox
 /// chrome, layout/flip measurements, failure banners, and the queue-edit
 /// LEASE machinery (`editing_queued`, lease ids, ack bookkeeping). A
 /// host-issued lease cannot be resurrected on a new entity, so a switch that
@@ -4057,6 +4098,11 @@ pub(crate) struct ComposerDraftState {
     attachments: HashMap<String, Vec<StagedAttachment>>,
     /// Captured window shots per chat key.
     appshots: HashMap<String, Vec<CapturedAppshot>>,
+    todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
+}
+
+fn composer_hover_key(action: &str, view: gpui::EntityId) -> SharedString {
+    format!("composer-{action}-{view}").into()
 }
 
 pub struct Composer {
@@ -4149,6 +4195,10 @@ pub struct Composer {
     /// Rows awaiting a host-authoritative removal acknowledgement. They stay
     /// visible but inert until the host wins the race against queue delivery.
     pub(crate) queue_removing: HashSet<String>,
+    /// Checklist and presentation state for this composer's chat target.
+    pub(crate) todo_cache: crate::todo_panel::TodoCache,
+    pub(crate) todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
+    pub(crate) todo_scroll: gpui::ScrollHandle,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -4216,6 +4266,12 @@ pub struct Composer {
     _pickers_observe: Subscription,
     _picker_focus: Subscription,
     _input_events: Subscription,
+    _dictation_events: Subscription,
+    dictation_hold: Option<DictationHold>,
+    dictation_focus: FocusHandle,
+    microphone_focus: FocusHandle,
+    dictation_blur: Option<Subscription>,
+    dictation_activation: Option<Subscription>,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -4344,8 +4400,11 @@ impl Composer {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
-        cx.on_release(|this, cx| this.release_queue_previews(cx))
-            .detach();
+        cx.on_release(|this, cx| {
+            this.input.update(cx, |input, _| input.cancel_dictation());
+            this.release_queue_previews(cx);
+        })
+        .detach();
         let input = cx.new(|cx| {
             let mut input =
                 ComposerInput::with_context("Message the agent…", MESSAGE_COMPOSER_CONTEXT, cx);
@@ -4372,7 +4431,7 @@ impl Composer {
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
-        let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+        let input_events = cx.subscribe(&input, |this: &mut Self, _, event: &ComposerInputEvent, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
             ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
@@ -4404,13 +4463,42 @@ impl Composer {
                 }
             }
             ComposerInputEvent::PastedImages(images) => {
-                let staged = images
-                    .iter()
-                    .map(|image| attachments::stage_clipboard_image(image.clone()))
-                    .collect();
-                this.add_staged(staged, cx);
+                let images = images.clone();
+                this.stage_in_background(
+                    move || {
+                        images
+                            .into_iter()
+                            .map(attachments::stage_clipboard_image)
+                            .map(Ok)
+                            .collect()
+                    },
+                    cx,
+                );
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+        });
+        cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
+            if !crate::settings::current(cx).dictation_enabled {
+                this.input.update(cx, |input, _| input.cancel_dictation());
+            }
+            cx.notify();
+        })
+        .detach();
+        let dictation_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            DictationInputEvent::Press => this.press_dictation(HoldSource::Key, cx),
+            DictationInputEvent::Release => this.release_dictation(HoldSource::Key, cx),
+            DictationInputEvent::Changed => cx.notify(),
+            DictationInputEvent::Submit(generation) => {
+                if this.input.read(cx).dictation.generation == *generation
+                    && composer_has_content(
+                        this.input.read(cx).text(),
+                        this.staged().len() + this.staged_appshots().len(),
+                        this.staged_comments(cx).len(),
+                    )
+                {
+                    this.on_submit(cx);
+                }
+            }
         });
         let current_key = target.key(state.read(cx));
         let context_indicator =
@@ -4467,6 +4555,9 @@ impl Composer {
             queue_full_preview: None,
             queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
+            todo_cache: Default::default(),
+            todo_panels: HashMap::new(),
+            todo_scroll: gpui::ScrollHandle::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
@@ -4496,6 +4587,12 @@ impl Composer {
             _pickers_observe: pickers_observe,
             _picker_focus: picker_focus,
             _input_events: input_events,
+            _dictation_events: dictation_events,
+            dictation_hold: None,
+            dictation_focus: cx.focus_handle(),
+            microphone_focus: cx.focus_handle(),
+            dictation_blur: None,
+            dictation_activation: None,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) - `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -4612,6 +4709,7 @@ impl Composer {
                 drafts: self.drafts.clone(),
                 attachments: self.attachments.clone(),
                 appshots: self.appshots.clone(),
+                todo_panels: self.todo_panels.clone(),
             };
             state
                 .attachments
@@ -4631,6 +4729,7 @@ impl Composer {
             drafts: self.drafts.clone(),
             attachments: self.attachments.clone(),
             appshots: self.appshots.clone(),
+            todo_panels: self.todo_panels.clone(),
         }
     }
 
@@ -4650,8 +4749,10 @@ impl Composer {
             drafts,
             attachments,
             appshots,
+            todo_panels,
         } = state;
         self.drafts.extend(drafts);
+        self.todo_panels.extend(todo_panels);
         for (key, staged) in attachments {
             self.attachments.entry(key).or_default().extend(staged);
         }
@@ -4813,40 +4914,65 @@ impl Composer {
         cx.notify();
     }
 
-    fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+    /// Run `stage` on the background executor — reading a file and converting
+    /// a BMP are too slow for the UI thread — and add what it staged to the
+    /// draft that is current now, even if the user has navigated away by the
+    /// time it finishes. Failures surface in that draft's failure notice.
+    fn stage_in_background(
+        &mut self,
+        stage: impl FnOnce() -> Vec<Result<StagedAttachment, String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.queue_edit_finishing {
             return;
         }
-        if staged.is_empty() {
-            return;
-        }
-        self.attachments
-            .entry(self.current_key.clone())
-            .or_default()
-            .extend(staged);
-        self.focus_pending = true;
-        cx.notify();
+        let key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let results = cx.background_executor().spawn(async move { stage() }).await;
+            this.update(cx, |this, cx| {
+                let mut staged = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(att) => staged.push(att),
+                        Err(message) => {
+                            this.failure = Some(message.into());
+                            this.failure_key = Some(key.clone());
+                        }
+                    }
+                }
+                if !staged.is_empty() {
+                    let current = this.current_key == key;
+                    if current
+                        && this.queue_edit_finishing
+                        && let Some((_, saved_attachments, _)) = &mut this.queue_edit_draft
+                    {
+                        saved_attachments.extend(staged);
+                    } else {
+                        this.attachments.entry(key).or_default().extend(staged);
+                    }
+                    this.focus_pending |= current && !this.queue_edit_finishing;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Stage image files (picker / drop / pasted paths). Non-images are
     /// skipped silently (matching the original's `image/*` filter); read
     /// failures and oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let mut staged = Vec::new();
-        for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
-                Err(message) => {
-                    self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
-                    cx.notify();
-                }
-            }
-        }
-        self.add_staged(staged, cx);
+        self.stage_in_background(
+            move || {
+                paths
+                    .iter()
+                    .filter(|path| attachments::format_by_extension(path).is_some())
+                    .map(|path| attachments::stage_file(path))
+                    .collect()
+            },
+            cx,
+        );
     }
 
     /// Add a file-tree or file-tab drop through the existing file-mention
@@ -6138,6 +6264,7 @@ impl Composer {
                     .as_ref()
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
+                    self.input.update(cx, |input, _| input.cancel_dictation());
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.advance_task = None;
@@ -6211,15 +6338,19 @@ impl Composer {
         if self.editing_queued.is_some() {
             return SendButtonMode::Send;
         }
-        let has_text = composer_has_content(
-            self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
-            self.staged_comments(cx).len(),
-        );
+        let has_text = self.input.read(cx).dictation.phase.active()
+            || composer_has_content(
+                self.input.read(cx).text(),
+                self.staged().len() + self.staged_appshots().len(),
+                self.staged_comments(cx).len(),
+            );
         send_button_mode(self.run_live(cx), has_text)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -6257,6 +6388,9 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -7393,6 +7527,7 @@ impl Composer {
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
+                    .debug_selector(|| "composer-send".into())
                     .size(px(28.0))
                     .flex_none()
                     .rounded_full()
@@ -7440,6 +7575,7 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.observe_dictation_focus(window, cx);
         if self.focus_pending {
             self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
@@ -7711,8 +7847,13 @@ impl Render for Composer {
         // queue tray's top edge exactly the way the queue tray tucks behind
         // the pill.
         let queue_panel = self.render_queue_panel(show_queue_latest_shortcut, window, cx);
+        let agents_tray = self.render_agents_tray(queue_panel.is_some(), cx);
         let container = container.when_some(
-            self.render_agents_tray(queue_panel.is_some(), cx),
+            self.render_todo_panel(queue_panel.is_some() || agents_tray.is_some(), window, cx),
+            |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
+        );
+        let container = container.when_some(
+            agents_tray,
             |el, tray| {
                 el.child(motion::fade_quick(
                     "composer-agents-tray",
@@ -7914,6 +8055,8 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let attach_hover_key = composer_hover_key("attach", cx.entity_id());
+        let microphone = self.render_dictation_button(cx);
         // Attach button - opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -7929,11 +8072,11 @@ impl Render for Composer {
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
-                "composer-attach",
+                &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener("composer-attach"))
+            .on_hover(motion::hover_listener(attach_hover_key))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -7971,6 +8114,7 @@ impl Render for Composer {
                     // Open menus keep their own keyboard/search focus.
                     if !this.pickers.read(cx).is_open() {
                         window.focus(&this.input.focus_handle(cx), cx);
+                        window.prevent_default();
                     }
                 }),
             )
@@ -8019,6 +8163,7 @@ impl Render for Composer {
         let usage = crate::context_usage::usage_for_target(self.state.read(cx), &self.target);
         let show_context = crate::context_usage::has_window(usage);
         let context_ring_width = context_indicator_width(show_context);
+        let dictation_width = if microphone.is_some() { 34.0 } else { 0.0 };
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
@@ -8031,6 +8176,7 @@ impl Render for Composer {
             - ACTION_PRIMARY_GAP
             - 28.0
             - context_ring_width
+            - dictation_width
             - morph_cluster_inset(expanded, layout_morph_t))
         .max(0.0);
         let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
@@ -8113,6 +8259,7 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .gap(px(6.0))
+                                .children(microphone)
                                 .children(
                                     show_context
                                         .then(|| self.context_indicator.clone().into_any_element()),
@@ -8185,6 +8332,7 @@ impl Render for Composer {
                                 .gap(px(6.0))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .children(microphone)
                                 .children(
                                     show_context
                                         .then(|| self.context_indicator.clone().into_any_element()),
@@ -8268,7 +8416,24 @@ impl Render for Composer {
         } else {
             container
         };
-        let container = container.child(pill_surface);
+        let dictation_status = self.render_dictation_status(cx);
+        let container = container.child(
+            div()
+                .track_focus(&self.dictation_focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && this.input.read(cx).dictation.phase.active()
+                    {
+                        this.dismiss_dictation(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_SM))
+                .child(pill_surface)
+                .children(dictation_status),
+        );
 
         // The lower slot keeps a stable footprint for Git projects while its
         // old floating checkout/ref controls dissolve into the session footer.
@@ -8355,7 +8520,7 @@ mod modal_selection_tests;
 mod tests {
     use super::*;
 
-    fn composer_focus_window(
+    pub(super) fn composer_focus_window(
         cx: &mut gpui::TestAppContext,
     ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
         let dir = tempfile::tempdir().unwrap();
@@ -8543,6 +8708,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn shift_backspace_deletes_text_and_selection_in_all_input_contexts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            init(cx, ComposerSendBehavior::default());
+        });
+        for context in [
+            GENERIC_COMPOSER_CONTEXT,
+            MESSAGE_COMPOSER_CONTEXT,
+            PALETTE_SEARCH_CONTEXT,
+        ] {
+            let handle = cx.add_window(|window, cx| {
+                let mut input = ComposerInput::with_context("", context, cx);
+                input.set_text("café", cx);
+                window.focus(&input.focus_handle, cx);
+                input
+            });
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            handle
+                .update(cx, |input, _, cx| {
+                    assert_eq!(input.text(), "caf", "{context}");
+                    input.set_text("hello world", cx);
+                    input.move_to(6, cx);
+                    input.select_to(11, cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            handle
+                .update(cx, |input, _, cx| {
+                    assert_eq!(input.text(), "hello ", "{context}");
+                    input.set_text("", cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(handle.into(), "shift-backspace");
+            assert_eq!(
+                handle
+                    .read_with(cx, |input, _| input.text().to_owned())
+                    .unwrap(),
+                ""
+            );
+        }
+    }
+
+    #[gpui::test]
     fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8684,11 +8897,96 @@ mod tests {
                 composer.add_paths(vec![image_path], cx);
             })
             .unwrap();
+        cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear();
             assert!(input.read(cx).focus_handle.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn staged_files_land_in_the_draft_they_were_added_to(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let bmp = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&bmp).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![bmp, dir.path().join("notes.txt")], cx);
+                // Staging runs in the background; navigating meanwhile must
+                // not move the attachment into the other chat's draft.
+                composer.current_key = "chat-b".into();
+                composer.focus_pending = false;
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let names: Vec<_> = composer.attachments["chat-a"]
+                    .iter()
+                    .map(|att| att.name.as_str())
+                    .collect();
+                assert_eq!(names, ["shot.png"]);
+                assert!(!composer.attachments.contains_key("chat-b"));
+                assert!(
+                    !composer.focus_pending,
+                    "staging must not focus another draft"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_keeps_failures_with_the_original_draft(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let broken = dir.path().join("broken.bmp");
+        std::fs::write(&broken, b"BM not a bitmap").unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![broken], cx);
+                composer.current_key = "chat-b".into();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                assert_eq!(composer.failure_key.as_deref(), Some("chat-a"));
+                assert_eq!(
+                    composer.failure.as_deref(),
+                    Some("broken.bmp is not a valid image.")
+                );
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_during_queue_finish_preserves_the_displaced_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (dir, handle) = composer_focus_window(cx);
+        let image = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&image).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.add_paths(vec![image], cx);
+                composer.queue_edit_finishing = true;
+                composer.queue_edit_draft = Some(("draft".into(), vec![], vec![]));
+                composer.focus_pending = false;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let (_, saved, _) = composer.queue_edit_draft.as_ref().unwrap();
+                assert_eq!(saved[0].name, "shot.png");
+                assert!(composer.attachments.is_empty());
+                assert!(!composer.focus_pending);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -10177,6 +10475,24 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[gpui::test]
+    fn attachment_hover_fades_are_scoped_to_each_composer(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let selected = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pane = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
+        let selected_key = composer_hover_key("attach", selected.entity_id());
+        let pane_key = composer_hover_key("attach", pane.entity_id());
+        assert_ne!(selected_key, pane_key);
+        motion::set_hover(&selected_key, true, true);
+        assert_eq!(motion::hover_t(&selected_key), 1.0);
+        assert_eq!(motion::hover_t(&pane_key), 0.0);
+        motion::set_hover(&pane_key, true, true);
+        motion::set_hover(&selected_key, false, true);
+        assert_eq!(motion::hover_t(&selected_key), 0.0);
+        assert_eq!(motion::hover_t(&pane_key), 1.0);
+        motion::set_hover(&pane_key, false, true);
     }
 
     #[gpui::test]

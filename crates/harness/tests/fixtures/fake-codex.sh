@@ -152,6 +152,8 @@ case "$turnline" in
   emit '{"method":"item/completed","params":{"item":{"id":"w1","type":"webSearch","query":"rust"}}}'
   # Completion-only lifecycle: must still open AND close the tool call.
   emit '{"method":"item/completed","params":{"item":{"id":"td1","type":"todoList","items":[{"text":"a","completed":true},{"text":"b","completed":false}]}}}'
+  emit '{"method":"turn/plan/updated","params":{"threadId":"th-1","turnId":"t-1","plan":[{"step":"read","status":"completed"},{"step":"fix","status":"inProgress"},{"step":"test","status":"pending"}]}}'
+  emit '{"method":"turn/plan/updated","params":{"threadId":"child-other","turnId":"tu-child","plan":[{"step":"child-only","status":"inProgress"}]}}'
   # Streamed agentMessage: completed text must NOT re-emit.
   emit '{"method":"item/completed","params":{"item":{"id":"m1","type":"agentMessage","text":"Hello world"}}}'
   # Never-streamed agentMessage: completed text is the fallback delta.

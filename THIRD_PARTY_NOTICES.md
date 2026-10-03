@@ -110,6 +110,11 @@ it should also be MIT licensed. Zeron is distributed under MIT terms.
 
 ## mermaid-rs-renderer
 
+The pinned MIT-licensed renderer, version 0.3.1, is used for file previews and
+chat diagrams. Its optional CLI and PNG features are disabled. Chat rendering
+adds no third-party dependencies; generated SVG uses the existing GPUI/usvg
+image preparation path.
+
 MIT License
 
 Copyright (c) 2026 mermaid-rs-renderer contributors
@@ -143,3 +148,90 @@ Zeron code.
 The Zui native overlay renderer adapts Apache-2.0 GPUI code from
 [`egoist/zed` at `57bd4fe`](https://github.com/egoist/zed/tree/57bd4fe181639797d395978d5de17bc9e10a6219/crates/gpui_macos).
 Attribution is retained in the pinned Zui dependency’s `NOTICE`.
+
+## Optional desktop dictation
+
+NVIDIA Parakeet TDT 0.6B v3 model weights are licensed under CC BY 4.0.
+The optional download uses Ivan Stupakov's INT8 ONNX conversion at immutable
+revision `8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce`, verified by SHA-256.
+Original: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3.
+Conversion: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx.
+License: https://creativecommons.org/licenses/by/4.0/.
+
+Runtime dependencies are parakeet-rs 0.3.8 and ort/ort-sys 2.0.0-rc.13,
+MIT OR Apache-2.0; ONNX Runtime 1.28.0, MIT; CPAL 0.15.3,
+Apache-2.0; and rubato 0.16.2, MIT. Hound 3.5.1, Apache-2.0, reads WAVs
+in the explicit verification example. Noches reuses CPAL 0.15.3 to preserve
+the existing GPT-Live audio backend and its ALSA linkage.
+See `crates/dictation/NOTICE.md` for model provenance and runtime limits.
+The model is not bundled with the application.
+
+The dictation port adds the following registry packages to the lockfile.
+Existing package versions are unchanged. Sources and packaged license texts
+are in each release's crate archive at `https://crates.io/crates/<name>/<version>`.
+Slash-separated MIT/Apache declarations below offer either license.
+
+| Added package and version | Declared license |
+| --- | --- |
+| base64 0.13.1 | MIT OR Apache-2.0 |
+| castaway 0.2.4 | MIT |
+| compact_str 0.9.1 | MIT |
+| daachorse 3.0.3 | MIT OR Apache-2.0 |
+| dary_heap 0.3.9 | MIT OR Apache-2.0 |
+| der 0.8.2 | Apache-2.0 OR MIT |
+| derive_builder, derive_builder_core, derive_builder_macro 0.20.2 | MIT OR Apache-2.0 |
+| esaxx-rs 0.1.10 | Apache-2.0 |
+| eyre 0.6.14 | MIT OR Apache-2.0 |
+| foreign-types 0.3.2, foreign-types-shared 0.1.1 | MIT OR Apache-2.0 |
+| hmac-sha256 1.1.15 | ISC |
+| hound 3.5.1 | Apache-2.0 |
+| indenter 0.3.4 | MIT OR Apache-2.0 |
+| lzma-rust2 0.15.8 | Apache-2.0 |
+| macro_rules_attribute, macro_rules_attribute-proc_macro 0.2.3 | Apache-2.0 OR MIT OR Zlib |
+| matrixmultiply 0.3.11 | MIT OR Apache-2.0 |
+| monostate, monostate-impl 0.1.18 | MIT OR Apache-2.0 |
+| native-tls 0.2.18 | MIT OR Apache-2.0 |
+| ndarray 0.17.2 | MIT OR Apache-2.0 |
+| onig 6.5.3, onig_sys 69.9.3 | MIT |
+| openssl 0.10.81 | Apache-2.0 |
+| openssl-macros 0.1.1 | MIT OR Apache-2.0 |
+| openssl-probe 0.2.1 | MIT OR Apache-2.0 |
+| openssl-sys 0.9.117 | MIT |
+| ort, ort-sys 2.0.0-rc.13 | MIT OR Apache-2.0 |
+| parakeet-rs 0.3.8 | MIT OR Apache-2.0 |
+| pastey 0.2.3 | MIT OR Apache-2.0 |
+| pem-rfc7468 1.0.0 | Apache-2.0 OR MIT |
+| primal-check 0.3.4 | MIT OR Apache-2.0 |
+| rawpointer 0.2.1 | MIT OR Apache-2.0 |
+| rayon-cond 0.4.0 | Apache-2.0 OR MIT |
+| realfft 3.5.0 | MIT |
+| rubato 0.16.2 | MIT |
+| rustfft 6.4.1 | MIT OR Apache-2.0 |
+| schannel 0.1.29 | MIT |
+| security-framework 3.7.0, security-framework-sys 2.17.0 | MIT OR Apache-2.0 |
+| spm_precompiled 0.1.4 | Apache-2.0 |
+| strength_reduce 0.2.4 | MIT OR Apache-2.0 |
+| tokenizers 0.23.2 | Apache-2.0 |
+| transpose 0.2.3 | MIT OR Apache-2.0 |
+| unicode-normalization-alignments 0.1.12 | MIT OR Apache-2.0 |
+| unicode_categories 0.1.1 | MIT OR Apache-2.0 |
+| webpki-root-certs 1.0.9 | CDLA-Permissive-2.0 |
+
+The ONNX build script downloads a checksum-verified native archive from
+`cdn.pyke.io` during compilation, not application startup. Linux x86_64's
+ONNX Runtime static archive is 105,481,448 bytes before final linking and
+dead-code elimination. The release binary size delta has not been measured.
+Native TLS dependencies serve that build-time downloader: OpenSSL on Linux,
+Security.framework on macOS and Schannel on Windows. ONNX also needs a C/C++
+toolchain; Oniguruma builds its bundled C engine. No new PulseAudio requirement
+is introduced. CPAL's ALSA runtime dependency was already present in GPT-Live.
+Intel macOS needs a separately built ONNX Runtime 1.28.0 because the pinned
+distribution has no prebuilt archive for it. macOS arm64, Linux x86_64/aarch64
+and Windows x86_64 have upstream archives; Windows also links DirectML/DX12.
+An archive is also available for Windows aarch64, not tested here.
+These targets, permission prompts and native packaging still need verification
+outside this Linux x86_64 build.
+
+The tokenizer also statically bundles Oniguruma's C engine under BSD-2-Clause.
+Its copyright, conditions and disclaimer, along with ONNX Runtime's MIT
+notice, are retained in `crates/dictation/NOTICE.md` and copied into packages.

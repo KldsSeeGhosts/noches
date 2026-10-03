@@ -333,8 +333,28 @@ pub fn traits_customized(
 // Pure: folder-browser navigation (used by the shell's add-space flow)
 // ---------------------------------------------------------------------------
 
+/// Whether `path` is drive-rooted (`C:`, `C:\…`, `C:/…`). Judged by shape,
+/// not `cfg`: the device being browsed may be a Windows machine reached from
+/// any platform.
+fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|b| matches!(b, b'/' | b'\\'))
+}
+
 /// Parent of an absolute path; `None` at the filesystem root.
 pub fn parent_path(path: &str) -> Option<String> {
+    if is_windows_path(path) {
+        let (drive, rest) = path.split_at(2);
+        let rest = rest.trim_matches(['/', '\\']);
+        if rest.is_empty() {
+            return None; // drive root
+        }
+        let parent = rest.rfind(['/', '\\']).map_or("", |at| &rest[..at]);
+        return Some(format!("{drive}\\{parent}"));
+    }
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return None; // was "/" (or empty)
@@ -348,8 +368,10 @@ pub fn parent_path(path: &str) -> Option<String> {
 
 /// Join a listing path and an entry name.
 pub fn child_path(base: &str, name: &str) -> String {
-    if base.ends_with('/') {
+    if base.ends_with(['/', '\\']) {
         format!("{base}{name}")
+    } else if is_windows_path(base) {
+        format!("{base}\\{name}")
     } else {
         format!("{base}/{name}")
     }
@@ -394,13 +416,29 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
-/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
-/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
-/// trailing slash trimmed. `home` is the device's resolved home — `None`
-/// until the first listing lands, when `~` can't expand yet. A query like
-/// `~foo` is a folder name, not a path.
+/// Whether a palette query is path-shaped (absolute, home-relative or
+/// drive-rooted) rather than a folder name to filter by.
+pub fn is_typed_path(query: &str) -> bool {
+    query.starts_with(['/', '~']) || is_windows_path(query)
+}
+
+/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`),
+/// drive-rooted (`D:\projects`) or home-relative (`~`, `~/github`). Returns the
+/// absolute path to browse, trailing separator trimmed. `home` is the device's
+/// resolved home — `None` until the first listing lands, when `~` can't expand
+/// yet. A query like `~foo` is a folder name, not a path.
 pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
     let query = query.trim();
+    if is_windows_path(query) {
+        let path = query.replace('/', "\\");
+        let trimmed = path.trim_end_matches('\\');
+        // `D:` and `D:\` both mean the drive root.
+        return Some(if trimmed.len() == 2 {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_string()
+        });
+    }
     if let Some(rest) = query.strip_prefix('~') {
         let home = home?.trim_end_matches('/');
         if rest.is_empty() {
@@ -426,10 +464,17 @@ pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
 
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
-    let mut acc = String::new();
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        acc.push('/');
+    let (drive, sep, rest) = if is_windows_path(path) {
+        let (drive, rest) = path.split_at(2);
+        (drive, '\\', rest)
+    } else {
+        ("", '/', path)
+    };
+    let root = format!("{drive}{sep}");
+    let mut out = vec![(root.clone(), root)];
+    let mut acc = drive.to_string();
+    for segment in rest.split(['/', sep]).filter(|s| !s.is_empty()) {
+        acc.push(sep);
         acc.push_str(segment);
         out.push((segment.to_string(), acc.clone()));
     }
@@ -2755,13 +2800,50 @@ impl Pickers {
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
+        Self::footer_label_shell(icon_path, theme)
+            .max_w(px(160.0))
+            .child(div().min_w_0().truncate().child(label))
+    }
+
+    /// A [`Self::footer_label`] that takes whatever width the row leaves it
+    /// and fades its tail only when that isn't enough.
+    fn footer_faded_label(
+        id: &'static str,
+        icon_path: &'static str,
+        label: SharedString,
+        theme: &Theme,
+    ) -> gpui::Div {
+        let overflow = gpui::ScrollHandle::new();
+        Self::footer_label_shell(icon_path, theme)
+            .child(Self::footer_faded_text(id, label, &overflow))
+    }
+
+    fn footer_faded_text(
+        id: &'static str,
+        label: impl IntoElement,
+        overflow: &gpui::ScrollHandle,
+    ) -> impl IntoElement {
+        crate::edge_fade::edge_faded(
+            20.0,
+            false,
+            false,
+            div()
+                .id(id)
+                .min_w_0()
+                .overflow_hidden()
+                .track_scroll(overflow)
+                .flex()
+                .child(div().flex_none().whitespace_nowrap().child(label)),
+        )
+        .fade_right(true)
+        .fade_overflow_x(overflow)
+    }
+
+    fn footer_label_shell(icon_path: &'static str, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
-            // Four of these share one row now (device, project, checkout,
-            // ref): cap each early and let them SHRINK (`min_w_0`) — without
-            // it the clusters overflowed into each other and the labels
-            // painted overlapped (user report).
-            .max_w(px(160.0))
+            // Labels SHRINK (`min_w_0`) — without it the clusters overflowed
+            // into each other and the labels painted overlapped (user report).
             .min_w_0()
             .flex()
             .flex_row()
@@ -2774,9 +2856,9 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             )
-            .child(div().min_w_0().truncate().child(label))
     }
 
     /// New-session destination controls. Machine and project form the
@@ -2979,7 +3061,8 @@ impl Pickers {
                 .items_center()
                 .gap(px(4.0))
                 .min_w_0()
-                .child(Self::footer_label(
+                .child(Self::footer_faded_label(
+                    "composer-session-branch",
                     crate::icons::GIT_BRANCH,
                     chat.branch
                         .clone()
@@ -5339,6 +5422,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn session_branch_uses_free_width_and_tracks_overflow(cx: &mut gpui::TestAppContext) {
+        struct Fixture {
+            width: f32,
+            overflow: gpui::ScrollHandle,
+        }
+        impl gpui::Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let fixed = |width| div().w(px(width)).h(px(20.0)).flex_none();
+                div().w(px(self.width)).child(
+                    workspace_footer_row()
+                        .child(fixed(120.0))
+                        .child(
+                            Pickers::footer_label_shell(crate::icons::GIT_BRANCH, &Theme::dark())
+                                .child(Pickers::footer_faded_text(
+                                    "branch",
+                                    fixed(300.0),
+                                    &self.overflow,
+                                )),
+                        )
+                        .child(div().flex_1().min_w_0())
+                        .child(fixed(60.0)),
+                )
+            }
+        }
+        let overflow = gpui::ScrollHandle::new();
+        let handle = cx.add_window(|_, _| Fixture {
+            width: 600.0,
+            overflow: overflow.clone(),
+        });
+        for (width, overflowing) in [(600.0, false), (320.0, true), (600.0, false)] {
+            handle
+                .update(cx, |fixture, _, cx| {
+                    fixture.width = width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            assert_eq!(overflow.max_offset().x > px(1.0), overflowing);
+            if !overflowing {
+                assert!(overflow.bounds().size.width > px(160.0));
+            }
+        }
+    }
+
+    #[gpui::test]
     fn picker_completion_and_dismissal_have_distinct_focus_behavior(cx: &mut gpui::TestAppContext) {
         use std::cell::Cell;
         use std::rc::Rc;
@@ -6343,6 +6472,28 @@ mod tests {
     }
 
     #[test]
+    fn windows_folder_paths_and_breadcrumbs() {
+        assert_eq!(
+            parent_path(r"D:\Random\zeron"),
+            Some(r"D:\Random".to_string())
+        );
+        assert_eq!(parent_path(r"D:\Random"), Some(r"D:\".to_string()));
+        assert_eq!(parent_path(r"D:\Random\"), Some(r"D:\".to_string()));
+        assert_eq!(parent_path(r"D:\"), None);
+        assert_eq!(parent_path("D:"), None);
+        assert_eq!(child_path(r"D:\", "Random"), r"D:\Random");
+        assert_eq!(child_path(r"D:\Random", "zeron"), r"D:\Random\zeron");
+        let crumbs = breadcrumbs(r"D:\Random\zeron");
+        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, [r"D:\", "Random", "zeron"]);
+        assert_eq!(crumbs[0].1, r"D:\");
+        assert_eq!(crumbs[1].1, r"D:\Random");
+        assert_eq!(breadcrumbs(r"D:\").len(), 1);
+        assert!(!is_windows_path("/D:/x"));
+        assert!(!is_windows_path("ab:/x"));
+    }
+
+    #[test]
     fn completion_prefix_lengths() {
         // Case-insensitive; the length indexes into the NAME's bytes.
         assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
@@ -6392,6 +6543,26 @@ mod tests {
         // `~` can't expand before the device's home is known.
         assert_eq!(typed_path_target("~/github", None), None);
         assert_eq!(typed_path_target("/disk2", None), Some("/disk2".into()));
+    }
+
+    #[test]
+    fn typed_path_target_accepts_windows_drive_paths() {
+        let home = Some(r"C:\Users\wing");
+        assert_eq!(typed_path_target(r"D:\", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:", home), Some(r"D:\".into()));
+        assert_eq!(typed_path_target("D:/", home), Some(r"D:\".into()));
+        assert_eq!(
+            typed_path_target(r"D:\Random\zeron\", home),
+            Some(r"D:\Random\zeron".into())
+        );
+        // Forward slashes normalise so the crumb trail can match the path.
+        assert_eq!(
+            typed_path_target("D:/Random/zeron", None),
+            Some(r"D:\Random\zeron".into())
+        );
+        assert!(is_typed_path(r"D:\x"));
+        assert!(is_typed_path("/x") && is_typed_path("~"));
+        assert!(!is_typed_path("src") && !is_typed_path("ab:/x"));
     }
 
     #[test]

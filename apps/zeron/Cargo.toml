@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zeron-browser.workspace = true
+zeron-mcp.workspace = true
 base64 = "0.22"
 zeron-engine.workspace = true
 zeron-rpc.workspace = true
