@@ -1719,6 +1719,13 @@ impl Theme {
         flatten(self.text.opacity(0.80), self.bg)
     }
 
+    /// Inline-code chip fill: a quiet neutral plate (T3 `--muted` behind
+    /// `code`). Derived from the ink ladder so it reads on every canvas.
+    // TODO(D1): use theme.muted
+    pub fn code_chip_fill(&self) -> Hsla {
+        self.ink(0.07)
+    }
+
     /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on dark).
     // TODO(D1): use theme.link
     pub fn link_text(&self) -> Hsla {

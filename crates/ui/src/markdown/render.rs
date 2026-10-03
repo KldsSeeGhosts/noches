@@ -1021,18 +1021,29 @@ pub struct FlatText {
     pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint: a text-safe use of the selected accent identity.
+/// Inline code is a neutral chip (T3): full-strength text on the muted fill
+/// with a hairline border. Accent never colors code - it encodes identity,
+/// not content.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
-    theme.code_text
+    theme.text
 }
 pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    theme.code_wash
+    theme.code_chip_fill()
 }
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
-pub const INLINE_CODE_PAD_X: f32 = 2.0;
-pub const INLINE_CODE_INSET_Y: f32 = 2.0;
+pub fn inline_code_border(theme: &Theme) -> Hsla {
+    theme.border
+}
+/// Chip geometry (paint-only, never in layout): T3's 6px radius on a box that
+/// extends past the glyphs by [`INLINE_CODE_PAD_X`] next to whitespace (T3
+/// pads the run 5.6px; gpui cannot pad inline text) and only
+/// [`INLINE_CODE_PAD_TIGHT_X`] beside punctuation, so a neighbouring comma or
+/// bracket is not run over by the border. y insets from the line box.
+pub const INLINE_CODE_RADIUS: f32 = 6.0;
+pub const INLINE_CODE_PAD_X: f32 = 3.5;
+pub const INLINE_CODE_PAD_TIGHT_X: f32 = 1.0;
+pub const INLINE_CODE_INSET_Y: f32 = 2.4;
+/// Hairline border width of the chip.
+const INLINE_CODE_BORDER: f32 = 1.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -1252,19 +1263,33 @@ pub(super) fn flat_text_presented_element(
         .as_ref()
         .map(|original| original.offsets.clone());
     let wash = inline_code_wash(theme);
+    let chip_border = inline_code_border(theme);
+    let chip_text = flat.text.clone();
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
             let surface = PAINTING_SURFACE.with(Cell::get);
             for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
+                let rects = range_rects(&layout, range, 0.0, INLINE_CODE_INSET_Y);
+                let last = rects.len().saturating_sub(1);
+                for (part, mut rect) in rects.into_iter().enumerate() {
+                    // Only the chip's outer edges grow: a wrapped chip keeps
+                    // its row ends flush.
+                    if part == 0 {
+                        let pad = chip_edge_pad(&chip_text, range.start, true);
+                        rect.origin.x -= px(pad);
+                        rect.size.width += px(pad);
+                    }
+                    if part == last {
+                        rect.size.width += px(chip_edge_pad(&chip_text, range.end, false));
+                    }
                     window.paint_quad(quad(
                         rect,
                         px(INLINE_CODE_RADIUS),
                         wash,
-                        px(0.0),
-                        gpui::transparent_black(),
+                        px(INLINE_CODE_BORDER),
+                        chip_border,
                         BorderStyle::default(),
                     ));
                 }
@@ -1349,6 +1374,21 @@ pub(super) fn flat_text_presented_element(
         ui: opts.link.clone(),
     }
     .into_any_element()
+}
+
+/// Horizontal chip growth at one outer edge: full padding where the chip sits
+/// beside whitespace or the block edge, tight beside any other character.
+fn chip_edge_pad(text: &str, at: usize, leading: bool) -> f32 {
+    let neighbour = if leading {
+        text[..at].chars().next_back()
+    } else {
+        text[at..].chars().next()
+    };
+    match neighbour {
+        None => INLINE_CODE_PAD_X,
+        Some(c) if c.is_whitespace() => INLINE_CODE_PAD_X,
+        Some(_) => INLINE_CODE_PAD_TIGHT_X,
+    }
 }
 
 /// Selection tint shared with native inputs and the composer.
@@ -3617,12 +3657,24 @@ mod tests {
         );
         // Adjacent code runs merge into ONE wash box; separated ones don't.
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the accent tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead). Body
-        // copy rides the 80% prose tone.
+        // Code text is full-strength text (a neutral chip, never accent); the
+        // square run background is gone (the rounded chip is painted by the
+        // canvas underlay instead). Body copy rides the 80% prose tone.
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
+        assert_eq!(flat.runs[1].color, theme.text);
+        assert_ne!(flat.runs[1].color, theme.accent);
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.prose_text());
+    }
+
+    #[test]
+    fn inline_code_chip_pads_only_beside_whitespace() {
+        assert_eq!(chip_edge_pad("use foo", 4, true), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo and", 3, false), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo", 0, true), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo", 3, false), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("(foo),", 4, false), INLINE_CODE_PAD_TIGHT_X);
+        assert_eq!(chip_edge_pad("(foo)", 1, true), INLINE_CODE_PAD_TIGHT_X);
     }
 
     #[test]
