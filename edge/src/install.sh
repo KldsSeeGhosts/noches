@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://zeron.sh/install.sh | sh
 #
-# Installs the self-contained native binary (no runtime deps) to
+# Installs the native binary (requires the system ALSA runtime) to
 # ~/.zeron/app, puts `zeron` on PATH, and runs it as a local-only
 # systemd user service that survives reboots. Signing in is optional and
 # enables sync after a restart. Re-running
@@ -58,6 +58,11 @@ else
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi
 
+if ! "$dest/zeron" --version >/dev/null; then
+  echo "zeron install: the downloaded executable could not start; see the loader error above." >&2
+  echo "Install the missing runtime libraries (including ALSA, libasound.so.2), then rerun this installer." >&2
+  exit 1
+fi
 ln -sfn "$dest" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/zeron" "$HOME/.local/bin/zeron"

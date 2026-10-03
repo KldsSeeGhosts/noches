@@ -39,6 +39,8 @@ sed -e "s/^Name=.*/Name=$APP_NAME/" -e "s/^Exec=.*/Exec=$APP_SLUG %u/" \
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/$APP_SLUG.png"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
+cp "$ROOT/crates/dictation/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/licenses/"
 
 install -m 755 "$ROOT/scripts/install-linux.sh" "$STAGE/install.sh"
 python3 - "$STAGE/install.json" <<'META'

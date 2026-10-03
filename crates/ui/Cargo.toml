@@ -48,6 +48,7 @@ name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 
 [dependencies]
+zeron-voice = { path = "../dictation" }
 noches-voice = { path = "../voice" }
 zeron-browser.workspace = true
 url = "2"

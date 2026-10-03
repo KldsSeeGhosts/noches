@@ -20,6 +20,7 @@ members = [
     "crates/syntax",
     "crates/workspace",
     "crates/voice",
+    "crates/dictation",
     "apps/zeron",
 ]
 

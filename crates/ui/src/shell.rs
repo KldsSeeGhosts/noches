@@ -408,6 +408,11 @@ pub fn apply_keymap(
     // rebuilding Zeron's bindings so the file editor keymap remains active.
     gpui_base::init(cx);
     crate::composer::init(cx, composer_send_behavior);
+    cx.bind_keys([KeyBinding::new(
+        &valid_or_default(&keymap.toggle_dictation, ShortcutId::ToggleDictation.default_combo()),
+        crate::composer::ToggleDictation,
+        Some("MessageComposer"),
+    )]);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
@@ -564,6 +569,7 @@ pub enum SettingsSection {
     Appearance,
     Files,
     Notifications,
+    Dictation,
     Shortcuts,
     Appshots,
     Archived,
@@ -571,7 +577,7 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 12] = [
         SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
@@ -579,6 +585,7 @@ impl SettingsSection {
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
+        SettingsSection::Dictation,
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Archived,
@@ -596,6 +603,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::Dictation => "Dictation",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
@@ -629,6 +637,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "appearance",
             SettingsSection::Files => "files",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::Dictation => "dictation",
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
@@ -649,6 +658,7 @@ impl SettingsSection {
             "appearance" => SettingsSection::Appearance,
             "files" => SettingsSection::Files,
             "notifications" => SettingsSection::Notifications,
+            "dictation" | "voice" => SettingsSection::Dictation,
             "shortcuts" => SettingsSection::Shortcuts,
             "appshots" => SettingsSection::Appshots,
             "archived" => SettingsSection::Archived,
@@ -4391,6 +4401,8 @@ impl Shell {
     /// keeps this block on a single source.
     fn sync_independent_settings(&mut self, cx: &App) {
         let current = settings::current(cx);
+        self.settings.dictation_enabled = current.dictation_enabled;
+        self.settings.dictation_input = current.dictation_input;
         self.settings.window_geometry = current.window_geometry;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
@@ -4775,6 +4787,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Dictation => crate::dictation::card(cx).into_any_element(),
             SettingsSection::Shortcuts | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -6373,6 +6386,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Dictation => icons::MICROPHONE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -14730,6 +14744,8 @@ mod settings_reopen_regressions {
             ("settings/agents", SettingsSection::Agents),
             ("settings/appearance", SettingsSection::Appearance),
             ("settings/files", SettingsSection::Files),
+            ("settings/dictation", SettingsSection::Dictation),
+            ("settings/voice", SettingsSection::Dictation),
             ("settings/shortcuts", SettingsSection::Shortcuts),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
@@ -14743,6 +14759,28 @@ mod settings_reopen_regressions {
         }
         assert_eq!(settings_open_route("settings/billing", remembered), None);
         assert_eq!(settings_open_route("new", remembered), None);
+    }
+
+    #[gpui::test]
+    fn shell_geometry_saves_preserve_dictation_consent_and_microphone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window.update(cx, |shell, _, cx| {
+            settings::update(SavePolicy::Immediate, cx, |s| {
+                s.dictation_enabled = true;
+                s.dictation_input = Some("USB microphone".into());
+            });
+            shell.settings.sidebar_width = 300.0;
+            shell.schedule_save(cx);
+            assert!(settings::current(cx).dictation_enabled);
+            assert_eq!(settings::current(cx).dictation_input.as_deref(), Some("USB microphone"));
+            settings::update(SavePolicy::Immediate, cx, |s| s.dictation_enabled = false);
+            shell.open_settings(SettingsSection::Appearance, cx);
+            shell.schedule_save(cx);
+            assert!(!settings::current(cx).dictation_enabled);
+            assert_eq!(settings::current(cx).dictation_input.as_deref(), Some("USB microphone"));
+        }).unwrap();
     }
 
     #[gpui::test]
