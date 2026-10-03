@@ -4406,11 +4406,17 @@ impl Composer {
                 }
             }
             ComposerInputEvent::PastedImages(images) => {
-                let staged = images
-                    .iter()
-                    .map(|image| attachments::stage_clipboard_image(image.clone()))
-                    .collect();
-                this.add_staged(staged, cx);
+                let images = images.clone();
+                this.stage_in_background(
+                    move || {
+                        images
+                            .into_iter()
+                            .map(attachments::stage_clipboard_image)
+                            .map(Ok)
+                            .collect()
+                    },
+                    cx,
+                );
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
@@ -4815,40 +4821,65 @@ impl Composer {
         cx.notify();
     }
 
-    fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+    /// Run `stage` on the background executor — reading a file and converting
+    /// a BMP are too slow for the UI thread — and add what it staged to the
+    /// draft that is current now, even if the user has navigated away by the
+    /// time it finishes. Failures surface in that draft's failure notice.
+    fn stage_in_background(
+        &mut self,
+        stage: impl FnOnce() -> Vec<Result<StagedAttachment, String>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.queue_edit_finishing {
             return;
         }
-        if staged.is_empty() {
-            return;
-        }
-        self.attachments
-            .entry(self.current_key.clone())
-            .or_default()
-            .extend(staged);
-        self.focus_pending = true;
-        cx.notify();
+        let key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let results = cx.background_executor().spawn(async move { stage() }).await;
+            this.update(cx, |this, cx| {
+                let mut staged = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(att) => staged.push(att),
+                        Err(message) => {
+                            this.failure = Some(message.into());
+                            this.failure_key = Some(key.clone());
+                        }
+                    }
+                }
+                if !staged.is_empty() {
+                    let current = this.current_key == key;
+                    if current
+                        && this.queue_edit_finishing
+                        && let Some((_, saved_attachments, _)) = &mut this.queue_edit_draft
+                    {
+                        saved_attachments.extend(staged);
+                    } else {
+                        this.attachments.entry(key).or_default().extend(staged);
+                    }
+                    this.focus_pending |= current && !this.queue_edit_finishing;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Stage image files (picker / drop / pasted paths). Non-images are
     /// skipped silently (matching the original's `image/*` filter); read
     /// failures and oversize files surface in the failure notice.
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let mut staged = Vec::new();
-        for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
-                continue;
-            }
-            match attachments::stage_file(path) {
-                Ok(att) => staged.push(att),
-                Err(message) => {
-                    self.failure = Some(message.into());
-                    self.failure_key = Some(self.current_key.clone());
-                    cx.notify();
-                }
-            }
-        }
-        self.add_staged(staged, cx);
+        self.stage_in_background(
+            move || {
+                paths
+                    .iter()
+                    .filter(|path| attachments::format_by_extension(path).is_some())
+                    .map(|path| attachments::stage_file(path))
+                    .collect()
+            },
+            cx,
+        );
     }
 
     /// Add a file-tree or file-tab drop through the existing file-mention
@@ -8734,11 +8765,90 @@ mod tests {
                 composer.add_paths(vec![image_path], cx);
             })
             .unwrap();
+        cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear();
             assert!(input.read(cx).focus_handle.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn staged_files_land_in_the_draft_they_were_added_to(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let bmp = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&bmp).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![bmp, dir.path().join("notes.txt")], cx);
+                // Staging runs in the background; navigating meanwhile must
+                // not move the attachment into the other chat's draft.
+                composer.current_key = "chat-b".into();
+                composer.focus_pending = false;
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let names: Vec<_> = composer.attachments["chat-a"]
+                    .iter()
+                    .map(|att| att.name.as_str())
+                    .collect();
+                assert_eq!(names, ["shot.png"]);
+                assert!(!composer.attachments.contains_key("chat-b"));
+                assert!(!composer.focus_pending, "staging must not focus another draft");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_keeps_failures_with_the_original_draft(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let broken = dir.path().join("broken.bmp");
+        std::fs::write(&broken, b"BM not a bitmap").unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.current_key = "chat-a".into();
+                composer.add_paths(vec![broken], cx);
+                composer.current_key = "chat-b".into();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                assert_eq!(composer.failure_key.as_deref(), Some("chat-a"));
+                assert_eq!(composer.failure.as_deref(), Some("broken.bmp is not a valid image."));
+                assert!(composer.attachments.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn background_staging_during_queue_finish_preserves_the_displaced_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (dir, handle) = composer_focus_window(cx);
+        let image = dir.path().join("shot.bmp");
+        image::RgbImage::new(1, 1).save(&image).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.add_paths(vec![image], cx);
+                composer.queue_edit_finishing = true;
+                composer.queue_edit_draft = Some(("draft".into(), vec![], vec![]));
+                composer.focus_pending = false;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |composer, _| {
+                let (_, saved, _) = composer.queue_edit_draft.as_ref().unwrap();
+                assert_eq!(saved[0].name, "shot.png");
+                assert!(composer.attachments.is_empty());
+                assert!(!composer.focus_pending);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
