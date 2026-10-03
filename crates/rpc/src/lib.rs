@@ -34,6 +34,10 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    /// Passive host/replica task state, `{chatId}`; never acknowledges results.
+    pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
+    pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
+    pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);

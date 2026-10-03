@@ -115,6 +115,22 @@ impl CredentialRegistry {
         }
     }
 
+    /// Host-only warm-turn rebinding. Preserve MCP session identity/lifetime;
+    /// the token never grants caller-supplied run or project authority.
+    pub(crate) fn advance_session(&self, scope: InvocationScope) {
+        let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        for record in records.values_mut().filter(|record| {
+            record.scope.caller.thread_id == scope.caller.thread_id
+                && record.scope.caller.session_id == scope.caller.session_id
+        }) {
+            let session_id = record.scope.caller.session_id.clone();
+            let issued_at = record.scope.issued_at;
+            record.scope = scope.clone();
+            record.scope.caller.session_id = session_id;
+            record.scope.issued_at = issued_at;
+            record.last_alive_at = (self.now)();
+        }
+    }
     pub fn revoke_session(&self, id: &str) {
         self.records
             .lock()

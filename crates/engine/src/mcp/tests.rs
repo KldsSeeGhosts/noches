@@ -629,3 +629,31 @@ async fn replacement_revocation_cannot_revoke_successor_and_debug_is_redacted() 
     sessions.revoke_session_mcp("parent");
     assert!(server.credentials.resolve(&raw).is_none());
 }
+
+#[test]
+fn warm_scope_advance_is_exact_session_owned_not_all_tokens_for_a_thread() {
+    let registry = auth::CredentialRegistry::default();
+    let first = registry.issue(scope()).unwrap();
+    let other = registry.issue(scope()).unwrap();
+    let mut bound = registry.resolve(&first.authorization).unwrap();
+    let original = registry.resolve(&other.authorization).unwrap();
+    bound.caller.run_id = "next-logical-run".into();
+    registry.advance_session(bound);
+    assert_eq!(
+        registry
+            .resolve(&first.authorization)
+            .unwrap()
+            .caller
+            .run_id
+            .as_ref(),
+        "next-logical-run"
+    );
+    assert_eq!(
+        registry
+            .resolve(&other.authorization)
+            .unwrap()
+            .caller
+            .run_id,
+        original.caller.run_id
+    );
+}

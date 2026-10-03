@@ -132,6 +132,7 @@ pub struct EngineCore {
     /// and starts workers after recovery; legacy session recovery never revives
     /// a chat already owned by this store.
     pub orchestration: orchestration::Kernel,
+    pub orchestration_host: Option<orchestration::assembly::OrchestrationHost>,
     pub sessions: SessionsEngine,
     pub doc_host: DocHost,
     pub workspace: WorkspaceHost,
@@ -259,6 +260,25 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // ON by default for T3 parity. Disable explicitly for legacy-only rigs;
+        // no provider runs start until a user turn or a scoped delegated task.
+        let orchestration_host = if std::env::var("ZERON_ORCHESTRATION")
+            .is_ok_and(|value| matches!(value.as_str(), "0" | "off" | "false"))
+        {
+            None
+        } else {
+            Some(
+                orchestration::assembly::OrchestrationHost::assemble(
+                    orchestration.clone(),
+                    sessions.clone(),
+                    doc_host.clone(),
+                    workspace.clone(),
+                    registry.clone(),
+                    device_id.clone(),
+                )
+                .map_err(|error| EngineError::Other(error.to_string()))?,
+            )
+        };
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -320,6 +340,12 @@ impl EngineCore {
         });
         let agent_accounts =
             AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
+        // Readiness must not depend on opening Settings. Discovery is bounded
+        // and off the startup critical path; unknown is non-blocking while it
+        // runs, explicit signed-out state is constraining afterwards.
+        if let Some(host) = &orchestration_host {
+            host.discover(registry.clone(), agent_accounts.clone());
+        }
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -334,6 +360,7 @@ impl EngineCore {
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
             orchestration,
+            orchestration_host,
             sessions,
             doc_host,
             workspace,
@@ -481,6 +508,7 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
+        .with_orchestration(self.orchestration.store.clone())
         .with_previews(self.previews.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -515,6 +543,9 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        if let Some(host) = &self.orchestration_host {
+            host.shutdown().await;
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();

@@ -70,6 +70,7 @@ pub(crate) fn enqueue(
                     records.remove("provider-session");
                     records.remove("runtime-request");
                 }
+                payload["uiState"] = super::ui::state(conn, &ThreadId(id.clone()))?;
                 payload
             },
         });

@@ -589,6 +589,7 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    orchestration: Option<crate::orchestration::Store>,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -637,6 +638,7 @@ impl EngineRpc {
             },
         };
         Self {
+            orchestration: None,
             sessions,
             doc_host,
             workspace,
@@ -660,6 +662,11 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    pub fn with_orchestration(mut self, store: crate::orchestration::Store) -> Self {
+        self.orchestration = Some(store);
         self
     }
 
@@ -1601,6 +1608,37 @@ impl RpcService for EngineRpc {
         };
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::LIST_ORCHESTRATION_THREADS => {
+                RpcReply::value(&self.workspace.orchestration_threads())
+            }
+            methods::GET_ORCHESTRATION_STATE => {
+                let p: ChatParams = parse_params(params)?;
+                let state = if let Some(store) = &self.orchestration
+                    && store
+                        .thread(&p.chat_id.clone().into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_some()
+                {
+                    store
+                        .ui_state(&p.chat_id.into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    self.doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .doc()
+                        .orchestration()["projection"]["uiState"]
+                        .clone()
+                };
+                RpcReply::value(&state)
+            }
+            methods::LIST_PROVIDER_INSTANCES => {
+                self.registry
+                    .provider_instances
+                    .refresh_all(&self.registry)
+                    .await;
+                RpcReply::value(&self.registry.provider_instances.snapshot(&self.registry))
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
