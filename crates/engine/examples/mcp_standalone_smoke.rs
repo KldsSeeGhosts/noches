@@ -81,6 +81,19 @@ async fn main() -> anyhow::Result<()> {
         Some("Smoke project".into()),
         false,
     )?;
+    // Workspace watch publication follows the registry mutation asynchronously.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut spaces = core.workspace.watch_spaces();
+        while !spaces
+            .borrow_and_update()
+            .iter()
+            .any(|space| space.id == "smoke-project")
+        {
+            spaces.changed().await?;
+        }
+        Ok::<_, tokio::sync::watch::error::RecvError>(())
+    })
+    .await??;
     let tools = Tools::new(Arc::new(Zeron::with_client(
         zeron_rpc::memory_client(core.rpc_service()),
         Origin::default(),
