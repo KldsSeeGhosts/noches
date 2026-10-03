@@ -26,9 +26,11 @@ pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod mcp;
 pub mod orchestration;
 pub mod profile;
 pub mod project_actions;
+pub mod provider_instances;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -223,6 +225,10 @@ impl EngineCore {
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
+        registry
+            .provider_instances
+            .load(data_dir)
+            .map_err(EngineError::Other)?;
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let orchestration = orchestration::Kernel::open(store.clone(), &device_id)
             .map_err(|error| EngineError::Other(error.to_string()))?;

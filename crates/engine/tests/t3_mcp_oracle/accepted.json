@@ -1,0 +1,518 @@
+[
+  {
+    "name": "orchestrator_capabilities",
+    "group": "orchestrator",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "delegate_task",
+    "group": "orchestrator",
+    "arguments": {
+      "task": "fixture"
+    },
+    "decoded": {
+      "task": "fixture"
+    }
+  },
+  {
+    "name": "task_status",
+    "group": "orchestrator",
+    "arguments": {
+      "taskId": "fixture"
+    },
+    "decoded": {
+      "taskId": "fixture"
+    }
+  },
+  {
+    "name": "task_cancel",
+    "group": "orchestrator",
+    "arguments": {
+      "taskId": "fixture"
+    },
+    "decoded": {
+      "taskId": "fixture"
+    }
+  },
+  {
+    "name": "schedule_task",
+    "group": "orchestrator",
+    "arguments": {
+      "prompt": "fixture",
+      "schedule": {
+        "type": "interval",
+        "everyMs": 60000
+      }
+    },
+    "decoded": {
+      "prompt": "fixture",
+      "schedule": {
+        "type": "interval",
+        "everyMs": 60000
+      }
+    }
+  },
+  {
+    "name": "list_scheduled_tasks",
+    "group": "orchestrator",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "update_scheduled_task",
+    "group": "orchestrator",
+    "arguments": {
+      "scheduledTaskId": "fixture"
+    },
+    "decoded": {
+      "scheduledTaskId": "fixture"
+    }
+  },
+  {
+    "name": "delete_scheduled_task",
+    "group": "orchestrator",
+    "arguments": {
+      "scheduledTaskId": "fixture"
+    },
+    "decoded": {
+      "scheduledTaskId": "fixture"
+    }
+  },
+  {
+    "name": "create_threads",
+    "group": "orchestrator",
+    "arguments": {
+      "threads": [
+        {}
+      ]
+    },
+    "decoded": {
+      "threads": [
+        {}
+      ]
+    }
+  },
+  {
+    "name": "t3_thread_list",
+    "group": "orchestrator",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_thread_read",
+    "group": "orchestrator",
+    "arguments": {
+      "threadId": "fixture"
+    },
+    "decoded": {
+      "threadId": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_update",
+    "group": "orchestrator",
+    "arguments": {
+      "action": "rename",
+      "title": "fixture"
+    },
+    "decoded": {
+      "action": "rename",
+      "title": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_send",
+    "group": "orchestrator",
+    "arguments": {
+      "threadId": "fixture",
+      "message": "fixture"
+    },
+    "decoded": {
+      "threadId": "fixture",
+      "message": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_wait",
+    "group": "orchestrator",
+    "arguments": {
+      "threadId": "fixture"
+    },
+    "decoded": {
+      "threadId": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_interrupt",
+    "group": "orchestrator",
+    "arguments": {
+      "threadId": "fixture"
+    },
+    "decoded": {
+      "threadId": "fixture"
+    }
+  },
+  {
+    "name": "run_scheduled_task_now",
+    "group": "thread",
+    "arguments": {
+      "taskId": "fixture"
+    },
+    "decoded": {
+      "taskId": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_search",
+    "group": "thread",
+    "arguments": {
+      "query": "fixture"
+    },
+    "decoded": {
+      "query": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_fork",
+    "group": "thread",
+    "arguments": {
+      "sourcePoint": {
+        "type": "latest_stable"
+      }
+    },
+    "decoded": {
+      "sourcePoint": {
+        "type": "latest_stable"
+      }
+    }
+  },
+  {
+    "name": "t3_thread_merge_back",
+    "group": "thread",
+    "arguments": {
+      "targetThreadId": "fixture",
+      "sourcePoint": {
+        "type": "latest_stable"
+      }
+    },
+    "decoded": {
+      "targetThreadId": "fixture",
+      "sourcePoint": {
+        "type": "latest_stable"
+      }
+    }
+  },
+  {
+    "name": "t3_thread_transfers",
+    "group": "thread",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_thread_configuration",
+    "group": "thread",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_thread_configure",
+    "group": "thread",
+    "arguments": {
+      "modelSelection": {
+        "instanceId": "mock",
+        "model": "mock"
+      }
+    },
+    "decoded": {
+      "modelSelection": {
+        "instanceId": "mock",
+        "model": "mock"
+      }
+    }
+  },
+  {
+    "name": "t3_pending_request_list",
+    "group": "thread",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_pending_request_read",
+    "group": "thread",
+    "arguments": {
+      "requestId": "fixture"
+    },
+    "decoded": {
+      "requestId": "fixture"
+    }
+  },
+  {
+    "name": "t3_pending_request_respond",
+    "group": "thread",
+    "arguments": {
+      "requestId": "fixture",
+      "answers": {}
+    },
+    "decoded": {
+      "requestId": "fixture",
+      "answers": {}
+    }
+  },
+  {
+    "name": "t3_thread_organize",
+    "group": "thread",
+    "arguments": {
+      "action": "pin"
+    },
+    "decoded": {
+      "action": "pin"
+    }
+  },
+  {
+    "name": "t3_queue_list",
+    "group": "thread",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_queue_read",
+    "group": "thread",
+    "arguments": {
+      "queuedRunId": "fixture"
+    },
+    "decoded": {
+      "queuedRunId": "fixture"
+    }
+  },
+  {
+    "name": "t3_queue_edit",
+    "group": "thread",
+    "arguments": {
+      "queuedRunId": "fixture",
+      "text": "fixture"
+    },
+    "decoded": {
+      "queuedRunId": "fixture",
+      "text": "fixture"
+    }
+  },
+  {
+    "name": "t3_queue_cancel",
+    "group": "thread",
+    "arguments": {
+      "queuedRunId": "fixture"
+    },
+    "decoded": {
+      "queuedRunId": "fixture"
+    }
+  },
+  {
+    "name": "t3_queue_reorder",
+    "group": "thread",
+    "arguments": {
+      "queuedRunId": "fixture",
+      "beforeRunId": null
+    },
+    "decoded": {
+      "queuedRunId": "fixture",
+      "beforeRunId": null
+    }
+  },
+  {
+    "name": "t3_queue_promote_to_steer",
+    "group": "thread",
+    "arguments": {
+      "queuedRunId": "fixture",
+      "targetRunId": "fixture"
+    },
+    "decoded": {
+      "queuedRunId": "fixture",
+      "targetRunId": "fixture"
+    }
+  },
+  {
+    "name": "t3_worktree_handoff",
+    "group": "worktree",
+    "arguments": {
+      "branch": "fixture"
+    },
+    "decoded": {
+      "branch": "fixture"
+    }
+  },
+  {
+    "name": "t3_worktree_status",
+    "group": "worktree",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_worktree_list",
+    "group": "worktree",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "link_pull_request",
+    "group": "pullRequests",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "unlink_pull_request",
+    "group": "pullRequests",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "list_thread_pull_requests",
+    "group": "pullRequests",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "watch_pull_request",
+    "group": "pullRequests",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "unwatch_pull_request",
+    "group": "pullRequests",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_thread_launch",
+    "group": "project",
+    "arguments": {
+      "title": "fixture"
+    },
+    "decoded": {
+      "title": "fixture"
+    }
+  },
+  {
+    "name": "t3_project_list",
+    "group": "project",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_project_read",
+    "group": "project",
+    "arguments": {
+      "projectId": "fixture"
+    },
+    "decoded": {
+      "projectId": "fixture"
+    }
+  },
+  {
+    "name": "t3_project_create",
+    "group": "project",
+    "arguments": {
+      "title": "fixture"
+    },
+    "decoded": {
+      "title": "fixture"
+    }
+  },
+  {
+    "name": "t3_project_update",
+    "group": "project",
+    "arguments": {
+      "projectId": "fixture"
+    },
+    "decoded": {
+      "projectId": "fixture"
+    }
+  },
+  {
+    "name": "t3_project_delete",
+    "group": "project",
+    "arguments": {
+      "projectId": "fixture"
+    },
+    "decoded": {
+      "projectId": "fixture"
+    }
+  },
+  {
+    "name": "t3_project_clone",
+    "group": "project",
+    "arguments": {
+      "destinationPath": "fixture"
+    },
+    "decoded": {
+      "destinationPath": "fixture"
+    }
+  },
+  {
+    "name": "t3_environment_read",
+    "group": "environment",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_environment_preferences_update",
+    "group": "environment",
+    "arguments": {},
+    "decoded": {}
+  },
+  {
+    "name": "t3_attachment_prepare_upload",
+    "group": "attachment",
+    "arguments": {
+      "upload": {
+        "name": "fixture",
+        "mimeType": "image/gif",
+        "sizeBytes": 1
+      }
+    },
+    "decoded": {
+      "upload": {
+        "name": "fixture",
+        "mimeType": "image/gif",
+        "sizeBytes": 1
+      }
+    }
+  },
+  {
+    "name": "t3_attachment_discard",
+    "group": "attachment",
+    "arguments": {
+      "attachmentId": "fixture"
+    },
+    "decoded": {
+      "attachmentId": "fixture"
+    }
+  },
+  {
+    "name": "t3_thread_send_attachments",
+    "group": "attachment",
+    "arguments": {
+      "attachments": [
+        {
+          "type": "image",
+          "id": "fixture",
+          "name": "fixture",
+          "mimeType": "image/png",
+          "sizeBytes": 1
+        }
+      ]
+    },
+    "decoded": {
+      "attachments": [
+        {
+          "type": "image",
+          "id": "fixture",
+          "name": "fixture",
+          "mimeType": "image/png",
+          "sizeBytes": 1
+        }
+      ]
+    }
+  }
+]

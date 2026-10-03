@@ -246,6 +246,7 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    mcp_server: Arc<crate::mcp::McpServer>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -316,6 +317,7 @@ impl SessionsEngine {
                 admission,
                 device_id,
                 journal,
+                mcp_server: Arc::new(crate::mcp::McpServer::new(registry.clone())),
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
@@ -440,6 +442,11 @@ impl SessionsEngine {
         }
     }
 
+    /// Engine-owned server; the V2 runner supplies the real domain service.
+    pub fn mcp_server(&self) -> Arc<crate::mcp::McpServer> {
+        self.inner.mcp_server.clone()
+    }
+
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
     pub fn set_generated_images(
         &self,
@@ -537,6 +544,7 @@ impl SessionsEngine {
     }
 
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
+        self.inner.mcp_server.credentials.touch(chat_id);
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
         }
@@ -817,6 +825,106 @@ impl SessionsEngine {
             .map_err(|e| EngineError::Other(format!("Cannot persist runtime authority: {e}")))?;
 
         let run_id = new_id();
+        // Issue before provider startup, never in RunRequest/journal/replicas.
+        // Existing explicitly registered bindings (including the V2 runner's
+        // canonical scope) take precedence; warm dispatch keeps its credential.
+        if !lock(&self.inner.session_mcp).contains_key(chat_id) {
+            use crate::mcp::auth::InvocationScope;
+            use crate::orchestration::service::CallerScope;
+            use crate::provider_instances::legacy_instance_id;
+            let project = self
+                .inner
+                .doc_host()
+                .and_then(|host| {
+                    host.workspace()
+                        .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                        .and_then(|chat| chat.space_id)
+                })
+                .unwrap_or_else(|| request.cwd.clone());
+            let instance_id = self
+                .inner
+                .registry
+                .provider_instances
+                .snapshot(&self.inner.registry)
+                .iter()
+                .find(|instance| instance.harness_id == Some(harness_id))
+                .map(|instance| instance.provider_instance_id.clone())
+                .unwrap_or_else(|| legacy_instance_id(harness_id));
+            let model = request.model.clone().unwrap_or_else(|| {
+                self.inner
+                    .registry
+                    .provider_instances
+                    .snapshot(&self.inner.registry)
+                    .iter()
+                    .find(|p| p.provider_instance_id == instance_id)
+                    .and_then(|p| p.models.first())
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| "default".into())
+            });
+            let mut inherited_options = request.model_options.clone();
+            // The legacy composer/harness option chip uses on/off strings.
+            // Canonical T3 boolean descriptors retain actual boolean values.
+            if let Some(model_row) = self
+                .inner
+                .registry
+                .provider_instances
+                .snapshot(&self.inner.registry)
+                .iter()
+                .find(|p| p.provider_instance_id == instance_id)
+                .and_then(|p| p.models.iter().find(|m| m.id == model))
+            {
+                for descriptor in model_row.options.as_ref().into_iter().flatten() {
+                    if let zeron_proto::provider_instance::ProviderOptionDescriptor::Boolean(option) =
+                        descriptor
+                        && let Some(value) = inherited_options.get_mut(&option.id)
+                        && let Some(text) = value.as_str()
+                    {
+                        *value = serde_json::Value::Bool(matches!(text, "on" | "true"));
+                    }
+                }
+            }
+            if let Some(reasoning) = request.reasoning {
+                let option_id = match harness_id {
+                    HarnessId::ClaudeCode => "effort",
+                    HarnessId::Pi => "thinking",
+                    _ => "reasoningEffort",
+                };
+                inherited_options
+                    .entry(option_id)
+                    .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));
+            }
+            let selection = serde_json::from_value(serde_json::json!({
+                "instanceId":instance_id,"model":model,"options":inherited_options
+            }))
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+            self.inner
+                .mcp_server
+                .register(
+                    self,
+                    chat_id,
+                    InvocationScope {
+                        environment_id: self.inner.device_id.clone(),
+                        caller: CallerScope {
+                            thread_id: chat_id.into(),
+                            run_id: run_id.clone().into(),
+                            session_id: String::new(),
+                            project_id: project.into(),
+                            workspace_root: request.cwd.clone().into(),
+                            runtime_mode: request.runtime_mode,
+                            interaction_mode: request.interaction_mode,
+                            provider_instance_id: instance_id,
+                        },
+                        selection,
+                        capabilities: ["orchestration", "worktree", "pull-requests"]
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
+                        issued_at: 0,
+                        task_id: None,
+                    },
+                )
+                .await?;
+        }
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -1290,6 +1398,7 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        self.inner.mcp_server.shutdown();
         let contexts = std::mem::take(&mut *lock(&self.inner.session_mcp));
         for context in contexts.into_values() {
             context.revoke();
