@@ -11,9 +11,9 @@
 
 use gpui::{Div, FontWeight, Hsla, SharedString, Stateful, div, hsla, point, prelude::*, px};
 
+use crate::elevation;
 use crate::icons::{self, icon};
 use crate::motion;
-use crate::elevation;
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
