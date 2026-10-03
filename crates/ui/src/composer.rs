@@ -4035,9 +4035,10 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 ///
 /// Only pane-local, user-authored content is carried: the live input text,
 /// the per-chat-key draft/attachment/appshot maps, and the draft a queue
-/// edit displaced. Deliberately EXCLUDED - global or host-coupled, never the
-/// pane's property: the model/harness picker choices (agent identity is
-/// global), in-flight send/interrupt/mention/slash tasks, popup + lightbox
+/// edit displaced, plus explicit checklist choices. Deliberately EXCLUDED -
+/// global or host-coupled, never the pane's property: the model/harness picker
+/// choices (agent identity is global), in-flight send/interrupt/mention/slash
+/// tasks, popup + lightbox
 /// chrome, layout/flip measurements, failure banners, and the queue-edit
 /// LEASE machinery (`editing_queued`, lease ids, ack bookkeeping). A
 /// host-issued lease cannot be resurrected on a new entity, so a switch that
@@ -4057,6 +4058,7 @@ pub(crate) struct ComposerDraftState {
     attachments: HashMap<String, Vec<StagedAttachment>>,
     /// Captured window shots per chat key.
     appshots: HashMap<String, Vec<CapturedAppshot>>,
+    todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
 }
 
 pub struct Composer {
@@ -4149,6 +4151,10 @@ pub struct Composer {
     /// Rows awaiting a host-authoritative removal acknowledgement. They stay
     /// visible but inert until the host wins the race against queue delivery.
     pub(crate) queue_removing: HashSet<String>,
+    /// Checklist and presentation state for this composer's chat target.
+    pub(crate) todo_cache: crate::todo_panel::TodoCache,
+    pub(crate) todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
+    pub(crate) todo_scroll: gpui::ScrollHandle,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -4467,6 +4473,9 @@ impl Composer {
             queue_full_preview: None,
             queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
+            todo_cache: Default::default(),
+            todo_panels: HashMap::new(),
+            todo_scroll: gpui::ScrollHandle::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
@@ -4612,6 +4621,7 @@ impl Composer {
                 drafts: self.drafts.clone(),
                 attachments: self.attachments.clone(),
                 appshots: self.appshots.clone(),
+                todo_panels: self.todo_panels.clone(),
             };
             state
                 .attachments
@@ -4631,6 +4641,7 @@ impl Composer {
             drafts: self.drafts.clone(),
             attachments: self.attachments.clone(),
             appshots: self.appshots.clone(),
+            todo_panels: self.todo_panels.clone(),
         }
     }
 
@@ -4650,8 +4661,10 @@ impl Composer {
             drafts,
             attachments,
             appshots,
+            todo_panels,
         } = state;
         self.drafts.extend(drafts);
+        self.todo_panels.extend(todo_panels);
         for (key, staged) in attachments {
             self.attachments.entry(key).or_default().extend(staged);
         }
@@ -7711,8 +7724,13 @@ impl Render for Composer {
         // queue tray's top edge exactly the way the queue tray tucks behind
         // the pill.
         let queue_panel = self.render_queue_panel(show_queue_latest_shortcut, window, cx);
+        let agents_tray = self.render_agents_tray(queue_panel.is_some(), cx);
         let container = container.when_some(
-            self.render_agents_tray(queue_panel.is_some(), cx),
+            self.render_todo_panel(queue_panel.is_some() || agents_tray.is_some(), window, cx),
+            |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
+        );
+        let container = container.when_some(
+            agents_tray,
             |el, tray| {
                 el.child(motion::fade_quick(
                     "composer-agents-tray",
