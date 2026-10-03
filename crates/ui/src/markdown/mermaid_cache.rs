@@ -6,14 +6,15 @@
 //! executor and drops requests whose rows left the viewport before their turn.
 //! Results are retained under a byte budget, least recently painted first out;
 //! an evicted diagram simply renders again when its row returns. Diagrams
-//! painted in the latest two passes are never evicted, so the budget is soft
-//! only when more diagrams than it admits are on screen at once.
+//! painted in the latest two passes are never evicted. If those fill the
+//! budget, additional fences keep their source.
 use crate::image_media::MediaImage;
 use gpui::SharedString;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 64;
+const MAX_ROWS_PER_SOURCE: usize = 128;
 
 pub(crate) enum Lookup {
     Pending,
@@ -31,7 +32,7 @@ struct Entry {
     state: State,
     /// Paint pass that last requested this source.
     used: u64,
-    /// Rows that painted this source, remeasured when its result lands.
+    /// Rows painting this source in its latest pass, remeasured on completion.
     rows: Vec<SharedString>,
 }
 
@@ -60,7 +61,7 @@ impl MermaidCache {
     pub(crate) fn begin_frame(&mut self, style: u32) -> Vec<MediaImage> {
         self.frame += 1;
         if self.style == Some(style) {
-            return Vec::new();
+            return self.evict(1, 0);
         }
         self.style = Some(style);
         self.drain()
@@ -91,7 +92,27 @@ impl MermaidCache {
 
     /// Look up a fence painted in the current pass, queueing it if unseen.
     pub(crate) fn request(&mut self, code: &str, frame_id: &str) -> Lookup {
+        if let Err(reason) = super::mermaid::validate_source(code) {
+            return Lookup::Failed(reason.into());
+        }
         let frame = self.frame;
+        if !self.entries.contains_key(code) && self.entries.len() >= MAX_ENTRIES {
+            // Retire a stale failed or pending entry without dropping painted
+            // media here, where there is no App to release its GPU assets.
+            let stale = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !matches!(entry.state, State::Ready(_)) && frame.saturating_sub(entry.used) > 1
+                })
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(code, _)| code.clone());
+            if let Some(stale) = stale {
+                self.entries.remove(&stale);
+            } else {
+                return Lookup::Failed("Diagram cache limit reached".into());
+            }
+        }
         let entry = match self.entries.get_mut(code) {
             Some(entry) => entry,
             None => {
@@ -103,9 +124,15 @@ impl MermaidCache {
                 })
             }
         };
+        if entry.used != frame {
+            entry.rows.clear();
+        }
         entry.used = frame;
         let row = frame_row(frame_id);
         if !entry.rows.iter().any(|known| known == row) {
+            if entry.rows.len() >= MAX_ROWS_PER_SOURCE {
+                return Lookup::Failed("Diagram cache row limit reached".into());
+            }
             entry.rows.push(row.to_owned().into());
         }
         match &entry.state {
@@ -148,30 +175,45 @@ impl MermaidCache {
         if self.style != Some(style) {
             return None;
         }
+        // An in-flight source may have scrolled away and been pruned. Do not
+        // resurrect it or bypass the entry admission limit.
+        if !self.entries.contains_key(&code) {
+            return Some((Vec::new(), result.into_iter().collect()));
+        }
+        let mut released = Vec::new();
         let state = match result {
-            Ok(media) => State::Ready(match self.view {
-                Some((target, scale)) => media.preview_for_view(target, scale),
-                None => media,
-            }),
+            Ok(media) => {
+                released.extend(self.evict(0, media.bytes));
+                let available = MAX_RETAINED_BYTES.saturating_sub(self.retained_bytes());
+                let media = match self.view {
+                    Some((target, scale)) => media.preview_within(target, scale, available),
+                    None => media,
+                };
+                if media.bytes > available {
+                    released.push(media);
+                    State::Failed("Diagram cache memory limit reached".into())
+                } else {
+                    State::Ready(media)
+                }
+            }
             Err(reason) => State::Failed(reason.into()),
         };
-        let frame = self.frame;
-        let entry = self.entries.entry(code).or_insert(Entry {
-            state: State::Pending,
-            used: frame,
-            rows: Vec::new(),
-        });
+        let entry = self.entries.get_mut(&code).expect("requested diagram");
+        debug_assert!(matches!(entry.state, State::Pending));
         entry.state = state;
         let rows = entry.rows.clone();
-        Some((rows, self.evict()))
+        released.extend(self.evict(0, 0));
+        Some((rows, released))
     }
 
     /// Release settled diagrams least recently painted first until the
     /// retained memory and entry count fit their limits.
-    fn evict(&mut self) -> Vec<MediaImage> {
+    fn evict(&mut self, reserve: usize, incoming_bytes: usize) -> Vec<MediaImage> {
         let mut released = Vec::new();
         let frame = self.frame;
-        while self.retained_bytes() > MAX_RETAINED_BYTES || self.entries.len() > MAX_ENTRIES {
+        while self.retained_bytes().saturating_add(incoming_bytes) > MAX_RETAINED_BYTES
+            || self.entries.len() > MAX_ENTRIES - reserve
+        {
             let Some(code) = self
                 .entries
                 .iter()
@@ -341,7 +383,9 @@ mod tests {
             cache.request(&code, &format!("row{ix}-mermaid-0"));
             cache.finish(code, 1, Err("bad".into()));
         }
+        cache.request("graph 0", "row0-mermaid-0");
         cache.begin_frame(1);
+        cache.request("graph 0", "row0-mermaid-0");
         cache.begin_frame(1);
         cache.request("graph 0", "row0-mermaid-0");
         cache.request("fresh", "fresh-mermaid-0");
@@ -362,5 +406,131 @@ mod tests {
         assert!(cache.source_visible(&frame));
         cache.retain_rows(&HashSet::from(["chat#p.1"]));
         assert!(!cache.source_visible(&frame));
+    }
+
+    #[test]
+    fn oversized_source_is_not_retained_or_queued() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        let source = "x".repeat(super::super::mermaid::MAX_SOURCE_BYTES + 1);
+        assert!(matches!(
+            cache.request(&source, "row-mermaid-0"),
+            Lookup::Failed(_)
+        ));
+        assert!(cache.entries.is_empty());
+        assert!(!cache.take_new_requests());
+        assert!(cache.next_job().is_none());
+    }
+
+    #[test]
+    fn painted_and_pending_entries_cannot_exceed_the_hard_cap() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        for ix in 0..MAX_ENTRIES {
+            assert!(matches!(
+                cache.request(&format!("graph {ix}"), &format!("row{ix}-mermaid-0")),
+                Lookup::Pending
+            ));
+        }
+        assert!(matches!(
+            cache.request("overflow", "extra-mermaid-0"),
+            Lookup::Failed(_)
+        ));
+        assert_eq!(cache.entries.len(), MAX_ENTRIES);
+        cache.begin_frame(1);
+        cache.begin_frame(1);
+        assert!(matches!(
+            cache.request("new", "new-mermaid-0"),
+            Lookup::Pending
+        ));
+        assert_eq!(cache.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn oversized_result_fails_soft_without_exceeding_the_memory_budget() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        cache.request("a", "row-mermaid-0");
+        let mut oversized = media(80);
+        oversized.bytes = MAX_RETAINED_BYTES + 1;
+        let (rows, released) = cache.finish("a".into(), 1, Ok(oversized)).unwrap();
+        assert_eq!(rows, ["row"]);
+        assert_eq!(released.len(), 1);
+        assert_eq!(cache.retained_bytes(), 0);
+        assert!(matches!(
+            cache.request("a", "row-mermaid-0"),
+            Lookup::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn late_results_do_not_resurrect_scrolled_away_requests() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        cache.request("a", "row-mermaid-0");
+        cache.begin_frame(1);
+        cache.begin_frame(1);
+        assert!(cache.next_job().is_none());
+        cache.finish("a".into(), 1, Ok(media(80)));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn a_failed_render_stays_source_and_is_not_requeued() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        cache.request("bad", "row-mermaid-0");
+        cache.take_new_requests();
+        cache.finish("bad".into(), 1, Err("Diagram render timed out".into()));
+        match cache.request("bad", "row-mermaid-0") {
+            Lookup::Failed(reason) => assert_eq!(reason.as_ref(), "Diagram render timed out"),
+            _ => panic!("failed native work must keep source"),
+        }
+        assert!(!cache.take_new_requests());
+        assert!(cache.next_job().is_none());
+    }
+
+    #[test]
+    fn repeated_source_cannot_retain_unbounded_row_ids() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        for ix in 0..MAX_ROWS_PER_SOURCE {
+            assert!(matches!(
+                cache.request("a", &format!("row{ix}-mermaid-0")),
+                Lookup::Pending
+            ));
+        }
+        assert!(matches!(
+            cache.request("a", "overflow-mermaid-0"),
+            Lookup::Failed(_)
+        ));
+        assert_eq!(cache.entries["a"].rows.len(), MAX_ROWS_PER_SOURCE);
+        cache.begin_frame(1);
+        assert!(matches!(
+            cache.request("a", "next-pass-mermaid-0"),
+            Lookup::Pending
+        ));
+        assert_eq!(cache.entries["a"].rows, ["next-pass"]);
+    }
+
+    #[test]
+    fn admission_releases_stale_media_to_make_room_for_newly_painted_diagrams() {
+        let mut cache = MermaidCache::default();
+        cache.begin_frame(1);
+        cache.request("old", "old-mermaid-0");
+        let mut full = media(80);
+        full.bytes = MAX_RETAINED_BYTES;
+        cache.finish("old".into(), 1, Ok(full));
+        cache.begin_frame(1);
+        cache.begin_frame(1);
+        cache.request("new", "new-mermaid-0");
+        let (_, released) = cache.finish("new".into(), 1, Ok(media(80))).unwrap();
+        assert_eq!(released.len(), 1);
+        assert!(!cache.entries.contains_key("old"));
+        assert!(matches!(
+            cache.request("new", "new-mermaid-0"),
+            Lookup::Ready(_)
+        ));
+        assert!(cache.retained_bytes() < MAX_RETAINED_BYTES);
     }
 }

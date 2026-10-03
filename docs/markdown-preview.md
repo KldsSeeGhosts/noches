@@ -36,7 +36,7 @@ Source revisions reject obsolete async results. Image watcher events invalidate 
 
 Image reads are limited to 8 MiB, with 384 KiB binary chunks and content-hash validation between chunks. Raster images are decoded with 4096px dimension and 64 MiB allocation limits, then flattened to a static PNG, including the first frame of animations. SVG sources are parsed and reserialized with embedded/external image resolution disabled; the prepared vector source is retained (up to 8 MiB) regardless of its natural dimensions. A bounded outer SVG viewport preserves the complete original coordinate system. Preview rasters adapt to the panel and display density (up to 4×), capped at 1,048,576 pixels and 4096 pixels per side. The lightbox uses its own viewport and up to 2,097,152 pixels within the remaining document memory budget, reusing the preview when there is no room for another raster. CPU pixels, GPU textures and retained SVG bytes are budgeted. An SVG or diagram is accounted at the raster it currently holds, not the largest raster any view could request. A re-raster at a higher width or density happens only when the larger variant fits the remaining budget; otherwise the current raster stays. Enlarged variants are evicted on close, replacement, source changes and preview disposal. Unsupported SVG content may be omitted.
 
-Mermaid source is limited to 16 KiB, 256 lines and 2048 lexical segments; generated SVG is limited to 2 MiB. The native engine has no cooperative cancellation or hard execution deadline. Its CPU work is serialized across previews and runs off the UI thread; obsolete results must be rejected by their owning view. These limits bound admitted work but do not constitute a strict wall-clock guarantee.
+Mermaid source is limited to 16 KiB, 256 lines and 2048 lexical segments; generated SVG is limited to 2 MiB. Noches runs the native engine in a disposable `mermaid-render` helper command before any GUI or engine startup. Helpers are serialized across previews and chat on the background executor, with a three-second deadline that includes waiting for the serialization lock. A timeout kills and reaps the helper, then keeps the original source. The helper does not inherit provider credentials or run a shell. It has no JavaScript runtime or network client; SVG preparation disables embedded and external image resolution and removes scripts and HTML. Its bounded JSON request and reply travel through private temporary stdio files, avoiding pipe backpressure. Source revisions and theme changes still reject obsolete results.
 
 Manual validation on macOS and a second physical remote device must be recorded separately from headless Linux tests. Automated tests cannot establish platform-specific focus, GPU rendering or real network behavior by themselves.
 
@@ -46,7 +46,7 @@ Assistant replies render ```` ```mermaid ```` fences as diagrams, sharing the fi
 
 Streaming never renders a fence that may still be growing. Only blocks that a later row of the same reply follows, or blocks of a completed reply, request a diagram. The streaming tail keeps its source; per-token commits start no render work. Until a diagram is ready, the fence shows its ordinary source, so completion changes the row height at most once. A failed render keeps the source and shows the engine's diagnostic in a warning marker in the fence header.
 
-Rows request their fences while they lay out, so only painted diagrams cost anything. One serialized loop per transcript renders them off the UI thread, choosing its next source between renders and dropping requests whose rows scrolled away. Retained diagrams share a 64 MiB budget and are evicted least recently painted first, with a 64-entry cap; an evicted diagram renders again when its row returns. Diagrams painted in the latest two passes are never evicted. Theme changes discard every diagram, and results computed under the previous theme are rejected. Rasters follow the conversation column width and display density, under the same budget check before a larger re-raster.
+Rows request their fences while they lay out, so only painted diagrams cost anything. One serialized loop per transcript renders them off the UI thread, choosing its next source between renders and dropping requests whose rows scrolled away. Retained diagrams share a hard 64 MiB media budget and a hard 64-entry cap including pending requests and failures. Oversized source is rejected before cache admission. Old entries are evicted least recently painted first; an evicted diagram renders again when its row returns. Diagrams painted in the latest two passes are never evicted. If those fill either limit, additional fences keep their source with a diagnostic rather than exceeding the budget. Theme changes discard every diagram, and results computed under the previous theme are rejected. Rasters follow the conversation column width and display density, under the same budget check before a larger re-raster.
 
 A diagram swap remeasures only the rows painting it and uses the same layout signals as other row-height changes. The bottom pin glides to the new end, and the own-turn runway reservation absorbs the change in the same layout without moving the sent prompt. Source toggles keep the stable row identity across streaming completion. The lightbox enlarges the diagram within the memory the retained diagrams leave available and releases that raster when it closes.
 
@@ -78,3 +78,38 @@ Chat Mermaid rendering was checked on Linux with `cargo test -p zeron-ui --lib -
 ### Diagram style follow-up
 
 The Zeron diagram style was checked with `cargo test -p zeron-ui --lib -- --test-threads=1` (1531 passed), Rustfmt for changed modules and Clippy, which reports no new warnings in changed code. New unit tests cover the transparent canvas, rounded node corners, accent-tinted default decisions alongside an explicitly styled one that keeps its colors, themed Gantt gridlines, and diagram type detection past front matter and comments. The six-fixture corpus was rendered with `ZERON_MERMAID_ARTIFACTS` in light, dark and Geist Mono variants. It was composited onto the fence body color at the chat column size and inspected visually. Native visual verification in the running application was not performed.
+
+### Noches port of upstream #760
+
+The follow-up sections above record upstream validation. Noches ported
+`9e1a11158b0626237c814f4bd36f5948483ed797` while preserving its markdown
+selection scoping, table drag geometry, selection registry and Copy-button
+chrome. No document schema, dependency pins, manifests or lock entries changed.
+The already-linked MIT renderer adds no native library, Node.js installation
+or browser dependency. Incremental release binary size was not measured.
+
+Noches adds the serialized helper deadline and hard cache admission limits
+described above. Each cached source tracks at most 128 rows in its latest paint
+pass, so repeated source does not accumulate off-screen row IDs. Pending,
+failed and over-budget diagrams keep their original selectable fenced source
+in both chat and Files.
+
+Linux validation used the assigned worktree target directory, `sccache`, four
+build jobs and the repository-selected Rustup toolchain:
+
+- `cargo test -p zeron-ui --lib --locked -- --test-threads=1`: 1,349 passed,
+  zero failed or ignored.
+- `cargo test -p zeron-ui --lib --locked markdown:: -- --test-threads=1`:
+  129 passed, zero failed.
+- `cargo test -p zeron-ui --lib --locked mermaid -- --test-threads=1`:
+  23 passed, zero failed.
+- `cargo test -p zeron --locked`: 10 application unit tests and two real
+  helper-process integration tests passed, zero failed or ignored.
+- `cargo check -p zeron --locked` and `git diff --check`: passed.
+
+The first cargo attempt did not compile or run tests because `/usr/bin/rustc`
+failed to load its LLVM symbols. Selecting Rustup through PATH resolved that
+host-toolchain error without changing repository build configuration. Test
+runs were sequential to avoid shared selection-state interference. Native
+desktop visual QA, macOS/Windows/iOS builds, authenticated sessions and a
+physical remote-device run were not performed.

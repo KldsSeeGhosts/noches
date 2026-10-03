@@ -3037,6 +3037,68 @@ mod tests {
     }
 
     #[gpui::test]
+    fn pending_and_failed_mermaid_fences_keep_the_original_selectable_source(
+        cx: &mut TestAppContext,
+    ) {
+        struct MermaidSourceHarness {
+            failed: bool,
+        }
+        impl Render for MermaidSourceHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let mut opts = RenderOptions::settled("mermaid-source-test".into());
+                let failed = self.failed;
+                opts.media = Some(MediaUi {
+                    image: None,
+                    diagram: Some(Rc::new(move |_, _, _| {
+                        if failed {
+                            DiagramView::Failed("Diagram render timed out".into())
+                        } else {
+                            DiagramView::Source
+                        }
+                    })),
+                });
+                render_code_block(
+                    Some("mermaid"),
+                    "flowchart TD\nA --> B",
+                    0,
+                    0,
+                    &opts,
+                    &theme,
+                    None,
+                )
+            }
+        }
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (view, cx) = cx.add_window_view(|_, _| MermaidSourceHarness { failed: false });
+        cx.simulate_resize(size(px(640.0), px(240.0)));
+        for failed in [false, true] {
+            view.update(cx, |view, cx| {
+                view.failed = failed;
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let first = "mermaid-source-test-code0-line0";
+            let last = "mermaid-source-test-code0-line1";
+            selection_test_bounds(first);
+            let bounds = selection_test_bounds(last);
+            super::super::selection::begin(first, 0);
+            assert!(update_drag_at(point(
+                bounds.right(),
+                bounds.top() + px(9.0)
+            )));
+            let selected = super::super::selection::selected_text();
+            super::super::selection::end_active_drag();
+            super::super::selection::clear_if_owner(first);
+            assert_eq!(selected.as_deref(), Some("flowchart TD\nA --> B"));
+        }
+    }
+
+    #[gpui::test]
     fn occluded_text_ignores_double_and_triple_clicks(cx: &mut TestAppContext) {
         let _selection = super::super::selection::test_state_lock();
         cx.update(|cx| cx.set_global(Theme::dark()));

@@ -5525,7 +5525,7 @@ impl Transcript {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let svg = crate::markdown::mermaid::render(&source, &palette)?;
+                        let svg = crate::markdown::mermaid::render_isolated(&source, &palette)?;
                         crate::image_media::decode_image("image/svg+xml", svg.into_bytes())
                     })
                     .await;

@@ -654,7 +654,7 @@ impl MarkdownPreview {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let svg = crate::markdown::mermaid::render(&source, &palette)?;
+                        let svg = crate::markdown::mermaid::render_isolated(&source, &palette)?;
                         crate::image_media::decode_image("image/svg+xml", svg.into_bytes())
                     })
                     .await;
@@ -1065,33 +1065,28 @@ impl MarkdownPreview {
                     diagram: Some(Rc::new(move |code, id, theme| {
                         let state = diagrams.get(code);
                         let allowed = diagram_allowed.contains(code);
-                        let source_shown = source_visible.contains(id.as_ref()) || !allowed;
+                        if !allowed {
+                            return render::DiagramView::Failed(
+                                "Document diagram preview limit reached".into(),
+                            );
+                        }
+                        let loaded = match state {
+                            Some(Ok(loaded)) => loaded,
+                            Some(Err(error)) => {
+                                return render::DiagramView::Failed(error.clone().into());
+                            }
+                            None => return render::DiagramView::Source,
+                        };
+                        let source_shown = source_visible.contains(id.as_ref());
                         let owner = diagram_owner.clone();
                         let toggle_id = id.to_string();
-                        let body = match state {
-                            Some(Ok(loaded)) => Self::media_element(
-                                loaded,
-                                format!("{id}-image").into(),
-                                "Mermaid diagram".into(),
-                                Some(crate::markdown::mermaid::Palette::plate(theme)),
-                                diagram_owner.clone(),
-                            ),
-                            Some(Err(error)) => div()
-                                .p(px(12.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.warning_muted)
-                                .child(error.clone())
-                                .into_any_element(),
-                            None => div()
-                                .p(px(12.0))
-                                .text_color(theme.text_muted)
-                                .child(if diagram_allowed.contains(code) {
-                                    "Rendering diagram…"
-                                } else {
-                                    "Document diagram preview limit reached"
-                                })
-                                .into_any_element(),
-                        };
+                        let body = Self::media_element(
+                            loaded,
+                            format!("{id}-image").into(),
+                            "Mermaid diagram".into(),
+                            Some(crate::markdown::mermaid::Palette::plate(theme)),
+                            diagram_owner.clone(),
+                        );
                         render::DiagramView::Diagram(render::DiagramUi {
                             body,
                             show_source: source_shown,
