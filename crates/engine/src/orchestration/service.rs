@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use zeron_proto::orchestration::{ProjectId, RunId, ThreadId};
 use zeron_proto::orchestration_mcp::{
     DelegateTaskInput, DelegateTaskResult, OrchestratorMcpFailure, OrchestratorMcpFailureCode,
-    OrchestratorMcpFailureTag, TaskCancelInput, TaskCancelResult, TaskStatusInput, TaskStatusResult,
+    OrchestratorMcpFailureTag, TaskCancelInput, TaskCancelResult, TaskStatusInput,
+    TaskStatusResult,
 };
 use zeron_proto::provider_instance::ProviderInstanceId;
 use zeron_proto::{InteractionMode, RuntimeMode};

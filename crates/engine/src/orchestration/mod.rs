@@ -1,14 +1,22 @@
 //! Opt-in V2 transactional kernel. SQLite owns execution; replicas never do.
-//! This module deliberately has no dependency on `sessions` and starts no runner.
+//! `runner` bridges effects to sessions; opening the kernel starts no workers.
 
 pub mod command;
+pub mod continuation;
+#[cfg(test)]
+mod delegation_live_tests;
+#[cfg(test)]
+mod delegation_tests;
 pub mod effects;
 pub mod event;
+pub mod mailbox;
 pub mod projection;
 pub mod recovery;
+pub mod runner;
 pub mod service;
 pub mod store;
 pub mod sync_publish;
+pub mod task;
 #[cfg(test)]
 mod tests;
 

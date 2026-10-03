@@ -126,6 +126,10 @@ pub struct EngineConfig {
 /// The assembled engine core — also constructible without the IPC server for tests
 /// and the in-process (headed) mode.
 pub struct EngineCore {
+    /// Profile-local V2 authority. The orchestration host registers services
+    /// and starts workers after recovery; legacy session recovery never revives
+    /// a chat already owned by this store.
+    pub orchestration: orchestration::Kernel,
     pub sessions: SessionsEngine,
     pub doc_host: DocHost,
     pub workspace: WorkspaceHost,
@@ -220,9 +224,12 @@ impl EngineCore {
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
+        let orchestration = orchestration::Kernel::open(store.clone(), &device_id)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.set_orchestration_store(orchestration.store.clone());
         sessions.set_browser_root(data_dir.to_path_buf());
         let doc_host = DocHost::new(
             store.clone(),
@@ -320,6 +327,7 @@ impl EngineCore {
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
+            orchestration,
             sessions,
             doc_host,
             workspace,

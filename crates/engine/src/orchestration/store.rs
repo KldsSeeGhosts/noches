@@ -260,7 +260,7 @@ impl Store {
             for event in plan.events {
                 let value = serde_json::to_value(&event)?;
                 let thread: ThreadId = serde_json::from_value(value["threadId"].clone())?;
-                if thread != command.thread_id {
+                if !command.lock_threads().contains(&thread) {
                     return Err(Error::Invariant(
                         "kernel command crosses lock participants".into(),
                     ));
@@ -269,19 +269,41 @@ impl Store {
                 receipt.result_sequence = stored.sequence;
                 changed_threads.insert(thread.0);
             }
-            let cancellations = if plan.cancel_process_effects {
+            let mut cancellations = if plan.cancel_process_effects {
                 let ids = effects::cancel_process(tx, &command.thread_id, now)?;
                 self.boundary(WriteBoundary::EffectsRetired)?;
                 ids
             } else {
                 vec![]
             };
+            for thread in &plan.cancel_threads {
+                cancellations.extend(effects::cancel_process(tx, thread, now)?);
+                self.boundary(WriteBoundary::EffectsRetired)?;
+            }
             for (index, request) in plan.effects.iter().enumerate() {
                 effects::enqueue(
                     tx,
                     &format!("effect:{}:{index}", encode_component(&command.id.0)),
                     &command.id,
                     &command.thread_id,
+                    request,
+                    now,
+                )?;
+                self.boundary(WriteBoundary::EffectEnqueued)?;
+            }
+            for (index, (thread, request)) in plan.routed_effects.iter().enumerate() {
+                if !command.lock_threads().contains(thread) {
+                    return Err(Error::Invariant("effect crosses lock participants".into()));
+                }
+                effects::enqueue(
+                    tx,
+                    &format!(
+                        "effect:{}:{}",
+                        encode_component(&command.id.0),
+                        index + plan.effects.len()
+                    ),
+                    &command.id,
+                    thread,
                     request,
                     now,
                 )?;
@@ -383,7 +405,7 @@ impl Store {
         })
     }
 
-    fn append_event(
+    pub(crate) fn append_event(
         &self,
         tx: &Transaction<'_>,
         command_id: Option<CommandId>,

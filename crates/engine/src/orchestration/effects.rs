@@ -21,6 +21,14 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum EffectRequest {
+    #[serde(rename = "delegated-completion.continue")]
+    DelegatedCompletionContinue {
+        parent_run_id: RunId,
+        generation: i64,
+        message_id: MessageId,
+    },
+    #[serde(rename = "managed-run.interrupt")]
+    ManagedRunInterrupt { run_id: RunId },
     #[serde(rename = "provider-runtime.continue")]
     ProviderRuntimeContinue { source_run_id: RunId },
     #[serde(rename = "provider-session.detach")]
@@ -90,6 +98,7 @@ impl EffectRequest {
         matches!(
             self,
             Self::ProviderTurnStart { .. }
+                | Self::ManagedRunInterrupt { .. }
                 | Self::ProviderTurnInterrupt { .. }
                 | Self::ProviderTurnSteer { .. }
                 | Self::ProviderTurnRestart { .. }
