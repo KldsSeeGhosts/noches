@@ -229,8 +229,13 @@ pub(crate) fn pane_header(
                 window.prevent_default();
             })
             .tooltip(move |_, cx| cx.new(|_| ChromeTooltip(label)).into())
-            .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.wash(0.12)))
-            .on_hover(motion::hover_listener(key))
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
+                &key,
+                gpui::transparent_black(),
+                theme.wash(0.12),
+            ))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), key))
             // GPUI SVGs require their own color; a parent div's tint is ignored.
             .child(icon(path).size(px(14.0)).text_color(theme.text_muted))
     };
@@ -446,12 +451,20 @@ pub(crate) fn tab_strip(
                 .bg(if chip.active {
                     theme.wash(0.09)
                 } else {
-                    motion::hover_blend(&chip_hover_key, gpui::transparent_black(), theme.wash(0.07))
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
+                        &chip_hover_key,
+                        gpui::transparent_black(),
+                        theme.wash(0.07),
+                    )
                 })
                 .when(chip.active, |el| {
                     el.border_1().border_color(theme.hairline(0.09))
                 })
-                .on_hover(motion::hover_listener(chip_hover_key.clone()))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    chip_hover_key.clone(),
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.switch_workspace_tab(view, tab, cx);
                 }))
@@ -520,12 +533,16 @@ pub(crate) fn tab_strip(
                         .role(gpui::Role::Button)
                         .aria_label("Close tab")
                         .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Close tab")).into())
-                        .bg(motion::hover_blend(
+                        .bg(motion::hover_blend_owned(
+                            cx.entity_id(),
                             &close_hover_key,
                             gpui::transparent_black(),
                             theme.wash(0.14),
                         ))
-                        .on_hover(motion::hover_listener(close_hover_key))
+                        .on_hover(motion::hover_listener_owned(
+                            cx.entity_id(),
+                            close_hover_key,
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_workspace_tab(view, tab, cx);
@@ -551,8 +568,13 @@ pub(crate) fn tab_strip(
             .role(gpui::Role::Button)
             .aria_label("Add tab")
             .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Add tab")).into())
-            .bg(motion::hover_blend(&plus_key, gpui::transparent_black(), theme.wash(0.09)))
-            .on_hover(motion::hover_listener(plus_key))
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
+                &plus_key,
+                gpui::transparent_black(),
+                theme.wash(0.09),
+            ))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), plus_key))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {

@@ -101,6 +101,9 @@ pub enum TableAlign {
 pub struct TopBlock {
     pub range: Range<usize>,
     pub block: Block,
+    /// Computed when immutable code is prepared, never while rendering it.
+    /// Stable incremental-prefix blocks share this key across tail updates.
+    pub code_highlight_key: Option<crate::syntax_cache::DocumentHighlightKey>,
 }
 
 /// The parse result: top-level blocks in document order.
@@ -152,13 +155,22 @@ fn parse_at(source: &str, offset: usize) -> BlockTree {
                 blocks.push(Arc::new(TopBlock {
                     range,
                     block: Block::Rule,
+                    code_highlight_key: None,
                 }));
             }
             Event::Start(_) => {
                 for block in parse_started_block(&mut cur) {
+                    let code_highlight_key = match &block {
+                        Block::CodeBlock { language, code } => language
+                            .as_deref()
+                            .and_then(zeron_syntax::language_for_alias)
+                            .map(|lang| crate::syntax_cache::DocumentHighlightKey::new(lang, code)),
+                        _ => None,
+                    };
                     blocks.push(Arc::new(TopBlock {
                         range: range.clone(),
                         block,
+                        code_highlight_key,
                     }));
                 }
             }

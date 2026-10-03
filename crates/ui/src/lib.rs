@@ -44,6 +44,7 @@ mod new_thread_background_mask;
 mod notice;
 pub mod notify;
 pub mod pane;
+mod perf_trace;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
@@ -64,6 +65,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod tool_palette;
 pub mod transcript;
+mod transcript_scene;
 pub mod typography;
 mod workspace_links;
 pub mod workspace_layout_store;
@@ -165,6 +167,7 @@ pub fn run_app(config: UiConfig) {
         }
     });
     app.run(move |cx: &mut App| {
+        perf_trace::init(cx);
         gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();

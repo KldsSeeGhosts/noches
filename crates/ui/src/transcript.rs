@@ -780,6 +780,8 @@ pub enum ToolDetail {
         file: Arc<crate::changes::FileDiff>,
         old_text: Option<Arc<str>>,
         new_text: Option<Arc<str>>,
+        old_highlight_key: Option<DocumentHighlightKey>,
+        new_highlight_key: Option<DocumentHighlightKey>,
     },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
@@ -826,6 +828,12 @@ pub fn tool_detail(
         // has no such cap; it virtualizes per line.
         crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
         return Some(ToolDetail::Diff {
+            old_highlight_key: diff.old_text.as_deref().and_then(|source| {
+                zeron_syntax::language_for_path(file.old_path.as_deref().unwrap_or(&file.path))
+                    .map(|lang| DocumentHighlightKey::new(lang, source))
+            }),
+            new_highlight_key: zeron_syntax::language_for_path(&file.path)
+                .map(|lang| DocumentHighlightKey::new(lang, &diff.new_text)),
             file: Arc::new(file),
             old_text: diff.old_text.as_deref().map(Arc::from),
             new_text: Some(Arc::from(diff.new_text.as_str())),
@@ -2141,12 +2149,11 @@ impl HighlightStore {
         &mut self,
         row_id: SharedString,
         block_ix: usize,
-        lang: Lang,
+        document_key: DocumentHighlightKey,
         code: &str,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
         let slot_key = (row_id.clone(), block_ix);
-        let document_key = DocumentHighlightKey::new(lang, code);
         if let Some(entry) = self.entries.get(&slot_key)
             && entry.key == document_key
         {
@@ -2168,6 +2175,7 @@ impl HighlightStore {
         }
         let code = code.to_string();
         let source_bytes = code.len();
+        let lang = document_key.language;
         let task = cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let document = cx
@@ -2818,11 +2826,22 @@ impl SavedViewportCache {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptChrome {
+    working: bool,
+    sending: bool,
+    queued: bool,
+    undelivered: bool,
+    elapsed: i64,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
+    chrome: Option<TranscriptChrome>,
+    scene_fade_band: Option<u32>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
@@ -3165,7 +3184,10 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.refresh_chrome(cx);
+            this.sync(cx);
+        });
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
@@ -3198,6 +3220,8 @@ impl Transcript {
             list,
             rows: Vec::new(),
             last_source: None,
+            chrome: None,
+            scene_fade_band: None,
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
@@ -4339,6 +4363,72 @@ impl Transcript {
 
     pub(crate) fn retain_for_route_exit(&mut self) {
         self.retain_on_deselect = true;
+    }
+
+    pub(crate) fn set_scene_fade_band(&mut self, band: f32, cx: &mut Context<Self>) -> bool {
+        let band = Some(band.to_bits());
+        if self.scene_fade_band != band {
+            self.scene_fade_band = band;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// State updates can change the in-flow trailer without changing rows.
+    /// Also called by the shell's deadline heartbeat for fixed split chats.
+    pub(crate) fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
+        let key = self.chrome_key(chrono::Utc::now(), cx);
+        if self.chrome != Some(key) {
+            self.chrome = Some(key);
+            cx.notify();
+        }
+    }
+
+    fn chrome_key(&self, now: chrono::DateTime<chrono::Utc>, cx: &gpui::App) -> TranscriptChrome {
+        let state = self.state.read(cx);
+        let chat = self
+            .doc_override
+            .as_deref()
+            .or(state.selected_chat.as_deref());
+        let Some(chat) = chat else {
+            return TranscriptChrome::default();
+        };
+        if self.doc_override.is_some() && !self.interactive_override {
+            let live = self.doc_live
+                && state.sub_transcript(chat).last().is_some_and(|last| {
+                    last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User
+                });
+            return TranscriptChrome {
+                working: live,
+                elapsed: if live {
+                    state
+                        .sub_transcript(chat)
+                        .last()
+                        .map(|e| (now.timestamp_millis() - e.created_at).max(0) / 1000)
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                ..Default::default()
+            };
+        }
+        let working = state.indicator_for(chat, now) == crate::state::Indicator::Working;
+        let started = state.session_for(chat).and_then(|s| s.started_at);
+        let sending = working && sending_bridge(state.pending_send_started(chat, now), started);
+        TranscriptChrome {
+            working,
+            sending,
+            queued: sending && state.chat_delivery_degraded(chat, now),
+            undelivered: state.send_undelivered(chat, now),
+            elapsed: if working && !sending {
+                started
+                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+        }
     }
 
     fn route_exit_pending(&self, cx: &gpui::App) -> bool {
@@ -6762,14 +6852,12 @@ impl Transcript {
             if only.is_some_and(|o| o != ix) {
                 continue;
             }
-            if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language
-                    .as_deref()
-                    .and_then(zeron_syntax::language_for_alias)
+            if let Block::CodeBlock { code, .. } = &top.block
+                && let Some(key) = top.code_highlight_key
             {
                 out.insert(
                     ix,
-                    self.highlights.request(row_id.clone(), ix, lang, code, cx),
+                    self.highlights.request(row_id.clone(), ix, key, code, cx),
                 );
             }
         }
@@ -6784,29 +6872,32 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Option<Arc<crate::changes::DiffHighlights>> {
         let ToolDetail::Diff {
-            file,
             old_text,
             new_text,
+            old_highlight_key,
+            new_highlight_key,
+            ..
         } = detail
         else {
             return None;
         };
         let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
         let old = match old_text {
-            Some(source) => {
-                let path = file.old_path.as_deref().unwrap_or(&file.path);
-                let lang = zeron_syntax::language_for_path(path)?;
-                Some(
-                    self.highlights
-                        .request(cache_row.clone(), 0, lang, source, cx)?,
-                )
-            }
+            Some(source) => Some(self.highlights.request(
+                cache_row.clone(),
+                0,
+                (*old_highlight_key)?,
+                source,
+                cx,
+            )?),
             None => None,
         };
         let new = match new_text {
             Some(source) => {
-                let lang = zeron_syntax::language_for_path(&file.path)?;
-                Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
+                Some(
+                    self.highlights
+                        .request(cache_row, 1, (*new_highlight_key)?, source, cx)?,
+                )
             }
             None => None,
         };
@@ -9028,6 +9119,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_trace::transcript_render(cx.entity_id());
         if record_view_frame("transcript") {
             tracing::warn!(
                 distance = self.distance_from_bottom(),
@@ -9314,6 +9406,8 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("transcript_scene_tests.rs");
+    include!("highlight_key_tests.rs");
 
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {
@@ -13696,6 +13790,7 @@ mod tests {
             file,
             old_text,
             new_text,
+            ..
         }) = tool_detail(None, Some(&diff), None)
         else {
             panic!("expected diff detail");
@@ -13733,6 +13828,7 @@ mod tests {
             file,
             old_text,
             new_text,
+            ..
         }) = tool_detail(None, Some(&created), None)
         else {
             panic!("expected diff detail");

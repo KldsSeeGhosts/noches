@@ -14,7 +14,7 @@ pub mod vscode;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -23,9 +23,9 @@ pub use library::{
     CustomThemeEntry, CustomThemeLibrary, CustomThemeSource, CustomThemeStatus, InstallMode,
 };
 
-fn custom_families() -> &'static RwLock<Vec<ThemeFamily>> {
-    static CUSTOM: OnceLock<RwLock<Vec<ThemeFamily>>> = OnceLock::new();
-    CUSTOM.get_or_init(|| RwLock::new(Vec::new()))
+fn runtime_registry() -> &'static RwLock<(u64, Arc<ThemeRegistry>)> {
+    static ACTIVE: OnceLock<RwLock<(u64, Arc<ThemeRegistry>)>> = OnceLock::new();
+    ACTIVE.get_or_init(|| RwLock::new((0, Arc::new(ThemeRegistry::builtin().clone()))))
 }
 
 /// Replace the process-wide custom portion of the runtime registry.
@@ -34,9 +34,13 @@ fn custom_families() -> &'static RwLock<Vec<ThemeFamily>> {
 /// returned registry remains source-neutral: renderers still see only resolved
 /// families and variants.
 pub fn replace_custom_families(families: Vec<ThemeFamily>) {
-    *custom_families()
+    let mut next = ThemeRegistry::builtin().families.clone();
+    next.extend(families);
+    let mut active = runtime_registry()
         .write()
-        .expect("custom theme registry lock was poisoned") = families;
+        .expect("custom theme registry lock was poisoned");
+    active.0 = active.0.wrapping_add(1);
+    active.1 = Arc::new(ThemeRegistry { families: next });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -599,15 +603,16 @@ impl ThemeRegistry {
 
     /// Built-ins plus the currently installed custom families.
     pub fn active() -> Self {
-        let mut families = Self::builtin().families.clone();
-        families.extend(
-            custom_families()
-                .read()
-                .expect("custom theme registry lock was poisoned")
-                .iter()
-                .cloned(),
-        );
-        Self { families }
+        Self::snapshot().1.as_ref().clone()
+    }
+
+    /// An immutable generation-tagged snapshot. Warm reads clone only an Arc;
+    /// installing a library atomically replaces both generation and contents.
+    pub fn snapshot() -> (u64, Arc<Self>) {
+        runtime_registry()
+            .read()
+            .expect("custom theme registry lock was poisoned")
+            .clone()
     }
 
     pub fn variant(&self, id: &str) -> Option<&ThemeVariant> {
@@ -878,6 +883,16 @@ impl VisualFixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_registry_reads_share_an_immutable_snapshot() {
+        let (first_generation, first) = ThemeRegistry::snapshot();
+        let (second_generation, second) = ThemeRegistry::snapshot();
+        assert_eq!(first_generation, second_generation);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.variant("zeron-dark").is_some());
+        assert!(first.variant("zeron-light").is_some());
+    }
 
     #[test]
     fn colors_round_trip_all_supported_css_hex_lengths() {
