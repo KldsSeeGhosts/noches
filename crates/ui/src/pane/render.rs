@@ -133,6 +133,8 @@ pub(crate) struct PaneSnap {
     /// Extra left padding inside this pane's header: nonzero only for the
     /// window's top-left pane while the titlebar cluster overlays it.
     pub leading_inset: f32,
+    /// The bound chat the header's title and badge act on.
+    pub header_chat: Option<chrome::HeaderChat>,
     /// The pane's own interactive transcript (`None` on the new-chat canvas
     /// or for a pane with no surface).
     pub transcript: Option<Entity<Transcript>>,
@@ -629,6 +631,7 @@ fn pane_container(
             pane.mark,
             &pane.meta,
             badge,
+            pane.header_chat.clone(),
             closable,
             pane.focused,
             pane.focused && pane.has_session,

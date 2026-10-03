@@ -1,8 +1,17 @@
 //! Inline titles for active thread cards and the compact archived shelf.
 use super::*;
 
+/// Which surface hosts the inline editor. The sidebar row and the pane header
+/// never mount the same input entity at once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RenameOrigin {
+    Sidebar,
+    Header,
+}
+
 pub(super) struct ChatRename {
     pub(super) chat_id: String,
+    origin: RenameOrigin,
     pub(super) input: Entity<ComposerInput>,
     focus_pending: bool,
     reveal_until: std::time::Instant,
@@ -10,7 +19,7 @@ pub(super) struct ChatRename {
     _blur: Option<Subscription>,
 }
 
-pub(super) fn chat_title_editor(
+pub(crate) fn chat_title_editor(
     id: SharedString,
     input: Entity<ComposerInput>,
     theme: &Theme,
@@ -36,8 +45,63 @@ pub(super) fn chat_title_editor(
         .into_any_element()
 }
 
+/// Pane-header title click waits this long before opening the thread menu.
+const HEADER_TITLE_MENU_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Shell {
     pub(super) fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.begin_rename_chat(chat_id, RenameOrigin::Sidebar, cx);
+    }
+
+    /// Double-click on a pane header's title: rename in place, without needing
+    /// the sidebar row to be on screen.
+    pub(crate) fn open_rename_chat_in_header(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.header_title_menu_task = None;
+        self.begin_rename_chat(chat_id, RenameOrigin::Header, cx);
+    }
+
+    /// Click on a pane header's title: the thread menu opens after a beat so a
+    /// double-click (rename) can cancel it first.
+    pub(crate) fn schedule_chat_title_menu(
+        &mut self,
+        chat_id: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.header_title_menu_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(HEADER_TITLE_MENU_DELAY)
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.header_title_menu_task = None;
+                shell.open_chat_title_menu(chat_id, position, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Open the thread menu (the sidebar row's right-click menu) at `position`.
+    pub(crate) fn open_chat_title_menu(
+        &mut self,
+        chat_id: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.header_title_menu_task = None;
+        self.chat_menu.open(ChatMenuState {
+            chat_id,
+            position,
+            page: ChatMenuPage::Root,
+        });
+        cx.notify();
+    }
+
+    fn begin_rename_chat(
+        &mut self,
+        chat_id: String,
+        origin: RenameOrigin,
+        cx: &mut Context<Self>,
+    ) {
         self.close_chat_menu(cx);
         self.finish_rename_chat(true, cx);
         let Some(current) = self
@@ -50,7 +114,7 @@ impl Shell {
         else {
             return;
         };
-        if !self.reveal_sidebar_chat(&chat_id, cx) {
+        if origin == RenameOrigin::Sidebar && !self.reveal_sidebar_chat(&chat_id, cx) {
             cx.notify();
             return;
         }
@@ -81,6 +145,7 @@ impl Shell {
         }
         self.chat_rename = Some(ChatRename {
             chat_id,
+            origin,
             input,
             focus_pending: true,
             reveal_until: std::time::Instant::now()
@@ -130,7 +195,24 @@ impl Shell {
     pub(super) fn rename_input_for(&self, chat_id: &str) -> Option<Entity<ComposerInput>> {
         self.chat_rename
             .as_ref()
-            .filter(|rename| rename.chat_id == chat_id)
+            .filter(|rename| rename.chat_id == chat_id && rename.origin == RenameOrigin::Sidebar)
+            .map(|rename| rename.input.clone())
+    }
+
+    /// The chat being renamed from a pane header, with its editor.
+    pub(super) fn header_rename(&self) -> Option<(String, Entity<ComposerInput>)> {
+        self.chat_rename
+            .as_ref()
+            .filter(|rename| rename.origin == RenameOrigin::Header)
+            .map(|rename| (rename.chat_id.clone(), rename.input.clone()))
+    }
+
+    /// The editor for a pane header showing `chat_id`, while a header-origin
+    /// rename is open.
+    pub(crate) fn header_rename_input_for(&self, chat_id: &str) -> Option<Entity<ComposerInput>> {
+        self.chat_rename
+            .as_ref()
+            .filter(|rename| rename.chat_id == chat_id && rename.origin == RenameOrigin::Header)
             .map(|rename| rename.input.clone())
     }
 
@@ -142,7 +224,9 @@ impl Shell {
         self.chat_rename
             .as_ref()
             .filter(|rename| {
-                rename.chat_id == chat_id && std::time::Instant::now() < rename.reveal_until
+                rename.chat_id == chat_id
+                    && rename.origin == RenameOrigin::Sidebar
+                    && std::time::Instant::now() < rename.reveal_until
             })
             .map(|_| {
                 let shell = cx.weak_entity();

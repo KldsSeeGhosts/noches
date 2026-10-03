@@ -47,6 +47,17 @@ use crate::theme::Theme;
 use super::hit_test::DragSource;
 use super::{SplitDragGhost, TabSplitDrag};
 
+/// The bound chat behind a pane header: what its title and project badge act
+/// on. `None` for unbound panes (the new-chat canvas), which stay static.
+#[derive(Clone)]
+pub(crate) struct HeaderChat {
+    pub chat_id: String,
+    /// The project (space) the chat belongs to, when it has one.
+    pub space_id: Option<String>,
+    /// The inline rename editor while a header rename is open.
+    pub rename: Option<gpui::Entity<crate::composer::ComposerInput>>,
+}
+
 /// The pane header's session metadata: the mono context line and the bound
 /// session's display state. Replaces the old buddy avatar (rule 5: no
 /// mascots in chrome); an unbound pane (the new-chat canvas, a terminal
@@ -185,6 +196,7 @@ pub(crate) fn pane_header(
     mark: TabMark,
     meta: &PaneMeta,
     badge: Option<AnyElement>,
+    chat: Option<HeaderChat>,
     closable: bool,
     focused: bool,
     show_changes: bool,
@@ -267,22 +279,38 @@ pub(crate) fn pane_header(
         )
         // Title: UI face, 13px MEDIUM (rule 4: MEDIUM is the pane title's
         // weight). It truncates and may shrink; the context below gives up
-        // space first.
-        .child(
-            div()
-                .flex_initial()
-                .min_w_0()
-                .truncate()
-                .text_size(crate::typography::ui_rems(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                // Focus cue (rule 3): the focused title is full-strength text;
-                // unfocused panes rest muted. No border, no size change.
-                .text_color(if focused { theme.text } else { theme.text_muted })
-                .child(title),
-        )
+        // space first. A bound title is interactive: click opens the thread
+        // menu after a beat, double-click renames in place, right-click opens
+        // it at once, and a chevron fades in on hover.
+        .child(pane_title(pane, title, focused, chat.as_ref(), theme, cx))
         // Project identity (rule 1): the bound chat's 14px badge, right after
-        // the title. Unbound panes carry none.
-        .when_some(badge, |el, badge| el.child(badge))
+        // the title. Clicking it starts a new session in that project.
+        .when_some(badge, |el, badge| {
+            let space_id = chat.as_ref().and_then(|chat| chat.space_id.clone());
+            match space_id {
+                Some(space_id) => {
+                    let hover = theme.control_hover();
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("pane-badge-{}", pane.0)))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_new_session_in_space(space_id.clone(), cx);
+                            }))
+                            .child(badge),
+                    )
+                }
+                None => el.child(badge),
+            }
+        })
         // Context: mono 11px text_faint, `{project}:{branch}` (plus the remote
         // device); it owns the remaining row and truncates first. With no
         // session the spacer keeps the controls right-aligned.
@@ -361,6 +389,87 @@ pub(crate) fn pane_header(
                 }),
             )
         })
+        .into_any_element()
+}
+
+/// The header title: static for an unbound pane, otherwise the interactive
+/// thread title (menu, inline rename, hover chevron).
+fn pane_title(
+    pane: PaneId,
+    title: SharedString,
+    focused: bool,
+    chat: Option<&HeaderChat>,
+    theme: &Theme,
+    cx: &Context<'_, Shell>,
+) -> AnyElement {
+    let color = if focused { theme.text } else { theme.text_muted };
+    let Some(chat) = chat else {
+        return div()
+            .flex_initial()
+            .min_w_0()
+            .truncate()
+            .text_size(crate::typography::ui_rems(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            // Focus cue (rule 3): the focused title is full-strength text;
+            // unfocused panes rest muted. No border, no size change.
+            .text_color(color)
+            .child(title)
+            .into_any_element();
+    };
+    if let Some(input) = chat.rename.clone() {
+        return div()
+            .flex_initial()
+            .min_w(px(120.0))
+            .max_w(px(280.0))
+            .w(px(240.0))
+            .child(crate::shell::chat_title_editor(
+                SharedString::from(format!("pane-title-editor-{}", pane.0)),
+                input,
+                theme,
+            ))
+            .into_any_element();
+    }
+    let group = SharedString::from(format!("pane-title-group-{}", pane.0));
+    let (click_id, menu_id) = (chat.chat_id.clone(), chat.chat_id.clone());
+    div()
+        .id(SharedString::from(format!("pane-title-{}", pane.0)))
+        .group(group.clone())
+        .flex_initial()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(13.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        // The header's drag and the pane's focus-on-press must not swallow
+        // the title's own clicks.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_chat_title_menu(menu_id.clone(), event.position, cx);
+            }),
+        )
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if event.click_count() >= 2 {
+                this.open_rename_chat_in_header(click_id.clone(), cx);
+            } else if let Some(position) = event.mouse_position() {
+                this.schedule_chat_title_menu(click_id.clone(), position, cx);
+            }
+        }))
+        .child(div().min_w_0().truncate().child(title))
+        .child(
+            icon(icons::ALT_ARROW_DOWN)
+                .size(px(12.0))
+                .text_color(theme.icon_muted())
+                .opacity(0.0)
+                .group_hover(group, |s| s.opacity(1.0)),
+        )
         .into_any_element()
 }
 

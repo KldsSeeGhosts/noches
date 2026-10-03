@@ -82,6 +82,7 @@ mod voice;
 mod voice_actions;
 
 use chat_rename::ChatRename;
+pub(crate) use chat_rename::chat_title_editor;
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 /// `connected` already includes the engine's degradation grace. A brief
@@ -1792,6 +1793,8 @@ pub struct Shell {
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     chat_rename: Option<ChatRename>,
+    /// The pending thread-menu open from a pane-header title click.
+    header_title_menu_task: Option<gpui::Task<()>>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
@@ -2294,6 +2297,7 @@ impl Shell {
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
             chat_rename: None,
+            header_title_menu_task: None,
             delete_confirm: None,
             discard_working_tree: None,
             discard_working_tree_task: None,

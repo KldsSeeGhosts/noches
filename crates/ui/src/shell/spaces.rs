@@ -679,7 +679,7 @@ impl Shell {
         rows
     }
 
-    pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
         }
