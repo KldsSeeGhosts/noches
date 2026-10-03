@@ -1332,7 +1332,10 @@ impl AcpHarness {
     /// extension loads even when the managed bridge is unavailable so it can
     /// disable Pi's legacy `cua` tool on every platform; the context-usage
     /// extension is independent and always loads with it.
-    fn prepare_pi_cua(socket: Option<&Path>) -> Result<PiLaunch, HarnessError> {
+    fn prepare_pi_cua(
+        socket: Option<&Path>,
+        mcp: &crate::mcp::SessionMcpContext,
+    ) -> Result<PiLaunch, HarnessError> {
         let configured = std::env::var_os("PI_ACP_PI_COMMAND")
             .map(PathBuf::from)
             .filter(|path| {
@@ -1357,6 +1360,11 @@ impl AcpHarness {
         Self::write_private_file(&extension, Self::CUA_EXTENSION, false)?;
         let usage_extension = dir.join("noches-context-usage.ts");
         Self::write_private_file(&usage_extension, Self::CONTEXT_USAGE_EXTENSION, false)?;
+        let mcp_extension = if mcp.entries().is_empty() && mcp.instructions().is_empty() {
+            None
+        } else {
+            Some(mcp.pi_extension(&dir)?)
+        };
         let usage_file = dir.join("context-usage.json");
         let (wrapper, script, executable) =
             Self::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
@@ -1370,6 +1378,9 @@ impl AcpHarness {
             ),
             ("NOCHES_PI_USAGE_FILE", usage_file.display().to_string()),
         ];
+        if let Some(extension) = mcp_extension {
+            env.push(("NOCHES_PI_MCP_EXTENSION", extension.display().to_string()));
+        }
         #[cfg(windows)]
         env.push(("NOCHES_CUA_PI_COMMAND", real.display().to_string()));
         if let Some(socket) = socket {
@@ -1448,7 +1459,7 @@ impl AcpHarness {
         (
             dir.join("pi-with-noches-cua"),
             format!(
-                "#!/bin/sh\nexec {} -e {} -e {} \"$@\"\n",
+                "#!/bin/sh\nif [ -n \"$NOCHES_PI_MCP_EXTENSION\" ]; then set -- -e \"$NOCHES_PI_MCP_EXTENSION\" \"$@\"; fi\nexec {} -e {} -e {} \"$@\"\n",
                 Self::shell_quote(real),
                 Self::shell_quote(extension),
                 Self::shell_quote(usage_extension),
@@ -1469,7 +1480,11 @@ impl AcpHarness {
             concat!(
                 "@echo off\r\n",
                 "setlocal DisableDelayedExpansion\r\n",
+                "if defined NOCHES_PI_MCP_EXTENSION (\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" -e \"%NOCHES_PI_MCP_EXTENSION%\" %*\r\n",
+                ") else (\r\n",
                 "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
+                ")\r\n",
             )
             .to_string(),
             false,
@@ -1514,6 +1529,13 @@ impl AcpHarness {
             "NOCHES_CUA_USAGE_EXTENSION",
             "NOCHES_CUA_PI_COMMAND",
             "NOCHES_PI_USAGE_FILE",
+            "NOCHES_PI_MCP_EXTENSION",
+            crate::mcp::ACP_EXECUTABLE_ENV,
+            crate::mcp::ACP_ENDPOINT_ENV,
+            crate::mcp::ACP_AUTHORIZATION_ENV,
+            crate::mcp::MCP_ENTRIES_ENV,
+            crate::mcp::MCP_INSTRUCTIONS_ENV,
+            crate::mcp::MCP_ALLOWED_TOOLS_ENV,
         ] {
             cmd.env_remove(key);
         }
@@ -1542,7 +1564,7 @@ impl AcpHarness {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::acp", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::acp", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
                 tail.close();
@@ -2118,18 +2140,21 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mcp_guard = controls.mcp.run_guard();
         // `with_executable` is used by tests and embedders that supply a
         // complete ACP server. Installed Pi runs always load the policy
         // extension, even when this host cannot provide the managed bridge.
-        let (cua_env, pi_launch_dir, pi_usage_file) =
+        let (mut cua_env, pi_launch_dir, pi_usage_file) =
             if self.spec.id == HarnessId::Pi && self.executable.is_none() {
-                Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
+                Self::prepare_pi_cua(controls.computer_use_socket.as_deref(), &controls.mcp)?
             } else {
                 (Vec::new(), None, self.pi_usage_file_override.clone())
             };
+        cua_env.extend(controls.mcp.process_environment());
         let (scratch, mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
             .await?;
+        stderr_tail.retain_mcp(&controls.mcp);
         let stdin = child
             .stdin
             .take()
@@ -2139,8 +2164,8 @@ impl Harness for AcpHarness {
             .take()
             .ok_or_else(|| HarnessError::Protocol("agent child has no stdout".into()))?;
         let (client, incoming) = RpcClient::new(stdin, stdout);
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             child,
             scratch,
             client,
@@ -2164,7 +2189,11 @@ impl Harness for AcpHarness {
             stderr_tail,
             pi_usage_file,
             _pi_launch_dir: pi_launch_dir,
-        }));
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -2756,7 +2785,7 @@ fn handle_server_request(
             Vec::new()
         }
         _ => {
-            tracing::debug!(target: "zeron_harness::acp", "unhandled server request: {method}");
+            tracing::debug!(target: "zeron_harness::acp", method = %crate::redact::redact_registered(method), "unhandled server request");
             client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
             Vec::new()
         }
@@ -3173,12 +3202,13 @@ async fn run_session(session: Session) {
         _pi_launch_dir,
     } = session;
     let RunControls {
-        browser,
+        mcp,
         request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
     let request_input = std::sync::Arc::new(request_input);
 
     // ---- handshake + session (interruptible) ------------------------------
@@ -3189,12 +3219,20 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let servers = browser.as_ref().map(|browser| json!({"name":"noches_browser","command":browser.executable,"args":browser.args(),"env":[]})).into_iter().collect::<Vec<_>>();
+        let servers = mcp.acp_servers();
         let session_params = json!({ "cwd": request.cwd, "mcpServers": servers });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
+            let resume_method = if init["agentCapabilities"]["sessionCapabilities"]
+                .get("resume")
+                .is_some()
+            {
+                "session/resume"
+            } else {
+                "session/load"
+            };
+            match request_draining(&client, &mut incoming, resume_method, load).await {
                 Ok(resp) => (resume.clone(), resp),
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
@@ -3533,10 +3571,18 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+    // Pi uses before_agent_start in its real system-prompt channel. Other
+    // ACP flavors have no standard system-instructions field.
+    let instructions = mcp.acp_instructions();
+    let first_prompt = if harness != HarnessId::Pi && !instructions.is_empty() {
+        format!("{}\n\n{}", instructions, request.prompt)
+    } else {
+        request.prompt.clone()
+    };
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some(prompt_turn(
         client.clone(),
         session_id.clone(),
-        prompt_transform(request.reasoning, &request.prompt),
+        prompt_transform(request.reasoning, &first_prompt),
         current_prompt_id.clone(),
     ));
     // Steers waiting for the turn boundary (agents without the extension, or
@@ -4572,7 +4618,11 @@ mod tests {
             concat!(
                 "@echo off\r\n",
                 "setlocal DisableDelayedExpansion\r\n",
+                "if defined NOCHES_PI_MCP_EXTENSION (\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" -e \"%NOCHES_PI_MCP_EXTENSION%\" %*\r\n",
+                ") else (\r\n",
                 "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
+                ")\r\n",
             )
         );
         assert!(!script.contains(real.to_string_lossy().as_ref()));
@@ -4593,7 +4643,7 @@ mod tests {
         assert!(executable);
         assert_eq!(
             script,
-            "#!/bin/sh\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' -e '/tmp/noches-private/noches-context-usage.ts' \"$@\"\n"
+            "#!/bin/sh\nif [ -n \"$NOCHES_PI_MCP_EXTENSION\" ]; then set -- -e \"$NOCHES_PI_MCP_EXTENSION\" \"$@\"; fi\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' -e '/tmp/noches-private/noches-context-usage.ts' \"$@\"\n"
         );
     }
 

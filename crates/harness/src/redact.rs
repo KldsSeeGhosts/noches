@@ -19,7 +19,7 @@
 /// - JWTs (`eyJ…`), vendor-prefixed keys (`sk-…`, `ghp_…`, `gho_…`, `xai-…`,
 ///   …), the value after `Bearer`, and long base64 / hex runs.
 pub fn redact_output(text: &str) -> String {
-    let text = strip_ansi(text);
+    let text = strip_ansi(&redact_registered(text));
     let mut redactor = Redactor::default();
     let mut word = String::new();
     for c in text.chars() {
@@ -37,6 +37,93 @@ pub fn redact_output(text: &str) -> String {
         redactor.word(&word);
     }
     redactor.finish()
+}
+
+/// Exact-value redaction supplements heuristics for opaque session tokens.
+/// Registered values are reference-counted and never printed, even in Debug.
+static SESSION_SECRETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) struct RegisteredSecrets(Vec<String>);
+
+pub(crate) fn register_secrets(mut values: Vec<String>) -> RegisteredSecrets {
+    values.retain(|v| !v.is_empty());
+    values.sort();
+    values.dedup();
+    let mut registry = SESSION_SECRETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for value in &values {
+        *registry.entry(value.clone()).or_default() += 1;
+    }
+    RegisteredSecrets(values)
+}
+
+impl Drop for RegisteredSecrets {
+    fn drop(&mut self) {
+        let mut registry = SESSION_SECRETS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for value in &self.0 {
+            if let Some(count) = registry.get_mut(value) {
+                *count -= 1;
+                if *count == 0 {
+                    registry.remove(value);
+                }
+            }
+        }
+    }
+}
+
+pub fn redact_registered(text: &str) -> String {
+    let registry = SESSION_SECRETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut values = registry.keys().collect::<Vec<_>>();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut clean = text.to_owned();
+    for value in values {
+        clean = clean.replace(value.as_str(), "[redacted]");
+    }
+    clean
+}
+
+/// Apply before journaling/folding/publication, including nested events and
+/// arbitrary tool input/output JSON. Only known secrets are replaced: this
+/// must not interpret ordinary tool content as an authentication flow.
+pub fn redact_event(event: zeron_proto::AgentEvent) -> zeron_proto::AgentEvent {
+    if SESSION_SECRETS.get().is_none_or(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }) {
+        return event;
+    }
+    fn visit(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = redact_registered(text),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(visit),
+            serde_json::Value::Object(fields) => {
+                let original = std::mem::take(fields);
+                for (key, mut value) in original {
+                    visit(&mut value);
+                    fields.insert(redact_registered(&key), value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(&event).expect("AgentEvent is JSON serializable");
+    visit(&mut value);
+    serde_json::from_value(value).unwrap_or_else(|_| zeron_proto::AgentEvent::Error {
+        message: "provider event discarded because credential redaction changed its wire shape"
+            .into(),
+    })
 }
 
 /// What follows a label.

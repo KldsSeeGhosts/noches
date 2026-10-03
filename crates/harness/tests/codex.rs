@@ -58,7 +58,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        browser: None,
+        mcp: Default::default(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -412,7 +412,7 @@ async fn approvals_round_trip_as_input_requests() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
-        browser: None,
+        mcp: Default::default(),
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -1312,7 +1312,7 @@ async fn real_image_generation_smoke() {
 }
 
 #[tokio::test]
-async fn registers_conversation_browser_mcp_at_process_start() {
+async fn registers_conversation_browser_mcp_at_thread_start() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let capture = temp.path().join("arguments");
@@ -1320,7 +1320,7 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\"\n",
+            "#!/bin/sh\nexport NOCHES_TEST_CODEX_CONFIG_WIRE={}\nexec {} \"$@\"\n",
             zeron_browser::shell_quote(capture.to_str().unwrap()),
             zeron_browser::shell_quote(fixture_path().to_str().unwrap())
         ),
@@ -1328,11 +1328,14 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut controls, _steer, _token) = controls("Yes");
-    controls.browser = Some(zeron_browser::Connection {
-        executable: "/Applications/Noches App/zeron".into(),
-        socket: "/tmp/browser-test/control.sock".into(),
-        session: "session-browser".into(),
-    });
+    controls.mcp = controls
+        .mcp
+        .with_browser(&zeron_browser::Connection {
+            executable: "/Applications/Noches App/zeron".into(),
+            socket: "/tmp/browser-test/control.sock".into(),
+            session: "session-browser".into(),
+        })
+        .unwrap();
     let provider = CodexHarness::new().with_executable(wrapper);
     let mut req = request("scenario:happy");
     req.cwd = "/tmp".into();

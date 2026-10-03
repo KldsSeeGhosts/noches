@@ -487,6 +487,7 @@ async function start(msg) {
   }
   const options = {
     model,
+    ...(msg.mcpServers && Object.keys(msg.mcpServers).length ? { mcpServers: msg.mcpServers } : {}),
     // askQuestion has no public answer channel in this SDK (SDKRequestMessage
     // carries only a request id) — a question would block the run forever.
     // generateImage has nowhere to land in a zeron session (ACP parity).
@@ -526,7 +527,12 @@ async function start(msg) {
     rememberAgentDir(agent.agentId, runDir);
     receiptPath = path.join(runDir, ".zeron-user-receipt.json");
   }
-  await runTurn(msg.prompt ?? "", () => {
+  // The SDK has no public system-instruction option. T3 uses the same
+  // first-run prompt channel; credentials never enter this text.
+  const prompt = msg.instructions
+    ? `${msg.instructions}\n\n${msg.prompt ?? ""}`
+    : msg.prompt ?? "";
+  await runTurn(prompt, () => {
     out({ ev: "ready", agentId: agent.agentId, model: agent.model?.id ?? model.id });
   });
 }
