@@ -161,10 +161,18 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-/// A user prompt renders at most this many wrapped lines until expanded. A
-/// pasted log or file drops into the transcript as one endless slab otherwise
-/// (user report) — past the cap the bubble clips and grows a chevron.
-pub const USER_COLLAPSED_LINES: usize = 5;
+/// A user prompt past this many lines folds until expanded. A pasted log or
+/// file drops into the transcript as one endless slab otherwise (user report)
+/// — past the cap the bubble clips to [`USER_COLLAPSED_HEIGHT`], fades out
+/// over [`USER_FOLD_FADE_BAND`], and grows a "Show full message" button.
+/// T3's thresholds: more than 8 lines or 600 characters.
+pub const USER_COLLAPSED_LINES: usize = 8;
+/// Visible height of a folded prompt (T3 `max-h-44`). The last
+/// [`USER_FOLD_FADE_BAND`] px fade out instead of ending on a hard edge or a
+/// "..." line.
+pub const USER_COLLAPSED_HEIGHT: f32 = 176.0;
+/// Bottom fade of a folded prompt (T3's `mask-image` ramp, 1.75rem).
+pub const USER_FOLD_FADE_BAND: f32 = 28.0;
 /// The user bubble's line box (T3 `leading-relaxed` at 14px).
 pub const USER_LINE_HEIGHT: f32 = 22.75;
 /// The user bubble's padding on every side (T3 `p-3`).
@@ -173,7 +181,7 @@ const USER_BUBBLE_PADDING: f32 = 12.0;
 /// bubble. The final decision uses the wrapped `StyledText` layout, but this
 /// fallback lets clearly long prompts render their affordance immediately
 /// before that first layout has completed.
-pub const USER_COLLAPSE_CHARS: usize = 400;
+pub const USER_COLLAPSE_CHARS: usize = 600;
 /// Vertical separation before the plain expand/collapse link.
 const USER_TOGGLE_GAP: f32 = 8.0;
 /// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
@@ -5282,10 +5290,11 @@ impl Transcript {
         let expanded = fold.open.unwrap_or(false);
         let line_height =
             f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
-        let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
-        // Include the continuation line in the resize endpoints so removing
-        // it on expansion does not make the bubble jump by a line.
-        let collapsed_h = collapsed_text_h + line_height;
+        // A prompt folds past USER_COLLAPSED_LINES visual lines; the folded
+        // viewport is the fixed T3 height, so the resize endpoints are the
+        // clip and the full measured text.
+        let collapse_trigger_h = USER_COLLAPSED_LINES as f32 * line_height;
+        let collapsed_h = USER_COLLAPSED_HEIGHT;
         let measured_h = self
             .user_heights
             .entry(row_id.clone())
@@ -5293,7 +5302,7 @@ impl Transcript {
             .clone();
         let measured = measured_h.get();
         let collapsible = text.lines().count() > USER_COLLAPSED_LINES
-            || (measured > 0.0 && measured > collapsed_text_h + 0.5)
+            || (measured > 0.0 && measured > collapse_trigger_h + 0.5)
             || (measured == 0.0 && user_message_needs_collapse(&text));
         let full_h = measured_h.get().max(collapsed_h);
         if let Some(fold) = self.user_folds.get_mut(row_id) {
@@ -5363,25 +5372,29 @@ impl Transcript {
                 .toggled_at
                 .is_some_and(|at| at.elapsed() < Duration::from_millis(duration_ms + 200))
             && !motion::reduced_motion(cx);
-        let ellipsis = || div().h(px(line_height)).child("...");
+        // The folded edge ramps out like T3's `mask-image`: a per-glyph fade at
+        // the clip's bottom edge, not an overlay quad, so it holds over any
+        // bubble surface.
         let body: AnyElement = if animating {
             let from = fold.from;
             let to = if expanded { full_h } else { collapsed_h };
             let resize = user_resize_spec(full_h - collapsed_h);
-            let ellipsis_h = if expanded { 0.0 } else { line_height };
-            div()
-                .child(div().overflow_hidden().child(body).with_animation(
-                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
-                    resize.animation(),
-                    move |el, t| el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0))),
-                ))
-                .when(!expanded, |el| el.child(ellipsis()))
+            let clip = div().overflow_hidden().child(body).with_animation(
+                SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
+                resize.animation(),
+                move |el, t| el.h(px(motion::lerp(from, to, t).max(0.0))),
+            );
+            // Opening drops the fade at once; closing brings it back at once.
+            crate::edge_fade::edge_faded(USER_FOLD_FADE_BAND, false, !expanded, clip)
                 .into_any_element()
         } else if collapsible && !expanded {
-            div()
-                .child(div().h(px(collapsed_text_h)).overflow_hidden().child(body))
-                .child(ellipsis())
-                .into_any_element()
+            crate::edge_fade::edge_faded(
+                USER_FOLD_FADE_BAND,
+                false,
+                true,
+                div().h(px(collapsed_h)).overflow_hidden().child(body),
+            )
+            .into_any_element()
         } else {
             body.into_any_element()
         };
@@ -5402,8 +5415,9 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// A plain text link aligned with the message's left edge, following the
-    /// continuation ellipsis when collapsed. No pill, border, or button wash.
+    /// T3's ghost "Show full message" / "Show less" text button under the
+    /// text, aligned with the message's left edge. No chevron, pill or border;
+    /// hover tints the label.
     fn render_user_expander(
         &mut self,
         row_id: &SharedString,
@@ -5415,12 +5429,11 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle_key = row_id.clone();
-        let glyph = if expanded {
-            crate::icons::ALT_ARROW_UP
+        let label = if expanded {
+            "Show less"
         } else {
-            crate::icons::ALT_ARROW_DOWN
+            "Show full message"
         };
-        let label = if expanded { "Show less" } else { "Show more" };
         let button = div()
             .id(SharedString::from(format!("{row_id}-expander")))
             .group("user-message-toggle")
@@ -5434,18 +5447,12 @@ impl Transcript {
             .flex()
             .items_center()
             .gap(px(5.0))
-            .text_size(crate::typography::ui_rems(14.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.text_color(theme.text))
             .child(label)
-            .child(
-                crate::icons::icon(glyph)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .group_hover("user-message-toggle", |s| s.text_color(theme.text)),
-            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_user_fold(
                     toggle_key.clone(),
@@ -12589,13 +12596,7 @@ mod tests {
                 let before = transcript.read(cx).list.max_offset_for_scrollbar();
                 let toggle = |this: &mut Transcript, cx: &mut Context<Transcript>| {
                     let full_h = this.user_heights["prompt"].get();
-                    this.toggle_user_fold(
-                        "prompt".into(),
-                        0,
-                        USER_LINE_HEIGHT * (USER_COLLAPSED_LINES + 1) as f32,
-                        full_h,
-                        true,
-                    );
+                    this.toggle_user_fold("prompt".into(), 0, USER_COLLAPSED_HEIGHT, full_h, true);
                     this.user_folds.get_mut("prompt").unwrap().toggled_at =
                         Some(Instant::now() - Duration::from_secs(5));
                     cx.notify();
@@ -12746,8 +12747,12 @@ mod tests {
     #[test]
     fn long_prompts_collapse_and_short_ones_do_not() {
         assert!(!user_message_needs_collapse("short message"));
-        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
-        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        // T3 folds past 8 lines or 600 characters.
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5\n6\n7\n8"));
+        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6\n7\n8\n9"));
+        assert_eq!((USER_COLLAPSED_LINES, USER_COLLAPSE_CHARS), (8, 600));
+        assert_eq!(USER_COLLAPSED_HEIGHT, 176.0);
         assert!(
             !user_message_needs_collapse(&"x".repeat(240)),
             "ordinary two- or three-line prose must not grow a toggle"

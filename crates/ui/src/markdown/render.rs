@@ -53,18 +53,29 @@ const CODE_HEADER_HEIGHT: f32 = 28.0;
 const CODE_ACTION_SIZE: f32 = 22.0;
 const CODE_SCROLLBAR_HIT_HEIGHT: f32 = 10.0;
 
-// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under zeron's
-// resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
-// rules under the header and between rows are the only chrome — no outer box,
-// no header fill, no corner radius (theme: headerBackground transparent,
-// radius 0). Cells use the body scale (14/22) with a uniform 12px padding;
-// the header row is weight-700 per `table.headerWeight`.
-/// Uniform cell padding in px (zeron `table.cellPadding`).
-pub const TABLE_CELL_PADDING: f32 = 12.0;
-/// Hairline between rows in px (zeron `table.gap`).
+// Table metrics — T3's `.chat-markdown table` on mugen-markdown's column
+// solver. The design is frameless ("flat hairline"): 1px horizontal rules
+// under the header and under every row are the only chrome — no outer box, no
+// header fill, no corner radius. Cells use T3's compact scale (12px text on
+// a 1.625 line, `.45rem .75rem` padding, header `.55rem` block padding in
+// weight 600).
+/// Table text size / line height (T3 `font-size: .75rem`, `leading-relaxed`).
+pub const TABLE_TEXT_SIZE: f32 = 12.0;
+pub const TABLE_LINE_HEIGHT: f32 = 19.5;
+/// Horizontal cell padding in px (T3 `.75rem`).
+pub const TABLE_CELL_PADDING_X: f32 = 12.0;
+/// Vertical padding of a body cell (T3 `.45rem`) and of a header cell
+/// (T3 `thead th { padding-block: .55rem }`).
+pub const TABLE_CELL_PADDING_Y: f32 = 7.2;
+pub const TABLE_HEADER_PADDING_Y: f32 = 8.8;
+/// Hairline between rows in px.
 pub const TABLE_DIVIDER: f32 = 1.0;
-/// Header row font weight (zeron `table.headerWeight` = 700).
-pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::BOLD;
+/// Header row font weight (T3 `thead th { font-weight: 600 }`).
+pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::SEMIBOLD;
+/// Reserved footer lane under a table in the transcript (T3 `mt-0.5` + an
+/// `icon-xs` row): copy actions fade in on hover without shifting layout.
+const TABLE_FOOTER_HEIGHT: f32 = 24.0;
+const TABLE_FOOTER_GAP: f32 = 2.0;
 /// Floor for a column's max-content share, so a short column ("1k") beside a
 /// prose column keeps a readable width (mugen `MIN_COLUMN_CONTENT`).
 pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
@@ -72,9 +83,9 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 /// `table.minColumnWidth`). Naturally narrower columns keep their content
 /// width; wider ones wrap down to this floor, then the table scrolls.
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
-/// Hairline tone (zeron md theme `table.borderColor`: rgba(255,255,255,0.1)).
-pub fn table_hairline() -> Hsla {
-    crate::theme::hairline(0.10)
+/// Row rule tone (T3 `color-mix(contrast-border 60%, transparent)`).
+pub fn table_hairline(theme: &Theme) -> Hsla {
+    theme.border.opacity(0.6)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
@@ -826,7 +837,7 @@ pub struct TableColumns {
 pub fn table_columns(content_widths: &[f32]) -> TableColumns {
     let naturals: Vec<f32> = content_widths
         .iter()
-        .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING)
+        .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING_X)
         .collect();
     let minimums: Vec<f32> = naturals
         .iter()
@@ -912,7 +923,12 @@ fn render_table(
                     .as_ref()
                     .filter(|ui| ui.source_session.is_some())
                     .map(|_| {
-                        super::link_presentation::present(&flat, px(560.), px(MD_TEXT_SIZE), window)
+                        super::link_presentation::present(
+                            &flat,
+                            px(560.),
+                            px(TABLE_TEXT_SIZE),
+                            window,
+                        )
                     });
                 let flat = measured.as_ref().unwrap_or(&flat);
                 // Cell sources are single-line; guard anyway (same byte count,
@@ -924,7 +940,7 @@ fn render_table(
                 };
                 let width = f32::from(
                     text_system
-                        .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
+                        .shape_line(line, px(TABLE_TEXT_SIZE), &flat.runs, None)
                         .width(),
                 );
                 if width > *natural {
@@ -937,20 +953,17 @@ fn render_table(
     }
     let geo = table_columns(&content);
 
-    // Frameless flat-hairline chrome: 1px rules under the header and between
-    // rows are the only paint (`table.gap` = 1, borderColor white@10%); the
-    // theme's headerBackground is transparent and its radius 0, so there is no
-    // header fill, outer box, or rounding.
-    let hairline = table_hairline();
+    // Frameless flat-hairline chrome: a 1px rule under the header and under
+    // every row (border at 60%) is the only paint - no header fill, outer box,
+    // or rounding.
+    let hairline = table_hairline(theme);
     let mut inner = div()
         .flex()
         .flex_col()
         .w_full()
         .min_w(px(geo.min_table_width));
     for (r, row) in flats.iter().enumerate() {
-        if r > 0 {
-            inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
-        }
+        let header_row = has_header && r == 0;
         let mut row_el = div().flex().flex_row();
         for (c, cell_flat) in row.iter().enumerate() {
             let mut cell = div()
@@ -958,9 +971,14 @@ fn render_table(
                 .flex_shrink(geo.naturals[c])
                 .flex_basis(px(0.0))
                 .min_w(px(geo.minimums[c]))
-                .p(px(TABLE_CELL_PADDING))
-                .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
-                .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT));
+                .px(px(TABLE_CELL_PADDING_X))
+                .py(px(if header_row {
+                    TABLE_HEADER_PADDING_Y
+                } else {
+                    TABLE_CELL_PADDING_Y
+                }))
+                .text_size(crate::typography::ui_rems(TABLE_TEXT_SIZE))
+                .line_height(crate::typography::ui_rems(TABLE_LINE_HEIGHT));
             cell = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Left => cell,
                 TableAlign::Center => cell.text_center(),
@@ -976,9 +994,9 @@ fn render_table(
             {
                 cell = cell.child(text_element(
                     &all[r][c],
-                    MD_TEXT_SIZE,
-                    MD_LINE_HEIGHT,
-                    has_header && r == 0,
+                    TABLE_TEXT_SIZE,
+                    TABLE_LINE_HEIGHT,
+                    header_row,
                     top_ix,
                     table_cell_ix(ix, r, c),
                     opts,
@@ -994,18 +1012,188 @@ fn render_table(
             }
             row_el = row_el.child(cell);
         }
-        inner = inner.child(row_el);
+        inner = inner
+            .child(row_el)
+            .child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
     }
 
     // The horizontal scroller — when the floors exceed the viewport the inner
     // block keeps `min_table_width` and this viewport scrolls it.
     let scroll_id: SharedString = format!("{}-table{ix}", opts.row_key).into();
-    div()
+    let scroller = div()
         .id(scroll_id)
         .w_full()
         .overflow_x_scroll()
-        .child(inner)
+        .child(inner);
+    // Transcript tables carry T3's copy footer; previews (no copy wiring)
+    // render the bare table.
+    if opts.copy.is_none() {
+        return scroller.into_any_element();
+    }
+    let group: SharedString = format!("{}-table-group{ix}", opts.row_key).into();
+    div()
+        .group(group.clone())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(scroller)
+        .child(
+            div()
+                .mt(px(TABLE_FOOTER_GAP))
+                .h(px(TABLE_FOOTER_HEIGHT))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(2.0))
+                .children(table_copy_actions(
+                    header, rows, align, ix, &group, opts, theme,
+                )),
+        )
         .into_any_element()
+}
+
+/// Discriminator offset giving the CSV copy its own transient "Copied" state
+/// beside the Markdown copy of the same table (`CopyUi::copied_ix` is one
+/// index per row).
+const TABLE_CSV_COPY_OFFSET: usize = 500_000;
+
+/// Plain text of one table cell (runs concatenated; cells are single-line).
+fn table_cell_text(runs: &[InlineRun]) -> String {
+    runs.iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+/// The table as GFM Markdown (T3 "Copy as Markdown"): header, alignment rule,
+/// rows, with `|` escaped inside cells.
+pub(crate) fn table_to_markdown(
+    header: &[Vec<InlineRun>],
+    rows: &[Vec<Vec<InlineRun>>],
+    align: &[TableAlign],
+) -> String {
+    let cols = std::iter::once(header.len())
+        .chain(rows.iter().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    let line = |cells: Vec<String>| format!("| {} |", cells.join(" | "));
+    let cell_at = |row: &[Vec<InlineRun>], c: usize| {
+        row.get(c)
+            .map(|runs| table_cell_text(runs).replace('|', "\\|"))
+            .unwrap_or_default()
+    };
+    let mut out = vec![line((0..cols).map(|c| cell_at(header, c)).collect())];
+    out.push(line(
+        (0..cols)
+            .map(|c| {
+                match align.get(c).copied().unwrap_or_default() {
+                    TableAlign::Left => "---",
+                    TableAlign::Center => ":---:",
+                    TableAlign::Right => "---:",
+                }
+                .to_string()
+            })
+            .collect(),
+    ));
+    for row in rows {
+        out.push(line((0..cols).map(|c| cell_at(row, c)).collect()));
+    }
+    out.join("\n")
+}
+
+/// The table as RFC 4180 CSV (T3 "Copy as CSV").
+pub(crate) fn table_to_csv(header: &[Vec<InlineRun>], rows: &[Vec<Vec<InlineRun>>]) -> String {
+    let quote = |text: String| {
+        if text.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text
+        }
+    };
+    let line = |row: &[Vec<InlineRun>]| {
+        row.iter()
+            .map(|runs| quote(table_cell_text(runs)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    std::iter::once(header)
+        .filter(|header| !header.is_empty())
+        .map(line)
+        .chain(rows.iter().map(|row| line(row)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Hover-revealed copy actions under a transcript table.
+fn table_copy_actions(
+    header: &[Vec<InlineRun>],
+    rows: &[Vec<Vec<InlineRun>>],
+    align: &[TableAlign],
+    ix: usize,
+    group: &SharedString,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> Vec<AnyElement> {
+    let Some(copy) = opts.copy.clone() else {
+        return Vec::new();
+    };
+    let action = |copy_ix: usize, label: &'static str, text: String| {
+        let copied = copy.copied_ix == Some(copy_ix);
+        let handler = copy.handler.clone();
+        let text: SharedString = text.into();
+        let fade_key = format!("{}-table-copy{copy_ix}", opts.row_key);
+        div()
+            .id(SharedString::from(fade_key.clone()))
+            .h(px(TABLE_FOOTER_HEIGHT))
+            .px(px(6.0))
+            .rounded(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .bg(crate::motion::hover_blend(
+                &fade_key,
+                gpui::transparent_black(),
+                crate::theme::ink(0.08),
+            ))
+            .on_hover(crate::motion::hover_listener(fade_key))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            // Quiet until the table is hovered; the confirmation stays up.
+            .opacity(if copied { 1.0 } else { 0.0 })
+            .group_hover(group.clone(), |style| style.opacity(1.0))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                handler(copy_ix, text.clone(), window, cx);
+            })
+            .child(
+                crate::icons::icon(if copied {
+                    crate::icons::CHECK
+                } else {
+                    crate::icons::COPY
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted),
+            )
+            .child(SharedString::from(if copied { "Copied" } else { label }))
+            .into_any_element()
+    };
+    vec![
+        action(
+            ix,
+            "Copy as Markdown",
+            table_to_markdown(header, rows, align),
+        ),
+        action(
+            ix.wrapping_add(TABLE_CSV_COPY_OFFSET),
+            "Copy as CSV",
+            table_to_csv(header, rows),
+        ),
+    ]
 }
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
@@ -3793,15 +3981,17 @@ mod tests {
     }
 
     #[test]
-    fn table_header_flattens_at_weight_700() {
+    fn table_header_flattens_at_weight_600() {
         let theme = Theme::dark();
         let runs = vec![InlineRun {
             text: "Header".into(),
             style: InlineStyle::default(),
         }];
         let flat = flatten_runs_weighted(&runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
-        // Strong runs inside a 700 header stay 700 (never drop to semibold).
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+        // Header cells read at full text strength, like headings.
+        assert_eq!(flat.runs[0].color, theme.text);
+        // Strong runs inside a 600 header stay 600 (never drop below it).
         let bold_runs = vec![InlineRun {
             text: "Strong".into(),
             style: InlineStyle {
@@ -3810,7 +4000,42 @@ mod tests {
             },
         }];
         let flat = flatten_runs_weighted(&bold_runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+    }
+
+    fn cell(text: &str) -> Vec<InlineRun> {
+        vec![InlineRun {
+            text: text.into(),
+            style: InlineStyle::default(),
+        }]
+    }
+
+    #[test]
+    fn table_copies_as_markdown_and_csv() {
+        let header = vec![cell("Name"), cell("Note")];
+        let rows = vec![
+            vec![cell("a|b"), cell("plain")],
+            vec![cell("c"), cell("say \"hi\", ok")],
+        ];
+        let align = [TableAlign::Left, TableAlign::Right];
+        assert_eq!(
+            table_to_markdown(&header, &rows, &align),
+            "| Name | Note |\n| --- | ---: |\n| a\\|b | plain |\n| c | say \"hi\", ok |"
+        );
+        assert_eq!(
+            table_to_csv(&header, &rows),
+            "Name,Note\na|b,plain\nc,\"say \"\"hi\"\", ok\""
+        );
+    }
+
+    #[test]
+    fn table_metrics_follow_the_t3_compact_scale() {
+        assert_eq!(TABLE_TEXT_SIZE, 12.0);
+        assert!((TABLE_LINE_HEIGHT - TABLE_TEXT_SIZE * 1.625).abs() < 0.01);
+        assert!((TABLE_CELL_PADDING_Y - 0.45 * 16.0).abs() < 0.01);
+        assert!((TABLE_HEADER_PADDING_Y - 0.55 * 16.0).abs() < 0.01);
+        let theme = Theme::light();
+        assert_eq!(table_hairline(&theme), theme.border.opacity(0.6));
     }
 
     #[test]
