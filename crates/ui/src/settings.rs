@@ -639,6 +639,10 @@ pub struct UiSettings {
     pub composer_send_behavior: ComposerSendBehavior,
     /// Queue or steer a message sent while the agent is working.
     pub follow_up_behavior: FollowUpBehavior,
+    /// How long sidebar, right-pane, terminal and disclosure open/close
+    /// animations run, 0-400ms. 0 (the default, T3's) makes them instant;
+    /// popovers, dialogs and hover fades keep their own smooth timing.
+    pub panel_animation_ms: u16,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -813,6 +817,7 @@ impl Default for UiSettings {
             settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             follow_up_behavior: FollowUpBehavior::default(),
+            panel_animation_ms: 0,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -2097,6 +2102,7 @@ mod tests {
             settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             follow_up_behavior: FollowUpBehavior::Steer,
+            panel_animation_ms: 250,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and

@@ -324,7 +324,7 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
-/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`]); the blank-
+/// starts exactly one 180ms ease-out morph ([`motion::FLIP`]); the blank-
 /// thread handoff swaps in the coordinated 420ms route-transition spec. Both use the
 /// manual-drive pattern from shell.rs `WidthTween` - never `with_animation`,
 /// whose element-id keying replays tweens on remount, round-6 §1–3.
@@ -354,7 +354,7 @@ impl FlipMorph {
         Self {
             from,
             start_ms,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         }
     }
 
@@ -10133,7 +10133,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         // Starts exactly at the committed height…
         let mut prev = m.height(124.0, 0.0);
@@ -10153,7 +10153,7 @@ mod tests {
         let down = FlipMorph {
             from: 124.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         assert!(down.height(49.0, 90.0) < 124.0);
         assert!(down.height(49.0, 90.0) > 49.0);
@@ -10164,7 +10164,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         let mid = m.height(124.0, 90.0);
         assert!(mid > 49.0 && mid < 124.0);
@@ -10193,7 +10193,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         assert_eq!(
             flip_morph_step(Some(m), false, 80.0, 50.0, false, true),
@@ -10260,7 +10260,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         // Auto-grow can move the target mid-morph: evaluation tracks the
         // live value instead of finishing on a stale height.

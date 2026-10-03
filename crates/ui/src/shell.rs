@@ -209,7 +209,7 @@ impl SidebarDisclosureMotion {
     }
 
     fn current(self) -> f32 {
-        let total = motion::COLLAPSE.total().as_secs_f32();
+        let total = motion::COLLAPSE.wall().as_secs_f32();
         let raw = if total > 0.0 {
             self.started.elapsed().as_secs_f32() / total
         } else {
@@ -219,7 +219,7 @@ impl SidebarDisclosureMotion {
     }
 
     fn animating(self) -> bool {
-        self.started.elapsed() < motion::COLLAPSE.total() + spaces::SIDEBAR_DISCLOSURE_TWEEN_GRACE
+        self.started.elapsed() < motion::COLLAPSE.wall() + spaces::SIDEBAR_DISCLOSURE_TWEEN_GRACE
     }
 }
 
@@ -4215,7 +4215,7 @@ impl Shell {
         }
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(RESIZE.total().mul_f32(motion::speed_scale()) + Duration::from_millis(30))
+                .timer(RESIZE.wall() + Duration::from_millis(30))
                 .await;
             this.update(cx, |shell, cx| {
                 shell.terminal_tween = None;
@@ -4351,6 +4351,7 @@ impl Shell {
         let current = settings::current(cx);
         self.settings.dictation_enabled = current.dictation_enabled;
         self.settings.follow_up_behavior = current.follow_up_behavior;
+        self.settings.panel_animation_ms = current.panel_animation_ms;
         self.settings.dictation_input = current.dictation_input;
         self.settings.window_geometry = current.window_geometry;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
@@ -5615,7 +5616,7 @@ impl Shell {
         if self.reduced_motion {
             return target;
         }
-        let total = RESIZE.total().mul_f32(motion::speed_scale());
+        let total = RESIZE.wall();
         let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
         if raw >= 1.0 {
             return target;
@@ -5662,7 +5663,7 @@ impl Shell {
     fn tween_active(&self, tween: Option<WidthTween>) -> bool {
         tween.is_some_and(|tween| {
             !self.reduced_motion
-                && self.tween_elapsed(tween.started) < RESIZE.total().mul_f32(motion::speed_scale())
+                && self.tween_elapsed(tween.started) < RESIZE.wall()
         })
     }
 
@@ -5671,7 +5672,7 @@ impl Shell {
             .filter(|transition| {
                 !self.reduced_motion
                     && self.tween_elapsed(transition.started)
-                        < RESIZE.total().mul_f32(motion::speed_scale())
+                        < RESIZE.wall()
             })
             .map(|transition| (transition.from, transition.to))
     }
@@ -12754,7 +12755,7 @@ mod tests {
     #[test]
     fn sidebar_disclosure_motion_lands_exactly_on_its_target() {
         let mut tween = SidebarDisclosureMotion::new(1, 240.0, 0.0);
-        tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
+        tween.started = std::time::Instant::now() - motion::COLLAPSE.wall().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
     }
@@ -12923,7 +12924,7 @@ mod exit_regressions {
         });
         window
             .update(cx, |shell, window, cx| {
-                let duration = RESIZE.total().mul_f32(motion::speed_scale());
+                let duration = RESIZE.wall();
                 let started = std::time::Instant::now() - duration.mul_f32(2.);
                 let tween = Some(WidthTween {
                     from: 520.,

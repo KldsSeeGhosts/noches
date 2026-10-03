@@ -1435,7 +1435,7 @@ impl GitHistorySearchControl {
         self.mode = GitHistorySearchMode::Collapsing;
         self.transition_epoch = self.transition_epoch.wrapping_add(1);
         let epoch = self.transition_epoch;
-        let duration = crate::motion::RESIZE
+        let duration = crate::motion::MORPH
             .total()
             .mul_f32(crate::motion::speed_scale());
         self.transition_task = Some(cx.spawn(async move |this, cx| {
@@ -1772,7 +1772,7 @@ impl Render for GitHistorySearchControl {
                     "history-search-morph-{transition_epoch}-{}",
                     if closing { "out" } else { "in" }
                 )),
-                crate::motion::RESIZE.animation(),
+                crate::motion::MORPH.animation(),
                 move |element, progress| {
                     let amount = if closing { 1.0 - progress } else { progress };
                     element
@@ -2331,9 +2331,7 @@ impl GitHistory {
             final_collapsed_counts,
             epoch,
         });
-        let duration = crate::motion::COLLAPSE
-            .total()
-            .mul_f32(crate::motion::speed_scale());
+        let duration = crate::motion::COLLAPSE.wall();
         self.view_transition_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(duration).await;
             this.update(cx, |history, cx| {

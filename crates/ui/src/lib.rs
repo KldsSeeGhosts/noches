@@ -203,6 +203,7 @@ pub fn run_app(config: UiConfig) {
         );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
+        motion::set_panel_animation_ms(ui_settings.panel_animation_ms);
         terminal::panel::init(cx);
         app_menus::init(cx);
         cx.register_url_scheme(zeron_update::identity::slug()).detach();

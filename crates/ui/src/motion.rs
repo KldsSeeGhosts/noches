@@ -302,6 +302,9 @@ pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 pub const EASE_OUT_QUINT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
 /// Sidebar resort glide (used from M3b).
 pub const EASE_RESORT: CubicBezier = EASE_OUT_QUINT;
+/// T3's drawer curve, CSS `cubic-bezier(0.32, 0.72, 0, 1)`: fast out of the
+/// gate, long soft landing. Panels (sidebar, right pane, disclosures) ride it.
+pub const EASE_DRAWER: CubicBezier = CubicBezier::new(0.32, 0.72, 0.0, 1.0);
 /// CSS `ease-in-out` — the transcript scroll glide (browser smooth-scroll
 /// shape: gentle start, cruise, gentle landing).
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
@@ -319,6 +322,10 @@ pub struct MotionSpec {
     pub duration_ms: u64,
     pub delay_ms: u64,
     pub curve: CubicBezier,
+    /// Panel-class timelines (sidebar, right pane, terminal and disclosure
+    /// open/close) follow the user's panel-animation duration; everything else
+    /// (popovers, hover fades, morphs) keeps its own smooth timing.
+    pub panel: bool,
 }
 
 impl MotionSpec {
@@ -327,7 +334,15 @@ impl MotionSpec {
             duration_ms,
             delay_ms: 0,
             curve,
+            panel: false,
         }
+    }
+
+    /// Mark this spec panel-class: its wall-clock span scales with the
+    /// panel-animation setting (see [`panel_animation_ms`]).
+    pub const fn panel(mut self) -> Self {
+        self.panel = true;
+        self
     }
 
     pub const fn with_delay(mut self, delay_ms: u64) -> Self {
@@ -352,11 +367,37 @@ impl MotionSpec {
         self.curve.eval(t.clamp(0.0, 1.0))
     }
 
+    /// Real-time span of the whole timeline: [`total`](Self::total) scaled by
+    /// the [`speed_scale`] measurement knob and, for panel-class specs, the
+    /// user's panel-animation duration. Never zero for a non-empty spec - a
+    /// manual tween divides elapsed time by this, and a 1ms floor makes
+    /// "animations off" a one-frame snap instead of a NaN.
+    pub fn wall(&self) -> Duration {
+        self.wall_at(panel_animation_ms())
+    }
+
+    /// [`wall`](Self::wall) for an explicit panel-animation setting (pure, so
+    /// it is testable without touching the process-wide value).
+    fn wall_at(&self, panel_ms: u16) -> Duration {
+        let total = self.total();
+        let mut scale = speed_scale();
+        if self.panel {
+            scale *= f32::from(panel_ms.min(PANEL_ANIMATION_MAX_MS)) / PANEL_ANIMATION_REFERENCE_MS;
+        }
+        let wall = total.mul_f32(scale);
+        if total > Duration::ZERO && wall < MIN_WALL {
+            MIN_WALL
+        } else {
+            wall
+        }
+    }
+
     /// A oneshot gpui [`Animation`] for this spec (delay folded in).
-    /// Wall-clock span honors [`speed_scale`] (measurement knob).
+    /// Wall-clock span honors [`speed_scale`] (measurement knob) and, for
+    /// panel-class specs, the panel-animation setting.
     pub fn animation(&self) -> Animation {
         let spec = *self;
-        Animation::new(spec.total().mul_f32(speed_scale())).with_easing(move |d| spec.progress(d))
+        Animation::new(spec.wall()).with_easing(move |d| spec.progress(d))
     }
 
     /// A repeating gpui [`Animation`] with linear easing over the raw period —
@@ -380,11 +421,22 @@ pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
 pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
-pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
+pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_DRAWER).panel();
+/// Composer compact <-> expanded morph: the authored 180ms ease-out, kept off
+/// the panel-animation setting (the composer is not a panel).
+pub const FLIP: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Browser page-load bar: a long, front-loaded creep toward ~the end that the
+/// finished load cuts short (T3 `cubic-bezier(.1,.5,.2,1)` over 5.3s).
+pub const PAGE_LOAD: MotionSpec = MotionSpec::new(5300, CubicBezier::new(0.1, 0.5, 0.2, 1.0));
+/// The context ring's stroke easing when the usage changes.
+pub const RING_STROKE: MotionSpec = MotionSpec::new(500, EASE_OUT);
+/// Compact control morphs (the history search field): the same 200ms ease-out
+/// the old panel tween used, independent of the panel-animation setting.
+pub const MORPH: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
 pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
 /// Diff-pane per-file collapse: 180ms height (§1.11).
-pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_DRAWER).panel();
 /// Reversible new-thread ↔ session handoff. The shared composer moves and
 /// morphs on a fast-starting, soft-landing curve while the canvas/transcript
 /// crossfade is staged around it. Slightly longer than a utility transition,
@@ -803,6 +855,32 @@ pub fn hover_blend(key: &str, rest: Hsla, hover: Hsla) -> Hsla {
 // Reduced motion
 // ---------------------------------------------------------------------------
 
+const MIN_WALL: Duration = Duration::from_millis(1);
+
+/// Upper bound of the panel-animation setting.
+pub const PANEL_ANIMATION_MAX_MS: u16 = 400;
+/// The duration the panel specs were authored at: a setting of 200 reproduces
+/// their catalog timings exactly.
+const PANEL_ANIMATION_REFERENCE_MS: f32 = 200.0;
+/// Process-wide panel-animation duration. Starts at the reference so code
+/// that never reads settings (tests, embedders) keeps the authored timings;
+/// the app overwrites it from settings at startup.
+static PANEL_ANIMATION_MS: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(PANEL_ANIMATION_REFERENCE_MS as u16);
+
+/// Set the panel open/close duration in milliseconds (0 = instant, capped at
+/// [`PANEL_ANIMATION_MAX_MS`]). T3 ships 0 by default.
+pub fn set_panel_animation_ms(ms: u16) {
+    PANEL_ANIMATION_MS.store(
+        ms.min(PANEL_ANIMATION_MAX_MS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn panel_animation_ms() -> u16 {
+    PANEL_ANIMATION_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Dev/measurement knob (`ZERON_MOTION_SCALE`, default 1): stretches every
 /// catalog timeline by this factor — e.g. `ZERON_MOTION_SCALE=10` slows the
 /// 200ms pane tweens to 2s so screenshot bursts can sample the geometry
@@ -996,6 +1074,23 @@ mod tests {
                 assert!(y >= last - 1e-4, "monotonicity violated at {i}");
                 last = y;
             }
+        }
+    }
+
+    #[test]
+    fn panel_specs_follow_the_setting_and_others_do_not() {
+        let scale = speed_scale();
+        // 200 reproduces the authored timing; 400 doubles it.
+        assert_eq!(RESIZE.wall_at(200), RESIZE.total().mul_f32(scale));
+        assert_eq!(RESIZE.wall_at(400), RESIZE.total().mul_f32(2.0 * scale));
+        // Off is a 1ms snap, never zero (manual tweens divide by it).
+        assert_eq!(RESIZE.wall_at(0), Duration::from_millis(1));
+        assert!(COLLAPSE.wall_at(0) > Duration::ZERO);
+        // The setting is capped.
+        assert_eq!(RESIZE.wall_at(9_999), RESIZE.wall_at(PANEL_ANIMATION_MAX_MS));
+        // Popovers, dialogs and hover fades ignore it.
+        for spec in [MENU_IN, MENU_OUT, DIALOG_IN, HOVER_FADE, MORPH] {
+            assert_eq!(spec.wall_at(0), spec.wall_at(400));
         }
     }
 
