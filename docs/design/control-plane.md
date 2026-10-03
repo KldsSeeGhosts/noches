@@ -148,6 +148,45 @@ snapshots the harness polls; `tokens: null` after compaction reads as
 
 ## Tool rows
 
+Transcript tool calls have two looks, chosen in Settings > Appearance >
+"Transcript tool rows". **Calm** (T3's work log) is the default; **Tree** is
+the earlier BoardUI task tree, kept as-is behind the setting. Both keep the
+inline diffs, the group-title shimmer, and the reserved `failed` tag. Subagent spawn
+chips are cards in either look.
+
+### Calm (default)
+
+A flat log, no rail, no ribbons, no per-family hue.
+
+- Rows are 24px: a 16px glyph in a 24px cell (`icon_muted`), 6px gap, the
+  label at 14px in `text_muted` (verb and detail as one run, files by name),
+  then a 16px box holding a 12px chevron (`icon_muted` at 70%). The chevron is
+  always present so labels never shift; it turns 90 degrees over 200ms
+  (`EASE_TAILWIND`) and an unexpandable row leaves its box empty.
+- Interactive rows take an 8px-radius hover plate (`row_hover_fill`, the
+  accent surface at 20%) that fades in over `HOVER_FADE`. Rows have 2px side
+  padding.
+- The group header is the first row of the log: a glyph chosen by what the
+  group did (uniform groups wear their tools' glyph, mixed groups the generic
+  tool mark), the summary label, and the chevron. Groups sit 8px from the
+  text around them (Tree: 12px).
+- Open details indent 28px and sit 4px below their row. Output, thought, and
+  stat lines are a quiet plate (`detail_panel_fill`, 8px radius, 12/8px
+  padding) in the code face at the code size on a 1.625 line, `text_muted`,
+  with the 24-line cap and counted tail. Diffs keep the changes pane body,
+  clipped to the same radius. Heights are analytic (`calm_detail_height`).
+- Thoughts read `Thinking` while streaming and `Thought` once settled, then
+  the first line of the reasoning as a preview.
+- Nothing animates but the chevron and the live shimmer: rows appear, folds
+  and details open instantly.
+- Failure keeps the reserved tag: the glyph softens to `theme.danger` at 60%
+  and a trailing mono 11px `failed` tag in danger at 0.9 follows the label.
+- Live shimmer: T3's `live-tool-shine` on the title of the active group (both
+  looks) and on each still-running row (Calm only), a 72px absolute crest
+  every 2.2s, `text_muted` to `text`.
+
+### Tree
+
 Transcript tool rows tint the 14px icon by the identity of the action -
 `crate::tool_palette::ToolFamily`, the same (dark, light) hue-pair pattern
 as `status_palette`. Verbs stay `text_muted` (MEDIUM on card chips),

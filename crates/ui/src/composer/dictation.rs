@@ -434,12 +434,13 @@ impl Composer {
                 })
                 .track_focus(&self.microphone_focus)
                 .cursor_pointer()
-                .bg(motion::hover_blend(
+                .bg(motion::hover_blend_owned(
+                    cx.entity_id(),
                     &hover_key,
                     gpui::transparent_black(),
                     crate::theme::ink(0.10),
                 ))
-                .on_hover(motion::hover_listener(hover_key))
+                .on_hover(motion::hover_listener_owned(cx.entity_id(), hover_key))
                 .focus_visible(|s| s.border_1().border_color(theme.accent))
                 .tooltip(crate::settings::widgets::text_tooltip(label))
                 .on_mouse_down(

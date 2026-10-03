@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, Context, CursorStyle, Div, FontStyle, FontWeight, Hsla,
-    Render, SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point,
-    prelude::*, px, quad, size,
+    Render, SharedString, StyledText, TextRun, Window, canvas, div, font, point, prelude::*, px,
+    quad, size,
 };
 use zeron_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
@@ -26,35 +26,64 @@ use crate::theme::Theme;
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
-/// Gap between markdown blocks inside one message (zeron mdBlockGap).
-pub const MD_BLOCK_GAP: f32 = 12.0;
-/// Body text size / line height (zeron: 14px / 22px).
+/// Gap between markdown blocks inside one message (T3 `margin: .65rem 0` =
+/// 10.4px; adjacent vertical margins collapse, so it is a gap, not a pad).
+pub const MD_BLOCK_GAP: f32 = 10.4;
+/// Gap above a heading (T3 `margin-top: 1.25rem` = 20px, which wins the
+/// margin collapse against the .65rem block margin). The gap below a heading
+/// is the ordinary [`MD_BLOCK_GAP`]: its 8px bottom margin loses the same
+/// collapse against the next block's .65rem.
+pub const MD_HEADING_TOP_GAP: f32 = 20.0;
+/// Body text size / line height (T3: 14px with `leading-relaxed` 1.625).
 pub const MD_TEXT_SIZE: f32 = 14.0;
-pub const MD_LINE_HEIGHT: f32 = 22.0;
-/// Default code block metrics; the rendered size comes from the theme.
-pub const CODE_TEXT_SIZE: f32 = 12.5;
-pub const CODE_LINE_HEIGHT: f32 = 18.0;
-/// Line height as a multiple of the code size, so a user-chosen size keeps the
-/// default's row rhythm.
+pub const MD_LINE_HEIGHT: f32 = 22.75;
+/// List indent (T3 `padding-left: 1.25rem`). Markers hang inside it.
+const MD_LIST_INDENT: f32 = 20.0;
+/// Blockquote rail inset (T3 `padding-left: .8rem`).
+const MD_QUOTE_INSET: f32 = 12.8;
+/// Default code block metrics; the rendered size comes from the theme. T3 sets
+/// fences at 13px on `leading-snug` (1.375), so a user-chosen size keeps that
+/// row rhythm.
+pub const CODE_TEXT_SIZE: f32 = 13.0;
+pub const CODE_LINE_HEIGHT: f32 = 17.875;
 const CODE_LINE_HEIGHT_RATIO: f32 = CODE_LINE_HEIGHT / CODE_TEXT_SIZE;
-pub const CODE_PADDING_X: f32 = 12.0;
-pub const CODE_PADDING_Y: f32 = 10.0;
-const CODE_HEADER_HEIGHT: f32 = 28.0;
-const CODE_ACTION_SIZE: f32 = 22.0;
+/// Fence body padding (T3 `pre { padding: .8rem .9rem }`).
+pub const CODE_PADDING_X: f32 = 14.4;
+pub const CODE_PADDING_Y: f32 = 12.8;
+/// The header shares the code's surface: no rule, no fill. T3 insets it
+/// `pt-1.5 pr-1.5 pl-3` around 24px actions, so the lane is 6 + 24.
+const CODE_HEADER_PAD_TOP: f32 = 6.0;
+const CODE_HEADER_PAD_RIGHT: f32 = 6.0;
+const CODE_HEADER_PAD_LEFT: f32 = 12.0;
+const CODE_ACTION_SIZE: f32 = 24.0;
+const CODE_ACTION_RADIUS: f32 = 8.0;
+const CODE_ACTION_ICON: f32 = 12.0;
+const CODE_HEADER_HEIGHT: f32 = CODE_HEADER_PAD_TOP + CODE_ACTION_SIZE;
 const CODE_SCROLLBAR_HIT_HEIGHT: f32 = 10.0;
 
-// Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under zeron's
-// resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
-// rules under the header and between rows are the only chrome — no outer box,
-// no header fill, no corner radius (theme: headerBackground transparent,
-// radius 0). Cells use the body scale (14/22) with a uniform 12px padding;
-// the header row is weight-700 per `table.headerWeight`.
-/// Uniform cell padding in px (zeron `table.cellPadding`).
-pub const TABLE_CELL_PADDING: f32 = 12.0;
-/// Hairline between rows in px (zeron `table.gap`).
+// Table metrics — T3's `.chat-markdown table` on mugen-markdown's column
+// solver. The design is frameless ("flat hairline"): 1px horizontal rules
+// under the header and under every row are the only chrome — no outer box, no
+// header fill, no corner radius. Cells use T3's compact scale (12px text on
+// a 1.625 line, `.45rem .75rem` padding, header `.55rem` block padding in
+// weight 600).
+/// Table text size / line height (T3 `font-size: .75rem`, `leading-relaxed`).
+pub const TABLE_TEXT_SIZE: f32 = 12.0;
+pub const TABLE_LINE_HEIGHT: f32 = 19.5;
+/// Horizontal cell padding in px (T3 `.75rem`).
+pub const TABLE_CELL_PADDING_X: f32 = 12.0;
+/// Vertical padding of a body cell (T3 `.45rem`) and of a header cell
+/// (T3 `thead th { padding-block: .55rem }`).
+pub const TABLE_CELL_PADDING_Y: f32 = 7.2;
+pub const TABLE_HEADER_PADDING_Y: f32 = 8.8;
+/// Hairline between rows in px.
 pub const TABLE_DIVIDER: f32 = 1.0;
-/// Header row font weight (zeron `table.headerWeight` = 700).
-pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::BOLD;
+/// Header row font weight (T3 `thead th { font-weight: 600 }`).
+pub const TABLE_HEADER_WEIGHT: FontWeight = FontWeight::SEMIBOLD;
+/// Reserved footer lane under a table in the transcript (T3 `mt-0.5` + an
+/// `icon-xs` row): copy actions fade in on hover without shifting layout.
+const TABLE_FOOTER_HEIGHT: f32 = 24.0;
+const TABLE_FOOTER_GAP: f32 = 2.0;
 /// Floor for a column's max-content share, so a short column ("1k") beside a
 /// prose column keeps a readable width (mugen `MIN_COLUMN_CONTENT`).
 pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
@@ -62,9 +91,9 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 /// `table.minColumnWidth`). Naturally narrower columns keep their content
 /// width; wider ones wrap down to this floor, then the table scrolls.
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
-/// Hairline tone (zeron md theme `table.borderColor`: rgba(255,255,255,0.1)).
-pub fn table_hairline() -> Hsla {
-    crate::theme::hairline(0.10)
+/// Row rule tone (T3 `color-mix(contrast-border 60%, transparent)`).
+pub fn table_hairline(theme: &Theme) -> Hsla {
+    theme.border.opacity(0.6)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
@@ -331,19 +360,8 @@ struct CodeBlockTooltip(SharedString);
 
 impl Render for CodeBlockTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .max_w(px(360.0))
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0.clone())
+        let theme = &Theme::of(cx).for_popup();
+        crate::tooltip::frost(crate::tooltip::surface(theme).child(self.0.clone()))
     }
 }
 
@@ -445,10 +463,9 @@ pub fn render_tree(
     div()
         .flex()
         .flex_col()
-        .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
             let document = highlight(ix);
-            render_block(
+            let block = render_block(
                 &top.block,
                 ix,
                 ix,
@@ -458,9 +475,26 @@ pub fn render_tree(
                 document
                     .as_deref()
                     .map(|document| document.lines.as_slice()),
-            )
+            );
+            // Each block opens its own gap (headings take more air above),
+            // the same numbers the transcript's row gaps use.
+            div()
+                .when(ix > 0, |el| el.mt(px(block_gap_before(&top.block))))
+                .child(block)
         }))
         .into_any_element()
+}
+
+/// Vertical gap that opens `block` when it follows a sibling block. Headings
+/// take [`MD_HEADING_TOP_GAP`]; everything else the ordinary
+/// [`MD_BLOCK_GAP`]. Transcript rows split from one message use this too, so
+/// a live reply and its split rows space identically.
+pub fn block_gap_before(block: &Block) -> f32 {
+    if matches!(block, Block::Heading { .. }) {
+        MD_HEADING_TOP_GAP
+    } else {
+        MD_BLOCK_GAP
+    }
 }
 
 fn quote_child_ix(ix: usize, child_ix: usize) -> usize {
@@ -512,8 +546,46 @@ pub fn render_block(
     window: &Window,
     highlight: CodeHighlight,
 ) -> AnyElement {
+    render_block_at(
+        block,
+        top_ix,
+        ix,
+        opts,
+        theme,
+        window,
+        highlight,
+        0,
+        Tone::Prose,
+    )
+}
+
+/// Which text tone a block's inline runs resolve to. Run colors are explicit
+/// (they override any inherited `text_color`), so a muted container such as a
+/// blockquote has to pick its tone at flatten time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tone {
+    /// Body copy: 80% prose tone; headings and strong runs at full text.
+    Prose,
+    /// Secondary copy (blockquotes): `text_muted`.
+    Muted,
+}
+
+/// [`render_block`] inside `list_depth` enclosing lists (marker glyph and
+/// nothing else depends on it).
+#[allow(clippy::too_many_arguments)]
+fn render_block_at(
+    block: &Block,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+    window: &Window,
+    highlight: CodeHighlight,
+    list_depth: usize,
+    tone: Tone,
+) -> AnyElement {
     match block {
-        Block::Paragraph { runs } => text_element(
+        Block::Paragraph { runs } => text_element_toned(
             runs,
             MD_TEXT_SIZE,
             MD_LINE_HEIGHT,
@@ -522,10 +594,11 @@ pub fn render_block(
             ix,
             opts,
             theme,
+            tone,
         ),
         Block::Heading { level, runs } => {
             let (size, line) = heading_metrics(*level);
-            text_element(runs, size, line, true, top_ix, ix, opts, theme)
+            text_element_toned(runs, size, line, true, top_ix, ix, opts, theme, tone)
         }
         Block::CodeBlock { language, code } => render_code_block(
             language.as_deref(),
@@ -537,22 +610,17 @@ pub fn render_block(
             highlight,
         ),
         Block::BlockQuote { children } => div()
-            // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // Neutral quote (T3): a 2px hairline rail, muted text, no fill and
+            // no accent - color encodes state, never decoration.
             .border_l_2()
-            .border_color(theme.accent.opacity(0.6))
-            .bg(theme.accent.opacity(0.05))
-            .rounded_tr(px(6.0))
-            .rounded_br(px(6.0))
-            .pl(px(12.0))
-            .pr(px(10.0))
-            .py(px(6.0))
+            .border_color(theme.border)
+            .pl(px(MD_QUOTE_INSET))
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(MD_BLOCK_GAP))
             .text_color(theme.text_muted)
             .children(children.iter().enumerate().map(|(ci, child)| {
-                render_block(
+                render_block_at(
                     child,
                     top_ix,
                     quote_child_ix(ix, ci),
@@ -560,6 +628,8 @@ pub fn render_block(
                     theme,
                     window,
                     None,
+                    list_depth,
+                    Tone::Muted,
                 )
             }))
             .into_any_element(),
@@ -571,9 +641,15 @@ pub fn render_block(
             .flex_col()
             .gap(px(4.0))
             .children(items.iter().enumerate().map(|(item_ix, item)| {
-                // Accent markers (the inline-code hue): ordered numbers as
-                // tinted text, unordered as a REAL 5px disc — the glyph "•"
-                // reads too small at 14px.
+                // Neutral markers in the prose tone (T3: list markers inherit
+                // the text color): ordered numbers as text, unordered as a
+                // REAL 5px glyph - the character "•" reads too small at 14px.
+                // Depth cycles disc -> circle -> square like CSS `list-style`.
+                let marker_color = if tone == Tone::Muted {
+                    theme.text_muted
+                } else {
+                    theme.prose_text()
+                };
                 let task = item
                     .first()
                     .and_then(|block| match block {
@@ -592,7 +668,7 @@ pub fn render_block(
                     };
                     div()
                         .flex_none()
-                        .min_w(px(18.0))
+                        .w(px(MD_LIST_INDENT))
                         .h(px(MD_LINE_HEIGHT))
                         .flex()
                         .items_center()
@@ -643,33 +719,32 @@ pub fn render_block(
                         .into_any_element()
                 } else {
                     match ordered_start {
+                        // Hang the numeral against the text like an outside
+                        // CSS marker: right-aligned in the indent, 5px short
+                        // of the text edge.
                         Some(start) => div()
                             .flex_none()
-                            .min_w(px(18.0))
+                            .w(px(MD_LIST_INDENT))
+                            .pr(px(5.0))
+                            .flex()
+                            .justify_end()
                             .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
                             .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT))
-                            .text_color(theme.accent)
+                            .text_color(marker_color)
                             .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                             .into_any_element(),
                         None => div()
                             .flex_none()
-                            .min_w(px(18.0))
-                            // Center the disc on the first text line's cap band.
+                            .w(px(MD_LIST_INDENT))
+                            // Center the glyph on the first text line's cap band.
                             .h(px(MD_LINE_HEIGHT))
                             .flex()
                             .items_center()
-                            .child(
-                                div()
-                                    .ml(px(1.0))
-                                    .w(px(5.0))
-                                    .h(px(5.0))
-                                    .rounded_full()
-                                    .bg(theme.accent),
-                            )
+                            .child(bullet_glyph(list_depth, marker_color))
                             .into_any_element(),
                     }
                 };
-                div().flex().flex_row().gap(px(8.0)).child(marker).child(
+                div().flex().flex_row().child(marker).child(
                     div()
                         .flex_1()
                         .min_w_0()
@@ -689,7 +764,7 @@ pub fn render_block(
                             } else {
                                 child
                             };
-                            render_block(
+                            render_block_at(
                                 child,
                                 top_ix,
                                 list_child_ix(ix, item_ix, ci),
@@ -697,6 +772,8 @@ pub fn render_block(
                                 theme,
                                 window,
                                 None,
+                                list_depth + 1,
+                                tone,
                             )
                         })),
                 )
@@ -715,14 +792,30 @@ pub fn render_block(
     }
 }
 
-/// Tight monochrome heading scale (zeron: h2 ≈ 16px semibold; headings step
-/// down quickly toward body size).
+/// Heading scale (T3 `.chat-markdown`: 20/18/16/14px at line-height 1.3, so a
+/// heading never reads as a body line with extra weight).
 fn heading_metrics(level: u8) -> (f32, f32) {
     match level {
-        1 => (19.0, 27.0),
-        2 => (16.0, 24.0),
-        3 => (15.0, 22.0),
-        _ => (14.0, 22.0),
+        1 => (20.0, 26.0),
+        2 => (18.0, 23.4),
+        3 => (16.0, 20.8),
+        _ => (14.0, 18.2),
+    }
+}
+
+/// Unordered marker: disc at depth 0, hollow circle at depth 1, square at
+/// depth 2+ (CSS `ul` -> `ul ul` -> `ul ul ul`).
+fn bullet_glyph(depth: usize, color: Hsla) -> Div {
+    let glyph = div().ml(px(8.0)).flex_none();
+    match depth % 3 {
+        0 => glyph.w(px(5.0)).h(px(5.0)).rounded_full().bg(color),
+        1 => glyph
+            .w(px(5.0))
+            .h(px(5.0))
+            .rounded_full()
+            .border_1()
+            .border_color(color),
+        _ => glyph.w(px(4.0)).h(px(4.0)).bg(color),
     }
 }
 
@@ -741,7 +834,7 @@ pub struct TableColumns {
 pub fn table_columns(content_widths: &[f32]) -> TableColumns {
     let naturals: Vec<f32> = content_widths
         .iter()
-        .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING)
+        .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING_X)
         .collect();
     let minimums: Vec<f32> = naturals
         .iter()
@@ -810,7 +903,15 @@ fn render_table(
                 out.push(None);
                 continue;
             };
-            let flat = flatten_cached(runs, weight, top_ix, table_cell_ix(ix, r, c), opts, theme);
+            let flat = flatten_cached(
+                runs,
+                weight,
+                Tone::Prose,
+                top_ix,
+                table_cell_ix(ix, r, c),
+                opts,
+                theme,
+            );
             if !flat.text.is_empty() {
                 // Intrinsic table proportions use the same bounded link presentation;
                 // each cell then resolves its exact width during measured layout.
@@ -819,7 +920,12 @@ fn render_table(
                     .as_ref()
                     .filter(|ui| ui.source_session.is_some())
                     .map(|_| {
-                        super::link_presentation::present(&flat, px(560.), px(MD_TEXT_SIZE), window)
+                        super::link_presentation::present(
+                            &flat,
+                            px(560.),
+                            px(TABLE_TEXT_SIZE),
+                            window,
+                        )
                     });
                 let flat = measured.as_ref().unwrap_or(&flat);
                 // Cell sources are single-line; guard anyway (same byte count,
@@ -831,7 +937,7 @@ fn render_table(
                 };
                 let width = f32::from(
                     text_system
-                        .shape_line(line, px(MD_TEXT_SIZE), &flat.runs, None)
+                        .shape_line(line, px(TABLE_TEXT_SIZE), &flat.runs, None)
                         .width(),
                 );
                 if width > *natural {
@@ -844,20 +950,17 @@ fn render_table(
     }
     let geo = table_columns(&content);
 
-    // Frameless flat-hairline chrome: 1px rules under the header and between
-    // rows are the only paint (`table.gap` = 1, borderColor white@10%); the
-    // theme's headerBackground is transparent and its radius 0, so there is no
-    // header fill, outer box, or rounding.
-    let hairline = table_hairline();
+    // Frameless flat-hairline chrome: a 1px rule under the header and under
+    // every row (border at 60%) is the only paint - no header fill, outer box,
+    // or rounding.
+    let hairline = table_hairline(theme);
     let mut inner = div()
         .flex()
         .flex_col()
         .w_full()
         .min_w(px(geo.min_table_width));
     for (r, row) in flats.iter().enumerate() {
-        if r > 0 {
-            inner = inner.child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
-        }
+        let header_row = has_header && r == 0;
         let mut row_el = div().flex().flex_row();
         for (c, cell_flat) in row.iter().enumerate() {
             let mut cell = div()
@@ -865,9 +968,14 @@ fn render_table(
                 .flex_shrink(geo.naturals[c])
                 .flex_basis(px(0.0))
                 .min_w(px(geo.minimums[c]))
-                .p(px(TABLE_CELL_PADDING))
-                .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
-                .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT));
+                .px(px(TABLE_CELL_PADDING_X))
+                .py(px(if header_row {
+                    TABLE_HEADER_PADDING_Y
+                } else {
+                    TABLE_CELL_PADDING_Y
+                }))
+                .text_size(crate::typography::ui_rems(TABLE_TEXT_SIZE))
+                .line_height(crate::typography::ui_rems(TABLE_LINE_HEIGHT));
             cell = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Left => cell,
                 TableAlign::Center => cell.text_center(),
@@ -883,9 +991,9 @@ fn render_table(
             {
                 cell = cell.child(text_element(
                     &all[r][c],
-                    MD_TEXT_SIZE,
-                    MD_LINE_HEIGHT,
-                    has_header && r == 0,
+                    TABLE_TEXT_SIZE,
+                    TABLE_LINE_HEIGHT,
+                    header_row,
                     top_ix,
                     table_cell_ix(ix, r, c),
                     opts,
@@ -901,18 +1009,188 @@ fn render_table(
             }
             row_el = row_el.child(cell);
         }
-        inner = inner.child(row_el);
+        inner = inner
+            .child(row_el)
+            .child(div().flex_none().h(px(TABLE_DIVIDER)).w_full().bg(hairline));
     }
 
     // The horizontal scroller — when the floors exceed the viewport the inner
     // block keeps `min_table_width` and this viewport scrolls it.
     let scroll_id: SharedString = format!("{}-table{ix}", opts.row_key).into();
-    div()
+    let scroller = div()
         .id(scroll_id)
         .w_full()
         .overflow_x_scroll()
-        .child(inner)
+        .child(inner);
+    // Transcript tables carry T3's copy footer; previews (no copy wiring)
+    // render the bare table.
+    if opts.copy.is_none() {
+        return scroller.into_any_element();
+    }
+    let group: SharedString = format!("{}-table-group{ix}", opts.row_key).into();
+    div()
+        .group(group.clone())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(scroller)
+        .child(
+            div()
+                .mt(px(TABLE_FOOTER_GAP))
+                .h(px(TABLE_FOOTER_HEIGHT))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(2.0))
+                .children(table_copy_actions(
+                    header, rows, align, ix, &group, opts, theme,
+                )),
+        )
         .into_any_element()
+}
+
+/// Discriminator offset giving the CSV copy its own transient "Copied" state
+/// beside the Markdown copy of the same table (`CopyUi::copied_ix` is one
+/// index per row).
+const TABLE_CSV_COPY_OFFSET: usize = 500_000;
+
+/// Plain text of one table cell (runs concatenated; cells are single-line).
+fn table_cell_text(runs: &[InlineRun]) -> String {
+    runs.iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+/// The table as GFM Markdown (T3 "Copy as Markdown"): header, alignment rule,
+/// rows, with `|` escaped inside cells.
+pub(crate) fn table_to_markdown(
+    header: &[Vec<InlineRun>],
+    rows: &[Vec<Vec<InlineRun>>],
+    align: &[TableAlign],
+) -> String {
+    let cols = std::iter::once(header.len())
+        .chain(rows.iter().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    let line = |cells: Vec<String>| format!("| {} |", cells.join(" | "));
+    let cell_at = |row: &[Vec<InlineRun>], c: usize| {
+        row.get(c)
+            .map(|runs| table_cell_text(runs).replace('|', "\\|"))
+            .unwrap_or_default()
+    };
+    let mut out = vec![line((0..cols).map(|c| cell_at(header, c)).collect())];
+    out.push(line(
+        (0..cols)
+            .map(|c| {
+                match align.get(c).copied().unwrap_or_default() {
+                    TableAlign::Left => "---",
+                    TableAlign::Center => ":---:",
+                    TableAlign::Right => "---:",
+                }
+                .to_string()
+            })
+            .collect(),
+    ));
+    for row in rows {
+        out.push(line((0..cols).map(|c| cell_at(row, c)).collect()));
+    }
+    out.join("\n")
+}
+
+/// The table as RFC 4180 CSV (T3 "Copy as CSV").
+pub(crate) fn table_to_csv(header: &[Vec<InlineRun>], rows: &[Vec<Vec<InlineRun>>]) -> String {
+    let quote = |text: String| {
+        if text.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text
+        }
+    };
+    let line = |row: &[Vec<InlineRun>]| {
+        row.iter()
+            .map(|runs| quote(table_cell_text(runs)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    std::iter::once(header)
+        .filter(|header| !header.is_empty())
+        .map(line)
+        .chain(rows.iter().map(|row| line(row)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Hover-revealed copy actions under a transcript table.
+fn table_copy_actions(
+    header: &[Vec<InlineRun>],
+    rows: &[Vec<Vec<InlineRun>>],
+    align: &[TableAlign],
+    ix: usize,
+    group: &SharedString,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> Vec<AnyElement> {
+    let Some(copy) = opts.copy.clone() else {
+        return Vec::new();
+    };
+    let action = |copy_ix: usize, label: &'static str, text: String| {
+        let copied = copy.copied_ix == Some(copy_ix);
+        let handler = copy.handler.clone();
+        let text: SharedString = text.into();
+        let fade_key = format!("{}-table-copy{copy_ix}", opts.row_key);
+        div()
+            .id(SharedString::from(fade_key.clone()))
+            .h(px(TABLE_FOOTER_HEIGHT))
+            .px(px(6.0))
+            .rounded(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .bg(crate::motion::hover_blend(
+                &fade_key,
+                gpui::transparent_black(),
+                crate::theme::ink(0.08),
+            ))
+            .on_hover(crate::motion::hover_listener(fade_key))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            // Quiet until the table is hovered; the confirmation stays up.
+            .opacity(if copied { 1.0 } else { 0.0 })
+            .group_hover(group.clone(), |style| style.opacity(1.0))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                handler(copy_ix, text.clone(), window, cx);
+            })
+            .child(
+                crate::icons::icon(if copied {
+                    crate::icons::CHECK
+                } else {
+                    crate::icons::COPY
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted),
+            )
+            .child(SharedString::from(if copied { "Copied" } else { label }))
+            .into_any_element()
+    };
+    vec![
+        action(
+            ix,
+            "Copy as Markdown",
+            table_to_markdown(header, rows, align),
+        ),
+        action(
+            ix.wrapping_add(TABLE_CSV_COPY_OFFSET),
+            "Copy as CSV",
+            table_to_csv(header, rows),
+        ),
+    ]
 }
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
@@ -928,18 +1206,30 @@ pub struct FlatText {
     pub code_ranges: Vec<Range<usize>>,
 }
 
-/// Inline-code tint: a text-safe use of the selected accent identity.
+/// Inline code is a neutral chip (T3): full-strength text on the muted fill
+/// with a hairline border. Accent never colors code - it encodes identity,
+/// not content.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
-    theme.code_text
+    theme.text
 }
 pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    theme.code_wash
+    theme.code_chip_fill()
 }
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
+pub fn inline_code_border(theme: &Theme) -> Hsla {
+    theme.border
+}
+/// Chip geometry (paint-only, never in layout): T3's 6px radius on a box that
+/// extends past the glyphs by [`INLINE_CODE_PAD_X`] next to whitespace (T3
+/// pads the run 5.6px, but gpui cannot pad inline text and a wider box eats
+/// the surrounding space character) and only
+/// [`INLINE_CODE_PAD_TIGHT_X`] beside punctuation, so a neighbouring comma or
+/// bracket is not run over by the border. y insets from the line box.
+pub const INLINE_CODE_RADIUS: f32 = 6.0;
 pub const INLINE_CODE_PAD_X: f32 = 2.0;
-pub const INLINE_CODE_INSET_Y: f32 = 2.0;
+pub const INLINE_CODE_PAD_TIGHT_X: f32 = 0.5;
+pub const INLINE_CODE_INSET_Y: f32 = 2.4;
+/// Hairline border width of the chip.
+const INLINE_CODE_BORDER: f32 = 1.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -957,6 +1247,20 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
 /// [`flatten_runs`] with an explicit base weight (table headers are 700 per
 /// zeron's `table.headerWeight`; strong runs never drop below semibold).
 fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
+    flatten_runs_toned(runs, theme, base_weight, Tone::Prose)
+}
+
+fn flatten_runs_toned(
+    runs: &[InlineRun],
+    theme: &Theme,
+    base_weight: FontWeight,
+    tone: Tone,
+) -> FlatText {
+    // Resolved once per block: body copy rides the 80% prose tone, headings
+    // and strong runs keep full text (T3 `text-foreground/80` body with
+    // `contrast-foreground` headings).
+    let prose = theme.prose_text();
+    let strong_prose = tone == Tone::Prose && base_weight.0 >= FontWeight::SEMIBOLD.0;
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
@@ -982,16 +1286,21 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (zeron's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
+        // Links take T3's info blue with no resting underline; the dotted
+        // hover underline is painted by the link overlay.
         let is_link = run.style.link.is_some();
-        // Inline code uses the spectrum's code tone; everything else
-        // stays the monochrome foreground.
+        // Inline code keeps the chip's own tone; everything else rides the
+        // block's tone.
         let color = if run.style.code {
             inline_code_text(theme)
-        } else {
+        } else if is_link {
+            theme.link_text()
+        } else if tone == Tone::Muted {
+            theme.text_muted
+        } else if strong_prose || run.style.bold {
             theme.text
+        } else {
+            prose
         };
         if run.style.code {
             // Merge adjacent code runs into one wash box (like links below).
@@ -1022,11 +1331,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // underlay (`code_wash_underlay`) — a run background here could
             // only be a square box.
             background_color: None,
-            underline: is_link.then_some(UnderlineStyle {
-                color: Some(theme.text_muted),
-                thickness: px(1.0),
-                wavy: false,
-            }),
+            underline: None,
             strikethrough: run.style.strikethrough.then_some(gpui::StrikethroughStyle {
                 thickness: px(1.0),
                 color: Some(theme.text_muted),
@@ -1048,6 +1353,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
 fn flatten_cached(
     runs: &[InlineRun],
     base_weight: FontWeight,
+    tone: Tone,
     top_ix: usize,
     ix: usize,
     opts: &RenderOptions,
@@ -1060,10 +1366,10 @@ fn flatten_cached(
             cache
                 .flats
                 .entry((opts.row_key.clone(), top_ix, ix))
-                .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
+                .or_insert_with(|| Rc::new(flatten_runs_toned(runs, theme, base_weight, tone)))
                 .clone()
         }
-        None => Rc::new(flatten_runs_weighted(runs, theme, base_weight)),
+        None => Rc::new(flatten_runs_toned(runs, theme, base_weight, tone)),
     }
 }
 
@@ -1143,19 +1449,33 @@ pub(super) fn flat_text_presented_element(
         .as_ref()
         .map(|original| original.offsets.clone());
     let wash = inline_code_wash(theme);
+    let chip_border = inline_code_border(theme);
+    let chip_text = flat.text.clone();
     let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
             let surface = PAINTING_SURFACE.with(Cell::get);
             for range in &code_ranges {
-                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
+                let rects = range_rects(&layout, range, 0.0, INLINE_CODE_INSET_Y);
+                let last = rects.len().saturating_sub(1);
+                for (part, mut rect) in rects.into_iter().enumerate() {
+                    // Only the chip's outer edges grow: a wrapped chip keeps
+                    // its row ends flush.
+                    if part == 0 {
+                        let pad = chip_edge_pad(&chip_text, range.start, true);
+                        rect.origin.x -= px(pad);
+                        rect.size.width += px(pad);
+                    }
+                    if part == last {
+                        rect.size.width += px(chip_edge_pad(&chip_text, range.end, false));
+                    }
                     window.paint_quad(quad(
                         rect,
                         px(INLINE_CODE_RADIUS),
                         wash,
-                        px(0.0),
-                        gpui::transparent_black(),
+                        px(INLINE_CODE_BORDER),
+                        chip_border,
                         BorderStyle::default(),
                     ));
                 }
@@ -1240,6 +1560,21 @@ pub(super) fn flat_text_presented_element(
         ui: opts.link.clone(),
     }
     .into_any_element()
+}
+
+/// Horizontal chip growth at one outer edge: full padding where the chip sits
+/// beside whitespace or the block edge, tight beside any other character.
+fn chip_edge_pad(text: &str, at: usize, leading: bool) -> f32 {
+    let neighbour = if leading {
+        text[..at].chars().next_back()
+    } else {
+        text[at..].chars().next()
+    };
+    match neighbour {
+        None => INLINE_CODE_PAD_X,
+        Some(c) if c.is_whitespace() => INLINE_CODE_PAD_X,
+        Some(_) => INLINE_CODE_PAD_TIGHT_X,
+    }
 }
 
 /// Selection tint shared with native inputs and the composer.
@@ -1720,6 +2055,31 @@ fn text_element(
     opts: &RenderOptions,
     theme: &Theme,
 ) -> AnyElement {
+    text_element_toned(
+        runs,
+        size,
+        line_height,
+        bold_default,
+        top_ix,
+        ix,
+        opts,
+        theme,
+        Tone::Prose,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_element_toned(
+    runs: &[InlineRun],
+    size: f32,
+    line_height: f32,
+    bold_default: bool,
+    top_ix: usize,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+    tone: Tone,
+) -> AnyElement {
     if let Some(image_ui) = opts.media.as_ref().and_then(|media| media.image.as_ref()) {
         if runs.iter().any(|run| run.style.image.is_some()) {
             let mut elements = Vec::new();
@@ -1727,7 +2087,7 @@ fn text_element(
             for (index, run) in runs.iter().enumerate() {
                 if let Some(image) = &run.style.image {
                     if start < index {
-                        elements.push(text_element(
+                        elements.push(text_element_toned(
                             &runs[start..index],
                             size,
                             line_height,
@@ -1736,6 +2096,7 @@ fn text_element(
                             ix.wrapping_mul(4099).wrapping_add(start + 1000),
                             opts,
                             theme,
+                            tone,
                         ));
                     }
                     elements.push(image_ui(
@@ -1747,7 +2108,7 @@ fn text_element(
                 }
             }
             if start < runs.len() {
-                elements.push(text_element(
+                elements.push(text_element_toned(
                     &runs[start..],
                     size,
                     line_height,
@@ -1756,6 +2117,7 @@ fn text_element(
                     ix.wrapping_mul(4099).wrapping_add(start + 1000),
                     opts,
                     theme,
+                    tone,
                 ));
             }
             return div()
@@ -1776,7 +2138,7 @@ fn text_element(
             .flex()
             .flex_col()
             .children(lines.into_iter().enumerate().map(|(line_ix, text)| {
-                text_element(
+                text_element_toned(
                     &[InlineRun {
                         text,
                         style: style.clone(),
@@ -1788,6 +2150,7 @@ fn text_element(
                     ix.wrapping_mul(4099).wrapping_add(line_ix + 2000),
                     opts,
                     theme,
+                    tone,
                 )
             }))
             .into_any_element();
@@ -1797,7 +2160,7 @@ fn text_element(
     } else {
         FontWeight::NORMAL
     };
-    let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
+    let flat = flatten_cached(runs, weight, tone, top_ix, ix, opts, theme);
     let inner = flat_text_element(&flat, ix, opts, theme);
     let direct_file = opts
         .workspace_root
@@ -2004,7 +2367,7 @@ fn code_icon_action(
     div()
         .id(id)
         .size(px(CODE_ACTION_SIZE))
-        .rounded(px(6.0))
+        .rounded(px(CODE_ACTION_RADIUS))
         .flex()
         .items_center()
         .justify_center()
@@ -2012,7 +2375,7 @@ fn code_icon_action(
         .bg(crate::motion::hover_blend(
             &fade_key,
             gpui::transparent_black(),
-            crate::theme::ink(0.08),
+            theme.control_hover(),
         ))
         .on_hover(crate::motion::hover_listener(fade_key))
         .on_click(move |_, window, cx| {
@@ -2022,7 +2385,7 @@ fn code_icon_action(
         .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label.into())).into())
         .child(
             crate::icons::icon(icon_path)
-                .size(px(13.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.text_muted),
         )
         .into_any_element()
@@ -2042,7 +2405,7 @@ fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyEle
         })
         .child(
             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                .size(px(13.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.warning_muted),
         )
         .into_any_element()
@@ -2063,7 +2426,7 @@ fn code_copy_button(
             .id(SharedString::from(fade_key.clone()))
             .h(px(CODE_ACTION_SIZE))
             .px(px(6.0))
-            .rounded(px(5.0))
+            .rounded(px(CODE_ACTION_RADIUS))
             .flex()
             .flex_row()
             .items_center()
@@ -2072,10 +2435,10 @@ fn code_copy_button(
             .bg(crate::motion::hover_blend(
                 &fade_key,
                 gpui::transparent_black(),
-                crate::theme::ink(0.08),
+                theme.control_hover(),
             ))
             .on_hover(crate::motion::hover_listener(fade_key))
-            .text_size(px(10.5))
+            .text_size(px(11.0))
             .text_color(theme.text_muted)
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
@@ -2087,7 +2450,7 @@ fn code_copy_button(
                 } else {
                     crate::icons::COPY
                 })
-                .size(px(12.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.text_muted),
             )
             .when(copied, |el| el.child(SharedString::from("Copied")))
@@ -2107,20 +2470,20 @@ fn code_block_header(
         div()
             .h(px(CODE_HEADER_HEIGHT))
             .flex_none()
-            .pl(px(CODE_PADDING_X))
-            .pr(px(5.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(crate::theme::ink(0.02))
+            .pt(px(CODE_HEADER_PAD_TOP))
+            .pl(px(CODE_HEADER_PAD_LEFT))
+            .pr(px(CODE_HEADER_PAD_RIGHT))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .child(
+                // T3: the language label is mono 11px at 72% of the code tone.
                 div()
                     .min_w_0()
+                    .font_family(theme.font_mono.clone())
                     .text_size(px(11.0))
-                    .text_color(theme.text_muted)
+                    .text_color(theme.code_foreground().opacity(0.72))
                     .children(language.map(|lang| SharedString::from(lang.to_string()))),
             )
             .child(
@@ -2150,7 +2513,7 @@ fn code_block_frame(
         .flex()
         .flex_col()
         .rounded(px(10.0))
-        .bg(crate::theme::ink(0.035))
+        .bg(theme.code_surface())
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
@@ -2207,7 +2570,13 @@ fn render_code_block_source_with_actions(
                     .unwrap_or(&[]);
                 (
                     SharedString::from(line.to_string()),
-                    runs_for_syntax_line(line, spans, &mono, theme),
+                    runs_for_syntax_line_with_plain(
+                        line,
+                        spans,
+                        &mono,
+                        theme.code_foreground(),
+                        theme,
+                    ),
                 )
             })
             .collect();
@@ -2255,7 +2624,7 @@ fn render_code_block_source_with_actions(
         div()
             .id(SharedString::from(fade_key.clone()))
             .size(px(CODE_ACTION_SIZE))
-            .rounded(px(6.0))
+            .rounded(px(CODE_ACTION_RADIUS))
             .flex()
             .items_center()
             .justify_center()
@@ -2281,7 +2650,7 @@ fn render_code_block_source_with_actions(
             })
             .child(
                 crate::icons::icon(crate::icons::WRAP_TEXT)
-                    .size(px(13.0))
+                    .size(px(CODE_ACTION_ICON))
                     .text_color(theme.text_muted),
             )
     });
@@ -3480,11 +3849,87 @@ mod tests {
         );
         // Adjacent code runs merge into ONE wash box; separated ones don't.
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
-        // Code text is the violet tint; the square run background is gone
-        // (the rounded wash is painted by the canvas underlay instead).
+        // Code text is full-strength text (a neutral chip, never accent); the
+        // square run background is gone (the rounded chip is painted by the
+        // canvas underlay instead). Body copy rides the 80% prose tone.
         assert_eq!(flat.runs[1].color, inline_code_text(&theme));
+        assert_eq!(flat.runs[1].color, theme.text);
+        assert_ne!(flat.runs[1].color, theme.accent);
         assert_eq!(flat.runs[1].background_color, None);
-        assert_eq!(flat.runs[0].color, theme.text);
+        assert_eq!(flat.runs[0].color, theme.prose_text());
+    }
+
+    #[test]
+    fn fence_chrome_follows_t3() {
+        assert_eq!(CODE_TEXT_SIZE, 13.0);
+        assert!((CODE_LINE_HEIGHT - CODE_TEXT_SIZE * 1.375).abs() < 1e-4);
+        assert_eq!((CODE_PADDING_X, CODE_PADDING_Y), (14.4, 12.8));
+        // The header shares the code surface: 6px above a 24px action lane.
+        assert_eq!(CODE_HEADER_HEIGHT, 30.0);
+        assert_eq!(CODE_ACTION_SIZE, 24.0);
+        for theme in [Theme::dark(), Theme::light()] {
+            // Built-in themes carry no code_background role: fences keep
+            // the quiet ink plate, plain code reads as full text.
+            assert_eq!(theme.code_surface(), theme.ink(0.035));
+            assert_eq!(theme.code_foreground(), theme.text);
+        }
+    }
+
+    #[test]
+    fn inline_code_chip_pads_only_beside_whitespace() {
+        assert_eq!(chip_edge_pad("use foo", 4, true), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo and", 3, false), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo", 0, true), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("foo", 3, false), INLINE_CODE_PAD_X);
+        assert_eq!(chip_edge_pad("(foo),", 4, false), INLINE_CODE_PAD_TIGHT_X);
+        assert_eq!(chip_edge_pad("(foo)", 1, true), INLINE_CODE_PAD_TIGHT_X);
+    }
+
+    #[test]
+    fn prose_is_quiet_headings_and_strong_are_full_strength() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let prose = theme.prose_text();
+            assert_ne!(prose, theme.text);
+            // 80% of text over the canvas stays comfortably readable.
+            assert!(crate::theme::contrast_ratio(prose, theme.bg) >= 7.0);
+            let plain = |text: &str, bold: bool| InlineRun {
+                text: text.into(),
+                style: InlineStyle {
+                    bold,
+                    ..Default::default()
+                },
+            };
+            let body = flatten_runs(&[plain("a", false), plain("b", true)], &theme, false);
+            assert_eq!(body.runs[0].color, prose);
+            assert_eq!(body.runs[1].color, theme.text);
+            let heading = flatten_runs(&[plain("h", false)], &theme, true);
+            assert_eq!(heading.runs[0].color, theme.text);
+            let quote = flatten_runs_toned(
+                &[plain("q", false), plain("b", true)],
+                &theme,
+                FontWeight::NORMAL,
+                Tone::Muted,
+            );
+            assert!(quote.runs.iter().all(|run| run.color == theme.text_muted));
+        }
+    }
+
+    #[test]
+    fn headings_open_more_air_than_ordinary_blocks() {
+        let heading = Block::Heading {
+            level: 2,
+            runs: Vec::new(),
+        };
+        let paragraph = Block::Paragraph { runs: Vec::new() };
+        assert_eq!(block_gap_before(&heading), MD_HEADING_TOP_GAP);
+        assert_eq!(block_gap_before(&paragraph), MD_BLOCK_GAP);
+        assert!(MD_HEADING_TOP_GAP > MD_BLOCK_GAP);
+        // T3 scale: 20/18/16/14px at line-height 1.3.
+        for (level, size) in [(1u8, 20.0f32), (2, 18.0), (3, 16.0), (4, 14.0), (6, 14.0)] {
+            let (got, line) = heading_metrics(level);
+            assert_eq!(got, size);
+            assert!((line - size * 1.3).abs() < 0.01, "h{level} line {line}");
+        }
     }
 
     #[test]
@@ -3528,9 +3973,11 @@ mod tests {
         assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
-        // Links stay monochrome (foreground + underline), never accent-tinted.
-        assert_eq!(flat.runs[1].color, theme.text);
-        assert!(flat.runs[1].underline.is_some());
+        // Links take T3's info blue and rest without an underline (the dotted
+        // underline appears on hover); never accent-tinted.
+        assert_eq!(flat.runs[1].color, theme.link_text());
+        assert_ne!(flat.runs[1].color, theme.accent);
+        assert!(flat.runs[1].underline.is_none());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
     }
 
@@ -3554,15 +4001,17 @@ mod tests {
     }
 
     #[test]
-    fn table_header_flattens_at_weight_700() {
+    fn table_header_flattens_at_weight_600() {
         let theme = Theme::dark();
         let runs = vec![InlineRun {
             text: "Header".into(),
             style: InlineStyle::default(),
         }];
         let flat = flatten_runs_weighted(&runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
-        // Strong runs inside a 700 header stay 700 (never drop to semibold).
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+        // Header cells read at full text strength, like headings.
+        assert_eq!(flat.runs[0].color, theme.text);
+        // Strong runs inside a 600 header stay 600 (never drop below it).
         let bold_runs = vec![InlineRun {
             text: "Strong".into(),
             style: InlineStyle {
@@ -3571,7 +4020,42 @@ mod tests {
             },
         }];
         let flat = flatten_runs_weighted(&bold_runs, &theme, TABLE_HEADER_WEIGHT);
-        assert_eq!(flat.runs[0].font.weight, FontWeight::BOLD);
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+    }
+
+    fn cell(text: &str) -> Vec<InlineRun> {
+        vec![InlineRun {
+            text: text.into(),
+            style: InlineStyle::default(),
+        }]
+    }
+
+    #[test]
+    fn table_copies_as_markdown_and_csv() {
+        let header = vec![cell("Name"), cell("Note")];
+        let rows = vec![
+            vec![cell("a|b"), cell("plain")],
+            vec![cell("c"), cell("say \"hi\", ok")],
+        ];
+        let align = [TableAlign::Left, TableAlign::Right];
+        assert_eq!(
+            table_to_markdown(&header, &rows, &align),
+            "| Name | Note |\n| --- | ---: |\n| a\\|b | plain |\n| c | say \"hi\", ok |"
+        );
+        assert_eq!(
+            table_to_csv(&header, &rows),
+            "Name,Note\na|b,plain\nc,\"say \"\"hi\"\", ok\""
+        );
+    }
+
+    #[test]
+    fn table_metrics_follow_the_t3_compact_scale() {
+        assert_eq!(TABLE_TEXT_SIZE, 12.0);
+        assert!((TABLE_LINE_HEIGHT - TABLE_TEXT_SIZE * 1.625).abs() < 0.01);
+        assert!((TABLE_CELL_PADDING_Y - 0.45 * 16.0).abs() < 0.01);
+        assert!((TABLE_HEADER_PADDING_Y - 0.55 * 16.0).abs() < 0.01);
+        let theme = Theme::light();
+        assert_eq!(table_hairline(&theme), theme.border.opacity(0.6));
     }
 
     #[test]

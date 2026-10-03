@@ -122,7 +122,10 @@ pub const fn ui_rems(pixels_at_default: f32) -> Rems {
     rems(pixels_at_default / 16.0)
 }
 
-pub const CODE_FONT_SIZE_DEFAULT: f32 = 12.5;
+/// T3's fence size (`--font-size-code`), shared by diffs and editors.
+pub const CODE_FONT_SIZE_DEFAULT: f32 = 13.0;
+/// Installed-only: never bundle the proprietary face or select it when absent.
+pub const ANTHROPIC_SANS: &str = "Anthropic Sans Variable";
 pub const TERMINAL_FONT_SIZE_DEFAULT: f32 = 13.0;
 pub const FONT_SIZE_MIN: f32 = 8.0;
 pub const FONT_SIZE_MAX: f32 = 32.0;
@@ -699,6 +702,46 @@ pub fn set_font_size(size: UiFontSize, window: &mut Window, cx: &mut App) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Device-dependent probe, deliberately excluded from portable CI. Run in
+    /// isolation on a Mac with the user's installed font, not simulated GPUI.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires installed Anthropic Sans and isolated native CoreText"]
+    fn native_anthropic_variable_weights() {
+        let platform = gpui_platform::current_platform(true);
+        let text = platform.text_system();
+        assert!(
+            text.all_font_names()
+                .iter()
+                .any(|name| name == ANTHROPIC_SANS)
+        );
+        assert!(installed_families_with_latin_metrics().contains_key(ANTHROPIC_SANS));
+        let mut ids = Vec::new();
+        for weight in [
+            gpui::FontWeight::NORMAL,
+            gpui::FontWeight::MEDIUM,
+            gpui::FontWeight::SEMIBOLD,
+        ] {
+            let mut font = gpui::font(ANTHROPIC_SANS);
+            font.weight = weight;
+            let id = text
+                .font_id(&font)
+                .expect("native family resolves without fallback");
+            let glyph = text.glyph_for_char(id, 'm').unwrap();
+            eprintln!(
+                "{ANTHROPIC_SANS} {}: {id:?}, m advance {:?}",
+                weight.0,
+                text.advance(id, glyph).unwrap()
+            );
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1], "NORMAL and MEDIUM resolve to the same face");
+        assert_ne!(
+            ids[1], ids[2],
+            "MEDIUM and SEMIBOLD resolve to the same face"
+        );
+    }
 
     #[test]
     fn wire_values_round_trip_and_unknown_falls_back() {

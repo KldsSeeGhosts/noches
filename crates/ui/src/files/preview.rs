@@ -112,9 +112,7 @@ struct TreeSidebarMotion {
 impl TreeSidebarMotion {
     fn sample(&mut self, visible: bool, now: Instant, reduced: bool) -> (f32, bool) {
         let end = f32::from(visible);
-        let duration = crate::motion::RESIZE
-            .total()
-            .mul_f32(crate::motion::speed_scale());
+        let duration = crate::motion::RESIZE.wall();
         // Layout and file activation changes are immediate. Only the toggle
         // action starts a transition through animate_to.
         if reduced || self.target != Some(visible) {
@@ -664,20 +662,12 @@ pub(super) struct FileEditorTooltip {
 
 impl Render for FileEditorTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let card = div()
-            .max_w(px(360.0))
-            .px(px(9.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::popover::surface_bg(theme))
-            .font_family(theme.font_sans.clone())
-            .text_size(px(10.5))
-            .text_color(theme.text_muted)
-            .child(self.text.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        let theme = &Theme::of(cx).for_popup();
+        crate::tooltip::frost(
+            crate::tooltip::surface(theme)
+                .max_w(px(360.0))
+                .child(self.text.clone()),
+        )
     }
 }
 

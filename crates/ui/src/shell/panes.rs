@@ -225,12 +225,14 @@ impl Shell {
             self.sidebar_now(),
             10.0,
         );
+        let header_rename = self.header_rename();
         let snap = Self::workspace_snapshot(
             &self.workspace,
             &self.state,
             action_control,
             project_badges,
             leading_inset,
+            header_rename,
             cx,
         );
         // WS4: the active drag's preview, converted to outlet-relative space.
@@ -287,7 +289,7 @@ impl Shell {
         let Some(pane) = self.workspace.focused_pane() else {
             return Empty.into_any_element();
         };
-        let (title, chat_id, meta, mark, badge) = {
+        let (title, chat_id, space_id, meta, mark, badge) = {
             let state = self.state.read(cx);
             let row = state.selected_chat_row();
             let title = row
@@ -295,6 +297,7 @@ impl Shell {
                 .map(|title| SharedString::from(transcript::single_line(&title)))
                 .unwrap_or_else(|| SharedString::from("New session"));
             let chat_id = row.map(|chat| chat.id.clone());
+            let space_id = row.and_then(|chat| chat.space_id.clone());
             let meta = pane_meta(chat_id.as_deref(), state);
             let composer_harness = self
                 .composer
@@ -305,7 +308,7 @@ impl Shell {
             let mark = header_mark(row, PaneMode::Chat, None, composer_harness);
             let badge = row
                 .map(|chat| ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat)));
-            (title, chat_id, meta, mark, badge)
+            (title, chat_id, space_id, meta, mark, badge)
         };
         let has_selection = chat_id.is_some();
         let badge = badge.map(|badge| self.render_project_icon(badge, 14.0, false, cx));
@@ -319,6 +322,11 @@ impl Shell {
             mark,
             &meta,
             badge,
+            chat_id.as_ref().map(|id| chrome::HeaderChat {
+                chat_id: id.clone(),
+                space_id,
+                rename: self.header_rename_input_for(id),
+            }),
             false,
             // The legacy route has one pane and it is always the active one.
             true,
@@ -655,6 +663,8 @@ impl Shell {
         action_control: Option<AnyElement>,
         project_badges: Rc<RefCell<BTreeMap<PaneId, AnyElement>>>,
         leading_inset: f32,
+        // The chat whose title is being renamed in a pane header, and its editor.
+        header_rename: Option<(String, Entity<crate::composer::ComposerInput>)>,
         cx: &App,
     ) -> WorkspaceSnap {
         let layout = &workspace.layout;
@@ -761,6 +771,16 @@ impl Shell {
                                     leading_inset: (top_left_pane == Some(*pane_id))
                                         .then_some(leading_inset)
                                         .unwrap_or(0.0),
+                                    header_chat: chat.map(|chat| {
+                                        chrome::HeaderChat {
+                                            chat_id: chat.id.clone(),
+                                            space_id: chat.space_id.clone(),
+                                            rename: header_rename
+                                                .as_ref()
+                                                .filter(|(id, _)| *id == chat.id)
+                                                .map(|(_, input)| input.clone()),
+                                        }
+                                    }),
                                     transcript: surface
                                         .and_then(|surface| surface.transcript.clone()),
                                     composer: surface.map(|surface| surface.composer.clone()),
@@ -920,9 +940,10 @@ impl Shell {
     /// Hover fades for a divider (rendered from `pane/render.rs`, which
     /// cannot see Shell's private fields): suppressed while any divider drag
     /// is live so the strip never re-fades mid-drag.
-    pub(crate) fn note_divider_hover(&mut self, key: &str, hovered: bool) {
+    pub(crate) fn note_divider_hover(&mut self, key: &str, hovered: bool, cx: &mut Context<Self>) {
         if !self.divider_dragging {
-            crate::motion::set_hover(key, hovered, self.reduced_motion);
+            crate::motion::set_hover_owned(cx.entity_id(), key, hovered, self.reduced_motion);
+            cx.notify();
         }
     }
 

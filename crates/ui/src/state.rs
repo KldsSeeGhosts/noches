@@ -868,16 +868,18 @@ pub struct AppState {
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
     /// First-observation finish times for terminal subagents whose doc is
-    /// not loaded - `{chat_id}/{part_id}` -> epoch millis. The selector
-    /// (`crate::subagents`) stamps it the frame a terminal status lands, but
+    /// not loaded - `{chat_id}/{part_id}` -> epoch millis. Doc update handling
+    /// stamps it when a terminal status lands, but
     /// only for keys this session earlier observed ACTIVE - after a restart
     /// the real finish time is lost and no duration should be guessed.
-    pub(crate) subagent_finished_obs: std::cell::RefCell<HashMap<String, i64>>,
+    pub(crate) subagent_finished_obs: HashMap<String, i64>,
     /// Subagent keys (`{chat_id}/{part_id}`) this app session has observed
     /// in an active phase. Memory-only - cleared on restart, which is what
     /// keeps `subagent_finished_obs` from stamping bogus post-restart
     /// finish times.
-    pub(crate) subagent_active_obs: std::cell::RefCell<std::collections::HashSet<String>>,
+    pub(crate) subagent_active_obs: HashSet<String>,
+    pub(crate) subagent_presentations: HashMap<String, Arc<crate::subagents::SubagentPresentation>>,
+    pub(crate) subagent_parents: HashMap<String, HashSet<String>>,
     /// Pending-message queues keyed by chat id for pane-fixed composers.
     /// Independent of `selected_chat`: a pane keeps reading its own queue
     /// while another chat is selected.
@@ -994,8 +996,10 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
-            subagent_finished_obs: std::cell::RefCell::new(HashMap::new()),
-            subagent_active_obs: std::cell::RefCell::new(std::collections::HashSet::new()),
+            subagent_finished_obs: HashMap::new(),
+            subagent_active_obs: HashSet::new(),
+            subagent_presentations: HashMap::new(),
+            subagent_parents: HashMap::new(),
             pane_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
             terminal_panels: HashMap::new(),
@@ -1219,6 +1223,7 @@ impl AppState {
             self.queue.clear();
             self.queue_task = None;
         }
+        self.prune_subagent_presentations();
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
@@ -1548,6 +1553,9 @@ impl AppState {
         self.transcript = entries;
         self.transcript_replayed = true;
         self.ack_pending_send_from_transcript();
+        if let Some(chat_id) = self.selected_chat.clone() {
+            self.refresh_subagents(&chat_id);
+        }
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -1572,6 +1580,9 @@ impl AppState {
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
         self.ack_pending_send_from_transcript();
+        if let Some(chat_id) = self.selected_chat.clone() {
+            self.refresh_subagents(&chat_id);
+        }
         Ok(())
     }
 
@@ -1664,6 +1675,15 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn subagent_source_retained(&self, doc_id: &str) -> bool {
+        self.selected_chat.as_deref() == Some(doc_id)
+            || self.sub_transcripts.contains_key(doc_id)
+            || self
+                .transcript_cache
+                .iter()
+                .any(|cached| cached.chat_id == doc_id)
+    }
+
     /// A pane-fixed chat's pending-message queue (empty until its watch's
     /// first frame lands, or while unwatched).
     pub(crate) fn pane_queue(&self, chat_id: &str) -> &[zeron_doc::QueuedMessage] {
@@ -1696,6 +1716,8 @@ impl AppState {
         self.sub_transcripts.remove(doc_id);
         self.prepared_transcripts.remove(doc_id);
         self.transcript_baselines.remove(doc_id);
+        self.refresh_subagents(doc_id);
+        self.prune_subagent_presentations();
     }
 
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
@@ -1708,7 +1730,8 @@ impl AppState {
             doc_id.clone(),
             Arc::new(zeron_doc::TranscriptBaseline::capture(&entries)),
         );
-        self.sub_transcripts.insert(doc_id, entries);
+        self.sub_transcripts.insert(doc_id.clone(), entries);
+        self.refresh_subagents(&doc_id);
     }
 
     pub(crate) fn set_prepared_subagent_snapshot(
@@ -1722,7 +1745,8 @@ impl AppState {
         self.transcript_baselines
             .insert(doc_id.clone(), prepared.navigation_baseline.clone());
         self.prepared_transcripts.insert(doc_id.clone(), prepared);
-        self.sub_transcripts.insert(doc_id, entries);
+        self.sub_transcripts.insert(doc_id.clone(), entries);
+        self.refresh_subagents(&doc_id);
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -2267,6 +2291,10 @@ impl AppState {
         self.transcript_baselines.clear();
         self.transcript_cache.clear();
         self.prepared_transcripts.clear();
+        self.subagent_presentations.clear();
+        self.subagent_parents.clear();
+        self.subagent_active_obs.clear();
+        self.subagent_finished_obs.clear();
         self.context_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
@@ -2654,7 +2682,11 @@ impl AppState {
             self.context_usage = cached.context_usage;
             self.transcript_replayed = true;
         }
+        if let Some(chat_id) = self.selected_chat.clone() {
+            self.refresh_subagents(&chat_id);
+        }
         self.transcript_task = None;
+        self.prune_subagent_presentations();
         self.queue.clear();
         self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
@@ -3454,6 +3486,7 @@ fn spawn_subagent_watch(
                                     .transcript_baselines
                                     .insert(doc_id.clone(), Arc::new(baseline));
                             }
+                            state.refresh_subagents(&doc_id);
                         }
                         if text_only && !desync {
                             cx.emit(TranscriptTextChanged {

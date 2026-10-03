@@ -302,6 +302,9 @@ pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 pub const EASE_OUT_QUINT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
 /// Sidebar resort glide (used from M3b).
 pub const EASE_RESORT: CubicBezier = EASE_OUT_QUINT;
+/// T3's drawer curve, CSS `cubic-bezier(0.32, 0.72, 0, 1)`: fast out of the
+/// gate, long soft landing. Panels (sidebar, right pane, disclosures) ride it.
+pub const EASE_DRAWER: CubicBezier = CubicBezier::new(0.32, 0.72, 0.0, 1.0);
 /// CSS `ease-in-out` — the transcript scroll glide (browser smooth-scroll
 /// shape: gentle start, cruise, gentle landing).
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
@@ -319,6 +322,10 @@ pub struct MotionSpec {
     pub duration_ms: u64,
     pub delay_ms: u64,
     pub curve: CubicBezier,
+    /// Panel-class timelines (sidebar, right pane, terminal and disclosure
+    /// open/close) follow the user's panel-animation duration; everything else
+    /// (popovers, hover fades, morphs) keeps its own smooth timing.
+    pub panel: bool,
 }
 
 impl MotionSpec {
@@ -327,7 +334,15 @@ impl MotionSpec {
             duration_ms,
             delay_ms: 0,
             curve,
+            panel: false,
         }
+    }
+
+    /// Mark this spec panel-class: its wall-clock span scales with the
+    /// panel-animation setting (see [`panel_animation_ms`]).
+    pub const fn panel(mut self) -> Self {
+        self.panel = true;
+        self
     }
 
     pub const fn with_delay(mut self, delay_ms: u64) -> Self {
@@ -352,11 +367,37 @@ impl MotionSpec {
         self.curve.eval(t.clamp(0.0, 1.0))
     }
 
+    /// Real-time span of the whole timeline: [`total`](Self::total) scaled by
+    /// the [`speed_scale`] measurement knob and, for panel-class specs, the
+    /// user's panel-animation duration. Never zero for a non-empty spec - a
+    /// manual tween divides elapsed time by this, and a 1ms floor makes
+    /// "animations off" a one-frame snap instead of a NaN.
+    pub fn wall(&self) -> Duration {
+        self.wall_at(panel_animation_ms())
+    }
+
+    /// [`wall`](Self::wall) for an explicit panel-animation setting (pure, so
+    /// it is testable without touching the process-wide value).
+    fn wall_at(&self, panel_ms: u16) -> Duration {
+        let total = self.total();
+        let mut scale = speed_scale();
+        if self.panel {
+            scale *= f32::from(panel_ms.min(PANEL_ANIMATION_MAX_MS)) / PANEL_ANIMATION_REFERENCE_MS;
+        }
+        let wall = total.mul_f32(scale);
+        if total > Duration::ZERO && wall < MIN_WALL {
+            MIN_WALL
+        } else {
+            wall
+        }
+    }
+
     /// A oneshot gpui [`Animation`] for this spec (delay folded in).
-    /// Wall-clock span honors [`speed_scale`] (measurement knob).
+    /// Wall-clock span honors [`speed_scale`] (measurement knob) and, for
+    /// panel-class specs, the panel-animation setting.
     pub fn animation(&self) -> Animation {
         let spec = *self;
-        Animation::new(spec.total().mul_f32(speed_scale())).with_easing(move |d| spec.progress(d))
+        Animation::new(spec.wall()).with_easing(move |d| spec.progress(d))
     }
 
     /// A repeating gpui [`Animation`] with linear easing over the raw period —
@@ -370,6 +411,15 @@ impl MotionSpec {
 pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
 /// Quick fade: 0.15s.
 pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+/// T3 `live-tool-shine`: the active tool label's highlight crosses the text in
+/// 2.2s (linear in time; Noches interpolates smoothly where T3 steps 30 times).
+pub const TOOL_SHIMMER_PERIOD: std::time::Duration = std::time::Duration::from_millis(2_200);
+/// Width of the shimmer crest in px - ABSOLUTE like T3's `4.5rem` gradient
+/// layer, not relative to the label, so a short and a long label sweep alike.
+pub const TOOL_SHIMMER_CREST_PX: f32 = 72.0;
+/// Transcript meta strip (timestamp, copy): T3's `transition-opacity
+/// duration-200` on message hover.
+pub const FADE_META: MotionSpec = MotionSpec::new(200, EASE_TAILWIND);
 /// Popover-in: 0.14s (scale 0.96 approximated, translateY −2).
 pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
 /// Popover-out: 0.1s — quicker than the entrance (exits should get out of the
@@ -380,11 +430,22 @@ pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
 pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
-pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
+pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_DRAWER).panel();
+/// Composer compact <-> expanded morph: the authored 180ms ease-out, kept off
+/// the panel-animation setting (the composer is not a panel).
+pub const FLIP: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Browser page-load bar: a long, front-loaded creep toward ~the end that the
+/// finished load cuts short (T3 `cubic-bezier(.1,.5,.2,1)` over 5.3s).
+pub const PAGE_LOAD: MotionSpec = MotionSpec::new(5300, CubicBezier::new(0.1, 0.5, 0.2, 1.0));
+/// The context ring's stroke easing when the usage changes.
+pub const RING_STROKE: MotionSpec = MotionSpec::new(500, EASE_OUT);
+/// Compact control morphs (the history search field): the same 200ms ease-out
+/// the old panel tween used, independent of the panel-animation setting.
+pub const MORPH: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
 pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
 /// Diff-pane per-file collapse: 180ms height (§1.11).
-pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_DRAWER).panel();
 /// Reversible new-thread ↔ session handoff. The shared composer moves and
 /// morphs on a fast-starting, soft-landing curve while the canvas/transcript
 /// crossfade is staged around it. Slightly longer than a utility transition,
@@ -526,6 +587,14 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, FADE_QUICK.animation(), |el, t| el.opacity(t))
+}
+
+/// Opacity-only fade over [`FADE_META`].
+pub fn fade_meta<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, FADE_META.animation(), |el, t| el.opacity(t))
 }
 
 /// Popover entrance: fade + translateY −2→0 over [`MENU_IN`].
@@ -727,10 +796,84 @@ impl HoverFades {
         });
         active
     }
+
+    fn snap_to_targets(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.origin = entry.target;
+        }
+    }
 }
 
 thread_local! {
     static HOVER_FADES: RefCell<HoverFades> = RefCell::new(HoverFades::default());
+    static OWNED_HOVER_FADES: RefCell<HashMap<EntityId, HoverFades>> = RefCell::new(HashMap::new());
+}
+
+/// Drop hover state with its render owner, including a hovered element that
+/// unmounts without receiving a leave event.
+pub fn init_hover_owner<V: 'static>(cx: &mut gpui::Context<V>) {
+    let owner = cx.entity_id();
+    cx.on_release(move |_, _| {
+        clear_hover_owner(owner);
+    })
+    .detach();
+}
+
+/// Reset retained surfaces when their content unmounts or starts a fresh open.
+/// A hovered element can disappear without ever receiving its leave event.
+pub fn clear_hover_owner(owner: EntityId) {
+    OWNED_HOVER_FADES.with(|fades| fades.borrow_mut().remove(&owner));
+}
+
+pub fn set_hover_owned(owner: EntityId, key: &str, hovered: bool, reduced: bool) {
+    OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .entry(owner)
+            .or_default()
+            .set_at(key, hovered, reduced, Instant::now());
+    });
+}
+
+pub fn hover_t_owned(owner: EntityId, key: &str) -> f32 {
+    OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .get_mut(&owner)
+            .map(|fades| fades.value_at(key, Instant::now()))
+            .unwrap_or(0.0)
+    })
+}
+
+pub fn hover_blend_owned(owner: EntityId, key: &str, from: Hsla, to: Hsla) -> Hsla {
+    mix(from, to, hover_t_owned(owner, key))
+}
+
+/// Event dispatch invalidates only the owner. Draw-phase scheduling belongs
+/// to `drive_hover_owner`, never to this callback or the window root.
+pub fn hover_listener_owned(
+    owner: EntityId,
+    key: impl Into<SharedString>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let key = key.into();
+    move |hovered, _, cx| {
+        set_hover_owned(owner, &key, *hovered, reduced_motion(cx));
+        cx.notify(owner);
+    }
+}
+
+/// Call after the owner's hover reads, once per render. Each owner has its own
+/// liveness clock, so rendering one window cannot prune another window's fades.
+pub fn drive_hover_owner(owner: EntityId, window: &mut Window) {
+    let active = OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .get_mut(&owner)
+            .is_some_and(|fades| fades.tick_at(Instant::now()))
+    });
+    if active {
+        window.request_animation_frame();
+    }
 }
 
 /// Hover progress (0..1) for `key` this frame.
@@ -803,6 +946,32 @@ pub fn hover_blend(key: &str, rest: Hsla, hover: Hsla) -> Hsla {
 // Reduced motion
 // ---------------------------------------------------------------------------
 
+const MIN_WALL: Duration = Duration::from_millis(1);
+
+/// Upper bound of the panel-animation setting.
+pub const PANEL_ANIMATION_MAX_MS: u16 = 400;
+/// The duration the panel specs were authored at: a setting of 200 reproduces
+/// their catalog timings exactly.
+const PANEL_ANIMATION_REFERENCE_MS: f32 = 200.0;
+/// Process-wide panel-animation duration. Starts at the reference so code
+/// that never reads settings (tests, embedders) keeps the authored timings;
+/// the app overwrites it from settings at startup.
+static PANEL_ANIMATION_MS: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(PANEL_ANIMATION_REFERENCE_MS as u16);
+
+/// Set the panel open/close duration in milliseconds (0 = instant, capped at
+/// [`PANEL_ANIMATION_MAX_MS`]). T3 ships 0 by default.
+pub fn set_panel_animation_ms(ms: u16) {
+    PANEL_ANIMATION_MS.store(
+        ms.min(PANEL_ANIMATION_MAX_MS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn panel_animation_ms() -> u16 {
+    PANEL_ANIMATION_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Dev/measurement knob (`ZERON_MOTION_SCALE`, default 1): stretches every
 /// catalog timeline by this factor — e.g. `ZERON_MOTION_SCALE=10` slows the
 /// 200ms pane tweens to 2s so screenshot bursts can sample the geometry
@@ -822,6 +991,14 @@ pub fn speed_scale() -> f32 {
 /// Global reduced-motion flag. gpui snaps every `with_animation` element when
 /// set (end state for oneshots, rest state for loops) and schedules no frames.
 pub fn set_reduced_motion(cx: &mut App, reduced: bool) {
+    if reduced {
+        HOVER_FADES.with(|fades| fades.borrow_mut().snap_to_targets());
+        OWNED_HOVER_FADES.with(|fades| {
+            for fades in fades.borrow_mut().values_mut() {
+                fades.snap_to_targets();
+            }
+        });
+    }
     cx.set_reduce_motion(reduced);
 }
 
@@ -935,6 +1112,65 @@ mod tests {
 
     use super::*;
 
+    #[gpui::test]
+    fn owned_hover_isolates_windows_and_reduced_motion(cx: &mut gpui::TestAppContext) {
+        struct Owner;
+        impl gpui::Render for Owner {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                gpui::div()
+            }
+        }
+        let first = cx.add_window(|_, cx| {
+            init_hover_owner(cx);
+            Owner
+        });
+        let second = cx.add_window(|_, cx| {
+            init_hover_owner(cx);
+            Owner
+        });
+        let first_id = cx.update(|cx| first.entity(cx).unwrap().entity_id());
+        let second_id = cx.update(|cx| second.entity(cx).unwrap().entity_id());
+        let second_notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = second_notifications.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&second.entity(cx).unwrap(), move |_, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        cx.update(|cx| set_reduced_motion(cx, true));
+        first
+            .update(cx, |_, window, cx| {
+                hover_listener_owned(first_id, "same-control")(&true, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(hover_t_owned(first_id, "same-control"), 1.0);
+        assert_eq!(hover_t_owned(second_id, "same-control"), 0.0);
+        assert_eq!(second_notifications.get(), 0);
+        set_hover_owned(second_id, "same-control", true, true);
+        // One owner's frame bookkeeping never ages another owner's entries.
+        OWNED_HOVER_FADES.with(|fades| {
+            let mut fades = fades.borrow_mut();
+            assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
+            assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
+        });
+        assert_eq!(hover_t_owned(second_id, "same-control"), 1.0);
+        first
+            .update(cx, |_, window, cx| {
+                hover_listener_owned(first_id, "same-control")(&false, window, cx);
+            })
+            .unwrap();
+        assert_eq!(hover_t_owned(first_id, "same-control"), 0.0);
+        cx.update(|cx| set_reduced_motion(cx, false));
+        set_hover_owned(first_id, "same-control", true, false);
+        cx.update(|cx| set_reduced_motion(cx, true));
+        assert_eq!(
+            hover_t_owned(first_id, "same-control"),
+            1.0,
+            "enabling reduced motion settles an in-flight fade"
+        );
+    }
+
     fn assert_close(actual: f32, expected: f32, tol: f32, ctx: &str) {
         assert!(
             (actual - expected).abs() <= tol,
@@ -996,6 +1232,23 @@ mod tests {
                 assert!(y >= last - 1e-4, "monotonicity violated at {i}");
                 last = y;
             }
+        }
+    }
+
+    #[test]
+    fn panel_specs_follow_the_setting_and_others_do_not() {
+        let scale = speed_scale();
+        // 200 reproduces the authored timing; 400 doubles it.
+        assert_eq!(RESIZE.wall_at(200), RESIZE.total().mul_f32(scale));
+        assert_eq!(RESIZE.wall_at(400), RESIZE.total().mul_f32(2.0 * scale));
+        // Off is a 1ms snap, never zero (manual tweens divide by it).
+        assert_eq!(RESIZE.wall_at(0), Duration::from_millis(1));
+        assert!(COLLAPSE.wall_at(0) > Duration::ZERO);
+        // The setting is capped.
+        assert_eq!(RESIZE.wall_at(9_999), RESIZE.wall_at(PANEL_ANIMATION_MAX_MS));
+        // Popovers, dialogs and hover fades ignore it.
+        for spec in [MENU_IN, MENU_OUT, DIALOG_IN, HOVER_FADE, MORPH] {
+            assert_eq!(spec.wall_at(0), spec.wall_at(400));
         }
     }
 

@@ -130,8 +130,17 @@ pub(crate) fn ring_chip(
     let track = theme.text_faint.opacity(0.25);
     let ring = canvas(
         |_, _, _| (),
-        move |bounds, _, window, _| {
+        move |bounds, _, window, cx| {
             let center = bounds.center();
+            // Ease the stroke to its new value instead of jumping.
+            let (fraction, animating) = ring_tween(
+                (id, f32::from(bounds.origin.x) as i32, f32::from(bounds.origin.y) as i32),
+                fraction,
+                cx.reduce_motion(),
+            );
+            if animating {
+                window.request_animation_frame();
+            }
             let mut arc_path = |fraction: f32, color| {
                 if fraction <= 0.0 {
                     return;
@@ -176,6 +185,55 @@ pub(crate) fn ring_chip(
         .hover(|s| s.bg(crate::theme::ink(0.05)))
         .child(ring)
         .child(SharedString::from(label))
+}
+
+/// One ring's easing state. Keyed by the ring's id plus its painted origin so
+/// two splits showing different chats never fight over one tween.
+#[derive(Clone, Copy)]
+struct RingTween {
+    from: f32,
+    to: f32,
+    started: std::time::Instant,
+}
+
+thread_local! {
+    static RING_TWEENS: std::cell::RefCell<std::collections::HashMap<(&'static str, i32, i32), RingTween>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The fraction to paint this frame for `target`, and whether a tween is still
+/// running (the caller keeps frames coming). A first paint, a reduced-motion
+/// session and a settled ring all paint `target` exactly.
+fn ring_tween(key: (&'static str, i32, i32), target: f32, reduced: bool) -> (f32, bool) {
+    RING_TWEENS.with(|tweens| {
+        let mut tweens = tweens.borrow_mut();
+        let now = std::time::Instant::now();
+        let Some(tween) = tweens.get_mut(&key) else {
+            tweens.insert(key, RingTween { from: target, to: target, started: now });
+            return (target, false);
+        };
+        if reduced {
+            *tween = RingTween { from: target, to: target, started: now };
+            return (target, false);
+        }
+        let total = crate::motion::RING_STROKE.wall().as_secs_f32();
+        let progress = |tween: &RingTween| {
+            crate::motion::RING_STROKE.progress(
+                (now.saturating_duration_since(tween.started).as_secs_f32() / total).min(1.0),
+            )
+        };
+        if (tween.to - target).abs() > 1e-4 {
+            let shown = crate::motion::lerp(tween.from, tween.to, progress(tween));
+            *tween = RingTween { from: shown, to: target, started: now };
+        }
+        let raw = now.saturating_duration_since(tween.started).as_secs_f32() / total;
+        // A first paint (from == to) has nothing to ease; don't hold frames.
+        if raw >= 1.0 || (tween.from - tween.to).abs() <= 1e-4 {
+            (tween.to, false)
+        } else {
+            (crate::motion::lerp(tween.from, tween.to, progress(tween)), true)
+        }
+    })
 }
 
 /// The context popover card's content, opened from [`chip`].
@@ -343,6 +401,20 @@ fn render_card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_paints_its_first_value_then_eases_to_a_new_one() {
+        let key = ("ring-test", 1, 2);
+        // First paint and an unchanged value: exactly the target, no tween.
+        assert_eq!(ring_tween(key, 0.4, false), (0.4, false));
+        assert_eq!(ring_tween(key, 0.4, false), (0.4, false));
+        // A change starts a tween that has not moved yet and is still running.
+        let (shown, animating) = ring_tween(key, 0.8, false);
+        assert!(animating);
+        assert!((0.4..0.8).contains(&shown), "{shown}");
+        // Reduced motion snaps straight to the target.
+        assert_eq!(ring_tween(key, 0.2, true), (0.2, false));
+    }
 
     #[test]
     fn usage_never_leaks_to_another_pane_or_an_unbound_composer() {

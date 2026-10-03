@@ -26,7 +26,9 @@ pub mod composer;
 mod dictation;
 mod composer_dock;
 mod context_usage;
+pub mod controls;
 pub mod edge_fade;
+pub(crate) mod elevation;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -44,6 +46,7 @@ mod new_thread_background_mask;
 mod notice;
 pub mod notify;
 pub mod pane;
+mod perf_trace;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
@@ -63,7 +66,9 @@ mod todo_panel;
 pub mod theme;
 pub mod theme_library;
 pub mod tool_palette;
+pub mod tooltip;
 pub mod transcript;
+mod transcript_scene;
 pub mod typography;
 mod workspace_links;
 pub mod workspace_layout_store;
@@ -165,6 +170,7 @@ pub fn run_app(config: UiConfig) {
         }
     });
     app.run(move |cx: &mut App| {
+        perf_trace::init(cx);
         gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
@@ -200,6 +206,7 @@ pub fn run_app(config: UiConfig) {
         );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
+        motion::set_panel_animation_ms(ui_settings.panel_animation_ms);
         terminal::panel::init(cx);
         app_menus::init(cx);
         cx.register_url_scheme(zeron_update::identity::slug()).detach();
