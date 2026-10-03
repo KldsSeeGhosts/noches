@@ -607,8 +607,36 @@ struct ModelPresentation {
     groups: std::sync::Arc<Vec<SettingGroup>>,
 }
 
+/// Animation samples belong to this retained surface, not its trigger or the
+/// inline footer. Only picker data changes invalidate it from outside.
+struct ModelPopup {
+    pickers: gpui::WeakEntity<Pickers>,
+    _observe: Subscription,
+}
+
+impl Render for ModelPopup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.pickers
+            .update(cx, |pickers, cx| {
+                if pickers.mounted_kind() != Some(PickerKind::HarnessModel) {
+                    return gpui::Empty.into_any_element();
+                }
+                let content = pickers.render_harness_model_popover(cx);
+                let content = pickers.popover_frame_flush(304.0, content, cx);
+                let closing = pickers.open.closing_since();
+                if pickers.target.chat_id(pickers.state.read(cx)).is_none() {
+                    popover::anchored_menu_below_end("model-popover", content, closing)
+                } else {
+                    popover::anchored_menu_above_end("model-popover", content, closing)
+                }
+            })
+            .unwrap_or_else(|_| gpui::Empty.into_any_element())
+    }
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
+    model_popup: Entity<ModelPopup>,
     /// The chat this instance serves (see [`ChatTarget`]).
     target: ChatTarget,
     config: DraftConfig,
@@ -721,6 +749,11 @@ impl Pickers {
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
         motion::init_hover_owner(cx);
+        let owner = cx.entity();
+        let model_popup = cx.new(|cx| ModelPopup {
+            pickers: owner.downgrade(),
+            _observe: cx.observe(&owner, |_, _, cx| cx.notify()),
+        });
         // Footer popup bodies are still inline in Composer. Their keyboard,
         // scrollbar and load notifications must reach that owner, whereas
         // the independently rendered model surface must never fan out.
@@ -820,6 +853,7 @@ impl Pickers {
         let device_owner = Self::target_device_id(&target, state.read(cx));
         Self {
             state,
+            model_popup,
             target,
             space_owner,
             device_owner,
@@ -5185,28 +5219,6 @@ impl Render for Pickers {
             }
             None => harness_brand_icon(HarnessId::ClaudeCode),
         };
-        // Render the open popover's body first (mutable borrow), then the
-        // chips. Branch/Checkout render in the composer FOOTER row (see
-        // `render_footer`), not here.
-        let closing = self.open.closing_since();
-        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
-            // Footer-row pickers — their popovers mount down there.
-            Some(PickerKind::Branch)
-            | Some(PickerKind::Checkout)
-            | Some(PickerKind::Space)
-            | Some(PickerKind::Device) => None,
-            Some(PickerKind::HarnessModel) => {
-                let content = self.render_harness_model_popover(cx);
-                Some((
-                    PickerKind::HarnessModel,
-                    // Compact single-harness pane (t3 ModelPickerContent
-                    // shrunk to its tabbed layout).
-                    self.popover_frame_flush(304.0, content, cx),
-                ))
-            }
-            None => None,
-        };
-
         // The composer places this model chip beside the attachment button.
         // ONE chip for the whole run identity (user request): monochrome mark
         // + model name, then the joined traits summary ("Medium", "High · 1M
@@ -5247,29 +5259,7 @@ impl Render for Pickers {
             .absolute()
             .inset_0(),
         );
-        let model_chip = if new_chat {
-            if overlay
-                .as_ref()
-                .is_some_and(|(kind, _)| *kind == PickerKind::HarnessModel)
-                && let Some((_, content)) = overlay.take()
-            {
-                model_chip.child(popover::anchored_menu_below_end(
-                    "model-popover",
-                    content,
-                    closing,
-                ))
-            } else {
-                model_chip
-            }
-        } else {
-            attach_overlay_end(
-                model_chip,
-                &mut overlay,
-                PickerKind::HarnessModel,
-                "model-popover",
-                closing,
-            )
-        };
+        let model_chip = model_chip.child(self.model_popup.clone());
         motion::drive_hover_owner(cx.entity_id(), window);
         div()
             .flex()
@@ -5401,6 +5391,25 @@ mod tests {
         assert!(
             events.get() > 1,
             "inline footer menus still notify their owner"
+        );
+    }
+
+    #[gpui::test]
+    fn model_surface_samples_do_not_notify_the_trigger(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = notifications.clone();
+        let _subscription =
+            cx.update(|cx| cx.observe(&pickers, move |_, _| observed.set(observed.get() + 1)));
+        pickers.update(cx, |pickers, cx| {
+            pickers.model_popup.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notifications.get(),
+            0,
+            "popup samples stay on the popup entity"
         );
     }
 
