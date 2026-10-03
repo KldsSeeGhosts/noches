@@ -74,6 +74,8 @@ mod command_palette;
 mod file_mutations;
 mod panes;
 mod project_icon;
+#[cfg(test)]
+mod project_new_chat_tests;
 mod spaces;
 mod tabs;
 mod voice;
@@ -6696,16 +6698,11 @@ impl Shell {
                         .rounded(px(5.0))
                         .hover(|s| s.bg(crate::theme::wash(0.10)))
                         .cursor_pointer()
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| {
-                                SidebarTooltip(if archived {
-                                    "Unarchive session"
-                                } else {
-                                    "Archive session"
-                                })
-                            })
-                            .into()
-                        })
+                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
+                            "Unarchive session"
+                        } else {
+                            "Archive session"
+                        }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();

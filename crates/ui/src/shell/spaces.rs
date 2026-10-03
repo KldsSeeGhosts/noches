@@ -698,9 +698,7 @@ impl Shell {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
         }
-        self.open_new_session(cx);
-        self.state
-            .update(cx, |state, cx| state.select_space(Some(space_id), cx));
+        self.open_new_session_for_project(Some(space_id), cx);
     }
 
     fn begin_sidebar_disclosure_motion(
@@ -1824,6 +1822,10 @@ impl Shell {
                             el.child(
                                 div()
                                     .id(SharedString::from(button_id))
+                                    .debug_selector({
+                                        let space_id = space_id.clone();
+                                        move || format!("sidebar-group-new-session-{space_id}")
+                                    })
                                     .size(px(20.0))
                                     .flex_none()
                                     .flex()
@@ -1833,6 +1835,12 @@ impl Shell {
                                     .cursor_pointer()
                                     .role(gpui::Role::Button)
                                     .aria_label("New session in project")
+                                    .tooltip(crate::settings::widgets::text_tooltip_above(
+                                        "New session in project",
+                                    ))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
                                     .opacity(0.0)
                                     .group_hover(group_name.clone(), |el| el.opacity(1.0))
                                     .hover(|el| el.bg(theme.glass_hover()))
@@ -2140,6 +2148,10 @@ impl Shell {
                         .rounded(px(5.0))
                         .bg(crate::theme::wash(0.10))
                         .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .tooltip(crate::settings::widgets::text_tooltip_above(
+                            "Unarchive session",
+                        ))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.set_chat_archived(restore_id.clone(), false, cx);
