@@ -554,6 +554,16 @@ pub(crate) struct ReturnComposerFocus;
 
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 
+/// Composer owns the inline footer, not the retained model-popup surface.
+/// Animation-frame notifications must stay inside Pickers.
+pub(crate) enum PickerPresentationChanged {
+    Config,
+    Catalog,
+    Footer,
+}
+
+impl gpui::EventEmitter<PickerPresentationChanged> for Pickers {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ModelSetting {
     Reasoning,
@@ -659,9 +669,19 @@ pub struct Pickers {
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
+    _footer_observe: Subscription,
 }
 
 impl Pickers {
+    fn presentation_changed(&self, event: PickerPresentationChanged, cx: &mut Context<Self>) {
+        cx.emit(event);
+        cx.notify();
+    }
+
+    fn popup_changed(&self, cx: &mut Context<Self>) {
+        cx.notify();
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::with_target(state, ChatTarget::Selected, cx)
     }
@@ -675,6 +695,17 @@ impl Pickers {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
+        // Footer popup bodies are still inline in Composer. Their keyboard,
+        // scrollbar and load notifications must reach that owner, whereas
+        // the independently rendered model surface must never fan out.
+        let footer_observe = cx.observe_self(|this, cx| {
+            if this
+                .mounted_kind()
+                .is_some_and(|kind| kind != PickerKind::HarnessModel)
+            {
+                cx.emit(PickerPresentationChanged::Footer);
+            }
+        });
         let search = cx.new(|cx| {
             ComposerInput::with_context("Search…", "PaletteSearch", cx)
                 .with_accessibility_role(gpui::Role::SearchInput)
@@ -702,7 +733,7 @@ impl Pickers {
                         this.model_scroll_base().set_offset(gpui::Point::default());
                     }
                 }
-                cx.notify();
+                this.popup_changed(cx);
             }
             ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted => {
                 this.on_search_submit(cx)
@@ -727,7 +758,7 @@ impl Pickers {
         // restart (stale rows stay visible while the reload runs).
         let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
             this.ensure_harnesses(true, cx);
-            cx.notify();
+            this.presentation_changed(PickerPresentationChanged::Catalog, cx);
         });
         // Dev/testing knob: `ZERON_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
@@ -807,6 +838,7 @@ impl Pickers {
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
+            _footer_observe: footer_observe,
         }
     }
 
@@ -846,7 +878,7 @@ impl Pickers {
             self.models.clear();
             self.catalog_rev += 1;
         }
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     /// Bind a pane-fixed instance to the chat its first send minted: the
@@ -859,7 +891,7 @@ impl Pickers {
         self.switch_error = None;
         self.setting_menu = None;
         self.setting_bounds = None;
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     /// The chat id this instance currently serves (pane composer's bind
@@ -878,7 +910,7 @@ impl Pickers {
             self.switch_error = None;
             self.setting_menu = None;
             self.setting_bounds = None;
-            cx.notify();
+            self.presentation_changed(PickerPresentationChanged::Config, cx);
         }
     }
 
@@ -1151,9 +1183,30 @@ impl Pickers {
         self.setting_bounds = None;
         self.menu_bar = popover::MenuScrollbarState::default();
         if self.open.begin_close() {
-            popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
+            cx.spawn(async move |view, cx| {
+                cx.background_executor()
+                    .timer(
+                        motion::MENU_OUT
+                            .total()
+                            .mul_f32(motion::speed_scale())
+                            .saturating_add(Duration::from_millis(20)),
+                    )
+                    .await;
+                view.update(cx, |pickers, cx| {
+                    let footer = pickers
+                        .mounted_kind()
+                        .is_some_and(|kind| kind != PickerKind::HarnessModel);
+                    pickers.open.finish_close();
+                    if footer {
+                        cx.emit(PickerPresentationChanged::Footer);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         }
-        cx.notify();
+        self.popup_changed(cx);
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -1199,7 +1252,13 @@ impl Pickers {
             cx.notify();
             return;
         }
+        let footer_was_mounted = self
+            .mounted_kind()
+            .is_some_and(|kind| kind != PickerKind::HarnessModel);
         self.open.open(kind);
+        if footer_was_mounted {
+            cx.emit(PickerPresentationChanged::Footer);
+        }
         self.focus_on_mount = true;
         // The plain-div menus (branch / project / device) share one scroll
         // handle; a fresh open starts at the top. The model list resets its
@@ -1302,7 +1361,7 @@ impl Pickers {
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
         }
-        cx.notify();
+        self.popup_changed(cx);
     }
 
     // ---- loads ----
@@ -1367,7 +1426,7 @@ impl Pickers {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 pickers.prefetch_models(false, cx);
-                cx.notify();
+                pickers.presentation_changed(PickerPresentationChanged::Catalog, cx);
             })
             .ok();
         }));
@@ -1513,7 +1572,7 @@ impl Pickers {
         {
             self.active = self.selected_model_index(cx);
         }
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Catalog, cx);
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -1582,7 +1641,7 @@ impl Pickers {
                 {
                     pickers.active = pickers.selected_ref_index(cx);
                 }
-                cx.notify();
+                pickers.presentation_changed(PickerPresentationChanged::Footer, cx);
             })
             .ok();
         }));
@@ -1613,7 +1672,7 @@ impl Pickers {
             return;
         }
         self.animate_close(cx);
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     /// Draft-mode checkout switch: `git checkout` in the SPACE's folder
@@ -1663,11 +1722,11 @@ impl Pickers {
                     }
                     Err(err) => pickers.switch_error = Some(err.to_string()),
                 }
-                cx.notify();
+                pickers.presentation_changed(PickerPresentationChanged::Config, cx);
             })
             .ok();
         }));
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Footer, cx);
     }
 
     fn pick_checkout(&mut self, kind: CheckoutKind, cx: &mut Context<Self>) {
@@ -1683,7 +1742,7 @@ impl Pickers {
         }
         self.config.checkout = kind;
         self.animate_close(cx);
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
@@ -1703,7 +1762,7 @@ impl Pickers {
         self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
@@ -1730,7 +1789,7 @@ impl Pickers {
                 self.save_defaults();
             }
         }
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
@@ -1742,7 +1801,7 @@ impl Pickers {
             self.defaults.reasoning = Some(level);
             self.save_defaults();
         }
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     fn pick_option(
@@ -1778,7 +1837,7 @@ impl Pickers {
             }
             self.save_defaults();
         }
-        cx.notify();
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
     /// Apply `change` to the selected chat's effective config and persist it:
@@ -2613,7 +2672,7 @@ impl Pickers {
                     self.model_scroll
                         .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
                 }
-                cx.notify();
+                self.popup_changed(cx);
                 cx.stop_propagation();
             }
             MenuKey::Enter | MenuKey::ModEnter => {
@@ -4954,9 +5013,9 @@ impl Render for Pickers {
         let engine_missing = self.engine(cx).is_none();
         let catalog_loading =
             matches!(self.harnesses, Loadable::Idle | Loadable::Loading) && !engine_missing;
-        let models_errored = self.effective_harness(cx).is_some_and(|harness| {
-            matches!(self.models.get(&harness), Some(Loadable::Error(_)))
-        });
+        let models_errored = self
+            .effective_harness(cx)
+            .is_some_and(|harness| matches!(self.models.get(&harness), Some(Loadable::Error(_))));
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
             !matches!(
                 self.models.get(&harness),
@@ -5100,6 +5159,57 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn popup_frames_do_not_emit_composer_presentation_events(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let events = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &handle.entity(cx).unwrap(),
+                move |_, _: &PickerPresentationChanged, _| {
+                    observed.set(observed.get() + 1);
+                },
+            )
+        });
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.open_model_menu(window, cx);
+                // The same notification AnimationElement sends on each sample.
+                cx.notify();
+                pickers.dismiss(cx);
+                pickers.open_model_menu(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            events.get(),
+            0,
+            "model motion/dismiss/reopen is popup-owned"
+        );
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.apply_model_catalog(HarnessId::Codex, Loadable::Ready(vec![]), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(events.get(), 1, "catalog changes are semantic");
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.toggle(PickerKind::Checkout, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            events.get() > 1,
+            "inline footer menus still notify their owner"
+        );
+    }
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,

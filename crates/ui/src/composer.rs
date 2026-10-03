@@ -4420,9 +4420,12 @@ impl Composer {
             }
         };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state - a pickers-side notify (refs
-        // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        // by the composer from picker state. Only semantic changes cross
+        // this boundary; model-popup animation samples belong to Pickers.
+        let pickers_observe = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::PickerPresentationChanged, cx| cx.notify(),
+        );
         let picker_focus = cx.subscribe(
             &pickers,
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
