@@ -773,9 +773,19 @@ impl SessionsEngine {
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
         let _admission = self.admit_work()?;
+        let configured = self
+            .inner
+            .doc_host()
+            .and_then(|host| host.workspace().and_then(|ws| ws.chat_config(chat_id)));
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
+            .filter(|h| {
+                configured.as_ref().is_none_or(|config| {
+                    config.runtime_mode == h.runtime_config.runtime_mode
+                        && config.interaction_mode == h.runtime_config.interaction_mode
+                })
+            })
             .map(|h| {
                 (
                     h.run_id.clone(),
@@ -926,6 +936,25 @@ impl SessionsEngine {
         Ok(resolve_permission(
             &pending, &engine_tx, request_id, option_id,
         ))
+    }
+
+    /// Implicit continuations inherit the last actual authority, not a stale
+    /// workspace default. Raising authority requires an explicit Run request.
+    pub(crate) fn recorded_runtime_authority(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<(zeron_proto::RuntimeMode, zeron_proto::InteractionMode)>, EngineError> {
+        if let Some(request) = lock(&self.inner.last_requests).get(chat_id) {
+            return Ok(Some((request.runtime_mode, request.interaction_mode)));
+        }
+        let events = self.inner.journal.replay(chat_id, 0)?;
+        Ok(events.into_iter().rev().find_map(|(_, event)| match event {
+            AgentEvent::RuntimePolicyConfigured {
+                runtime_mode,
+                interaction_mode,
+            } => Some((runtime_mode, interaction_mode)),
+            _ => None,
+        }))
     }
 
     /// Boot recovery: for every journal whose last event is not `Done` (a run died

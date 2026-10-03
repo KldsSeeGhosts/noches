@@ -24,6 +24,10 @@ pinned T3 nightly's `packages/contracts/src/providerPolicy.ts`
 Users can select Supervised, Auto-accept, Auto, or Full access in the composer.
 Mode changes replace warm runtimes; native session resume receives the new
 policy explicitly. Authority is journaled so crash revival does not widen it.
+Explicit steering cannot retain broader authority after a saved mode change.
+Its new-turn fallback and orphan-question continuations inherit the last
+journaled authority, narrowed by the selected modes. Escalation needs an
+explicit Run request, never an implicit question answer or steer fallback.
 Restricted/Plan runs require the explicit `runtime-policy-v1` capability from
 both the local engine and execution host. Old or unknown hosts refuse before
 forwarding or writing a durable command; semver is not evidence of support.

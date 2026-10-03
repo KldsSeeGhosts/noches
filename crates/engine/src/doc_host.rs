@@ -4168,6 +4168,7 @@ impl DocHost {
                 "no live run and no prior run config".into(),
             ));
         };
+        self.apply_saved_runtime_authority(&sessions, chat_id, &mut request)?;
         request.prompt = prompt;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
@@ -5353,6 +5354,7 @@ impl DocHost {
                         Some("no pending input request and no prior run config".into()),
                     ));
                 };
+                self.apply_saved_runtime_authority(sessions, chat_id, &mut request)?;
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
@@ -5419,6 +5421,7 @@ impl DocHost {
                         Some("no live run and no prior run config".into()),
                     ));
                 };
+                self.apply_saved_runtime_authority(sessions, chat_id, &mut request)?;
                 request.prompt = prompt;
                 request.resume = None; // dispatch re-derives the harness session
                 // A reused config must not re-inline the PREVIOUS turn's
@@ -5641,6 +5644,25 @@ impl DocHost {
     /// row — cwd from the row, model/reasoning/options/sandbox from its config
     /// (composer defaults otherwise). `None` without a workspace host or row.
     // (Also the RespondInput dead-run fallback's config source.)
+    fn apply_saved_runtime_authority(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        request: &mut zeron_proto::RunRequest,
+    ) -> Result<(), EngineError> {
+        if let Some((runtime, interaction)) = sessions.recorded_runtime_authority(chat_id)? {
+            request.runtime_mode = runtime;
+            request.interaction_mode = interaction;
+        }
+        if let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) {
+            request.runtime_mode = request.runtime_mode.min(config.runtime_mode);
+            if config.interaction_mode == zeron_proto::InteractionMode::Plan {
+                request.interaction_mode = config.interaction_mode;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn request_from_chat_row(
         &self,
         chat_id: &str,

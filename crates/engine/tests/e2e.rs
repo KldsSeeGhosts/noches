@@ -135,6 +135,151 @@ impl Harness for PermissionHarness {
 }
 
 #[tokio::test]
+async fn saved_mode_change_replaces_the_runtime_instead_of_steering_with_old_authority() {
+    struct AuthorityHarness(Arc<std::sync::Mutex<Vec<RunRequest>>>);
+    #[async_trait]
+    impl Harness for AuthorityHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Authority fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.0.lock().unwrap().push(request);
+            Ok(
+                futures::stream::unfold((controls, true), |(mut controls, first)| async move {
+                    if first {
+                        return Some((Ok(done(DoneStatus::Completed)), (controls, false)));
+                    }
+                    tokio::select! {
+                        _ = controls.interrupt.cancelled() => None,
+                        message = controls.steering.recv() => {
+                            message.map(|_| (Ok(AgentEvent::Steered {
+                                assistant_message_id: None, next_assistant_message_id: None
+                            }), (controls, false)))
+                        }
+                    }
+                })
+                .boxed(),
+            )
+        }
+    }
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(AuthorityHarness(seen.clone())));
+    let mut config = zeron_proto::ChatConfig {
+        harness: HarnessId::Mock,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: zeron_proto::RuntimeMode::FullAccess,
+        interaction_mode: zeron_proto::InteractionMode::Default,
+    };
+    core.workspace
+        .create_chat(
+            CHAT,
+            None,
+            Some(core.workspace.device_id()),
+            Some(config.clone()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("first"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "parked runtime",
+    )
+    .await;
+    config.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+    config.interaction_mode = zeron_proto::InteractionMode::Plan;
+    core.workspace.set_chat_config(CHAT, &config).unwrap();
+    assert_eq!(
+        core.sessions
+            .steer(CHAT, "must not route", None)
+            .await
+            .unwrap(),
+        zeron_engine::SteerOutcome::NotSteerable
+    );
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Steer {
+                prompt: "new policy".into(),
+                message_id: Some("new-policy".into()),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.prompt == "new policy")
+        },
+        "replacement runtime",
+    )
+    .await;
+    let requests = seen.lock().unwrap().clone();
+    let replacement = requests.iter().find(|r| r.prompt == "new policy").unwrap();
+    assert_eq!(replacement.runtime_mode, config.runtime_mode);
+    assert_eq!(replacement.interaction_mode, config.interaction_mode);
+    // A broader (or stale legacy) row is not authority to escalate an
+    // implicit continuation. Only an explicit Run carries that consent.
+    config.runtime_mode = zeron_proto::RuntimeMode::FullAccess;
+    config.interaction_mode = zeron_proto::InteractionMode::Default;
+    core.workspace.set_chat_config(CHAT, &config).unwrap();
+    let command = core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Steer {
+                prompt: "no implicit escalation".into(),
+                message_id: Some("no-escalation".into()),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            command_status(&core, &command)
+                == Some((
+                    SessionCommandStatus::Applied,
+                    Some("queued as new turn".into()),
+                ))
+        },
+        "narrow implicit continuation",
+    )
+    .await;
+    let actual = core.sessions.last_request(CHAT).unwrap();
+    assert_eq!(
+        actual.runtime_mode,
+        zeron_proto::RuntimeMode::ApprovalRequired
+    );
+    assert_eq!(actual.interaction_mode, zeron_proto::InteractionMode::Plan);
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn approval_command_round_trip_sets_awaiting_input_and_resolves_separately() {
     for option in ["allow-once", "allow-session", "deny"] {
         let dir = tempfile::tempdir().unwrap();
