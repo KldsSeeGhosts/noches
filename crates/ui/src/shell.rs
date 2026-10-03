@@ -7577,12 +7577,7 @@ impl Shell {
                     )),
                 )
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "sync-enable-cancel")
                                 .id("sync-enable-cancel")
@@ -7626,12 +7621,7 @@ impl Shell {
                     .into(),
                     (None, None) => "Zeron can switch to your synced workspace now.".into(),
                 };
-                let mut actions = div()
-                    .mt(px(16.0))
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(8.0))
+                let mut actions = popover::dialog_footer(&theme)
                     .child(
                         popover::btn_ghost(&theme, "Later", "sync-switch-later")
                             .id("sync-switch-later")
@@ -7749,12 +7739,8 @@ impl Shell {
                     .child(popover::dialog_title(&theme, "You're all set"))
                     .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
                     .child(
-                        div()
-                            .mt(px(16.0))
-                            .flex()
-                            .flex_row()
-                            .justify_end()
-                            .child(
+                        popover::dialog_footer(&theme)
+.child(
                                 popover::btn_primary(&theme, "Continue")
                                     .id("sync-switch-done")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -7782,12 +7768,7 @@ impl Shell {
                     )
                 })
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Later", "import-failed-dismiss")
                                 .id("import-failed-dismiss")
@@ -7830,12 +7811,7 @@ impl Shell {
                     )
                 })
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Later", "sync-restart-later")
                                 .id("sync-restart-later")
@@ -7864,12 +7840,7 @@ impl Shell {
                     )),
                 )
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "signout-cancel")
                                 .id("signout-cancel")
@@ -8298,12 +8269,7 @@ impl Shell {
                     format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
                 )))
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
                                 .id("delete-chat-cancel")
@@ -8337,12 +8303,7 @@ impl Shell {
                             "Discard all uncommitted changes in this working tree? This can’t be undone.",
                         )))
                         .child(
-                            div()
-                                .mt(px(16.0))
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap(px(8.0))
+                            popover::dialog_footer(&theme)
                                 .child(
                                     popover::btn_ghost(
                                         &theme,
@@ -8369,7 +8330,8 @@ impl Shell {
                     .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
                     .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
                     .child(
-                        div().mt(px(16.0)).flex().justify_end().child(
+                        popover::dialog_footer(&theme)
+.child(
                             popover::btn_primary(&theme, "Close")
                                 .id("discard-working-tree-error-close")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -8391,7 +8353,8 @@ impl Shell {
                         ),
                     )))
                     .child(
-                        div().mt(px(16.0)).flex().justify_end().child(
+                        popover::dialog_footer(&theme)
+.child(
                             popover::btn_primary(&theme, "Close")
                                 .id("discard-working-tree-error-close")
                                 .on_click(cx.listener(|this, _, _, cx| {

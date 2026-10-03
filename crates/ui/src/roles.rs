@@ -135,6 +135,17 @@ pub(crate) fn composer_shadow(theme: &Theme) -> Vec<BoxShadow> {
     }
 }
 
+/// The 1px top highlight filled plates (primary / destructive buttons) carry.
+pub(crate) fn plate_highlight() -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: hsla(0.0, 0.0, 1.0, 0.16),
+        offset: point(px(0.0), px(1.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(0.0),
+        inset: true,
+    }]
+}
+
 /// The send/stop circle: a 1px top highlight plus a tight shadow tinted with
 /// the plate colour so it sits on the surface instead of floating.
 pub(crate) fn send_shadow(plate: Hsla) -> Vec<BoxShadow> {
@@ -156,6 +167,33 @@ pub(crate) fn send_shadow(plate: Hsla) -> Vec<BoxShadow> {
     ]
 }
 
+/// Menu / popover elevation (R5 §2.7): `0 16px 40px -18px black/55`, deeper in
+/// dark so the card still separates from a dark canvas.
+pub(crate) fn menu_shadow(theme: &Theme) -> Vec<BoxShadow> {
+    match theme.appearance {
+        Appearance::Dark => vec![drop(18.0, 44.0, -18.0, 0.80)],
+        Appearance::Light => vec![drop(16.0, 40.0, -18.0, 0.55)],
+    }
+}
+
+/// Dialog elevation (R5 §2.7): a long soft drop plus, in dark, a 1px top
+/// highlight so the plate reads as lit from above.
+pub(crate) fn dialog_shadow(theme: &Theme) -> Vec<BoxShadow> {
+    match theme.appearance {
+        Appearance::Dark => vec![
+            drop(24.0, 72.0, -20.0, 0.90),
+            BoxShadow {
+                color: hsla(0.0, 0.0, 1.0, 0.04),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(0.0),
+                spread_radius: px(0.0),
+                inset: true,
+            },
+        ],
+        Appearance::Light => vec![drop(24.0, 64.0, -24.0, 0.65)],
+    }
+}
+
 /// Tooltip elevation: one soft layer (T3 `shadow-md/5`).
 pub(crate) fn tooltip_shadow(theme: &Theme) -> Vec<BoxShadow> {
     match theme.appearance {
@@ -173,6 +211,8 @@ mod tests {
         for theme in [Theme::dark(), Theme::light()] {
             assert_eq!(tooltip_shadow(&theme).len(), 1);
             assert_eq!(composer_shadow(&theme).len(), 1);
+            assert_eq!(menu_shadow(&theme).len(), 1);
+            assert!(!dialog_shadow(&theme).is_empty());
             assert!(focus_ring(&theme)[0].inset);
         }
     }

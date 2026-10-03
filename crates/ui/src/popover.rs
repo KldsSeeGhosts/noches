@@ -308,6 +308,10 @@ pub const CARD_INSET: f32 = 4.0;
 /// Concentric corners: the row radius follows the card's inset curve.
 pub const MENU_ITEM_RADIUS: f32 = CARD_RADIUS - CARD_INSET;
 pub const PALETTE_ITEM_RADIUS: f32 = 14.0 - CARD_INSET;
+/// Menu rows never shrink below 28px, however small their text (T3 `min-h-7`).
+pub const MENU_ITEM_MIN_HEIGHT: f32 = 28.0;
+/// Dialog corner radius (T3 `dialog-glass`); the frost mask must match.
+pub const DIALOG_RADIUS: f32 = 18.0;
 
 pub fn surface_bg(theme: &Theme) -> gpui::Hsla {
     if theme.is_frost() {
@@ -322,7 +326,9 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border)
         .rounded(px(CARD_RADIUS))
-        .when(!theme.is_frost(), |el| el.shadow_lg())
+        .when(!theme.is_frost(), |el| {
+            el.shadow(crate::roles::menu_shadow(theme))
+        })
         .bg(surface_bg(theme))
         .p(px(CARD_INSET))
         .gap(px(MENU_GAP))
@@ -724,13 +730,13 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 /// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
 /// so the scrim needs explicit dimensions). The frost radius matches
-/// [`dialog_card`]'s 16px rounding.
+/// [`dialog_card`]'s [`DIALOG_RADIUS`] rounding.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    modal_with(id, viewport, card, 16.0, 0.35)
+    modal_with(id, viewport, card, DIALOG_RADIUS, 0.35)
 }
 
 /// [`modal`] with custom rounding for glass palettes. Both use a light
@@ -785,6 +791,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .flex_row()
         .items_center()
         .gap(px(10.0))
+        .min_h(px(MENU_ITEM_MIN_HEIGHT))
         .px(px(8.0))
         .py(px(6.0))
         .rounded(px(MENU_ITEM_RADIUS))
@@ -804,7 +811,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .bg(motion::hover_blend(
                 &fade_key,
                 crate::theme::wash(0.0),
-                crate::theme::card_selected_bg(),
+                crate::roles::control_hover(theme),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -826,7 +833,7 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(crate::theme::card_selected_bg())
+        row.bg(crate::roles::control_hover(theme))
             .text_color(theme.text)
     } else {
         row
@@ -1068,21 +1075,47 @@ pub fn menu_section() -> gpui::Div {
 pub fn dialog_card(theme: &Theme) -> gpui::Div {
     div()
         .w(px(360.0))
-        .p(px(20.0))
-        .rounded(px(16.0))
+        .p(px(DIALOG_PAD))
+        .rounded(px(DIALOG_RADIUS))
         .bg(surface_bg(theme))
         .border_1()
-        .border_color(hairline(0.10))
-        .when(!theme.is_frost(), |el| el.shadow_lg())
+        .border_color(theme.border)
+        .when(!theme.is_frost(), |el| {
+            el.shadow(crate::roles::dialog_shadow(theme))
+        })
         .flex()
         .flex_col()
         .text_color(theme.text)
 }
 
-/// Dialog title: `text-[15px] font-semibold tracking-tight`.
+/// Dialog padding; [`dialog_footer`] bleeds back out by the same amount.
+const DIALOG_PAD: f32 = 24.0;
+
+/// The dialog's action row: a recessed band across the card's bottom edge with
+/// a hairline above it, actions right-aligned (T3 `dialog-footer`). Chain the
+/// buttons as children; it bleeds through [`dialog_card`]'s padding itself.
+pub fn dialog_footer(theme: &Theme) -> gpui::Div {
+    div()
+        .mt(px(20.0))
+        .mx(px(-DIALOG_PAD))
+        .mb(px(-DIALOG_PAD))
+        .px(px(DIALOG_PAD))
+        .py(px(14.0))
+        .rounded_b(px(DIALOG_RADIUS))
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(band())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(px(8.0))
+}
+
+/// Dialog title: 16px semibold.
 pub fn dialog_title(theme: &Theme, title: &str) -> gpui::Div {
     div()
-        .text_size(crate::typography::ui_rems(15.0))
+        .text_size(crate::typography::ui_rems(16.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.text)
         .child(SharedString::from(title.to_string()))
@@ -1126,7 +1159,7 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
-            ink(0.06),
+            crate::roles::control_hover(theme),
         ))
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
@@ -1135,18 +1168,20 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
     btn
 }
 
-/// Primary button (`btnPrimary`): white fill, near-black text.
+/// Primary button (`btnPrimary`): the action plate with a top highlight.
 pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
+    let hover = crate::roles::action_hover(theme);
     div()
         .px(px(12.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(theme.text)
+        .bg(crate::roles::action(theme))
+        .shadow(crate::roles::plate_highlight())
         .text_size(crate::typography::ui_rems(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.on_solid)
+        .text_color(crate::roles::on_action(theme))
         .cursor_pointer()
-        .hover(|s| s.opacity(0.9))
+        .hover(move |s| s.bg(hover))
         .child(SharedString::from(label.to_string()))
 }
 
@@ -1157,6 +1192,7 @@ pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
         .py(px(6.0))
         .rounded(px(8.0))
         .bg(theme.danger_strong)
+        .shadow(crate::roles::plate_highlight())
         .text_size(crate::typography::ui_rems(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(gpui::white())

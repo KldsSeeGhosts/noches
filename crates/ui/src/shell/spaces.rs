@@ -3690,12 +3690,7 @@ impl Shell {
                         .child(popover::dialog_field(input.into_any_element())),
                 )
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
                                 .id("rename-space-cancel")
@@ -3744,12 +3739,7 @@ impl Shell {
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
                                 .id("delete-space-cancel")
