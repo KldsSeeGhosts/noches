@@ -493,6 +493,37 @@ impl Protocol {
 }
 
 impl Server {
+    #[cfg(all(test, unix))]
+    async fn password_fixture() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("opencode");
+        std::fs::write(
+            &exe,
+            r#"#!/usr/bin/env python3
+import base64,json,os,http.server
+assert os.environ['OPENCODE_PASSWORD'] == os.environ['OPENCODE_SERVER_PASSWORD']
+assert os.environ['OPENCODE_PASSWORD']
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        expected = 'Basic ' + base64.b64encode(('opencode:' + os.environ['OPENCODE_PASSWORD']).encode()).decode()
+        assert self.headers.get('Authorization') == expected
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({'healthy':True,'version':'2.0.20'}).encode())
+    def log_message(self,*args): pass
+import sys
+http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),Handler).serve_forever()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut server = Self::spawn(&exe, dir.path().to_str(), Duration::from_secs(5))
+            .await
+            .expect("both OpenCode password variables must match our Basic auth");
+        server.shutdown(Duration::from_millis(100)).await;
+    }
+
     fn attached(base: String) -> Self {
         Self {
             child: None,
@@ -532,6 +563,9 @@ impl Server {
             .arg(port.to_string())
             .arg("--hostname")
             .arg("127.0.0.1")
+            // 2.x prefers this name over the legacy one. Own both so an
+            // inherited password cannot lock us out of our per-run server.
+            .env("OPENCODE_PASSWORD", &password)
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
         crate::compose_child_environment(&mut cmd, exe);
@@ -837,6 +871,12 @@ impl Server {
             .await
             .map(|_| ())
     }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn spawned_server_owns_both_password_variables() {
+    Server::password_fixture().await;
 }
 
 fn http_client() -> reqwest::Client {
