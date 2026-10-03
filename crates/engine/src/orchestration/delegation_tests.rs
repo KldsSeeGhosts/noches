@@ -2233,3 +2233,57 @@ async fn cancelled_delivery_run_reclaims_mail_with_successor_identity() {
         next.message_id
     );
 }
+
+#[tokio::test]
+async fn acknowledging_all_active_batch_members_keeps_successor_delivery_fence() {
+    let fixture = Fixture::new();
+    let first = fixture.delegate("observed-active").await;
+    let second = fixture.delegate("pending-successor").await;
+    fixture.complete(&first, "first").await;
+    let delivery = fixture.delivery(DeliveryAction::Queue);
+    fixture
+        .op(
+            &fixture.caller.thread_id,
+            TaskOperation::Delivery(delivery.clone()),
+        )
+        .await;
+    let parent = fixture.parent();
+    fixture
+        .event(
+            &parent.thread.id,
+            &parent.runs[0],
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("parent done".into()),
+                error: None,
+                session_id: None,
+            },
+        )
+        .await;
+    fixture
+        .op(&fixture.caller.thread_id, TaskOperation::DrainQueue)
+        .await;
+    fixture.complete(&second, "second").await;
+    fixture.status(&first).await;
+    assert_eq!(
+        cohort(&fixture.parent().runs[0])["delivery"]["taskIds"],
+        json!([])
+    );
+    fixture
+        .op(
+            &fixture.caller.thread_id,
+            TaskOperation::Delivery(DeliveryCommand {
+                action: DeliveryAction::Completed { cancelled: false },
+                ..delivery
+            }),
+        )
+        .await;
+    assert_eq!(
+        cohort(&fixture.parent().runs[0])["delivery"]["taskIds"],
+        json!([second.task_id])
+    );
+    assert_eq!(
+        cohort(&fixture.parent().runs[0])["delivery"]["generation"],
+        2
+    );
+}

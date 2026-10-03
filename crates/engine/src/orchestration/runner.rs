@@ -255,14 +255,9 @@ impl RunnerBridge {
                 harness.clone(),
             )
             .map_err(|error| Error::Invariant(error.to_string()))?;
-        let cwd = projection
-            .thread
-            .worktree_path
-            .as_ref()
-            .map(String::as_str)
-            .ok_or_else(|| {
-                Error::Invariant("Runner requires a resolved workspace binding.".into())
-            })?;
+        let cwd = projection.thread.worktree_path.as_deref().ok_or_else(|| {
+            Error::Invariant("Runner requires a resolved workspace binding.".into())
+        })?;
         let parent_space = projection
             .thread
             .lineage
@@ -679,30 +674,28 @@ impl EffectExecutor for RunnerBridge {
                 ) {
                     return EffectOutcome::Retry; // same mail identity, at-least-once acceptance
                 }
-                if let EffectRequest::ProviderTurnStart { run_id } = &effect.request {
-                    if let Ok(Some(projection)) = self.kernel.store.thread(&effect.thread_id)
-                        && let Some(run) = projection.runs.iter().find(|run| &run.id == run_id)
+                if let EffectRequest::ProviderTurnStart { run_id } = &effect.request
+                    && let Ok(Some(projection)) = self.kernel.store.thread(&effect.thread_id)
+                    && let Some(run) = projection.runs.iter().find(|run| &run.id == run_id)
+                {
+                    if let Err(report_error) = self
+                        .record_event(
+                            &effect.thread_id,
+                            run,
+                            0,
+                            AgentEvent::Done {
+                                status: DoneStatus::Errored,
+                                result: None,
+                                error: Some(error.to_string()),
+                                session_id: None,
+                            },
+                            None,
+                        )
+                        .await
                     {
-                        if let Err(report_error) = self
-                            .record_event(
-                                &effect.thread_id,
-                                run,
-                                0,
-                                AgentEvent::Done {
-                                    status: DoneStatus::Errored,
-                                    result: None,
-                                    error: Some(error.to_string()),
-                                    session_id: None,
-                                },
-                                None,
-                            )
-                            .await
-                        {
-                            tracing::error!(%report_error,"failed start terminal report failed");
-                        } else if let Err(settle_error) = self.settle(&effect.thread_id, run).await
-                        {
-                            tracing::error!(%settle_error,"failed start mailbox settlement failed");
-                        }
+                        tracing::error!(%report_error,"failed start terminal report failed");
+                    } else if let Err(settle_error) = self.settle(&effect.thread_id, run).await {
+                        tracing::error!(%settle_error,"failed start mailbox settlement failed");
                     }
                 }
                 EffectOutcome::Failed

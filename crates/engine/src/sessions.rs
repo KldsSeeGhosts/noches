@@ -239,6 +239,8 @@ struct RoutedSteer {
     message_id: String,
 }
 
+type ProviderBinding = (String, Arc<dyn Harness>);
+
 struct Inner {
     admission: zeron_update::admission::AdmissionGate,
     device_id: String,
@@ -268,7 +270,7 @@ struct Inner {
     /// Host-only bindings. Never serialized with a session or RunRequest.
     session_mcp: Mutex<HashMap<String, zeron_harness::mcp::SessionMcpContext>>,
     /// Host-local exact provider-instance bindings for app-owned V2 runs.
-    provider_bindings: Mutex<HashMap<String, (String, Arc<dyn Harness>)>>,
+    provider_bindings: Mutex<HashMap<String, ProviderBinding>>,
     orchestration_store: Mutex<Option<crate::orchestration::Store>>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh

@@ -81,10 +81,10 @@ pub(crate) fn reserve(
             }
             if disabled {
                 task["completionDelivery"] = json!({"state":"disposed","observedByRunId":null});
-            } else if task["completionWake"] == "always" || active_run(projection).is_none() {
-                if state(task) == "pending" {
-                    candidates.push(task["id"].clone());
-                }
+            } else if (task["completionWake"] == "always" || active_run(projection).is_none())
+                && state(task) == "pending"
+            {
+                candidates.push(task["id"].clone());
             }
         }
         if disabled {
@@ -186,11 +186,15 @@ pub fn current_delivery(projection: &ThreadProjection, input: &DeliveryCommand) 
         || cohort["disposition"] != "open"
         || delivery["generation"].as_i64() != Some(input.generation)
         || delivery["messageId"] != input.message_id.0
-        || !delivery["taskIds"].as_array()?.iter().any(|id| {
+        || !(delivery["taskIds"].as_array()?.iter().any(|id| {
             records(projection, "subagent")
                 .iter()
                 .any(|task| task["id"] == *id && state(task) == "claimed")
-        })
+        }) || (delivery["taskIds"].as_array()?.is_empty()
+            && matches!(
+                input.action,
+                DeliveryAction::Accepted | DeliveryAction::Completed { .. }
+            )))
     {
         return None;
     }
@@ -405,14 +409,53 @@ pub(crate) fn remove_member(
             let remaining = ids.clone();
             let empty = ids.is_empty();
             let message_id = value["delegatedCompletion"]["delivery"]["messageId"].clone();
-            if empty {
+            let delivery_run = projection
+                .runs
+                .iter()
+                .find(|run| run.user_message_id.0 == message_id.as_str().unwrap());
+            let unstarted =
+                delivery_run.is_none_or(|run| run.status == OrchestrationV2RunStatus::Queued);
+            // An empty active batch is still an in-flight fence. Its terminal
+            // receipt must reserve pending successors, even after all reads.
+            if empty && unstarted {
                 value["delegatedCompletion"]["delivery"] = Value::Null;
             }
             plan.emit(command, "run.updated", &value, now)?;
+            if empty
+                && let Some(queued) =
+                    delivery_run.filter(|run| run.status == OrchestrationV2RunStatus::Queued)
+            {
+                let mut row = serde_json::to_value(queued)?;
+                row["status"] = json!("cancelled");
+                row["completedAt"] = json!(iso(now)?);
+                row["queuePosition"] = Value::Null;
+                plan.emit(command, "run.updated", &row, now)?;
+                for attempt in projection
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.run_id == queued.id)
+                {
+                    let mut row = serde_json::to_value(attempt)?;
+                    row["status"] = json!("cancelled");
+                    row["completedAt"] = json!(iso(now)?);
+                    plan.emit(command, "run-attempt.updated", &row, now)?;
+                }
+                for node in projection
+                    .nodes
+                    .iter()
+                    .filter(|node| node.run_id.as_ref() == Some(&queued.id))
+                {
+                    let mut row = serde_json::to_value(node)?;
+                    row["status"] = json!("cancelled");
+                    row["completedAt"] = json!(iso(now)?);
+                    plan.emit(command, "node.updated", &row, now)?;
+                }
+            }
             if let Some(message) = records(projection, "message")
                 .iter()
                 .find(|message| message["id"] == message_id)
                 && message["streaming"] != true
+                && unstarted
             {
                 let mut message = message.clone();
                 message["text"] = json!(wake_detail(&remaining));

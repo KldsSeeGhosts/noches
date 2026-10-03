@@ -703,12 +703,16 @@ pub(crate) fn plan(
             let transfer = transfer(
                 command,
                 "subagent_spawn",
-                &projection.thread.id,
-                &child_id,
-                &run.id,
-                Some(&seed.run.id),
-                &run.provider_instance_id.0,
-                &request.target.selection.instance_id.0,
+                TransferEnd {
+                    thread: &projection.thread.id,
+                    run: Some(&run.id),
+                    instance: &run.provider_instance_id.0,
+                },
+                TransferEnd {
+                    thread: &child_id,
+                    run: Some(&seed.run.id),
+                    instance: &request.target.selection.instance_id.0,
+                },
                 now,
             )?;
             plan.emit_on(
@@ -774,12 +778,16 @@ pub(crate) fn plan(
                 let mut transfer = transfer(
                     command,
                     "subagent_result",
-                    child_thread_id,
-                    &command.thread_id,
-                    &run.id,
-                    parent_run.as_ref(),
-                    &run.provider_instance_id.0,
-                    &projection.thread.provider_instance_id.0,
+                    TransferEnd {
+                        thread: child_thread_id,
+                        run: Some(&run.id),
+                        instance: &run.provider_instance_id.0,
+                    },
+                    TransferEnd {
+                        thread: &command.thread_id,
+                        run: parent_run.as_ref(),
+                        instance: &projection.thread.provider_instance_id.0,
+                    },
                     now,
                 )?;
                 if let Some(parent_run) = parent_run
@@ -959,23 +967,25 @@ pub(crate) fn plan(
     Ok(plan)
 }
 
-pub(crate) fn transfer(
+struct TransferEnd<'a> {
+    thread: &'a ThreadId,
+    run: Option<&'a RunId>,
+    instance: &'a str,
+}
+
+fn transfer(
     command: &Command,
     kind: &str,
-    source: &ThreadId,
-    target: &ThreadId,
-    source_run: &RunId,
-    target_run: Option<&RunId>,
-    source_instance: &str,
-    target_instance: &str,
+    source: TransferEnd<'_>,
+    target: TransferEnd<'_>,
     now: i64,
 ) -> Result<Value> {
     Ok(json!({
         "id":format!("context-transfer:{kind}:{}",encode_component(&command.id.0)),
-        "type":kind,"sourceThreadId":source,"targetThreadId":target,
-        "sourcePoint":{"threadId":source,"runId":source_run},"basePoint":null,
-        "sourceProviderInstanceId":source_instance,"targetProviderInstanceId":target_instance,
-        "targetRunId":target_run,"status":"consumed","resolution":null,"createdBy":"agent","error":null,
+        "type":kind,"sourceThreadId":source.thread,"targetThreadId":target.thread,
+        "sourcePoint":{"threadId":source.thread,"runId":source.run},"basePoint":null,
+        "sourceProviderInstanceId":source.instance,"targetProviderInstanceId":target.instance,
+        "targetRunId":target.run,"status":"consumed","resolution":null,"createdBy":"agent","error":null,
         "createdAt":iso(now)?,"updatedAt":iso(now)?,"consumedAt":iso(now)?
     }))
 }
