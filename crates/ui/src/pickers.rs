@@ -695,6 +695,7 @@ impl Pickers {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         // Footer popup bodies are still inline in Composer. Their keyboard,
         // scrollbar and load notifications must reach that owner, whereas
         // the independently rendered model surface must never fan out.
@@ -2745,9 +2746,14 @@ impl Pickers {
             .bg(if open {
                 theme.element_hover
             } else {
-                motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
+                motion::hover_blend_owned(
+                    cx.entity_id(),
+                    id,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                )
             })
-            .on_hover(motion::hover_listener(id))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), id))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2822,7 +2828,8 @@ impl Pickers {
             .rounded(px(FOOTER_CHIP_RADIUS))
             .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
+            .text_color(motion::hover_blend_owned(
+                cx.entity_id(),
                 id,
                 theme.text_muted.opacity(0.7),
                 theme.text.opacity(0.8),
@@ -2830,9 +2837,14 @@ impl Pickers {
             .bg(if open {
                 theme.element_hover
             } else {
-                motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
+                motion::hover_blend_owned(
+                    cx.entity_id(),
+                    id,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                )
             })
-            .on_hover(motion::hover_listener(id))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), id))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -5140,6 +5152,7 @@ impl Render for Pickers {
                 closing,
             )
         };
+        motion::drive_hover_owner(cx.entity_id(), window);
         div()
             .flex()
             .flex_row()

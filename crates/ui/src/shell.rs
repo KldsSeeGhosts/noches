@@ -956,6 +956,7 @@ fn sidebar_footer_button(
     glyph: &'static str,
     label: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
 ) -> gpui::Stateful<gpui::Div> {
     let motion_key = format!("{id}-motion");
     div()
@@ -969,16 +970,16 @@ fn sidebar_footer_button(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .bg(motion::hover_blend(
+        .bg(motion::hover_blend_owned(owner,
             &motion_key,
             crate::theme::wash(0.0),
             theme.glass_hover(),
         ))
-        .on_hover(motion::hover_listener(motion_key.clone()))
+        .on_hover(motion::hover_listener_owned(owner, motion_key.clone()))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
         .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend(
+        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend_owned(owner,
             &motion_key,
             theme.text_muted,
             theme.text,
@@ -1641,7 +1642,7 @@ struct SidebarPane {
 }
 
 impl Render for SidebarPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::transcript::record_view_frame("sidebar");
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
@@ -1653,6 +1654,7 @@ impl Render for SidebarPane {
                 Route::Chat => shell.render_chat_sidebar(&theme, cx),
             }
         });
+        motion::drive_hover_owner(cx.entity_id(), window);
         div().size_full().child(inner).into_any_element()
     }
 }
@@ -2088,6 +2090,7 @@ impl Shell {
     }
 
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
@@ -2253,9 +2256,12 @@ impl Shell {
                     .await;
             }
         });
-        let sidebar_pane = cx.new(|cx| SidebarPane {
-            shell: shell.downgrade(),
-            _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
+        let sidebar_pane = cx.new(|cx| {
+            motion::init_hover_owner(cx);
+            SidebarPane {
+                shell: shell.downgrade(),
+                _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
+            }
         });
         Self {
             voice: voice::VoiceUi::default(),
@@ -6743,6 +6749,7 @@ impl Shell {
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("{row_id}-hover");
+        let hover_owner = if sidebar_row { self.sidebar_pane.entity_id() } else { cx.entity_id() };
         let rest_bg = if selected {
             selected_wash
         } else {
@@ -6780,26 +6787,26 @@ impl Shell {
                 8.0
             }))
             .px(px(Theme::SPACE_SM))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
+            .text_color(motion::hover_blend_owned(hover_owner, &fade_key, rest_text, text))
+            .bg(motion::hover_blend_owned(hover_owner, &fade_key, rest_bg, hover_bg))
             // No selection ring (user request) — the wash alone marks the
             // active row.
             // Row hover drives BOTH the wash blend and the corner's
             // time→Archive reveal (one listener - gpui allows a single
             // hover listener per element).
             .on_hover({
-                let fade_hover = motion::hover_listener(fade_key.clone());
+                let fade_hover = motion::hover_listener_owned(hover_owner, fade_key.clone());
                 let hover_id = row_id.clone();
                 cx.listener(move |this, hovered: &bool, window, cx| {
                     fade_hover(hovered, window, cx);
                     if *hovered {
                         if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
                             this.chat_status_hover = Some(hover_id.clone());
-                            cx.notify();
+                            gpui::App::notify(cx, hover_owner);
                         }
                     } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
                         this.chat_status_hover = None;
-                        cx.notify();
+                        gpui::App::notify(cx, hover_owner);
                     }
                 })
             })
@@ -7369,13 +7376,13 @@ impl Shell {
             .bg(if open {
                 theme.glass_hover()
             } else {
-                motion::hover_blend(
+                motion::hover_blend_owned(self.sidebar_pane.entity_id(),
                     "user-menu-trigger",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover().opacity(0.8),
                 )
             })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
+            .on_hover(motion::hover_listener_owned(self.sidebar_pane.entity_id(), "user-menu-trigger"))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
@@ -7441,7 +7448,7 @@ impl Shell {
                     }),
             )
             .child(
-                sidebar_footer_button("sidebar-voice", icons::MICROPHONE, "Voice", theme)
+                sidebar_footer_button("sidebar-voice", icons::MICROPHONE, "Voice", theme, self.sidebar_pane.entity_id())
                     .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
@@ -7449,14 +7456,14 @@ impl Shell {
                     })),
             )
             .child(
-                sidebar_footer_button("remote-control", icons::SMARTPHONE, "Remote control", theme)
+                sidebar_footer_button("remote-control", icons::SMARTPHONE, "Remote control", theme, self.sidebar_pane.entity_id())
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_settings(SettingsSection::Connections, cx);
                     })),
             )
             .child(
-                sidebar_footer_button("sidebar-settings", icons::SETTINGS_GEAR, "Settings", theme)
+                sidebar_footer_button("sidebar-settings", icons::SETTINGS_GEAR, "Settings", theme, self.sidebar_pane.entity_id())
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_settings(SettingsSection::Devices, cx);
@@ -8464,7 +8471,7 @@ impl Shell {
     {
         let theme = Theme::of(cx);
         let fade_key = format!("pane-resize-{id}");
-        let hover_highlight = motion::hover_blend(
+        let hover_highlight = motion::hover_blend_owned(cx.entity_id(),
             &fade_key,
             theme.border_strong.opacity(0.0),
             theme.border_strong,
@@ -8490,7 +8497,7 @@ impl Shell {
             .flex_none()
             .occlude()
             .cursor_col_resize()
-            .on_hover(motion::hover_listener(fade_key))
+            .on_hover(motion::hover_listener_owned(cx.entity_id(), fade_key))
             // Codex-style seam feedback: the existing 1px panel border stays
             // visible at rest; hover adds a stronger center highlight that
             // fades back into that border toward both ends.
@@ -8528,23 +8535,23 @@ impl Shell {
             })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
                     if event.click_count == 2 {
                         reset(this, cx);
                         this.schedule_save(cx);
                         cx.notify();
                     }
                     this.finish_pane_resize(kind);
-                    motion::set_hover(&release_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), &release_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, _| {
+                cx.listener(move |this, _, _window, cx| {
                     this.finish_pane_resize(kind);
-                    motion::set_hover(&release_out_key, false, this.reduced_motion);
-                    window.refresh();
+                    motion::set_hover_owned(cx.entity_id(), &release_out_key, false, this.reduced_motion);
+                    cx.notify();
                 }),
             )
     }
@@ -11546,6 +11553,7 @@ impl Render for Shell {
         // scheduling `with_animation` would have requested). Hover color fades
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
+        motion::drive_hover_owner(cx.entity_id(), window);
         if self.motion_active.get() | motion::hover_fades_active() {
             window.request_animation_frame();
         }
