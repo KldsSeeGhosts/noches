@@ -26,6 +26,7 @@ pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod mcp;
 pub mod orchestration;
 pub mod profile;
 pub mod project_actions;

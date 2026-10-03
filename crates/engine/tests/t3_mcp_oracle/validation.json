@@ -1,0 +1,933 @@
+{
+  "tag": "v0.0.46-nightly.20261003.2632",
+  "commit": "f391794a35c604d57e166a3ab48d56fc6e4e469a",
+  "effect": "4.0.0-rc.115",
+  "cases": [
+    {
+      "name": "delegate_task",
+      "arguments": {},
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Missing key\\n  at [\\\"task\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Missing key\n  at [\"task\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": null,
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected object\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected object"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "   "
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected a value with a length of at least 1\\n  at [\\\"task\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected a value with a length of at least 1\n  at [\"task\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": 3
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected string\\n  at [\\\"task\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected string\n  at [\"task\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "mode": "invalid"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected \\\"async\\\" | \\\"wait\\\"\\n  at [\\\"mode\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected \"async\" | \"wait\"\n  at [\"mode\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "runtimeMode": "invalid"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected \\\"approval-required\\\" | \\\"auto-accept-edits\\\" | \\\"auto\\\" | \\\"full-access\\\"\\n  at [\\\"runtimeMode\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected \"approval-required\" | \"auto-accept-edits\" | \"auto\" | \"full-access\"\n  at [\"runtimeMode\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "target": null
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected object | undefined\\n  at [\\\"target\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected object | undefined\n  at [\"target\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "title": null
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected string | undefined\\n  at [\\\"title\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected string | undefined\n  at [\"title\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "title": "  "
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected a value with a length of at least 1\\n  at [\\\"title\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected a value with a length of at least 1\n  at [\"title\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "target": {
+          "driverKind": "?"
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected a string matching the RegExp ^[a-zA-Z][a-zA-Z0-9_-]*$\\n  at [\\\"target\\\"][\\\"driverKind\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected a string matching the RegExp ^[a-zA-Z][a-zA-Z0-9_-]*$\n  at [\"target\"][\"driverKind\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "target": {
+          "options": {
+            "effort": 1
+          }
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected string | boolean\\n  at [\\\"target\\\"][\\\"options\\\"][\\\"effort\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected string | boolean\n  at [\"target\"][\"options\"][\"effort\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "delegate_task",
+      "arguments": {
+        "task": "x",
+        "target": {
+          "options": [
+            {
+              "id": "effort",
+              "value": 1
+            }
+          ]
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"delegate_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"delegate_task\",\"description\":\"Expected string | boolean\\n  at [\\\"target\\\"][\\\"options\\\"][0][\\\"value\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "delegate_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "delegate_task",
+              "description": "Expected string | boolean\n  at [\"target\"][\"options\"][0][\"value\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "task_status",
+      "arguments": {
+        "taskId": " "
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"task_status.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"task_status\",\"description\":\"Expected a value with a length of at least 1\\n  at [\\\"taskId\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "task_status.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "task_status",
+              "description": "Expected a value with a length of at least 1\n  at [\"taskId\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "task_cancel",
+      "arguments": {
+        "taskId": false
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"task_cancel.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"task_cancel\",\"description\":\"Expected string\\n  at [\\\"taskId\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "task_cancel.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "task_cancel",
+              "description": "Expected string\n  at [\"taskId\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "create_threads",
+      "arguments": {
+        "threads": []
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"create_threads.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"create_threads\",\"description\":\"Expected a value with a length of at least 1\\n  at [\\\"threads\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "create_threads.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "create_threads",
+              "description": "Expected a value with a length of at least 1\n  at [\"threads\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_list",
+      "arguments": {
+        "limit": 0
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_list.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_list\",\"description\":\"Expected a value greater than or equal to 1\\n  at [\\\"limit\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_list.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_list",
+              "description": "Expected a value greater than or equal to 1\n  at [\"limit\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_list",
+      "arguments": {
+        "limit": 1.5
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_list.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_list\",\"description\":\"Expected an integer\\n  at [\\\"limit\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_list.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_list",
+              "description": "Expected an integer\n  at [\"limit\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_list",
+      "arguments": {
+        "limit": 101
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_list.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_list\",\"description\":\"Expected a value less than or equal to 100\\n  at [\\\"limit\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_list.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_list",
+              "description": "Expected a value less than or equal to 100\n  at [\"limit\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_list",
+      "arguments": {
+        "statuses": [
+          "invalid"
+        ]
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_list.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_list\",\"description\":\"Expected \\\"preparing\\\" | \\\"queued\\\" | \\\"starting\\\" | \\\"running\\\" | \\\"waiting\\\" | \\\"completed\\\" | \\\"interrupted\\\" | \\\"failed\\\" | \\\"cancelled\\\" | \\\"rolled_back\\\"\\n  at [\\\"statuses\\\"][0]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_list.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_list",
+              "description": "Expected \"preparing\" | \"queued\" | \"starting\" | \"running\" | \"waiting\" | \"completed\" | \"interrupted\" | \"failed\" | \"cancelled\" | \"rolled_back\"\n  at [\"statuses\"][0]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_read",
+      "arguments": {
+        "threadId": "x",
+        "afterPosition": -2
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_read.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_read\",\"description\":\"Expected a value greater than or equal to 0\\n  at [\\\"afterPosition\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_read.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_read",
+              "description": "Expected a value greater than or equal to 0\n  at [\"afterPosition\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_update",
+      "arguments": {
+        "action": "rename"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_update\",\"description\":\"rename requires title and does not accept pullRequest.\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_update",
+              "description": "rename requires title and does not accept pullRequest."
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_update",
+      "arguments": {
+        "action": "regenerate_title",
+        "title": "x"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_update\",\"description\":\"regenerate_title does not accept title or pullRequest.\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_update",
+              "description": "regenerate_title does not accept title or pullRequest."
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_update",
+      "arguments": {
+        "action": "link_pull_request"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_update\",\"description\":\"link_pull_request requires pullRequest and does not accept title.\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_update",
+              "description": "link_pull_request requires pullRequest and does not accept title."
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_update",
+      "arguments": {
+        "action": "unlink_pull_request",
+        "title": "x"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_update\",\"description\":\"unlink_pull_request does not accept title or pullRequest.\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_update",
+              "description": "unlink_pull_request does not accept title or pullRequest."
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_update",
+      "arguments": {
+        "action": "link_pull_request",
+        "pullRequest": {
+          "repository": "o/r",
+          "number": 1,
+          "url": "not-a-url"
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_update\",\"description\":\"Pull request URL must be a well-formed HTTP(S) URL.\\n  at [\\\"pullRequest\\\"][\\\"url\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_update",
+              "description": "Pull request URL must be a well-formed HTTP(S) URL.\n  at [\"pullRequest\"][\"url\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_queue_reorder",
+      "arguments": {
+        "queuedRunId": "x",
+        "beforeRunId": 0
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_queue_reorder.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_queue_reorder\",\"description\":\"Expected string | null\\n  at [\\\"beforeRunId\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_queue_reorder.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_queue_reorder",
+              "description": "Expected string | null\n  at [\"beforeRunId\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_thread_search",
+      "arguments": {
+        "query": "a"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_thread_search.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_thread_search\",\"description\":\"Expected a value with a length of at least 2\\n  at [\\\"query\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_thread_search.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_thread_search",
+              "description": "Expected a value with a length of at least 2\n  at [\"query\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "schedule_task",
+      "arguments": {
+        "prompt": "x",
+        "schedule": {
+          "type": "interval",
+          "everyMs": 3
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"schedule_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"schedule_task\",\"description\":\"Expected a value greater than or equal to 60000\\n  at [\\\"schedule\\\"][\\\"everyMs\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "schedule_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "schedule_task",
+              "description": "Expected a value greater than or equal to 60000\n  at [\"schedule\"][\"everyMs\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "schedule_task",
+      "arguments": {
+        "prompt": "x",
+        "schedule": "garbage"
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"schedule_task.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"schedule_task\",\"description\":\"Expected a valid JSON string\\n  at [\\\"schedule\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "schedule_task.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "schedule_task",
+              "description": "Expected a valid JSON string\n  at [\"schedule\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "link_pull_request",
+      "arguments": {
+        "number": 0
+      },
+      "expected": {
+        "error": {
+          "code": -32602,
+          "message": "Invalid parameters for tool 'link_pull_request': Expected a value greater than or equal to 1\n  at [\"number\"]"
+        }
+      }
+    },
+    {
+      "name": "link_pull_request",
+      "arguments": {
+        "number": 1.5
+      },
+      "expected": {
+        "error": {
+          "code": -32602,
+          "message": "Invalid parameters for tool 'link_pull_request': Expected an integer\n  at [\"number\"]"
+        }
+      }
+    },
+    {
+      "name": "t3_worktree_handoff",
+      "arguments": {
+        "branch": " "
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_worktree_handoff.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_worktree_handoff\",\"description\":\"Expected a value with a length of at least 1\\n  at [\\\"branch\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_worktree_handoff.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_worktree_handoff",
+              "description": "Expected a value with a length of at least 1\n  at [\"branch\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_project_update",
+      "arguments": {
+        "projectId": "x",
+        "title": null
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_project_update.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_project_update\",\"description\":\"Expected string | undefined\\n  at [\\\"title\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_project_update.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_project_update",
+              "description": "Expected string | undefined\n  at [\"title\"]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "t3_attachment_prepare_upload",
+      "arguments": {
+        "upload": {
+          "name": "x",
+          "mimeType": "image/png",
+          "sizeBytes": -1
+        }
+      },
+      "expected": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"_tag\":\"AiError\",\"module\":\"Toolkit\",\"method\":\"t3_attachment_prepare_upload.handle\",\"reason\":{\"_tag\":\"ToolParameterValidationError\",\"toolName\":\"t3_attachment_prepare_upload\",\"description\":\"Expected a value greater than or equal to 0\\n  at [\\\"upload\\\"][\\\"sizeBytes\\\"]\"}}"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "_tag": "AiError",
+            "module": "Toolkit",
+            "method": "t3_attachment_prepare_upload.handle",
+            "reason": {
+              "_tag": "ToolParameterValidationError",
+              "toolName": "t3_attachment_prepare_upload",
+              "description": "Expected a value greater than or equal to 0\n  at [\"upload\"][\"sizeBytes\"]"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
