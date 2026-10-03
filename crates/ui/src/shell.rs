@@ -67,15 +67,21 @@ use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
+mod chat_rename;
+#[cfg(test)]
+mod chat_rename_tests;
 mod command_palette;
 mod file_mutations;
 mod panes;
 mod project_icon;
+#[cfg(test)]
+mod project_new_chat_tests;
 mod spaces;
 mod tabs;
 mod voice;
 mod voice_actions;
 
+use chat_rename::ChatRename;
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 /// `connected` already includes the engine's degradation grace. A brief
@@ -1282,15 +1288,6 @@ enum SplashPhase {
     Gone,
 }
 
-/// The chat-row Rename dialog.
-struct RenameChatDialog {
-    chat_id: String,
-    input: Entity<ComposerInput>,
-    /// Focus the input on the dialog's first paint (opened without window access).
-    focus_pending: bool,
-    _events: Subscription,
-}
-
 /// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
 enum UpdateFlow {
     Idle,
@@ -1747,6 +1744,7 @@ pub struct Shell {
     /// In-flight disclosure tweens, shared by device groups and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
+    sidebar_reveal_motions: std::collections::HashSet<String>,
     /// The jump-hint overlay: true while the held modifiers exactly match a
     /// jump shortcut, which swaps the first nine rows' time-ago for their
     /// key-cap chip (t3code's `showJumpHints`). Frame-transient — window
@@ -1836,7 +1834,7 @@ pub struct Shell {
     appearance_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
-    rename_dialog: Option<RenameChatDialog>,
+    chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
     /// Global confirmation/error dialog for the Changes-pane trash action. The
@@ -2284,6 +2282,7 @@ impl Shell {
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
+            sidebar_reveal_motions: std::collections::HashSet::new(),
             jump_hints: false,
             terminal: None,
             right_terminal: None,
@@ -2337,7 +2336,7 @@ impl Shell {
             files_settings_sub: None,
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
-            rename_dialog: None,
+            chat_rename: None,
             delete_confirm: None,
             discard_working_tree: None,
             discard_working_tree_task: None,
@@ -4877,48 +4876,6 @@ impl Shell {
         }));
     }
 
-    fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.close_chat_menu(cx);
-        let current = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|c| c.id == chat_id)
-            .and_then(|c| c.title.clone())
-            .unwrap_or_default();
-        let input = cx.new(|cx| {
-            ComposerInput::new("Session title", cx).with_accessibility_role(gpui::Role::TextInput)
-        });
-        input.update(cx, |input, cx| input.set_text(current, cx));
-        let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_rename_chat(cx);
-            }
-        });
-        self.rename_dialog = Some(RenameChatDialog {
-            chat_id,
-            input,
-            focus_pending: true,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    fn submit_rename_chat(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.rename_dialog.take() else {
-            return;
-        };
-        let title = dialog.input.read(cx).text().trim().to_string();
-        if !title.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id, "title": title }),
-                cx,
-            );
-        }
-        cx.notify();
-    }
-
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.set_chat_archived(chat_id, true, cx);
     }
@@ -4972,6 +4929,7 @@ impl Shell {
     /// stranding it over a session the user never picked.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
+            || self.chat_rename.is_some()
             || self.add_space.is_some()
             || self.tool_picker.is_some()
             || self.active_composer().read(cx).pickers().read(cx).is_open()
@@ -6740,16 +6698,11 @@ impl Shell {
                         .rounded(px(5.0))
                         .hover(|s| s.bg(crate::theme::wash(0.10)))
                         .cursor_pointer()
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| {
-                                SidebarTooltip(if archived {
-                                    "Unarchive session"
-                                } else {
-                                    "Archive session"
-                                })
-                            })
-                            .into()
-                        })
+                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
+                            "Unarchive session"
+                        } else {
+                            "Archive session"
+                        }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -6771,6 +6724,8 @@ impl Shell {
         let selected_wash = crate::theme::glass_selected_bg();
         let select_id = id.clone();
         let menu_id = id.clone();
+        let sidebar_row = search_query.is_none();
+        let rename_input = sidebar_row.then(|| self.rename_input_for(&id)).flatten();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("{row_id}-hover");
@@ -6794,6 +6749,10 @@ impl Shell {
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         div()
             .id(SharedString::from(row_id.clone()))
+            .debug_selector({
+                let row_id = row_id.clone();
+                move || row_id.clone()
+            })
             .relative()
             .flex()
             .flex_col()
@@ -6835,7 +6794,12 @@ impl Shell {
                 if !matches!(event, gpui::ClickEvent::Mouse(_))
                     || !this.sidebar_drag_suppressed_click
                 {
-                    this.open_chat(select_id.clone(), cx);
+                    if event.click_count() >= 2 && sidebar_row {
+                        this.sidebar_session_pointer = None;
+                        this.open_rename_chat(select_id.clone(), cx);
+                    } else {
+                        this.open_chat(select_id.clone(), cx);
+                    }
                 }
             }))
             .on_mouse_down(
@@ -6854,6 +6818,11 @@ impl Shell {
                         });
                     }
                 }),
+            )
+            .children(
+                sidebar_row
+                    .then(|| self.rename_row_reveal(&id, cx))
+                    .flatten(),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -6891,8 +6860,18 @@ impl Shell {
                                 )
                             }),
                     )
-                    .child(
-                        div()
+                    .child(match rename_input {
+                        Some(input) => chat_rename::chat_title_editor(
+                            format!("chat-title-editor-{id}").into(),
+                            input,
+                            theme,
+                        ),
+                        None => div()
+                            .id(SharedString::from(format!("chat-title-{id}")))
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("chat-title-{id}")
+                            })
                             .flex_1()
                             .min_w_0()
                             .truncate()
@@ -6903,8 +6882,9 @@ impl Shell {
                                 title.clone(),
                                 search_query,
                                 theme,
-                            )),
-                    )
+                            ))
+                            .into_any_element(),
+                    })
                     .child(corner),
             )
             // One compact context line. No empty third line for sessions
@@ -7979,9 +7959,9 @@ impl Shell {
         {
             return true;
         }
-        if self.rename_dialog.is_some() {
-            self.rename_dialog = None;
-            cx.notify();
+        if self.chat_rename.is_some() {
+            self.finish_rename_chat(false, cx);
+            self.focus_composer(cx);
             return true;
         }
         if self.rename_space_dialog.is_some() {
@@ -8144,7 +8124,7 @@ impl Shell {
                                 this.open_rename_chat(rename_id.clone(), cx)
                             }))
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from("Rename…")),
+                            .child(SharedString::from("Rename")),
                     )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
@@ -8304,52 +8284,6 @@ impl Shell {
                 menu,
                 chat_menu_closing,
             ));
-        }
-
-        if let Some(dialog) = &mut self.rename_dialog {
-            if std::mem::take(&mut dialog.focus_pending) {
-                window.focus(&dialog.input.focus_handle(cx), cx);
-            }
-            let input = dialog.input.clone();
-            let card = popover::dialog_card(&theme)
-                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        this.rename_dialog = None;
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }))
-                .child(popover::dialog_title(&theme, "Rename session"))
-                .child(
-                    div()
-                        .mt(px(12.0))
-                        .child(popover::dialog_field(input.into_any_element())),
-                )
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "rename-chat-cancel")
-                                .id("rename-chat-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.rename_dialog = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            popover::btn_primary(&theme, "Rename")
-                                .id("rename-chat-save")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.submit_rename_chat(cx)),
-                                ),
-                        ),
-                )
-                .into_any_element();
-            overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
         if let Some(overlay) = self.render_voice_overlay(viewport, cx) {
@@ -10957,6 +10891,7 @@ impl Render for Shell {
                 files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
             }
         }
+        self.focus_rename_chat(window, cx);
         self.render_time = Some(std::time::Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()

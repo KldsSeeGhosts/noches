@@ -153,6 +153,15 @@ impl Shell {
     /// open it just hides (detach, not close - the source chat's tabs and
     /// PTYs survive for the return trip).
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.open_new_session_for_project(None, cx);
+    }
+
+    /// A header's project wins over the sidebar filter before canvas routing.
+    pub(super) fn open_new_session_for_project(
+        &mut self,
+        project: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.command_palette = None;
         self.route = Route::Chat;
         self.enter_solo_session(cx);
@@ -176,9 +185,8 @@ impl Shell {
         self.pending_explicit_nav = None;
         let target = {
             let state = self.state.read(cx);
-            self.settings
-                .space_filter
-                .clone()
+            project
+                .or_else(|| self.settings.space_filter.clone())
                 .filter(|id| state.space_row(id).is_some())
         };
         let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
