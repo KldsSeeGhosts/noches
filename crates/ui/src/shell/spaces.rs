@@ -1953,16 +1953,11 @@ impl Shell {
             .iter()
             .any(|(_, session)| session.as_deref() == Some(chat.id.as_str()));
         let sub_summaries = if is_selected || pane_open {
-            let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat.id);
-            summaries
-                .iter()
-                .filter(|s| s.status == crate::subagents::SubagentPhase::Running)
-                .cloned()
-                .collect::<Vec<_>>()
+            Some(crate::subagents::subagents_for(self.state.read(cx), &chat.id))
         } else {
-            Vec::new()
+            None
         };
-        let running_count = sub_summaries.len();
+        let running_count = sub_summaries.as_ref().map_or(0, |s| s.running().len());
         // +1 extra row's height when the running set overflows the 3-row
         // cap (the `+N more` line). Children sit INSIDE the card (after
         // the context line), so their block also carries the 2px gap and 4px bottom
@@ -2003,7 +1998,7 @@ impl Shell {
             });
             let content = crate::subagents::sidebar_children(
                 &chat.id,
-                &sub_summaries,
+                sub_summaries.as_ref().unwrap().running(),
                 now,
                 theme,
                 cx.entity_id(),

@@ -8616,7 +8616,7 @@ mod tests {
                     room_gen: None,
                 }]);
                 state.selected_chat = Some("parent".into());
-                state.transcript = vec![SessionMessageEntry {
+                state.apply_transcript(vec![SessionMessageEntry {
                     id: "m1".into(),
                     role: MessageRole::Assistant,
                     parts: vec![MessagePart::Tool {
@@ -8641,7 +8641,7 @@ mod tests {
                     device_id: "dev".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
-                }];
+                }]);
                 cx.notify();
             });
             Host {
