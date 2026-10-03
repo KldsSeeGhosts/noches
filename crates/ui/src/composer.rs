@@ -10647,21 +10647,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn attachment_hover_fades_are_scoped_to_each_composer(cx: &mut gpui::TestAppContext) {
+    fn attachment_and_send_hover_fades_are_owned_by_each_composer(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let selected = cx.new(|cx| Composer::new(state.clone(), cx));
         let pane = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
-        let selected_key = composer_hover_key("attach", selected.entity_id());
-        let pane_key = composer_hover_key("attach", pane.entity_id());
-        assert_ne!(selected_key, pane_key);
-        motion::set_hover(&selected_key, true, true);
-        assert_eq!(motion::hover_t(&selected_key), 1.0);
-        assert_eq!(motion::hover_t(&pane_key), 0.0);
-        motion::set_hover(&pane_key, true, true);
-        motion::set_hover(&selected_key, false, true);
-        assert_eq!(motion::hover_t(&selected_key), 0.0);
-        assert_eq!(motion::hover_t(&pane_key), 1.0);
-        motion::set_hover(&pane_key, false, true);
+        let selected_owner = selected.entity_id();
+        let pane_owner = pane.entity_id();
+        for control in ["attach", "send", "stop"] {
+            let selected_key = composer_hover_key(control, selected_owner);
+            let pane_key = composer_hover_key(control, pane_owner);
+            assert_ne!(selected_key, pane_key);
+            motion::set_hover_owned(selected_owner, &selected_key, true, true);
+            assert_eq!(motion::hover_t_owned(selected_owner, &selected_key), 1.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &pane_key), 0.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &selected_key), 0.0);
+            motion::set_hover_owned(pane_owner, &pane_key, true, true);
+            motion::set_hover_owned(selected_owner, &selected_key, false, true);
+            assert_eq!(motion::hover_t_owned(selected_owner, &selected_key), 0.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &pane_key), 1.0);
+            motion::set_hover_owned(pane_owner, &pane_key, false, true);
+        }
     }
 
     #[gpui::test]

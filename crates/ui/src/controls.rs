@@ -263,6 +263,90 @@ pub fn close_button(id: impl Into<SharedString>, owner: EntityId, theme: &Theme)
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn chrome_controls_notify_only_their_hover_owner(cx: &mut gpui::TestAppContext) {
+        struct Owner;
+        impl gpui::Render for Owner {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let theme = Theme::dark();
+                let owner = cx.entity_id();
+                let content = div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(button(
+                        "text-control",
+                        owner,
+                        &theme,
+                        Variant::Ghost,
+                        Size::Md,
+                        "Parent",
+                    ))
+                    .child(icon_button(
+                        "icon-control",
+                        owner,
+                        &theme,
+                        Variant::Ghost,
+                        Size::Md,
+                        icons::PLUS,
+                        "Add",
+                    ))
+                    .child(close_button("close-control", owner, &theme));
+                motion::drive_hover_owner(owner, window);
+                content
+            }
+        }
+        cx.update(|cx| motion::set_reduced_motion(cx, true));
+        let first = cx.add_window(|_, cx| {
+            motion::init_hover_owner(cx);
+            Owner
+        });
+        let second = cx.add_window(|_, cx| {
+            motion::init_hover_owner(cx);
+            Owner
+        });
+        let first_id = cx.update(|cx| first.entity(cx).unwrap().entity_id());
+        let second_id = cx.update(|cx| second.entity(cx).unwrap().entity_id());
+        let second_notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = second_notifications.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&second.entity(cx).unwrap(), move |_, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        for (key, y) in [
+            ("text-control", 8.0),
+            ("icon-control", 40.0),
+            ("close-control", 72.0),
+        ] {
+            cx.update_window(first.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: point(px(8.0), px(y)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(motion::hover_t_owned(first_id, key), 1.0, "{key}");
+            assert_eq!(motion::hover_t_owned(second_id, key), 0.0, "{key}");
+            assert_eq!(
+                motion::hover_t(key),
+                0.0,
+                "no window-wide hover state for {key}"
+            );
+            assert_eq!(second_notifications.get(), 0, "{key}");
+        }
+    }
+
     #[test]
     fn sizes_follow_the_documented_ladder() {
         assert_eq!(Size::Micro.height(), 20.0);

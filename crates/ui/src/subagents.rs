@@ -1364,7 +1364,10 @@ mod tests {
             doc_ref: doc.map(|d| d.to_string().into()),
             latest_turn: true,
         };
-        let all = vec![summary("a", Some("doc-a")), summary("b", None)];
+        let all = Arc::new(SubagentPresentation::new(vec![
+            summary("a", Some("doc-a")),
+            summary("b", None),
+        ]));
         assert_eq!(
             summary_for_doc(&all, "chat", "doc-a").map(|s| s.id.as_str()),
             Some("a")
@@ -1375,6 +1378,10 @@ mod tests {
             Some("b")
         );
         assert!(summary_for_doc(&all, "chat", "elsewhere").is_none());
+        assert!(
+            std::ptr::eq(summary_for_doc(&all, "chat", "doc-a").unwrap(), &all[0],),
+            "the banner borrows the shared presentation rather than cloning a summary"
+        );
     }
 
     #[test]
@@ -1423,6 +1430,12 @@ mod tests {
                         assert!(Arc::ptr_eq(&presentation, &hit));
                         let _ = strip_visible(&hit).len();
                         let _ = hit.running().len();
+                        let banner = summary_for_doc(&hit, "c", "doc-1");
+                        if agents {
+                            assert!(std::ptr::eq(banner.unwrap(), &hit[0]));
+                        } else {
+                            assert!(banner.is_none());
+                        }
                     }
                 }
             }
