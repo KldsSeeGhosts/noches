@@ -6536,6 +6536,12 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        let latest_assistant_strip = !is_user_row
+            && row.timestamp.is_some()
+            && !self
+                .rows
+                .get(ix + 1..)
+                .is_some_and(|rest| rest.iter().any(|later| later.timestamp.is_some()));
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -6593,11 +6599,20 @@ impl Transcript {
                 // text's first-character x, user label's right edge on the
                 // bubble's right edge (user-reported 4px drift).
                 .when(is_user_row, |el| el.justify_end())
-                .when(hovered, |el| {
-                    el.child(motion::fade_meta(
-                        SharedString::from(format!("meta-{}", row.id)),
-                        metadata,
-                    ))
+                .map(|el| {
+                    if latest_assistant_strip {
+                        // The newest settled reply keeps its strip on (T3's
+                        // `alwaysVisible` meta row); no fade, so scrolling it
+                        // back into view never replays one.
+                        el.child(metadata)
+                    } else if hovered {
+                        el.child(motion::fade_meta(
+                            SharedString::from(format!("meta-{}", row.id)),
+                            metadata,
+                        ))
+                    } else {
+                        el
+                    }
                 })
         });
         let entry_id = row.entry_id.clone();
