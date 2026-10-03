@@ -1642,7 +1642,7 @@ fn native_thread_import_uses_t3_identity_and_never_starts_a_provider() {
         .to_string();
     value["importedNativeThread"] =
         json!({"ref":{"driver":"fake","nativeId":"native/1","strength":"strong"}});
-    *wire = Box::new(serde_json::from_value(value).unwrap());
+    **wire = serde_json::from_value(value).unwrap();
     accept(&fixture.kernel.store, &command);
     assert!(fixture.kernel.store.effects().unwrap().is_empty());
     let projection = fixture
