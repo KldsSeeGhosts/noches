@@ -132,12 +132,12 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
 // ---------------------------------------------------------------------------
 
 /// Instant mock harness so a forwarded QueueCommand fully executes on the target.
-struct InstantHarness;
+struct InstantHarness(HarnessId);
 
 #[async_trait]
 impl Harness for InstantHarness {
     fn id(&self) -> HarnessId {
-        HarnessId::Mock
+        self.0
     }
     fn display_name(&self) -> &str {
         "Instant"
@@ -161,12 +161,12 @@ impl Harness for InstantHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Ok(futures::stream::iter([
             Ok(AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
+                harness: self.0,
                 model: "instant-1".into(),
                 tools: vec![],
                 cwd: "/tmp".into(),
                 session_id: "hs-1".into(),
-                assistant_message_id: "a-1".into(),
+                assistant_message_id: uuid::Uuid::new_v4().to_string(),
             }),
             Ok(AgentEvent::TextDelta {
                 text: "remote reply".into(),
@@ -183,9 +183,151 @@ impl Harness for InstantHarness {
 }
 
 fn registry() -> Arc<HarnessRegistry> {
+    registry_for(HarnessId::Mock)
+}
+
+fn registry_for(harness: HarnessId) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(InstantHarness));
+    registry.register(Arc::new(InstantHarness(harness)));
     Arc::new(registry)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_standalone_session_executes_on_the_selected_device() {
+    use serde_json::json;
+    use zeron_mcp::{Origin, Tools, Zeron};
+
+    let (relay_url, relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let a = assemble(&dirs.path().join("a"), "device-a");
+    let remote_dir = dirs.path().join("b");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::write(remote_dir.join("device-id"), "device-b").unwrap();
+    let profile = zeron_engine::EngineProfile::development(&remote_dir, "dev-org", "dev-user");
+    let remote_store = zeron_sync::DocsStore::open(profile.store_root()).unwrap();
+    let b = EngineCore::assemble_with_profile(
+        profile,
+        registry_for(HarnessId::Codex),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+    a.workspace.connect_registry_url(&registry.url());
+    b.workspace.connect_registry_url(&registry.url());
+    let host = b.start_host_relay(&relay_url);
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    a.set_links(LinkCache::new(config));
+    let tools = Tools::new(Arc::new(Zeron::with_client(
+        zeron_rpc::memory_client(a.rpc_service()),
+        Origin::default(),
+    )));
+    let folder = dirs.path().join("remote-project");
+    std::fs::create_dir_all(&folder).unwrap();
+    b.workspace
+        .create_space(
+            "remote-project",
+            "device-b",
+            folder.to_str().unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let projects = tools
+            .call("list_projects", json!({"device":"device-b"}))
+            .await;
+        if projects
+            .as_ref()
+            .is_ok_and(|value| value["projects"].as_array().unwrap().len() == 1)
+            && tools
+                .call("list_harnesses", json!({"device":"device-b"}))
+                .await
+                .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "discovery did not converge"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let invalid = tools
+        .call(
+            "create_chat",
+            json!({
+                "device":"device-a","project":"remote-project","harness":"codex"
+            }),
+        )
+        .await;
+    assert!(
+        invalid.is_err(),
+        "project membership mismatch must fail before writing"
+    );
+    let created = tools
+        .call(
+            "create_chat",
+            json!({
+                "kind":"chat","device":"device-b","project":"remote-project","harness":"codex",
+                "title":"Remote MCP session","prompt":"execute on B","wait":true,"timeout_secs":10
+            }),
+        )
+        .await
+        .unwrap();
+    let id = created["chatId"].as_str().unwrap();
+    assert_eq!(created["kind"], "chat");
+    assert_eq!(created["deviceId"], "device-b");
+    assert!(created["parentChatId"].is_null());
+    assert_eq!(created["turn"]["outcome"], "completed", "{created}");
+    assert_eq!(created["turn"]["replies"][0]["deviceId"], "device-b");
+    let chat = b.workspace.chat(id).unwrap().unwrap();
+    assert_eq!(chat.space_id.as_deref(), Some("remote-project"));
+    assert!(
+        a.sessions.session_status(id).is_none(),
+        "caller must not execute"
+    );
+    assert!(
+        b.sessions.session_status(id).is_some(),
+        "selected host ran the harness"
+    );
+    let read = tools.call("read_chat", json!({"chat":id})).await.unwrap();
+    assert!(
+        read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["role"] == "assistant" && entry["deviceId"] == "device-b")
+    );
+    let sent = tools
+        .call(
+            "send_message",
+            json!({
+                "chat":id,"text":"second remote turn","wait":true,"timeout_secs":10
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["turn"]["outcome"], "completed", "{sent}");
+    assert_eq!(sent["turn"]["replies"].as_array().unwrap().len(), 1);
+    let interrupted = tools
+        .call("interrupt_chat", json!({"chat":id}))
+        .await
+        .unwrap();
+    let interrupt_id = interrupted["commandId"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !remote_store.is_processed(interrupt_id).unwrap() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("interrupt must reach the selected host's command ledger");
+    a.shutdown().await;
+    b.shutdown().await;
+    drop(host);
+    relay.abort();
 }
 
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {

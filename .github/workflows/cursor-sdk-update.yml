@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
       - name: Check stable SDK version
@@ -25,7 +25,7 @@ jobs:
           if git diff --quiet; then exit 0; fi
           git diff -- crates/harness/src/cursor/mod.rs > "$RUNNER_TEMP/cursor-sdk-update.patch"
           echo 'A newer SDK is available. Apply the patch on dev and run Cursor compatibility before promotion to main.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cursor-sdk-proposed-update
           path: ${{ runner.temp }}/cursor-sdk-update.patch

@@ -37,6 +37,8 @@ struct Cli {
 enum Command {
     #[command(hide = true)]
     MermaidRender,
+    /// Serve opt-in session-control tools over MCP stdio.
+    Mcp,
     #[cfg(unix)]
     /// Control this conversation's integrated Chromium browser with JSON.
     Browser {
@@ -152,6 +154,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Mcp)) {
+        return tokio::runtime::Runtime::new()?.block_on(zeron_mcp::run());
+    }
     // Keep MCP stdout strictly protocol-only, even with RUST_LOG set.
     #[cfg(unix)]
     match &cli.command {
@@ -231,6 +236,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::MermaidRender) => unreachable!(),
         #[cfg(unix)]
         Some(Command::Browser { .. } | Command::BrowserMcp { .. }) => unreachable!(),
+        Some(Command::Mcp) => unreachable!(),
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {

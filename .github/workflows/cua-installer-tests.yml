@@ -32,11 +32,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Check out the legacy Cua baseline
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: trycua/cua
           ref: 4af83697b8425944d668c543851ef6ae3639a130
@@ -44,7 +44,7 @@ jobs:
           sparse-checkout: libs/cua-driver/rust
           persist-credentials: false
       - name: Check out the integrated Cua repair
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: KldsSeeGhosts/cua
           ref: ${{ env.CUA_INTEGRATED_REV }}
@@ -88,7 +88,7 @@ jobs:
             scripts/cua/test_hyprland_runtime_patch.py \
             scripts/cua/test_native_installers.py \
             scripts/cua/build_native.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: native-installer-evidence
