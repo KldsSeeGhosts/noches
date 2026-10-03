@@ -169,11 +169,14 @@ pub enum CheckoutPlan {
 /// loaded), plus the explicit non-default option picks.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedRunConfig {
+    pub runtime_mode: zeron_proto::RuntimeMode,
+    pub interaction_mode: zeron_proto::InteractionMode,
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
 }
+mod runtime;
 
 impl ResolvedRunConfig {
     /// The `ChatConfig` recorded on `Mutate createChat` (needs a known harness).
@@ -184,6 +187,8 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: self.runtime_mode,
+            interaction_mode: self.interaction_mode,
         })
     }
 }
@@ -576,6 +581,8 @@ struct SettingGroup {
 }
 
 pub struct Pickers {
+    draft_runtime_mode: zeron_proto::RuntimeMode,
+    runtime_menu_open: bool,
     state: Entity<AppState>,
     /// The chat this instance serves (see [`ChatTarget`]).
     target: ChatTarget,
@@ -762,6 +769,8 @@ impl Pickers {
         let space_owner = Self::target_space_id(&target, state.read(cx)).map(str::to_owned);
         let device_owner = Self::target_device_id(&target, state.read(cx));
         Self {
+            draft_runtime_mode: Default::default(),
+            runtime_menu_open: false,
             state,
             target,
             space_owner,
@@ -819,6 +828,8 @@ impl Pickers {
         let selected = self.target.chat_id(self.state.read(cx)).map(str::to_owned);
         if selected != self.draft_owner {
             self.draft_owner = selected;
+            self.draft_runtime_mode = Default::default();
+            self.runtime_menu_open = false;
             self.config.harness = None;
             self.config.model = None;
             self.config.reasoning = None;
@@ -1094,6 +1105,13 @@ impl Pickers {
     /// loaded (no "engine picks a default" passthrough).
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
+            runtime_mode: self.runtime_mode(cx),
+            interaction_mode: self
+                .target
+                .chat(self.state.read(cx))
+                .and_then(|c| c.config.as_ref())
+                .map(|c| c.interaction_mode)
+                .unwrap_or_default(),
             harness: self.effective_harness(cx),
             model: self
                 .selected_model(cx)
@@ -1127,7 +1145,7 @@ impl Pickers {
     /// go quiet underneath an open popover instead of yanking the session out
     /// from under it).
     pub fn is_open(&self) -> bool {
-        self.open.as_open().is_some()
+        self.open.as_open().is_some() || self.runtime_menu_open
     }
 
     /// The picker to render: open or mid-exit.
@@ -1145,6 +1163,7 @@ impl Pickers {
 
     /// Outside clicks and navigation keep focus at the clicked destination.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.runtime_menu_open = false;
         self.focus_on_mount = false;
         self.cancel_setting_hover();
         self.setting_menu = None;
@@ -1185,6 +1204,7 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.runtime_menu_open = false;
         // A press that found this picker open closes it — the card's
         // `on_mouse_down_out` already began the close on that same press,
         // so by click time the popup reads as closed and a plain toggle
@@ -1801,6 +1821,8 @@ impl Pickers {
             .and_then(|c| c.config.as_ref())
         {
             config.sandbox = existing.sandbox;
+            config.runtime_mode = existing.runtime_mode;
+            config.interaction_mode = existing.interaction_mode;
         }
         change(&mut config);
         // Reasoning must stay concrete for whatever model the row now names —
@@ -5093,6 +5115,7 @@ impl Render for Pickers {
             .min_w_0()
             .gap(px(4.0))
             .child(model_chip)
+            .child(self.render_runtime_control(cx))
     }
 }
 

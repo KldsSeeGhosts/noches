@@ -1409,6 +1409,12 @@ impl AppState {
             .is_some_and(|device| device.supports(capability))
     }
 
+    pub fn runtime_policy_supported(&self, device_id: &str) -> bool {
+        let capability = zeron_proto::capabilities::RUNTIME_POLICY_V1;
+        self.engine().is_some_and(|engine| engine.engine_info().supports(capability))
+            && self.device_supports(device_id, capability)
+    }
+
     pub fn chat_host_supports(&self, chat_id: &str, capability: &str) -> bool {
         self.chats
             .iter()
@@ -5098,6 +5104,8 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -5122,6 +5130,8 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
             },
         );
     }

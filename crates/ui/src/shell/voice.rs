@@ -599,6 +599,14 @@ impl Shell {
                         .voice_config(cx)
                         .ok_or("Choose an agent in the composer first")?
                 };
+                if (config.runtime_mode != zeron_proto::RuntimeMode::FullAccess
+                    || config.interaction_mode != zeron_proto::InteractionMode::Default)
+                    && !state.runtime_policy_supported(&device)
+                {
+                    return Err(
+                        "Update the local and execution engines to enforce this runtime mode".into(),
+                    );
+                }
                 if config.sandbox != zeron_proto::SandboxLevel::WorkspaceWrite {
                     return Err(
                         "Voice-created sessions use the normal workspace-write sandbox".into(),
@@ -630,6 +638,17 @@ impl Shell {
             }
             "send_message" | "steer_session" | "stop_session" | "respond_to_question" => {
                 let chat = chat.ok_or("Choose a session")?;
+                if name != "stop_session"
+                    && chat.config.as_ref().is_some_and(|config| {
+                        config.runtime_mode != zeron_proto::RuntimeMode::FullAccess
+                            || config.interaction_mode != zeron_proto::InteractionMode::Default
+                    })
+                    && !state.runtime_policy_supported(&chat.device_id)
+                {
+                    return Err(
+                        "Update the local and execution engines to enforce this runtime mode".into(),
+                    );
+                }
                 let text = args["text"].as_str().unwrap_or("");
                 if name == "send_message"
                     && matches!(
@@ -977,6 +996,8 @@ fn run_request(
         model_options: config.model_options.clone(),
         cwd,
         sandbox: config.sandbox,
+        runtime_mode: config.runtime_mode,
+        interaction_mode: config.interaction_mode,
         auto_approve: false,
         resume: None,
         attachments: Vec::new(),
