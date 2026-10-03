@@ -200,6 +200,7 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
 }
 
 /// An explicit selection never silently becomes a different model after refresh.
+#[cfg(test)]
 fn selected_catalog_model<'a>(models: &'a [Model], selected: Option<&str>) -> Option<&'a Model> {
     match selected {
         Some(id) => models.iter().find(|model| model.id == id),
@@ -585,6 +586,27 @@ struct SettingGroup {
     choices: Vec<SettingChoice>,
 }
 
+#[derive(PartialEq)]
+struct ModelPresentationKey {
+    catalog_rev: u64,
+    harness: Option<HarnessId>,
+    model: Option<String>,
+    reasoning: Option<ReasoningLevel>,
+    options: serde_json::Map<String, serde_json::Value>,
+    fallback_label: Option<String>,
+    bound: bool,
+}
+
+struct ModelPresentation {
+    label: Option<String>,
+    chip_label: Option<SharedString>,
+    traits: Option<SharedString>,
+    reasoning: Option<ReasoningLevel>,
+    ladder: Vec<ReasoningLevel>,
+    options: serde_json::Map<String, serde_json::Value>,
+    groups: std::sync::Arc<Vec<SettingGroup>>,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     /// The chat this instance serves (see [`ChatTarget`]).
@@ -635,6 +657,9 @@ pub struct Pickers {
     model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
     /// Bumped on every catalog/favorites mutation; invalidates the cache.
     catalog_rev: u64,
+    model_indices: std::cell::RefCell<(u64, HashMap<HarnessId, HashMap<String, usize>>)>,
+    model_presentation:
+        std::cell::RefCell<Option<(ModelPresentationKey, std::sync::Arc<ModelPresentation>)>>,
     /// Hover/drag state of the floating menu scrollbar. One instance serves
     /// every picker list like `menu_scroll` does — the popups are mutually
     /// exclusive, so only one list mounts at a time.
@@ -823,6 +848,8 @@ impl Pickers {
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
             catalog_rev: 0,
+            model_indices: std::cell::RefCell::new((u64::MAX, HashMap::new())),
+            model_presentation: std::cell::RefCell::new(None),
             menu_bar: popover::MenuScrollbarState::default(),
             menu_scroll: gpui::ScrollHandle::new(),
             search,
@@ -1004,7 +1031,7 @@ impl Pickers {
         // disabled it in Settings → Agents since).
         if let Some(harness) = self.defaults.harness {
             let offered = match self.harnesses.ready() {
-                Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
+                Some(list) => offered_harnesses_iter(list).any(|d| d.id == harness),
                 None => true, // catalog not loaded yet — trust the memory
             };
             if offered {
@@ -1017,7 +1044,7 @@ impl Pickers {
         // model (it stays available under `ZERON_HARNESS=mock`).
         self.harnesses
             .ready()
-            .and_then(|list| offered_harnesses(list).first().map(|d| d.id))
+            .and_then(|list| offered_harnesses_iter(list).next().map(|d| d.id))
     }
 
     /// Effective model id: the draft pick, the selected chat's config, or (on
@@ -1037,19 +1064,7 @@ impl Pickers {
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        let explicit = self.config.reasoning.or_else(|| {
-            match self.target.chat(self.state.read(cx)) {
-                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
-                // New chat: the remembered last-used level.
-                None => self.defaults.reasoning,
-            }
-        });
-        if self.selected_model(cx).is_none() {
-            // Catalog not loaded yet: show the explicit value as-is (nothing
-            // to clamp against); it resolves to a concrete level on load.
-            return explicit;
-        }
-        clamp_reasoning(explicit, &self.trait_ladder(cx))
+        self.scalar_presentation(cx).reasoning
     }
 
     /// Only an implicit selection follows the harness default. An explicit ID
@@ -1057,10 +1072,17 @@ impl Pickers {
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
-        selected_catalog_model(models, self.effective_model_id(cx))
+        match self.effective_model_id(cx) {
+            Some(id) => self.catalog_model(harness, id),
+            None => default_model(models),
+        }
     }
 
     fn selected_model_label(&self, cx: &App) -> Option<String> {
+        self.scalar_presentation(cx).label.clone()
+    }
+
+    fn uncached_model_label(&self, cx: &App) -> Option<String> {
         self.selected_model(cx)
             .map(|model| model.label.clone())
             .or_else(|| {
@@ -1084,6 +1106,10 @@ impl Pickers {
     /// selections for existing chats, the remembered picks for the model the
     /// new-chat canvas resolves to (same id [`Self::resolved`] sends).
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
+        self.scalar_presentation(cx).options.clone()
+    }
+
+    fn raw_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
         if let Some(chat) = self.target.chat(self.state.read(cx)) {
             return chat
                 .config
@@ -1095,13 +1121,11 @@ impl Pickers {
             return Default::default();
         };
         match self.selected_model(cx) {
-            Some(model) => offered_options(
-                model,
-                self.defaults
-                    .model_options_for(harness, &model.id)
-                    .cloned()
-                    .unwrap_or_default(),
-            ),
+            Some(model) => self
+                .defaults
+                .model_options_for(harness, &model.id)
+                .cloned()
+                .unwrap_or_default(),
             // Catalog not loaded (or failed): the picks were validated for
             // this exact model when made, so they are safe to send as-is.
             None => self
@@ -1119,7 +1143,84 @@ impl Pickers {
     pub fn no_agents_available(&self) -> bool {
         self.harnesses
             .ready()
-            .is_some_and(|list| offered_harnesses(list).is_empty())
+            .is_some_and(|list| offered_harnesses_iter(list).next().is_none())
+    }
+
+    fn catalog_model(&self, harness: HarnessId, id: &str) -> Option<&Model> {
+        let models = self.models.get(&harness)?.ready()?;
+        let mut indices = self.model_indices.borrow_mut();
+        if indices.0 != self.catalog_rev {
+            indices.0 = self.catalog_rev;
+            indices.1.clear();
+        }
+        let index = indices
+            .1
+            .entry(harness)
+            .or_insert_with(|| {
+                let mut index = HashMap::with_capacity(models.len());
+                for (position, model) in models.iter().enumerate() {
+                    index.entry(model.id.clone()).or_insert(position);
+                }
+                index
+            })
+            .get(id)
+            .copied()?;
+        models.get(index)
+    }
+
+    fn scalar_presentation(&self, cx: &App) -> std::sync::Arc<ModelPresentation> {
+        let model = self.selected_model(cx);
+        let key = ModelPresentationKey {
+            catalog_rev: self.catalog_rev,
+            harness: self.effective_harness(cx),
+            model: self.effective_model_id(cx).map(str::to_owned),
+            reasoning: self.config.reasoning.or_else(|| {
+                match self.target.chat(self.state.read(cx)) {
+                    Some(chat) => chat.config.as_ref().and_then(|config| config.reasoning),
+                    None => self.defaults.reasoning,
+                }
+            }),
+            options: self.raw_options(cx),
+            fallback_label: model
+                .is_none()
+                .then(|| self.uncached_model_label(cx))
+                .flatten(),
+            bound: self.target.chat(self.state.read(cx)).is_some(),
+        };
+        if let Some((cached_key, cached)) = self.model_presentation.borrow().as_ref()
+            && cached_key == &key
+        {
+            return cached.clone();
+        }
+        let ladder = self.uncached_trait_ladder(cx);
+        let reasoning = if model.is_some() {
+            clamp_reasoning(key.reasoning, &ladder)
+        } else {
+            key.reasoning
+        };
+        let options = if self.target.chat(self.state.read(cx)).is_none() {
+            model
+                .map(|model| offered_options(model, key.options.clone()))
+                .unwrap_or_else(|| key.options.clone())
+        } else {
+            key.options.clone()
+        };
+        let label = self.uncached_model_label(cx);
+        let groups =
+            std::sync::Arc::new(self.derive_setting_groups(cx, &ladder, reasoning, &options));
+        let presentation = std::sync::Arc::new(ModelPresentation {
+            chip_label: label
+                .as_deref()
+                .map(|label| SharedString::from(chip_model_label(label))),
+            traits: traits_summary(model, reasoning, &options).map(SharedString::from),
+            label,
+            reasoning,
+            ladder,
+            options,
+            groups,
+        });
+        *self.model_presentation.borrow_mut() = Some((key, presentation.clone()));
+        presentation
     }
 
     /// The fully-resolved config the composer threads into the Run request and
@@ -1440,7 +1541,7 @@ impl Pickers {
     /// its slot state, so re-running this every catalog load/render is free.
     fn prefetch_models(&mut self, force: bool, cx: &mut Context<Self>) {
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
-            Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
+            Some(list) => offered_harnesses_iter(list).map(|d| d.id).collect(),
             None => Vec::new(),
         };
         // The committed chat's harness may be outside the offered set (e.g.
@@ -1783,7 +1884,7 @@ impl Pickers {
                     .models
                     .get(&harness)
                     .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
+                    .and_then(|_| self.catalog_model(harness, &model_id))
                     .map(|m| m.label.clone())
                     .unwrap_or_else(|| model_id.clone());
                 self.defaults.remember_model(harness, model_id, label);
@@ -1919,6 +2020,10 @@ impl Pickers {
     /// The traits popover's reasoning ladder (model levels, falling back to
     /// the harness's advertised ladder) — shared by render and keyboard nav.
     fn trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
+        self.scalar_presentation(cx).ladder.clone()
+    }
+
+    fn uncached_trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
         let Some(model) = self.selected_model(cx) else {
             return Vec::new();
         };
@@ -2598,7 +2703,7 @@ impl Pickers {
                 "up" | "down" => {
                     let count = self
                         .setting_groups(cx)
-                        .into_iter()
+                        .iter()
                         .find(|g| Some(&g.id) == self.setting_menu.as_ref())
                         .map(|g| g.choices.len())
                         .unwrap_or(0);
@@ -4140,17 +4245,26 @@ impl Pickers {
         div().pb(px(2.0)).child(el).into_any_element()
     }
 
-    fn setting_groups(&self, cx: &App) -> Vec<SettingGroup> {
+    fn setting_groups(&self, cx: &App) -> std::sync::Arc<Vec<SettingGroup>> {
+        self.scalar_presentation(cx).groups.clone()
+    }
+
+    fn derive_setting_groups(
+        &self,
+        cx: &App,
+        levels: &[ReasoningLevel],
+        selected: Option<ReasoningLevel>,
+        selections: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<SettingGroup> {
         let mut groups = Vec::new();
-        let levels = self.trait_ladder(cx);
         if !levels.is_empty() {
-            let selected = self.effective_reasoning(cx);
             let default = default_reasoning(&levels);
             groups.push(SettingGroup {
                 id: ModelSetting::Reasoning,
                 label: "Reasoning".into(),
                 choices: levels
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|level| SettingChoice {
                         label: reasoning_label(level).into(),
                         value: String::new(),
@@ -4162,7 +4276,6 @@ impl Pickers {
             });
         }
         if let Some(model) = self.selected_model(cx) {
-            let selections = self.explicit_options(cx);
             for option in &model.options {
                 if option.choices.is_empty() {
                     continue;
@@ -4262,9 +4375,9 @@ impl Pickers {
     }
 
     fn activate_setting_choice(&mut self, cx: &mut Context<Self>) {
-        let Some(group) = self
-            .setting_groups(cx)
-            .into_iter()
+        let groups = self.setting_groups(cx);
+        let Some(group) = groups
+            .iter()
             .find(|g| Some(&g.id) == self.setting_menu.as_ref())
         else {
             return;
@@ -4272,14 +4385,14 @@ impl Pickers {
         let Some(choice) = group.choices.get(self.setting_active) else {
             return;
         };
-        match group.id {
+        match &group.id {
             ModelSetting::Reasoning => {
                 if let Some(level) = choice.reasoning {
                     self.pick_reasoning(level, cx);
                 }
             }
             ModelSetting::Option(id) => {
-                self.pick_option(id, choice.value.clone(), choice.default, cx)
+                self.pick_option(id.clone(), choice.value.clone(), choice.default, cx)
             }
         }
         self.setting_menu = None;
@@ -4292,7 +4405,7 @@ impl Pickers {
         let theme = Theme::of(cx).for_popup();
         let base_index = self.model_rows_len(cx);
         let mut rows = Vec::new();
-        for (ix, group) in self.setting_groups(cx).into_iter().enumerate() {
+        for (ix, group) in self.setting_groups(cx).iter().enumerate() {
             let open = self.setting_menu.as_ref() == Some(&group.id);
             let value = group
                 .choices
@@ -4429,7 +4542,7 @@ impl Pickers {
                             .flex()
                             .flex_col()
                             .gap(px(2.0))
-                            .children(group.choices.into_iter().enumerate().map(
+                            .children(group.choices.iter().enumerate().map(
                                 |(choice_ix, choice)| {
                                     popover::menu_row(
                                         &theme,
@@ -4445,7 +4558,7 @@ impl Pickers {
                                         this.activate_setting_choice(cx);
                                         cx.stop_propagation();
                                     }))
-                                    .child(SharedString::from(choice.label))
+                                    .child(SharedString::from(choice.label.clone()))
                                     .child(div().flex_1())
                                     .when(choice.default, |el| el.child(default_badge(&theme)))
                                     .when(
@@ -4874,6 +4987,19 @@ pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     offered_harnesses_impl(list, mock_harness_enabled())
 }
 
+fn offered_harnesses_iter(list: &[HarnessDescriptor]) -> impl Iterator<Item = &HarnessDescriptor> {
+    let allow_mock = mock_harness_enabled();
+    let has_real = list
+        .iter()
+        .any(|descriptor| descriptor.id != HarnessId::Mock);
+    list.iter().filter(move |descriptor| {
+        (allow_mock || !has_real || descriptor.id != HarnessId::Mock)
+            && descriptor.installed
+            && (zeron_engine::registry::descriptor_enabled(descriptor)
+                || (allow_mock && descriptor.id == HarnessId::Mock))
+    })
+}
+
 fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
     visible_harnesses_impl(list, allow_mock)
         .into_iter()
@@ -5011,13 +5137,11 @@ impl Render for Pickers {
         // loaded, so that's a conclusion, not a loading gap) — the chip says
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
+        let presentation = self.scalar_presentation(cx);
         let model_label: SharedString = if no_agents {
             SharedString::from("No agents available")
         } else {
-            let label = self.selected_model_label(cx);
-            label
-                .map(|label| SharedString::from(chip_model_label(&label)))
-                .unwrap_or_default()
+            presentation.chip_label.clone().unwrap_or_default()
         };
         // A load only counts as in-flight while an engine exists to answer
         // it; with no engine the Idle/Loading slots can never resolve, which
@@ -5061,12 +5185,6 @@ impl Render for Pickers {
             }
             None => harness_brand_icon(HarnessId::ClaudeCode),
         };
-        let explicit_options = self.explicit_options(cx);
-        let traits_set = traits_summary(
-            self.selected_model(cx),
-            self.effective_reasoning(cx),
-            &explicit_options,
-        );
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
         // `render_footer`), not here.
@@ -5095,7 +5213,7 @@ impl Render for Pickers {
         // · Fast", "Agent · Balance") as the chip's fainter second tone - the
         // run's configuration reads without opening anything. No suffix when
         // the model has neither a ladder nor options (e.g. Hermes).
-        let chip_suffix = traits_set.map(SharedString::from);
+        let chip_suffix = presentation.traits.clone();
         let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
@@ -5172,6 +5290,68 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn scalar_presentation_reuses_large_catalog_and_tracks_config(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.config.harness = Some(HarnessId::Codex);
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(
+                    (0..7000)
+                        .map(|index| bare_model(&format!("m-{index}"), &format!("Model {index}")))
+                        .collect(),
+                ),
+                cx,
+            );
+            for index in [0, 3500, 6999] {
+                pickers.config.model = Some(format!("m-{index}"));
+                assert_eq!(pickers.selected_model(cx).unwrap().id, format!("m-{index}"));
+                let first = pickers.scalar_presentation(cx);
+                let rows = pickers.model_rows(cx);
+                for _ in 0..10 {
+                    assert!(std::sync::Arc::ptr_eq(
+                        &first,
+                        &pickers.scalar_presentation(cx)
+                    ));
+                    assert!(std::sync::Arc::ptr_eq(
+                        &first.groups,
+                        &pickers.setting_groups(cx)
+                    ));
+                    assert!(std::sync::Arc::ptr_eq(&rows, &pickers.model_rows(cx)));
+                }
+                pickers.config.reasoning = Some(ReasoningLevel::High);
+                assert!(!std::sync::Arc::ptr_eq(
+                    &first,
+                    &pickers.scalar_presentation(cx)
+                ));
+                pickers.config.reasoning = None;
+            }
+            pickers.config.model = Some("missing".into());
+            assert!(pickers.selected_model(cx).is_none());
+            assert_eq!(
+                pickers.scalar_presentation(cx).label.as_deref(),
+                Some("missing")
+            );
+            let missing = pickers.scalar_presentation(cx);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("missing", "Now listed")]),
+                cx,
+            );
+            assert!(!std::sync::Arc::ptr_eq(
+                &missing,
+                &pickers.scalar_presentation(cx)
+            ));
+            assert_eq!(
+                pickers.scalar_presentation(cx).label.as_deref(),
+                Some("Now listed")
+            );
+        });
+    }
 
     #[gpui::test]
     fn popup_frames_do_not_emit_composer_presentation_events(cx: &mut gpui::TestAppContext) {
