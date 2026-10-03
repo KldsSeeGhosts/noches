@@ -358,6 +358,137 @@ pub fn status_glyph(
 }
 
 // ---------------------------------------------------------------------------
+// Child-thread banner
+// ---------------------------------------------------------------------------
+
+/// The summary behind an open child thread: its spawned doc, or (for
+/// doc-less harnesses) the synthetic result doc of the spawn call.
+pub fn summary_for_doc(
+    summaries: Vec<SubagentSummary>,
+    parent_chat_id: &str,
+    doc_id: &str,
+) -> Option<SubagentSummary> {
+    summaries.into_iter().find(|s| {
+        s.doc_ref.as_deref() == Some(doc_id) || result_doc_id(parent_chat_id, &s.id) == doc_id
+    })
+}
+
+/// What the banner needs from the open child thread. The thread is read-only
+/// (the agent runs on its own), so this stands where a composer would.
+pub struct ChildBanner<'a> {
+    /// Unique per pane tab; keys the live equalizer.
+    pub key: &'a str,
+    /// The spawn's strip title; the model name when the summary carries none.
+    pub title: &'a SharedString,
+    /// `None` while the parent's transcript is not loaded.
+    pub summary: Option<&'a SubagentSummary>,
+    /// The parent harness's brand mark, when known.
+    pub mark: Option<(&'static str, Option<gpui::Hsla>)>,
+}
+
+/// The read-only banner under a subagent thread: the agent's mark, model
+/// (medium), type (muted), ticking status, "Runs on its own", and a way back
+/// to the parent. `open_parent` runs on the button.
+pub fn child_thread_banner(
+    banner: &ChildBanner<'_>,
+    now: DateTime<Utc>,
+    theme: &Theme,
+    view: gpui::EntityId,
+    open_parent: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let summary = banner.summary;
+    let (mark, tint) = banner.mark.unwrap_or((icons::BOT, None));
+    let model = summary
+        .and_then(|s| s.model.clone())
+        .unwrap_or_else(|| banner.title.clone());
+    let status: Option<AnyElement> = summary.map(|s| {
+        let elapsed = s.elapsed(now);
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(status_glyph(
+                SharedString::from(format!("child-banner-{}", banner.key)),
+                s.status,
+                true,
+                theme,
+                view,
+                cx,
+            ))
+            .children(elapsed.map(|elapsed| {
+                div()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(elapsed))
+            }))
+            .into_any_element()
+    });
+    div()
+        .flex_none()
+        .m(px(12.0))
+        .h(px(CHILD_BANNER_HEIGHT))
+        .pl(px(16.0))
+        .pr(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .rounded(px(CHILD_BANNER_HEIGHT / 2.0))
+        .border_1()
+        .border_color(theme.composer_outline())
+        .bg(theme.input_glass_bg())
+        .text_size(crate::typography::ui_rems(13.0))
+        .child(
+            icons::icon(mark)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(tint.unwrap_or(theme.text_muted)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(model),
+        )
+        .children(summary.and_then(|s| s.agent_type.clone()).map(|kind| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.text_muted)
+                .child(kind)
+        }))
+        .children(status)
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_faint)
+                .child("Runs on its own"),
+        )
+        .child(
+            crate::controls::button(
+                format!("child-banner-parent-{}", banner.key),
+                theme,
+                crate::controls::Variant::Ghost,
+                crate::controls::Size::Xs,
+                "Open parent",
+            )
+            .on_click(open_parent),
+        )
+        .into_any_element()
+}
+
+/// Banner height: the pill the composer morphs through, minus its action row.
+pub const CHILD_BANNER_HEIGHT: f32 = 44.0;
+
+// ---------------------------------------------------------------------------
 // Composer agents tray
 // ---------------------------------------------------------------------------
 
@@ -1088,5 +1219,32 @@ mod tests {
         assert_eq!(out[0].status, SubagentPhase::Done);
         assert!(out[0].finished.is_some());
         assert!(out[0].elapsed(Utc::now()).is_some());
+    }
+
+    #[test]
+    fn a_child_thread_finds_its_summary_by_doc_or_result_doc() {
+        let summary = |id: &str, doc: Option<&str>| SubagentSummary {
+            id: id.into(),
+            title: id.to_string().into(),
+            agent_type: None,
+            model: None,
+            status: SubagentPhase::Running,
+            started: None,
+            finished: None,
+            summary: None,
+            doc_ref: doc.map(|d| d.to_string().into()),
+            latest_turn: true,
+        };
+        let all = vec![summary("a", Some("doc-a")), summary("b", None)];
+        assert_eq!(
+            summary_for_doc(all.clone(), "chat", "doc-a").map(|s| s.id),
+            Some("a".into())
+        );
+        // A doc-less harness opens its synthetic result doc.
+        assert_eq!(
+            summary_for_doc(all.clone(), "chat", &result_doc_id("chat", "b")).map(|s| s.id),
+            Some("b".into())
+        );
+        assert!(summary_for_doc(all, "chat", "elsewhere").is_none());
     }
 }

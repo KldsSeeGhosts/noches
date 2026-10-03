@@ -1606,6 +1606,8 @@ struct OrgGateUi {
 /// One right-pane subagent tab: the doc it shows, its strip title, and the
 /// read-only transcript entity whose drop tears the view down.
 struct SubagentTab {
+    /// The parent chat that spawned it (the banner's "Open parent" target).
+    chat_id: String,
     doc_id: String,
     title: SharedString,
     transcript: Entity<Transcript>,
@@ -3819,6 +3821,7 @@ impl Shell {
         self.subagent_tabs.insert(
             id,
             SubagentTab {
+                chat_id,
                 doc_id,
                 title: title.into(),
                 transcript,
@@ -9407,19 +9410,50 @@ impl Shell {
                     panel.into_any_element()
                 }
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
-                    let transcript = self
-                        .subagent_tabs
-                        .get(&id)
-                        .expect("checked")
-                        .transcript
-                        .clone();
+                    let tab = self.subagent_tabs.get(&id).expect("checked");
+                    let (transcript, parent_id, doc_id, tab_title) = (
+                        tab.transcript.clone(),
+                        tab.chat_id.clone(),
+                        tab.doc_id.clone(),
+                        tab.title.clone(),
+                    );
+                    let theme = Theme::of(cx).clone();
+                    let (summary, mark) = {
+                        let state = self.state.read(cx);
+                        let summary = crate::subagents::summary_for_doc(
+                            crate::subagents::subagents_for(state, &parent_id),
+                            &parent_id,
+                            &doc_id,
+                        );
+                        let mark = state
+                            .chats
+                            .iter()
+                            .find(|chat| chat.id == parent_id)
+                            .and_then(|chat| chat.config.as_ref())
+                            .map(|config| crate::pickers::harness_brand_icon(config.harness));
+                        (summary, mark)
+                    };
+                    let banner_key = format!("{id}");
+                    let banner = crate::subagents::child_thread_banner(
+                        &crate::subagents::ChildBanner {
+                            key: &banner_key,
+                            title: &tab_title,
+                            summary: summary.as_ref(),
+                            mark,
+                        },
+                        Utc::now(),
+                        &theme,
+                        cx.entity_id(),
+                        cx.listener(move |this, _, _, cx| this.open_chat(parent_id.clone(), cx)),
+                        cx,
+                    );
                     // The pane hosts its own jump pill: the conversation
                     // overlay's is bound to the PRIMARY transcript, and this
-                    // one anchors to the pane (no composer stack to clear).
+                    // one anchors to the pane, above the child-thread banner.
                     let pill = transcript.read(cx).jump_button_shown().then(|| {
                         div()
                             .absolute()
-                            .bottom(px(16.0))
+                            .bottom(px(16.0 + crate::subagents::CHILD_BANNER_HEIGHT + 24.0))
                             .left_0()
                             .right_0()
                             .flex()
@@ -9431,14 +9465,16 @@ impl Shell {
                                 cx,
                             ))
                     });
-                    // Read-only surface: the transcript fills the pane — no
-                    // composer, no status strip.
+                    // Read-only surface: the transcript fills the pane; a
+                    // banner stands where the composer would, saying the
+                    // agent runs on its own and linking back to the parent.
                     div()
                         .size_full()
                         .relative()
                         .flex()
                         .flex_col()
                         .child(div().flex_1().min_h_0().child(transcript))
+                        .child(banner)
                         .children(pill)
                         .into_any_element()
                 }
