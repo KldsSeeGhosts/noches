@@ -38,6 +38,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     let token = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(move |_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -55,6 +56,8 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

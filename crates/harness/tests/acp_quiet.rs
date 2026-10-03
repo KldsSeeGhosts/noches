@@ -48,6 +48,8 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -60,6 +62,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let token = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions

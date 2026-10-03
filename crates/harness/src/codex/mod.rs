@@ -15,12 +15,9 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals, reviewer, and sandbox compile from explicit T3 runtime modes.
+//!   Command/file/permissions approvals use [`RunControls::request_permission`];
+//!   content questions separately use [`RunControls::request_input`].
 //! - Subagents are full child app-server threads. Parent spawn items establish
 //!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
@@ -604,17 +601,21 @@ impl CodexHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
-        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
-        // Parity with the Claude adapter, which auto-approves every
-        // can_use_tool and so effectively grants full access. This also
-        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
-        // worktree on a slash-named branch derives a malformed mount that
-        // kills every command.
+        let policy = crate::policy::compile(
+            HarnessId::Codex,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
+        if request.interaction_mode == zeron_proto::InteractionMode::Plan && request.model.is_none()
+        {
+            return Err(HarnessError::Protocol(
+                "Codex plan mode requires an explicit model selection".into(),
+            ));
+        }
         request.sandbox = if title_only {
             zeron_proto::SandboxLevel::ReadOnly
         } else {
-            zeron_proto::SandboxLevel::DangerFullAccess
+            policy.codex_sandbox
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -795,6 +796,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        request_permission,
         browser: _,
         request_input,
         mut steering,
@@ -802,16 +804,23 @@ async fn run_session(session: Session) {
         computer_use_socket: _,
     } = controls;
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
+    let _permission_lifetime = interrupt.clone().drop_guard();
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (zeron sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // Only isolated read-only title runs use never without full access.
+    // Ordinary runs compile explicit native authority.
+    let policy = crate::policy::compile(
+        HarnessId::Codex,
+        request.runtime_mode,
+        request.interaction_mode,
+    )
+    .expect("policy was validated before launch");
+    let approval_policy = if title_only {
+        "never"
+    } else {
+        policy.codex_approval
+    };
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -957,6 +966,7 @@ async fn run_session(session: Session) {
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
         p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalsReviewer".into(), policy.codex_reviewer.into());
         p.insert(
             "sandboxPolicy".into(),
             sandbox_policy_value(request.sandbox),
@@ -974,6 +984,17 @@ async fn run_session(session: Session) {
         }
         if let Some(tier) = &service_tier {
             p.insert("serviceTier".into(), Value::String(tier.clone()));
+        }
+        if request.interaction_mode == zeron_proto::InteractionMode::Plan {
+            p.insert(
+                "collaborationMode".into(),
+                json!({
+                    "mode":"plan", "settings": {
+                        "model":request.model,
+                        "reasoning_effort":effort.unwrap_or("medium")
+                    }
+                }),
+            );
         }
         Value::Object(p)
     };
@@ -1297,7 +1318,8 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        &request_permission,
+                        &interrupt,
                         &request_input,
                     );
                 }
@@ -1498,7 +1520,7 @@ async fn steer_as_new_turn(
 }
 
 // ---------------------------------------------------------------------------
-// Approvals (approval-as-input parity with zeron's UX)
+// Native approvals and separate content questions
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<
@@ -1517,7 +1539,8 @@ fn handle_server_request(
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
+    request_permission: &Arc<crate::RequestPermission>,
+    interrupt: &crate::CancellationToken,
     request_input: &Arc<RequestInputFn>,
 ) {
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
@@ -1531,9 +1554,13 @@ fn handle_server_request(
         }
         let client = client.clone();
         let request_input = Arc::clone(request_input);
+        let interrupt = interrupt.clone();
         tokio::spawn(async move {
             let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
-            let answers = (request_input)(asked).await.unwrap_or_default();
+            let answers = tokio::select! {
+                answers = (request_input)(asked) => answers.unwrap_or_default(),
+                _ = interrupt.cancelled() => Vec::new(),
+            };
             let mut by_id = serde_json::Map::new();
             for (wire_id, q) in &questions {
                 let labels: Vec<Value> = answers
@@ -1547,10 +1574,12 @@ fn handle_server_request(
         });
         return;
     }
-    let is_approval = matches!(
-        method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-    );
+    let is_permissions = method == "item/permissions/requestApproval";
+    let is_approval = is_permissions
+        || matches!(
+            method,
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        );
     if !is_approval {
         tracing::debug!(
             target: "zeron_harness::codex",
@@ -1559,32 +1588,41 @@ fn handle_server_request(
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
         return;
     }
-    if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
-        return;
-    }
-
-    let question = approval_question(method, params);
+    let request = zeron_proto::PermissionRequest::standard(
+        method,
+        approval_question(method, params).question,
+        true,
+    );
     let client = client.clone();
-    let request_input = Arc::clone(request_input);
+    let request_permission = request_permission.clone();
+    let interrupt = interrupt.clone();
+    let permissions = params
+        .get("permissions")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
+        // A live permission callback is separate from content questions.
         //
         // A dropped sender (caller went away) degrades to a decline so the
         // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
-        client.respond(
-            &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
-        );
+        let answer = tokio::select! {
+            biased;
+            _ = interrupt.cancelled() => zeron_proto::PermissionOption::default(),
+            answer = (request_permission)(request).recv() => answer,
+        };
+        let decision = match answer.decision {
+            zeron_proto::PermissionDecision::Accept => "accept",
+            zeron_proto::PermissionDecision::AcceptForSession => "acceptForSession",
+            _ => "decline",
+        };
+        if is_permissions {
+            client.respond(&id, json!({
+                "permissions": if matches!(answer.decision, zeron_proto::PermissionDecision::Accept | zeron_proto::PermissionDecision::AcceptForSession) {permissions} else {json!({})},
+                "scope": if answer.decision == zeron_proto::PermissionDecision::AcceptForSession {"session"} else {"turn"}
+            }));
+        } else {
+            client.respond(&id, json!({ "decision": decision }));
+        }
     });
 }
 
@@ -1646,9 +1684,17 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
         .collect()
 }
 
-/// Synthesize the yes/no question an approval request surfaces to the user.
+/// Describe the native authority requested, never disguise it as content input.
 fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
-    let (header, question) = if method.contains("commandExecution") {
+    let (header, question) = if method == "item/permissions/requestApproval" {
+        (
+            "Approve permissions".to_owned(),
+            format!(
+                "Codex requests these permissions: {}",
+                params.get("permissions").unwrap_or(&Value::Null)
+            ),
+        )
+    } else if method.contains("commandExecution") {
         let command = match params.get("command") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(parts)) => parts
@@ -1786,4 +1832,14 @@ mod tests {
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
     }
+}
+#[test]
+fn permission_grant_description_names_network_and_filesystem_authority() {
+    let q = approval_question(
+        "item/permissions/requestApproval",
+        &json!({"permissions":{"network":{"enabled":true},"fileSystem":{"write":["/tmp"]}}}),
+    );
+    assert_eq!(q.header, "Approve permissions");
+    assert!(q.question.contains("network"));
+    assert!(q.question.contains("/tmp"));
 }

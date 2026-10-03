@@ -375,6 +375,11 @@ impl Harness for OpencodeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::policy::compile(
+            HarnessId::Opencode,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
         let server = self.server(cwd.as_deref()).await?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
@@ -783,6 +788,39 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
         };
         let info = self.get_json(&path, directory).await?;
         Ok(unwrap_data(info))
+    }
+
+    async fn apply_policy(
+        &self,
+        session: &str,
+        directory: Option<&str>,
+        runtime: zeron_proto::RuntimeMode,
+    ) -> Result<(), HarnessError> {
+        let v2 = self.protocol().await == Protocol::V2;
+        let path = if v2 {
+            format!("/api/session/{session}")
+        } else {
+            format!("/session/{session}")
+        };
+        let key = if v2 { "permissions" } else { "permission" };
+        let rules = crate::policy::opencode_rules(runtime, v2);
+        let req = self
+            .request(reqwest::Method::PATCH, &path)
+            .timeout(CALL_TIMEOUT)
+            .json(&json!({key:rules}));
+        let response = self
+            .scoped(req, directory)
+            .await
+            .send()
+            .await
+            .map_err(|e| HarnessError::Protocol(format!("permission policy update failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(HarnessError::Protocol(format!(
+                "OpenCode refused runtime policy: {}",
+                response.status()
+            )));
+        }
+        Ok(())
     }
 
     /// Provider catalog for the picker, variant picking, and context
@@ -1308,6 +1346,7 @@ async fn run_session(session: Session) {
         known_commands,
     } = session;
     let RunControls {
+        request_permission,
         browser: _,
         request_input,
         mut steering,
@@ -1315,6 +1354,9 @@ async fn run_session(session: Session) {
         computer_use_socket: _,
     } = controls;
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
+    let permission_gate = crate::PermissionGate::default();
+    let _permission_lifetime = interrupt.clone().drop_guard();
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
     let dir = directory.as_deref();
 
@@ -1334,12 +1376,17 @@ async fn run_session(session: Session) {
                             target: "zeron_harness::opencode",
                             "session resume failed (starting fresh): {e}"
                         );
-                        create_session(&server, dir).await?
+                        create_session(&server, dir, request.runtime_mode).await?
                     }
                 }
             }
-            None => create_session(&server, dir).await?,
+            None => create_session(&server, dir, request.runtime_mode).await?,
         };
+        if request.resume.is_some() {
+            server
+                .apply_policy(&session_id, dir, request.runtime_mode)
+                .await?;
+        }
 
         // Provider catalog: resolves the model's advertised reasoning
         // variants so the requested effort only rides models that have it.
@@ -1845,7 +1892,10 @@ async fn run_session(session: Session) {
                             dir,
                             event_tx: &event_tx,
                             request_input: &request_input,
-                            auto_approve: request.auto_approve,
+                            request_permission: &request_permission,
+                            permission_gate: &permission_gate,
+                            runtime_mode: request.runtime_mode,
+                            interrupt: &interrupt,
                             main_feed: &mut main_feed,
                             children: &mut children,
                             pending_spawns: &mut pending_spawns,
@@ -1877,16 +1927,21 @@ async fn run_session(session: Session) {
     server.shutdown(kill_grace).await;
 }
 
-async fn create_session(server: &Server, dir: Option<&str>) -> Result<String, HarnessError> {
+async fn create_session(
+    server: &Server,
+    dir: Option<&str>,
+    runtime: zeron_proto::RuntimeMode,
+) -> Result<String, HarnessError> {
     if server.protocol().await == Protocol::V2 {
         // 2.x takes the run directory in the BODY (`location.directory`) —
         // the header is ignored on this route (observed live, 2.0.3) — and
         // wraps the answer in `{data}`. Its schema is stable; the 1.x-only
         // lazy-migration crash below doesn't exist there.
-        let body = match dir {
+        let mut body = match dir {
             Some(dir) => json!({ "location": { "directory": dir } }),
             None => json!({}),
         };
+        body["permissions"] = crate::policy::opencode_rules(runtime, true);
         let created = server.post_json("/api/session", dir, &body).await?;
         return created
             .pointer("/data/id")
@@ -1906,7 +1961,13 @@ async fn create_session(server: &Server, dir: Option<&str>) -> Result<String, Ha
     // retried immediately succeeds. Retry once on any 5xx: this failure
     // class then costs one round-trip instead of a dead turn.
     for attempt in 0..2 {
-        let (status, text) = server.post_json_raw("/session", dir, &json!({})).await?;
+        let (status, text) = server
+            .post_json_raw(
+                "/session",
+                dir,
+                &json!({"permission":crate::policy::opencode_rules(runtime, false)}),
+            )
+            .await?;
         if status.is_success() {
             let created = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
             return created
@@ -2252,7 +2313,10 @@ struct BusCtx<'a> {
     dir: Option<&'a str>,
     event_tx: &'a mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request_input: &'a Arc<RequestInput>,
-    auto_approve: bool,
+    request_permission: &'a Arc<crate::RequestPermission>,
+    permission_gate: &'a crate::PermissionGate,
+    runtime_mode: zeron_proto::RuntimeMode,
+    interrupt: &'a crate::CancellationToken,
     main_feed: &'a mut SessionFeed,
     children: &'a mut HashMap<String, ChildRun>,
     pending_spawns: &'a mut VecDeque<PendingSpawn>,
@@ -2304,7 +2368,10 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         dir,
         event_tx,
         request_input,
-        auto_approve,
+        request_permission,
+        permission_gate,
+        runtime_mode,
+        interrupt,
         main_feed,
         children,
         pending_spawns,
@@ -2456,6 +2523,17 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let Some(child_id) = info.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
+            if let Err(err) = server.apply_policy(child_id, dir, runtime_mode).await {
+                let _ = server.abort_session(child_id, dir).await;
+                let _ = send(
+                    event_tx,
+                    AgentEvent::Error {
+                        message: format!("Child permission policy refused: {err}"),
+                    },
+                )
+                .await;
+                return BusOutcome::Continue;
+            }
             if children.contains_key(child_id) {
                 return BusOutcome::Continue;
             }
@@ -2661,14 +2739,25 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             } else {
                 "reply"
             };
-            let permission_input = Arc::clone(request_input);
-            let question = UserInputQuestion {
-                id: format!("permission:{id}"),
-                header: "Permission".into(),
-                question: format!("Allow this OpenCode request once? {}", props),
-                options: vec!["No".into(), "Yes".into()],
-                multi_select: false,
-            };
+            let permission_input = request_permission.clone();
+            let grant_input = json!({"permission":props.get("permission").or_else(|| props.get("action")),
+                "patterns":props.get("patterns").or_else(|| props.get("resources")), "metadata":props.get("metadata")});
+            let fingerprint = crate::permission_fingerprint(&grant_input);
+            let request = zeron_proto::PermissionRequest::standard(
+                "OpenCode tool",
+                format!("{}: {}", grant_input["permission"], grant_input["patterns"])
+                    .chars()
+                    .take(2000)
+                    .collect::<String>(),
+                grant_input["patterns"].as_array().is_some_and(|patterns| {
+                    !patterns.is_empty()
+                        && patterns
+                            .iter()
+                            .all(|p| p.as_str().is_some_and(|s| !s.is_empty()))
+                }),
+            );
+            let permission_gate = permission_gate.clone();
+            let interrupt = interrupt.clone();
             tokio::spawn(async move {
                 let server = Server {
                     child: None,
@@ -2679,18 +2768,20 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     protocol: protocol_cell,
                     version: tokio::sync::OnceCell::new(),
                 };
-                let allowed = auto_approve
-                    || (permission_input)(vec![question.clone()])
-                        .await
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|answer| {
-                            answer.question_id == question.id
-                                && answer
-                                    .labels
-                                    .iter()
-                                    .any(|label| label.eq_ignore_ascii_case("yes"))
-                        });
+                let allowed = if interrupt.is_cancelled() {
+                    false
+                } else if runtime_mode == zeron_proto::RuntimeMode::FullAccess {
+                    true
+                } else {
+                    let answer = permission_gate
+                        .ask(request, fingerprint, &permission_input, &interrupt)
+                        .await;
+                    matches!(
+                        answer.decision,
+                        zeron_proto::PermissionDecision::Accept
+                            | zeron_proto::PermissionDecision::AcceptForSession
+                    )
+                };
                 // V2 "always" writes durable project-wide permission rules.
                 // Approval of this request must not grant future runs access.
                 let reply = if allowed { "once" } else { "reject" };

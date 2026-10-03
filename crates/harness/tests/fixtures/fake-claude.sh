@@ -77,7 +77,7 @@ case "$first" in
 
 *scenario:askuser*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-ask"}'
-  # A plain tool permission request: must be auto-allowed.
+  # A plain tool permission request: the test bridge explicitly allows it.
   emit '{"type":"control_request","request_id":"cr-0","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}'
   read -r resp0 || exit 1
   case "$resp0" in

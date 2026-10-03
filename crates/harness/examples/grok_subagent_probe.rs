@@ -18,6 +18,7 @@ async fn main() {
     let (_steer_tx, steering) = mpsc::channel(8);
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -46,6 +47,8 @@ async fn main() {
         model_options: serde_json::Map::new(),
         cwd,
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

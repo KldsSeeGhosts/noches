@@ -42,6 +42,8 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -54,6 +56,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let token = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -272,10 +275,10 @@ async fn resumed_first_class_model_is_switched_before_prompt() {
 }
 
 #[tokio::test]
-async fn permission_requests_auto_accept_the_preferred_allow_option() {
+async fn full_access_permission_never_creates_a_persistent_grant() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
-    // The fixture answers refusal unless the harness selected "always".
+    // A Full access run selects allow_once, never persistent allow_always.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "approved".into()
     }));
@@ -830,7 +833,7 @@ async fn antigravity_runs_the_picked_effort_variant_unattended() {
     let events = antigravity_config_sets("gemini-3.7-flash", Some(ReasoningLevel::Medium)).await;
     assert!(
         events.contains(&AgentEvent::TextDelta {
-            text: "sets:model=gemini-3.7-flash-medium;mode=yolo;".into()
+            text: "sets:mode=yolo;model=gemini-3.7-flash-medium;".into()
         }),
         "{events:?}"
     );
@@ -873,14 +876,14 @@ async fn antigravity_clamps_to_an_offered_level_and_keeps_saved_variant_ids() {
     let clamped = antigravity_config_sets("gemini-3.1-pro", Some(ReasoningLevel::Medium)).await;
     assert!(
         clamped.contains(&AgentEvent::TextDelta {
-            text: "sets:model=gemini-pro-agent;mode=yolo;".into()
+            text: "sets:mode=yolo;model=gemini-pro-agent;".into()
         }),
         "{clamped:?}"
     );
     let saved = antigravity_config_sets("gemini-3.7-flash-low", Some(ReasoningLevel::High)).await;
     assert!(
         saved.contains(&AgentEvent::TextDelta {
-            text: "sets:model=gemini-3.7-flash-low;mode=yolo;".into()
+            text: "sets:mode=yolo;model=gemini-3.7-flash-low;".into()
         }),
         "{saved:?}"
     );

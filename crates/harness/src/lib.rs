@@ -24,6 +24,165 @@ use zeron_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+/// A permission callback is live-only. Dropping its receiver expires it in
+/// the engine; it can never be replayed as a resumed prompt.
+pub struct PermissionReceiver {
+    receiver: oneshot::Receiver<zeron_proto::PermissionOption>,
+    expire: Option<Box<dyn FnOnce() + Send>>,
+}
+impl PermissionReceiver {
+    pub fn new(
+        receiver: oneshot::Receiver<zeron_proto::PermissionOption>,
+        expire: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            receiver,
+            expire: Some(Box::new(expire)),
+        }
+    }
+    pub async fn recv(mut self) -> zeron_proto::PermissionOption {
+        let result = (&mut self.receiver).await.unwrap_or_default();
+        // On either send or channel closure, the engine already removed it.
+        self.expire.take();
+        result
+    }
+}
+impl Drop for PermissionReceiver {
+    fn drop(&mut self) {
+        if let Some(expire) = self.expire.take() {
+            expire();
+        }
+    }
+}
+pub type RequestPermission =
+    Box<dyn Fn(zeron_proto::PermissionRequest) -> PermissionReceiver + Send + Sync>;
+
+/// Session grants are exact tool+request grants, never provider project rules.
+/// The gate belongs to one runtime and is discarded on mode change/restart.
+#[derive(Clone, Default)]
+pub struct PermissionGate(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+);
+impl PermissionGate {
+    pub async fn ask(
+        &self,
+        request: zeron_proto::PermissionRequest,
+        fingerprint: String,
+        callback: &RequestPermission,
+        interrupt: &CancellationToken,
+    ) -> zeron_proto::PermissionOption {
+        if interrupt.is_cancelled() {
+            return zeron_proto::PermissionOption::default();
+        }
+        let key = (request.tool.clone(), fingerprint);
+        if self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+        {
+            return request
+                .options
+                .iter()
+                .find(|o| o.decision == zeron_proto::PermissionDecision::Accept)
+                .cloned()
+                .unwrap_or_default();
+        }
+        let answer = tokio::select! {
+            biased;
+            _ = interrupt.cancelled() => zeron_proto::PermissionOption::default(),
+            answer = callback(request).recv() => answer,
+        };
+        if answer.decision == zeron_proto::PermissionDecision::AcceptForSession {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+        }
+        answer
+    }
+}
+
+pub(crate) fn permission_fingerprint(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
+    )
+}
+
+pub(crate) fn permission_summary(tool: &str, input: &serde_json::Value) -> String {
+    let detail = ["command", "file_path", "path", "url", "title", "reason"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(serde_json::Value::as_str));
+    format!(
+        "{tool}: {}",
+        detail.unwrap_or("The agent needs permission to use this tool.")
+    )
+    .chars()
+    .take(2000)
+    .collect()
+}
+
+/// Refusing bridge for title runs and fixtures with no permission UI.
+pub fn refuse_permissions() -> RequestPermission {
+    Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(zeron_proto::PermissionOption::default());
+        PermissionReceiver::new(rx, || {})
+    })
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_grants_are_exact_and_do_not_survive_a_runtime_or_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let asked = count.clone();
+        let callback: RequestPermission = Box::new(move |request| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(
+                request
+                    .options
+                    .into_iter()
+                    .find(|o| o.decision == zeron_proto::PermissionDecision::AcceptForSession)
+                    .unwrap(),
+            );
+            PermissionReceiver::new(rx, || {})
+        });
+        let gate = PermissionGate::default();
+        let interrupt = CancellationToken::new();
+        let request = || zeron_proto::PermissionRequest::standard("Bash", "echo safe", true);
+        gate.ask(request(), "echo safe".into(), &callback, &interrupt)
+            .await;
+        assert_eq!(
+            gate.ask(request(), "echo safe".into(), &callback, &interrupt)
+                .await
+                .decision,
+            zeron_proto::PermissionDecision::Accept
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        gate.ask(request(), "different command".into(), &callback, &interrupt)
+            .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        PermissionGate::default()
+            .ask(request(), "echo safe".into(), &callback, &interrupt)
+            .await;
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        interrupt.cancel();
+        assert_eq!(
+            gate.ask(request(), "echo safe".into(), &callback, &interrupt)
+                .await
+                .decision,
+            zeron_proto::PermissionDecision::Cancel
+        );
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
     #[error("harness binary not found: {0}")]
@@ -46,6 +205,7 @@ pub struct SteerMessage {
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
+    pub request_permission: RequestPermission,
     /// Host-provided connection to this conversation’s integrated browser.
     pub browser: Option<zeron_browser::Connection>,
     /// Private engine socket for the managed `noches_cua` Pi tool. Absent
@@ -126,6 +286,7 @@ pub(crate) mod executable;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub mod policy;
 pub mod process;
 pub mod redact;
 mod scratch;

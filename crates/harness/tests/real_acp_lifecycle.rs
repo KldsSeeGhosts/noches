@@ -17,6 +17,7 @@ async fn live_run(cancel: bool) {
         browser: None,
         steering,
         interrupt: interrupt.clone(),
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -29,6 +30,7 @@ async fn live_run(cancel: bool) {
         harness: None, model: None, reasoning: None,
         model_options: serde_json::Map::new(), cwd: cwd.path().display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite, auto_approve: true,
+        runtime_mode: Default::default(), interaction_mode: Default::default(),
         attachments: Vec::new(), worktree: None, resume: None,
     };
     let mut stream = AcpHarness::pi()

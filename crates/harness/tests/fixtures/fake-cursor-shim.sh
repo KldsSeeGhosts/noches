@@ -21,6 +21,13 @@ esac
 
 case "$first" in
 
+*scenario:policy*)
+  emit '{"ev":"ready","agentId":"agent-policy","model":"auto"}'
+  printf '%s\n' "$first" | python3 -c 'import json,sys; print(json.dumps({"ev":"text","text":sys.stdin.read().strip()}))'
+  emit '{"ev":"turn","status":"finished"}'
+  exit 0
+  ;;
+
 *scenario:burst*)
   exec node "$(dirname "$0")/cursor-steering-peer.mjs" "$first"
   ;;

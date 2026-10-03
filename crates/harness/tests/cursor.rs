@@ -38,6 +38,8 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -50,6 +52,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let token = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(move |_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -60,6 +63,41 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         computer_use_socket: None,
     };
     (controls, steer_tx, token)
+}
+
+/// Collect events until the first Done (the session parks afterwards).
+#[tokio::test]
+async fn native_policy_and_plan_flags_reach_the_sdk_shim() {
+    for mode in zeron_proto::RuntimeMode::ALL {
+        for interaction in [
+            zeron_proto::InteractionMode::Default,
+            zeron_proto::InteractionMode::Plan,
+        ] {
+            let mut req = request("scenario:policy");
+            req.runtime_mode = mode;
+            req.interaction_mode = interaction;
+            let (controls, _, _) = controls();
+            let events = run_to_first_done(&harness(), req, controls).await;
+            let text = events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::TextDelta { text } => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            let wire: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(wire["runtimeMode"], serde_json::json!(mode));
+            assert_eq!(wire["interactionMode"], serde_json::json!(interaction));
+            assert_eq!(
+                wire["autoReview"],
+                mode == zeron_proto::RuntimeMode::ApprovalRequired
+            );
+            assert_eq!(
+                wire["sandboxEnabled"],
+                mode != zeron_proto::RuntimeMode::FullAccess
+            );
+        }
+    }
 }
 
 /// Collect events until the first Done (the session parks afterwards).

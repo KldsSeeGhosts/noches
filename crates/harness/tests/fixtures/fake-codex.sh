@@ -254,9 +254,8 @@ case "$turnline" in
   ;;
 
 *scenario:approve*)
-  # Wire policy is always "never" (unattended parity with the Claude
-  # adapter); the requests below are the STRAY-approval path, which must
-  # still round-trip as input questions.
+  # This scenario uses Full access, but unexpected native asks still go
+  # through the permission bridge, never through content questions.
   has "$thread_line" '"approvalPolicy":"never"' ||
     { fail_turn "$tid" "thread approvalPolicy should be never"; exit 0; }
   has "$turnline" '"approvalPolicy":"never"' ||

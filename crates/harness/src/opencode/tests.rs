@@ -186,6 +186,13 @@ impl TurnWire {
             event_tx,
             controls: RunControls {
                 browser: None,
+                request_permission: Box::new(move |request| {
+                    let answer = answer.expect("fixture must not ask for permission");
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let decision = if answer {zeron_proto::PermissionDecision::Accept} else {zeron_proto::PermissionDecision::Decline};
+                    let _ = tx.send(request.options.into_iter().find(|o| o.decision == decision).unwrap());
+                    crate::PermissionReceiver::new(rx, || {})
+                }),
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -200,6 +207,7 @@ impl TurnWire {
 },
             request: serde_json::from_value({
                 let mut request = json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
+                request["runtimeMode"] = json!(if auto_approve {"full-access"} else {"approval-required"});
                 if let Some(fields) = overrides["request"].as_object() {
                     request
                         .as_object_mut()

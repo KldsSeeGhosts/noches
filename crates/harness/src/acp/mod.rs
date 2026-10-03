@@ -18,9 +18,9 @@
 //! - `session/prompt` owns the turn: its response's `stopReason` ends the
 //!   turn (`cancelled` → Interrupted, `refusal` → Errored, else Completed).
 //! - `session/update` notifications normalize per [`normalize::map_update`].
-//! - Permission requests auto-accept with the agent's preferred allow option
-//!   (zeron sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge.
+//! - Native policy is selected before prompting; restricted permissions use
+//!   the engine's live approval bridge. Full access returns one-time grants
+//!   only. Content questions always use the separate input bridge.
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -1496,8 +1496,12 @@ impl AcpHarness {
     ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
-        cmd.args(args);
-        cmd.args(extra_args);
+        if self.spec.id == HarnessId::Grok && !extra_args.is_empty() {
+            cmd.args(extra_args);
+        } else {
+            cmd.args(args);
+            cmd.args(extra_args);
+        }
         child::configure(&mut cmd);
         crate::compose_child_environment(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
@@ -2118,6 +2122,7 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::policy::compile(self.spec.id, request.runtime_mode, request.interaction_mode)?;
         // `with_executable` is used by tests and embedders that supply a
         // complete ACP server. Installed Pi runs always load the policy
         // extension, even when this host cannot provide the managed bridge.
@@ -2127,8 +2132,13 @@ impl Harness for AcpHarness {
             } else {
                 (Vec::new(), None, self.pi_usage_file_override.clone())
             };
+        let policy_args = if self.spec.id == HarnessId::Grok {
+            crate::policy::grok_args(request.runtime_mode)
+        } else {
+            Vec::new()
+        };
         let (scratch, mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
+            .spawn_agent(Some(&request.cwd), true, &policy_args, &cua_env)
             .await?;
         let stdin = child
             .stdin
@@ -2226,7 +2236,7 @@ fn initialize_params(harness: HarnessId) -> Value {
         // separate subagentControl extension: Zeron has no matching UI yet.
         capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
     }
-    json!({
+    let mut params = json!({
         "protocolVersion": 1,
         "clientInfo": {
             "name": "zeron",
@@ -2237,7 +2247,11 @@ fn initialize_params(harness: HarnessId) -> Value {
         // is what zeron wants — the working tree is the source of truth for
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
-    })
+    });
+    if harness == HarnessId::Grok {
+        params["_meta"] = json!({"clientType":"extension"});
+    }
+    params
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -2496,6 +2510,21 @@ fn config_option_sets(
         let Some(config_id) = option.get("id").and_then(Value::as_str) else {
             continue;
         };
+        // A malformed/missing category must not let model selections change
+        // authority through the generic normalized-id path.
+        if option["category"] == "mode"
+            || matches!(
+                norm_id(config_id).as_str(),
+                "mode"
+                    | "permissionmode"
+                    | "permissions"
+                    | "approvalpolicy"
+                    | "sandbox"
+                    | "runtimemode"
+            )
+        {
+            continue;
+        }
         let kind = option.get("type").and_then(Value::as_str).unwrap_or("");
         let category = option.get("category").and_then(Value::as_str);
         let current = option.get("currentValue");
@@ -2512,32 +2541,6 @@ fn config_option_sets(
             ("select", Some("model")) => model
                 .and_then(|m| pick_model_value(m, &available, context_1m))
                 .map(Value::String),
-            // Unattended parity with the retired custom adapters (claude
-            // bypassPermissions / codex approvalPolicy never): pick the
-            // no-prompts mode when the agent offers one. claude-agent-acp
-            // calls it `bypassPermissions`, codex-acp `agent-full-access`
-            // (approvalPolicy "never" + danger-full-access sandbox), Devin
-            // `bypass`. Cursor instead exposes agent/plan/ask — those arrive
-            // as a Traits "Mode" option and win when the run selected one.
-            ("select", Some("mode")) => model_options
-                .get("mode")
-                .and_then(Value::as_str)
-                .filter(|c| available.contains(c))
-                .map(|c| Value::String(c.to_owned()))
-                .or_else(|| {
-                    [
-                        "bypassPermissions",
-                        "bypass_permissions",
-                        "bypass",
-                        "yolo",
-                        "agent-full-access",
-                        "danger-full-access",
-                        "full-access",
-                    ]
-                    .into_iter()
-                    .find(|v| available.contains(v))
-                    .map(|v| Value::String(v.to_owned()))
-                }),
             ("select", Some("thought_level")) => efforts
                 .iter()
                 .find(|c| available.contains(*c))
@@ -2746,13 +2749,8 @@ fn handle_server_request(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            match preferred_allow_option(&options) {
-                Some(option_id) => client.respond(
-                    &id,
-                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                ),
-                None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
-            }
+            let _ = options;
+            client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } }));
             Vec::new()
         }
         _ => {
@@ -2777,12 +2775,13 @@ type RequestInputFn = Box<
 /// legitimately repeat — codex sends two `allow_always` options ("Allow for
 /// Session" and a prefix-rule amendment) on every exec approval.
 fn is_user_question(options: &[Value]) -> bool {
-    options.iter().any(|option| {
-        !matches!(
-            option.get("kind").and_then(Value::as_str),
-            Some("allow_once" | "allow_always" | "reject_once" | "reject_always")
-        )
-    })
+    !options.is_empty()
+        && options.iter().all(|option| {
+            !matches!(
+                option.get("kind").and_then(Value::as_str),
+                Some("allow_once" | "allow_always" | "reject_once" | "reject_always")
+            )
+        })
 }
 
 /// The live-run request handler: tool permissions auto-accept like
@@ -2796,14 +2795,69 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    request_permission: &std::sync::Arc<crate::RequestPermission>,
+    permission_gate: &crate::PermissionGate,
+    runtime_mode: zeron_proto::RuntimeMode,
+    interrupt: &crate::CancellationToken,
     session_id: &str,
 ) -> Vec<AgentEvent> {
+    let params = params.get("params").unwrap_or(params);
     if params
         .get("sessionId")
         .and_then(Value::as_str)
         .is_some_and(|id| id != session_id)
     {
         client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        return Vec::new();
+    }
+    if matches!(method, "x.ai/ask_user_question" | "_x.ai/ask_user_question") {
+        let params = params.get("params").unwrap_or(params);
+        let questions: Vec<UserInputQuestion> = params["questions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(ix, q)| UserInputQuestion {
+                id: q["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("q{ix}")),
+                header: "Agent question".into(),
+                question: q["question"].as_str().unwrap_or_default().into(),
+                options: q["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| o["label"].as_str().map(str::to_owned))
+                    .collect(),
+                multi_select: q["multiSelect"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        let callback = request_input.clone();
+        let client = client.clone();
+        let interrupt = interrupt.clone();
+        tokio::spawn(async move {
+            let answers = tokio::select! {
+                answers = callback(questions.clone()) => answers.unwrap_or_default(),
+                _ = interrupt.cancelled() => Vec::new(),
+            };
+            if answers.is_empty() {
+                client.respond(&id, json!({"outcome":"cancelled"}));
+            } else {
+                let answers: serde_json::Map<String, Value> = questions
+                    .iter()
+                    .filter_map(|q| {
+                        let labels = answers
+                            .iter()
+                            .find(|a| a.question_id == q.id)?
+                            .labels
+                            .clone();
+                        Some((q.question.clone(), json!(labels)))
+                    })
+                    .collect();
+                client.respond(&id, json!({"outcome":"accepted","answers":answers}));
+            }
+        });
         return Vec::new();
     }
     if method != "session/request_permission" {
@@ -2815,7 +2869,102 @@ fn handle_server_request_live(
         .cloned()
         .unwrap_or_default();
     if !is_user_question(&options) {
-        return handle_server_request(client, id, method, params);
+        if runtime_mode == zeron_proto::RuntimeMode::FullAccess {
+            // Never synthesize an always/project grant for an individual call.
+            if let Some(option_id) = preferred_allow_option(&options) {
+                client.respond(
+                    &id,
+                    json!({"outcome":{"outcome":"selected","optionId":option_id}}),
+                );
+                return Vec::new();
+            }
+        }
+        let mut request = zeron_proto::PermissionRequest::standard(
+            "ACP tool",
+            params["toolCall"]["title"]
+                .as_str()
+                .unwrap_or("Allow this tool?"),
+            false,
+        );
+        request.options = options
+            .iter()
+            .filter_map(|o| {
+                let decision = match o["kind"].as_str()? {
+                    "allow_once" => zeron_proto::PermissionDecision::Accept,
+                    "reject_once" => zeron_proto::PermissionDecision::Decline,
+                    // ACP allow_always may persist project rules. Without a
+                    // provider-specific verified session scope, don't offer it.
+                    _ => return None,
+                };
+                Some(zeron_proto::PermissionOption {
+                    id: o["optionId"].as_str()?.into(),
+                    label: o["name"].as_str().unwrap_or("Permission").into(),
+                    decision,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if !request
+            .options
+            .iter()
+            .any(|o| o.decision == zeron_proto::PermissionDecision::Decline)
+        {
+            request.options.push(zeron_proto::PermissionOption {
+                id: "__noches-deny".into(),
+                label: "Deny".into(),
+                decision: zeron_proto::PermissionDecision::Decline,
+                ..Default::default()
+            });
+        }
+        let once_id = request
+            .options
+            .iter()
+            .find(|o| o.decision == zeron_proto::PermissionDecision::Accept)
+            .map(|o| o.id.clone());
+        let mut grant_input = params["toolCall"].clone();
+        if let Some(fields) = grant_input.as_object_mut() {
+            fields.remove("toolCallId");
+        }
+        let fingerprint = crate::permission_fingerprint(&grant_input);
+        if once_id.is_some()
+            && grant_input
+                .get("rawInput")
+                .or_else(|| grant_input.get("raw_input"))
+                .and_then(Value::as_object)
+                .is_some_and(|input| !input.is_empty())
+        {
+            request.options.push(zeron_proto::PermissionOption {
+                id: "__noches-session-grant".into(),
+                label: "Allow for session".into(),
+                decision: zeron_proto::PermissionDecision::AcceptForSession,
+                scope: zeron_proto::DecisionScope::Session,
+                ..Default::default()
+            });
+        }
+        let client = client.clone();
+        let request_permission = request_permission.clone();
+        let permission_gate = permission_gate.clone();
+        let interrupt = interrupt.clone();
+        tokio::spawn(async move {
+            let answer = permission_gate
+                .ask(request, fingerprint, &request_permission, &interrupt)
+                .await;
+            let option_id = if answer.decision == zeron_proto::PermissionDecision::AcceptForSession
+            {
+                once_id.unwrap_or_default()
+            } else {
+                answer.id
+            };
+            if option_id.is_empty() || option_id == "__noches-deny" {
+                client.respond(&id, json!({"outcome":{"outcome":"cancelled"}}));
+            } else {
+                client.respond(
+                    &id,
+                    json!({"outcome":{"outcome":"selected","optionId":option_id}}),
+                );
+            }
+        });
+        return Vec::new();
     }
     let names: Vec<String> = options
         .iter()
@@ -2840,10 +2989,12 @@ fn handle_server_request_live(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    let interrupt = interrupt.clone();
     tokio::spawn(async move {
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
+        let answers = tokio::select! {
+            answers = (request_input)(vec![question.clone()]) => answers.unwrap_or_default(),
+            _ = interrupt.cancelled() => Vec::new(),
+        };
         let picked = answers
             .iter()
             .find(|a| a.question_id == question.id)
@@ -3173,6 +3324,7 @@ async fn run_session(session: Session) {
         _pi_launch_dir,
     } = session;
     let RunControls {
+        request_permission,
         browser,
         request_input,
         mut steering,
@@ -3180,6 +3332,9 @@ async fn run_session(session: Session) {
         computer_use_socket: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
+    let request_permission = std::sync::Arc::new(request_permission);
+    let permission_gate = crate::PermissionGate::default();
+    let _permission_lifetime = interrupt.clone().drop_guard();
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -3300,6 +3455,19 @@ async fn run_session(session: Session) {
         // runs.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let options_snapshot = session_response;
+        if let Some((method, mut payload)) =
+            crate::policy::acp_mode_set(harness, request.runtime_mode, &options_snapshot)?
+        {
+            payload["sessionId"] = session_id.clone().into();
+            let method = if method == "session/set_mode" {
+                "session/set_mode"
+            } else {
+                "session/set_config_option"
+            };
+            request_draining(&client, &mut incoming, method, payload)
+                .await
+                .map_err(|e| HarnessError::Protocol(format!("permission mode rejected: {e}")))?;
+        }
         let mut switched_options: Option<Value> = None;
         for (config_id, payload) in config_option_sets(
             &options_snapshot,
@@ -3698,6 +3866,10 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &request_permission,
+                                &permission_gate,
+                                request.runtime_mode,
+                                &interrupt,
                                 &session_id,
                             ) {
                                 if !send(&event_tx, ev).await {
@@ -3894,6 +4066,10 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
+                        &request_permission,
+                        &permission_gate,
+                        request.runtime_mode,
+                        &interrupt,
                         &session_id,
                     ) {
                         if !send(&event_tx, ev).await {
@@ -4016,6 +4192,10 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &request_permission,
+                                        &permission_gate,
+                                        request.runtime_mode,
+                                        &interrupt,
                                         &session_id,
                                     ) {
                                         if !send(&event_tx, ev).await {
@@ -5307,11 +5487,11 @@ mod tests {
             json!({ "optionId": "a", "name": "Proceed", "kind": "allow_once" }),
             json!({ "optionId": "b", "name": "Другое", "kind": "other" }),
         ];
-        assert!(is_user_question(&mixed));
+        assert!(!is_user_question(&mixed));
     }
 
     #[test]
-    fn mode_config_option_prefers_a_no_prompt_mode_per_adapter_naming() {
+    fn model_option_compiler_cannot_override_permission_mode() {
         let codex = json!({
             "sessionId": "s-1",
             "configOptions": [{
@@ -5327,10 +5507,7 @@ mod tests {
             }],
         });
         let no_opts = serde_json::Map::new();
-        assert_eq!(
-            config_option_sets(&codex, None, &[], &no_opts),
-            vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
-        );
+        assert!(config_option_sets(&codex, None, &[], &no_opts).is_empty());
     }
 
     fn antigravity_signed_in_catalog() -> Value {

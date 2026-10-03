@@ -210,6 +210,8 @@ fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: false,
         attachments: Vec::new(),
         worktree: None,
@@ -226,6 +228,7 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -321,6 +324,7 @@ async fn exercise_tree(prompt: &str, drop_stream: bool) {
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (_, rx) = oneshot::channel();
             rx
@@ -481,6 +485,7 @@ async fn batch_overrides_launch_through_cmd() {
         let (_steer, steering) = mpsc::channel(1);
         let controls = RunControls {
             browser: None,
+            request_permission: zeron_harness::refuse_permissions(),
             request_input: Box::new(|_| {
                 let (tx, rx) = oneshot::channel();
                 let _ = tx.send(Vec::new());
