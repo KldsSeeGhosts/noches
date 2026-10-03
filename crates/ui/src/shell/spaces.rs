@@ -2006,6 +2006,7 @@ impl Shell {
             harness,
             status,
             is_selected,
+            pane_open && !is_selected,
             false,
             jump_label,
             None,

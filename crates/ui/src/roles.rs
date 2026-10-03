@@ -35,6 +35,38 @@ pub(crate) fn control_hover(theme: &Theme) -> Hsla {
     theme.element_hover
 }
 
+/// Sidebar row fill under the pointer.
+pub(crate) fn sidebar_hover(theme: &Theme) -> Hsla {
+    // TODO(D1): theme.sidebar_hover
+    theme.glass_hover()
+}
+
+/// Sidebar row on screen in a pane that is not the focused one. One step
+/// heavier than hover so the two never read as the same fill (R5 §2.4).
+pub(crate) fn sidebar_selected(theme: &Theme) -> Hsla {
+    // TODO(D1): theme.sidebar_selected
+    step_up(sidebar_hover(theme), 1.45, theme)
+}
+
+/// The focused (open) sidebar row: the heaviest tier.
+pub(crate) fn sidebar_active(theme: &Theme) -> Hsla {
+    // TODO(D1): theme.sidebar_active
+    step_up(sidebar_hover(theme), 1.8, theme)
+}
+
+/// Scale a translucent wash by `factor` (capped so rows never turn into
+/// plates); an opaque theme hover mixes toward the text colour instead.
+fn step_up(base: Hsla, factor: f32, theme: &Theme) -> Hsla {
+    if base.a < 0.99 {
+        Hsla {
+            a: (base.a * factor).min(0.30),
+            ..base
+        }
+    } else {
+        mix(base, theme.text, 0.05 * factor)
+    }
+}
+
 /// Pressed fill for ghost/outline controls: one step past hover.
 pub(crate) fn control_pressed(theme: &Theme) -> Hsla {
     // TODO(D1): theme.control_hover darkened/lightened
@@ -142,6 +174,18 @@ mod tests {
             assert_eq!(tooltip_shadow(&theme).len(), 1);
             assert_eq!(composer_shadow(&theme).len(), 1);
             assert!(focus_ring(&theme)[0].inset);
+        }
+    }
+
+    #[test]
+    fn sidebar_tiers_step_up_from_hover() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let (h, s, a) = (
+                sidebar_hover(&theme),
+                sidebar_selected(&theme),
+                sidebar_active(&theme),
+            );
+            assert!(h.a < s.a && s.a < a.a, "{h:?} {s:?} {a:?}");
         }
     }
 

@@ -60,6 +60,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::roles;
 use crate::status_palette::SessionState;
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -969,6 +970,9 @@ fn sidebar_footer_button(
     .tooltip(crate::tooltip::text(label))
     .tooltip_show_delay(crate::tooltip::SHOW_DELAY)
 }
+
+/// Opacity of a running row that is not on screen, until it is hovered.
+const SIDEBAR_RECEDE_OPACITY: f32 = 0.7;
 
 /// Compact title-first thread: 8px + 20px title + 4px gap + 16px context + 8px.
 const CHAT_ROW_HEIGHT: f32 = 56.0;
@@ -6457,6 +6461,8 @@ impl Shell {
         harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
         selected: bool,
+        // On screen in a pane that is not the focused one: the middle fill tier.
+        visible: bool,
         archived: bool,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
@@ -6605,7 +6611,9 @@ impl Shell {
                         .font_family(theme.font_mono.clone())
                         .text_size(crate::typography::ui_rems(11.0))
                         .line_height(px(16.0))
-                        .text_color(color)
+                        // Text stays neutral (the hue lives on the glyph): the
+                        // light-theme sky tone is only 3.7:1 at 11px.
+                        .text_color(theme.text_muted)
                         .child(elapsed),
                 );
             }
@@ -6679,25 +6687,30 @@ impl Shell {
                 )
             })
             .into_any_element();
-        let (hover, text) = (theme.glass_hover(), theme.text);
-        let selected_wash = crate::theme::glass_selected_bg();
+        let text = theme.text;
         let select_id = id.clone();
         let menu_id = id.clone();
         let sidebar_row = search_query.is_none();
         let rename_input = sidebar_row.then(|| self.rename_input_for(&id)).flatten();
-        // Hover fades over transition-colors (zeron session-row.tsx) — both
-        // the wash and the title brighten ride the same 150ms blend.
+        // Hover fades over transition-colors (zeron session-row.tsx) - both
+        // the wash and the title brighten ride the same 150ms blend. Three
+        // fill tiers (R5 §2.4): hover < on screen in another pane < focused.
         let fade_key = format!("{row_id}-hover");
-        let rest_bg = if selected {
-            selected_wash
+        let tier = if selected {
+            Some(roles::sidebar_active(theme))
+        } else if visible && sidebar_row {
+            Some(roles::sidebar_selected(theme))
         } else {
-            crate::theme::wash(0.0)
+            None
         };
-        // A selected row must NOT drift toward the hover wash: in dark the two
-        // fills are identical so the blend is a no-op, but light's hover sits
-        // below its near-opaque selected fill, and blending toward it visibly
-        // dimmed the active row under the pointer (user report).
-        let hover_bg = if selected { selected_wash } else { hover };
+        let rest_bg = tier.unwrap_or_else(|| crate::theme::wash(0.0));
+        // A tiered row must NOT drift toward the hover wash: the tiers are the
+        // heavier fills, and blending toward the lighter hover visibly dimmed
+        // the active row under the pointer (user report).
+        let hover_bg = tier.unwrap_or_else(|| roles::sidebar_hover(theme));
+        // Background work recedes: a running row that is not on screen sits
+        // at 70% until the pointer reaches it.
+        let recede = session == SessionState::Working && !selected && !visible && sidebar_row;
         // Rule 4: titles are NORMAL weight; a card that needs you lifts to
         // MEDIUM and full-strength text. Everything else rests at 0.9.
         let rest_text = if selected || needs_you || search_query.is_some() {
@@ -6727,6 +6740,13 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
+            .when(recede, |row| {
+                row.opacity(motion::lerp(
+                    SIDEBAR_RECEDE_OPACITY,
+                    1.0,
+                    motion::hover_t(&fade_key),
+                ))
+            })
             // No selection ring (user request) — the wash alone marks the
             // active row.
             // Row hover drives BOTH the wash blend and the corner's
@@ -14353,6 +14373,7 @@ mod workspace_persistence {
                         Some(zeron_proto::HarnessId::Pi),
                         self.status,
                         true,
+                        false,
                         false,
                         self.jump.then(|| {
                             if self.index == 5 {
