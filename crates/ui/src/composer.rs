@@ -8803,7 +8803,10 @@ mod tests {
                     .collect();
                 assert_eq!(names, ["shot.png"]);
                 assert!(!composer.attachments.contains_key("chat-b"));
-                assert!(!composer.focus_pending, "staging must not focus another draft");
+                assert!(
+                    !composer.focus_pending,
+                    "staging must not focus another draft"
+                );
             })
             .unwrap();
     }
@@ -8824,7 +8827,10 @@ mod tests {
         handle
             .read_with(cx, |composer, _| {
                 assert_eq!(composer.failure_key.as_deref(), Some("chat-a"));
-                assert_eq!(composer.failure.as_deref(), Some("broken.bmp is not a valid image."));
+                assert_eq!(
+                    composer.failure.as_deref(),
+                    Some("broken.bmp is not a valid image.")
+                );
                 assert!(composer.attachments.is_empty());
             })
             .unwrap();

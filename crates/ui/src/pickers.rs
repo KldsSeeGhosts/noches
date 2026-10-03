@@ -5434,15 +5434,12 @@ mod tests {
                     workspace_footer_row()
                         .child(fixed(120.0))
                         .child(
-                            Pickers::footer_label_shell(
-                                crate::icons::GIT_BRANCH,
-                                &Theme::dark(),
-                            )
-                            .child(Pickers::footer_faded_text(
-                                "branch",
-                                fixed(300.0),
-                                &self.overflow,
-                            )),
+                            Pickers::footer_label_shell(crate::icons::GIT_BRANCH, &Theme::dark())
+                                .child(Pickers::footer_faded_text(
+                                    "branch",
+                                    fixed(300.0),
+                                    &self.overflow,
+                                )),
                         )
                         .child(div().flex_1().min_w_0())
                         .child(fixed(60.0)),
