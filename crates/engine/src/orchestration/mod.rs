@@ -6,6 +6,7 @@ pub mod effects;
 pub mod event;
 pub mod projection;
 pub mod recovery;
+pub mod service;
 pub mod store;
 pub mod sync_publish;
 #[cfg(test)]
