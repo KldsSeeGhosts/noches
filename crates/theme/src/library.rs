@@ -579,6 +579,43 @@ fn rekey_family(family: &mut ThemeFamily, new_id: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn t3_fixture_detects_installs_and_reloads_both_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, include_str!("../tests/fixtures/claude.json")).unwrap();
+        let compiled = CustomThemeLibrary::compile(&path, "t3-claude", "Claude").unwrap();
+        assert_eq!(compiled.family.variants.len(), 2);
+        assert!(
+            compiled
+                .family
+                .variants
+                .iter()
+                .all(|variant| variant.source.format == "t3-theme-v1")
+        );
+        let mut library = CustomThemeLibrary::default();
+        let id = library.install(compiled, &[], InstallMode::Link).unwrap();
+        assert!(matches!(
+            library.entry(&id).unwrap().source,
+            CustomThemeSource::LinkedFile { .. }
+        ));
+        let original = library.entry(&id).unwrap().family.clone();
+        library.reload(&id).unwrap();
+        assert_eq!(library.entry(&id).unwrap().family, original);
+        fs::write(&path, "bad json").unwrap();
+        assert!(library.reload(&id).is_err());
+        assert_eq!(library.entry(&id).unwrap().family, original);
+        library.save(dir.path()).unwrap();
+        assert_eq!(
+            CustomThemeLibrary::load(dir.path())
+                .unwrap()
+                .entry(&id)
+                .unwrap()
+                .family,
+            original
+        );
+    }
+
     fn package(dir: &Path) {
         fs::create_dir_all(dir.join("themes")).unwrap();
         fs::write(

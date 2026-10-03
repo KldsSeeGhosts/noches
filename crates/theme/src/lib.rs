@@ -5,7 +5,10 @@
 //! needs to understand a workbench color id or TextMate scope.
 
 mod builtins;
+mod color_css;
 mod library;
+pub mod syntax_presets;
+pub mod t3;
 pub mod vscode;
 
 use std::collections::{BTreeMap, HashSet};
@@ -208,6 +211,10 @@ impl FromStr for Color {
     type Err = ColorParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if !value.starts_with('#') {
+            return color_css::parse(value);
+        }
         let value = value.trim().strip_prefix('#').ok_or(ColorParseError)?;
         let expand = |c: u8| (c << 4) | c;
         let nibble = |c: u8| match c {
@@ -269,7 +276,7 @@ impl<'de> Deserialize<'de> for Color {
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("expected a CSS hex color (#rgb, #rgba, #rrggbb, or #rrggbbaa)")]
+#[error("expected a CSS hex, rgb(), rgba(), or oklch() color")]
 pub struct ColorParseError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -463,6 +470,46 @@ pub struct ThemeColors {
     pub diff_add: Color,
     pub diff_delete: Color,
     pub diff_hunk: Color,
+    // Optional semantic overrides. Absence preserves the legacy derived paint;
+    // skip None on serialization so older builtins keep their definition hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_action: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_hover: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_hover: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_hover: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_selected: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_active: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_outline: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "message")]
+    pub message_surface: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_foreground: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_background: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_foreground: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_muted: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_surface: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger_surface: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning_surface: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<Color>,
 }
 
 impl ThemeColors {
@@ -608,6 +655,56 @@ impl ThemeRegistry {
                     variant.colors.background,
                     4.5,
                 );
+                for (role, foreground, background, floor) in [
+                    (
+                        "on-action",
+                        variant.colors.on_action,
+                        variant.colors.action.unwrap_or(variant.colors.solid),
+                        4.5,
+                    ),
+                    (
+                        "placeholder",
+                        variant.colors.placeholder,
+                        variant.colors.input,
+                        3.0,
+                    ),
+                    (
+                        "message foreground",
+                        variant.colors.message_foreground,
+                        variant
+                            .colors
+                            .message_surface
+                            .unwrap_or(variant.colors.raised),
+                        4.5,
+                    ),
+                    (
+                        "code foreground",
+                        variant.colors.code_foreground,
+                        variant
+                            .colors
+                            .code_background
+                            .unwrap_or(variant.colors.background),
+                        4.5,
+                    ),
+                    (
+                        "icon muted",
+                        variant.colors.icon_muted,
+                        variant.colors.shell,
+                        3.0,
+                    ),
+                    ("link", variant.colors.link, variant.colors.background, 4.5),
+                ] {
+                    if let Some(foreground) = foreground {
+                        validate_contrast(
+                            &mut issues,
+                            variant,
+                            role,
+                            foreground,
+                            background,
+                            floor,
+                        );
+                    }
+                }
                 validate_contrast(
                     &mut issues,
                     variant,
@@ -800,7 +897,10 @@ mod tests {
                 assert_eq!(variant.colors.ok(), variant.colors.success);
                 assert_eq!(variant.warning_color(), variant.colors.warning);
                 assert_eq!(variant.danger_color(), variant.colors.danger);
-                assert_eq!(variant.working_color(AccentSelection::ThemeDefault), variant.accent.activity);
+                assert_eq!(
+                    variant.working_color(AccentSelection::ThemeDefault),
+                    variant.accent.activity
+                );
             }
         }
     }
@@ -852,7 +952,7 @@ mod tests {
     #[test]
     fn builtins_have_complete_provenance_and_no_validation_errors() {
         let registry = ThemeRegistry::builtin();
-        assert_eq!(registry.families.len(), 19);
+        assert_eq!(registry.families.len(), 20);
         assert!(registry.variant("zeron-light").is_some());
         assert!(registry.variant("zeron-dark").is_some());
         let errors: Vec<_> = registry
@@ -871,7 +971,23 @@ mod tests {
             .iter()
             .map(|family| family.variants.len())
             .sum::<usize>();
-        assert_eq!(variants, 30);
-        assert_eq!(variants * VisualFixture::ALL.len(), 300);
+        assert_eq!(variants, 32);
+        assert_eq!(variants * VisualFixture::ALL.len(), 320);
+    }
+
+    #[test]
+    fn absent_optional_roles_round_trip_without_changing_legacy_definitions() {
+        for variant in ThemeRegistry::builtin()
+            .families
+            .iter()
+            .filter(|family| family.id != "claude")
+            .flat_map(|family| &family.variants)
+        {
+            let json = serde_json::to_value(&variant.colors).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 26);
+            let restored: ThemeColors = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(restored, variant.colors);
+            assert_eq!(serde_json::to_value(restored).unwrap(), json);
+        }
     }
 }
