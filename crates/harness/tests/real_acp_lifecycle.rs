@@ -61,7 +61,7 @@ async fn live_run(cancel: bool) {
                     // Both messages must queue until the slow original prompt
                     // responds. The real adapter rejects overlapping prompts.
                     for word in ["SECOND-DONE", "THIRD-DONE"] {
-                        steer.send(SteerMessage { prompt: format!("Do not call tools. Reply exactly {word}."), message_id: None }).await.unwrap();
+                        steer.send(SteerMessage { prompt: format!("Do not call tools. Reply exactly {word}."), message_id: None, notification_acceptance: None }).await.unwrap();
                     }
                 }
                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),

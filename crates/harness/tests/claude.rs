@@ -374,6 +374,7 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
     let (controls, steer, _token) = controls("A");
     steer
         .send(SteerMessage {
+            notification_acceptance: None,
             prompt: "redirect please".into(),
             message_id: None,
         })

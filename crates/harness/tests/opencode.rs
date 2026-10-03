@@ -570,6 +570,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
 
     steer
         .send(SteerMessage {
+            notification_acceptance: None,
             prompt: "also do this".into(),
             message_id: None,
         })

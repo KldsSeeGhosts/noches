@@ -205,6 +205,7 @@ impl RuntimeConfig {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    steering_mode: zeron_proto::SteeringMode,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Shared handle to the live run's computer-use bridge (Pi only). The run
@@ -266,6 +267,9 @@ struct Inner {
     browser_root: OnceLock<std::path::PathBuf>,
     /// Host-only bindings. Never serialized with a session or RunRequest.
     session_mcp: Mutex<HashMap<String, zeron_harness::mcp::SessionMcpContext>>,
+    /// Host-local exact provider-instance bindings for app-owned V2 runs.
+    provider_bindings: Mutex<HashMap<String, (String, Arc<dyn Harness>)>>,
+    orchestration_store: Mutex<Option<crate::orchestration::Store>>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
@@ -322,6 +326,8 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
                 session_mcp: Mutex::new(HashMap::new()),
+                provider_bindings: Mutex::new(HashMap::new()),
+                orchestration_store: Mutex::new(None),
                 turn_listener: OnceLock::new(),
                 computer_use,
             }),
@@ -452,6 +458,82 @@ impl SessionsEngine {
         let _ = self.inner.turn_listener.set(listener);
     }
 
+    pub fn set_orchestration_store(&self, store: crate::orchestration::Store) {
+        *lock(&self.inner.orchestration_store) = Some(store);
+    }
+
+    /// An instance may have its own executable/environment even when another
+    /// configured instance uses the same vendor driver. Do not collapse it to
+    /// the global HarnessId slot. Bind before registering MCP/starting work.
+    pub fn bind_provider_instance(
+        &self,
+        chat_id: &str,
+        instance_id: &str,
+        harness: Arc<dyn Harness>,
+    ) -> Result<(), EngineError> {
+        let runs = lock(&self.inner.runs);
+        let mut bindings = lock(&self.inner.provider_bindings);
+        if runs.contains_key(chat_id)
+            && bindings
+                .get(chat_id)
+                .is_none_or(|(id, _)| id != instance_id)
+        {
+            return Err(EngineError::Other(
+                "Cannot replace an active provider instance.".into(),
+            ));
+        }
+        bindings.insert(chat_id.into(), (instance_id.into(), harness));
+        Ok(())
+    }
+
+    /// Completion mail is never allowed to use the legacy steer's automatic
+    /// redispatch fallback. The V2 mailbox owns that fallback durably.
+    pub async fn steer_notification(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: String,
+    ) -> Result<SteerOutcome, EngineError> {
+        let _admission = self.admit_work()?;
+        let target = {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            runs.get(chat_id)
+                .filter(|run| {
+                    run.steerable && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
+                })
+                .filter(|_| {
+                    statuses
+                        .get(chat_id)
+                        .is_some_and(|session| session.status == SessionStatus::Working)
+                })
+                .map(|run| run.steer_tx.clone())
+        };
+        let Some(sender) = target else {
+            return Ok(SteerOutcome::NotSteerable);
+        };
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_user_message(&message_id, prompt, now_ms())?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        if sender
+            .try_send(SteerMessage {
+                prompt: prompt.into(),
+                message_id: Some(message_id),
+                notification_acceptance: Some(accepted_tx),
+            })
+            .is_err()
+        {
+            return Ok(SteerOutcome::NotSteerable);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(10), accepted_rx).await {
+            Ok(Ok(true)) => Ok(SteerOutcome::Accepted),
+            Ok(Ok(false)) => Ok(SteerOutcome::NotSteerable),
+            _ => Err(EngineError::Other(
+                "Notification provider acceptance is uncertain.".into(),
+            )),
+        }
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
@@ -546,6 +628,32 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        self.refuse_readonly_child(chat_id)?;
+        self.dispatch_with(chat_id, harness_id, request, message_id, false)
+            .await
+    }
+
+    fn refuse_readonly_child(&self, chat_id: &str) -> Result<(), EngineError> {
+        if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+            && let Some(thread) = store
+                .thread(&zeron_proto::orchestration::ThreadId(chat_id.into()))
+                .map_err(|error| EngineError::Other(error.to_string()))?
+            && serde_json::to_value(&thread.thread.lineage)
+                .map_err(|error| EngineError::Other(error.to_string()))?["relationshipToParent"]
+                == "subagent"
+        {
+            return Err(EngineError::Other("Child threads are read-only to user session commands; control their owned task from the parent.".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn dispatch_orchestrated(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: Option<String>,
+    ) -> Result<String, EngineError> {
         self.dispatch_with(chat_id, harness_id, request, message_id, false)
             .await
     }
@@ -599,6 +707,7 @@ impl SessionsEngine {
                 // Register acceptance before a fast boundary can retire it.
                 let mut pending = lock(&ledger);
                 let message = SteerMessage {
+                    notification_acceptance: None,
                     prompt: request.prompt.clone(),
                     message_id: Some(user_id.clone()),
                 };
@@ -664,7 +773,18 @@ impl SessionsEngine {
             self.interrupt(chat_id).await?;
         }
 
-        let harness = self.inner.registry.resolve(harness_id)?;
+        let bound = lock(&self.inner.provider_bindings)
+            .get(chat_id)
+            .map(|(_, harness)| harness.clone());
+        let harness = match bound {
+            Some(harness) if harness.id() == harness_id => harness,
+            Some(_) => {
+                return Err(EngineError::Other(
+                    "Provider instance/driver mismatch.".into(),
+                ));
+            }
+            None => self.inner.registry.resolve(harness_id)?,
+        };
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -757,6 +877,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steering_mode: harness.steering_mode(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 cua_bridge: cua_bridge.clone(),
@@ -810,6 +931,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        self.refuse_readonly_child(chat_id)?;
         let _admission = self.admit_work()?;
         let configured = self
             .inner
@@ -837,6 +959,7 @@ impl SessionsEngine {
         };
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
+            notification_acceptance: None,
             prompt: prompt.to_string(),
             message_id: Some(user_id.clone()),
         };
@@ -1009,6 +1132,17 @@ impl SessionsEngine {
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
         for chat_id in stale {
+            if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+                && (store
+                    .is_v2_managed(&chat_id)
+                    .map_err(|error| EngineError::Other(error.to_string()))?
+                    || store
+                        .thread(&zeron_proto::orchestration::ThreadId(chat_id.clone()))
+                        .map_err(|error| EngineError::Other(error.to_string()))?
+                        .is_some())
+            {
+                continue; // V2 recovery, not legacy auto-resume, owns this chat.
+            }
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }

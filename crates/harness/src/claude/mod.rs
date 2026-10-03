@@ -764,7 +764,11 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let _ = stdin_tx.send(StdinMsg::Line(line));
+                    let accepted = stdin_tx.send(StdinMsg::Line(line)).is_ok();
+                    if let Some(receipt) = msg.notification_acceptance {
+                        let _ = receipt.send(accepted);
+                        if !accepted {continue 'main;}
+                    }
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.

@@ -80,6 +80,7 @@ async fn real_pi_mock_lifecycle() {
                             started = true;
                             steer
                                 .send(SteerMessage {
+                                    notification_acceptance: None,
                                     prompt: "second".into(),
                                     message_id: None,
                                 })

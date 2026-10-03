@@ -207,6 +207,10 @@ impl std::fmt::Debug for HarnessError {
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+    /// Host-local app mailbox delivery receipt. When present, a rejected/idle
+    /// active steer must return false, not silently start a new native turn;
+    /// the durable orchestration continuation owns that fallback.
+    pub notification_acceptance: Option<oneshot::Sender<bool>>,
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
