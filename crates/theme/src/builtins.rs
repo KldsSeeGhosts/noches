@@ -261,7 +261,7 @@ fn claude() -> ThemeFamily {
         crate::vscode::CompileOptions {
             family_id: "claude".into(),
             family_name: "Claude".into(),
-            source_url: "https://github.com/KldsSeeGhosts/noches/blob/design/theme-foundation/crates/theme/tests/fixtures/claude.json".into(),
+            source_url: "https://github.com/KldsSeeGhosts/noches/blob/dev/crates/theme/tests/fixtures/claude.json".into(),
             revision: "user-palette-2026-10-03".into(),
             license: "User-authored palette, included by permission".into(),
         },
