@@ -6,7 +6,10 @@
 pub mod agent;
 pub mod entities;
 pub mod motion;
+pub mod orchestration;
+pub mod orchestration_mcp;
 pub mod preview;
+pub mod provider_instance;
 pub mod view;
 pub mod workspace;
 
@@ -14,6 +17,8 @@ pub use agent::*;
 pub use entities::*;
 pub use preview::*;
 pub use workspace::*;
+// TODO(merge): re-export from runtime_policy when orch/runtime-policy lands.
+pub use orchestration::{ProviderInteractionMode, RuntimeMode};
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)
 /// into a comparable triple — the fleet feature-gate primitive (device rows
