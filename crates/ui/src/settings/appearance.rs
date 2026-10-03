@@ -2,9 +2,10 @@
 //! and the optional interactive accent overlay.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
@@ -32,7 +33,8 @@ struct ImportDialog {
     focus: FocusHandle,
     focus_pending: bool,
     mode: InstallMode,
-    compilation: Option<SourceCompilation>,
+    compilation: Option<Arc<SourceCompilation>>,
+    previews: Arc<HashMap<String, Theme>>,
     selected: HashSet<String>,
     review_variant: Option<String>,
     error: Option<SharedString>,
@@ -938,6 +940,7 @@ impl AppearancePage {
                         .is_some_and(|(compilation, source)| compilation.path != *source)
                 {
                     dialog.compilation = None;
+                    dialog.previews = Arc::default();
                     dialog.selected.clear();
                     dialog.review_variant = None;
                     dialog.error = None;
@@ -964,6 +967,7 @@ impl AppearancePage {
             focus_pending: true,
             mode: InstallMode::Snapshot,
             compilation: None,
+            previews: Arc::default(),
             selected: HashSet::new(),
             review_variant: None,
             error: None,
@@ -995,7 +999,24 @@ impl AppearancePage {
                 // Mapping diagnostics are useful, but they are an advanced
                 // inspection surface rather than part of the happy path.
                 dialog.review_variant = None;
-                dialog.compilation = Some(compilation);
+                dialog.previews = Arc::new(
+                    compilation
+                        .family
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            (
+                                variant.id.clone(),
+                                Theme::from_variant(
+                                    variant,
+                                    AccentSelection::ThemeDefault,
+                                    SurfacePreference::ThemeDefault,
+                                ),
+                            )
+                        })
+                        .collect(),
+                );
+                dialog.compilation = Some(Arc::new(compilation));
                 dialog.error = None;
             }
             Err(error) => dialog.error = Some(error.to_string().into()),
@@ -1077,7 +1098,7 @@ impl AppearancePage {
             return;
         };
         let selected = dialog.selected.iter().cloned().collect::<Vec<_>>();
-        match theme_library::install(compilation.clone(), &selected, dialog.mode, cx) {
+        match theme_library::install(compilation.as_ref().clone(), &selected, dialog.mode, cx) {
             Ok(_) => self.import_dialog = None,
             Err(error) => {
                 dialog.compilation = Some(compilation);
@@ -1488,12 +1509,7 @@ fn compact_action(
         .text_size(crate::typography::ui_rems(11.5))
 }
 
-fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
-    let theme = Theme::from_variant(
-        variant,
-        AccentSelection::ThemeDefault,
-        SurfacePreference::ThemeDefault,
-    );
+fn import_scene_preview(theme: &Theme) -> AnyElement {
     div()
         .w_full()
         .h(px(86.0))
@@ -2024,7 +2040,7 @@ impl AppearancePage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let registry = ThemeRegistry::active();
+        let (_, registry) = ThemeRegistry::snapshot();
         let selected_id = selections
             .variant_id(model_appearance(appearance_kind))
             .to_owned();
@@ -2204,6 +2220,7 @@ impl AppearancePage {
         let focus = dialog.focus.clone();
         let mode = dialog.mode;
         let compilation = dialog.compilation.clone();
+        let previews = dialog.previews.clone();
         let selected = dialog.selected.clone();
         let review_variant = dialog.review_variant.clone();
         let error = dialog.error.clone();
@@ -2375,11 +2392,9 @@ impl AppearancePage {
                     "Light"
                 };
                 let report = compilation.reports.get(&variant.id);
-                let sample = Theme::from_variant(
-                    variant,
-                    AccentSelection::ThemeDefault,
-                    SurfacePreference::ThemeDefault,
-                );
+                let sample = previews
+                    .get(&variant.id)
+                    .expect("compiled theme has a preview");
                 main = main.child(
                     div()
                         .id(SharedString::from(format!("theme-import-row-{variant_id}")))
@@ -2495,7 +2510,7 @@ impl AppearancePage {
                                     .pt(px(10.0))
                                     .border_t_1()
                                     .border_color(hairline)
-                                    .child(import_scene_preview(variant)),
+                                    .child(import_scene_preview(sample)),
                             )
                             .when_some(report, |row, report| row.child(report_panel(theme, report)))
                         }),
@@ -2706,8 +2721,9 @@ impl AppearancePage {
     ) -> Option<AnyElement> {
         let entry_id = self.review_entry.as_ref()?;
         let entry = theme_library::entries(cx)
-            .into_iter()
-            .find(|entry| &entry.id == entry_id)?;
+            .iter()
+            .find(|entry| &entry.id == entry_id)?
+            .clone();
         let mut card = popover::dialog_card(theme)
             .id("theme-review-card")
             .w(px(660.0))
@@ -2727,7 +2743,16 @@ impl AppearancePage {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(SharedString::from(variant.name.clone())),
                 )
-                .child(import_scene_preview(variant));
+                .child(import_scene_preview(&Theme::for_selection(
+                    if variant.appearance.is_dark() {
+                        Appearance::Dark
+                    } else {
+                        Appearance::Light
+                    },
+                    &variant.id,
+                    AccentSelection::ThemeDefault,
+                    SurfacePreference::ThemeDefault,
+                )));
             if let Some(report) = entry.reports.get(&variant.id) {
                 card = card.child(report_panel(theme, report));
             }
@@ -2751,7 +2776,7 @@ impl AppearancePage {
 
     fn render_library_entry(
         &mut self,
-        entry: CustomThemeEntry,
+        entry: Arc<CustomThemeEntry>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2901,7 +2926,8 @@ impl AppearancePage {
     ) -> Vec<AnyElement> {
         let entries = theme_library::entries(cx);
         let (linked, imported): (Vec<_>, Vec<_>) = entries
-            .into_iter()
+            .iter()
+            .cloned()
             .partition(|entry| entry.source.is_linked());
         let mut rows = vec![
             widgets::card_row(theme, false)
