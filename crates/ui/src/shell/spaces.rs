@@ -2091,7 +2091,8 @@ impl Shell {
         let section = div().flex().flex_col().child(header);
         let body = {
             let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
+            // Same tiers as the live rows: focused < hover is never inverted.
+            let selected_wash = theme.sidebar_active();
             let mut list = div()
                 .flex()
                 .flex_col()
@@ -2156,9 +2157,12 @@ impl Shell {
                         )
                         .into_any_element()
                 } else {
+                    // Settled time is tertiary metadata: mono 11px, faint
+                    // (control-plane rule 3), like the live rows' time.
                     div()
+                        .font_family(theme.font_mono.clone())
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_faint)
                         .child(time_ago)
                         .into_any_element()
                 };
@@ -2182,7 +2186,7 @@ impl Shell {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.sidebar_hover())))
                         .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
                             if *entered {
                                 if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
