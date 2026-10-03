@@ -309,6 +309,54 @@ pub struct SessionDoc {
 }
 
 impl SessionDoc {
+    /// Host-owned, additive chat2 projection; excluded from transcript messages.
+    /// Epoch/version fencing makes SQL publication replay safe after a crash.
+    pub fn publish_orchestration(
+        &self,
+        owner: &str,
+        epoch: i64,
+        version: i64,
+        batch_id: &str,
+        barrier: &serde_json::Value,
+        projection: &serde_json::Value,
+    ) -> Result<(), DocError> {
+        let map = self.doc.get_map("orchestration");
+        let current = map.get_deep_value().to_json_value();
+        if current["hostId"].as_str().is_some_and(|id| id != owner) {
+            return Err(DocError::Schema("foreign orchestration owner".into()));
+        }
+        let previous_epoch = current["hostEpoch"].as_i64().unwrap_or(-1);
+        let previous_version = current["version"].as_i64().unwrap_or(-1);
+        if epoch < previous_epoch || (epoch == previous_epoch && version <= previous_version) {
+            return Ok(());
+        }
+        map.insert("hostId", owner)?;
+        map.insert("hostEpoch", epoch)?;
+        map.insert("version", version)?;
+        map.insert("batchId", batch_id)?;
+        // Barrier identities/versions only: do not copy sibling projections into
+        // every doc (or multiply transcripts quadratically).
+        let barrier = barrier
+            .as_array()
+            .map(|docs| {
+                docs.iter()
+                    .map(|doc| serde_json::json!({"docId":doc["docId"],"version":doc["version"]}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        map.insert("barrier", loro_value_from_json(&serde_json::json!(barrier)))?;
+        map.insert("projection", loro_value_from_json(projection))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Passive replica read. Does not acknowledge completion or grant execution.
+    pub fn orchestration(&self) -> serde_json::Value {
+        self.doc
+            .get_map("orchestration")
+            .get_deep_value()
+            .to_json_value()
+    }
     /// Wrap an existing doc (e.g. imported from a snapshot).
     pub fn from_doc(doc: LoroDoc) -> Self {
         Self { doc }
