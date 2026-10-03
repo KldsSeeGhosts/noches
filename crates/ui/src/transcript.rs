@@ -2489,10 +2489,6 @@ fn activity_branch_points(progress: f32) -> Vec<Point<f32>> {
     visible
 }
 
-fn tool_disclosure_progress(open: bool, fold: FoldState, now: Instant) -> f32 {
-    disclosure_progress_at(open, fold.disclosure_at, TOOL_FOLD, now)
-}
-
 /// Chevron turn progress (0 closed .. 1 open) for a toggle at `start`.
 fn disclosure_progress_at(
     open: bool,
@@ -10059,8 +10055,14 @@ mod tests {
             toggled_at: Some(now),
             ..Default::default()
         };
-        assert_eq!(tool_disclosure_progress(true, fold, now), 1.0);
-        assert_eq!(tool_disclosure_progress(false, fold, now), 0.0);
+        assert_eq!(
+            disclosure_progress_at(true, fold.disclosure_at, TOOL_FOLD, now),
+            1.0
+        );
+        assert_eq!(
+            disclosure_progress_at(false, fold.disclosure_at, TOOL_FOLD, now),
+            0.0
+        );
     }
 
     #[test]
