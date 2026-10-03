@@ -162,6 +162,7 @@ pub fn result_doc_id(chat_id: &str, part_id: &str) -> String {
 ///
 /// Order: running first (oldest first), then finished (newest first).
 pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
+    crate::perf_trace::subagent_scan();
     let entries: &[SessionMessageEntry] = if state.selected_chat.as_deref() == Some(chat_id) {
         &state.transcript
     } else {
