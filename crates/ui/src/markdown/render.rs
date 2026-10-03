@@ -41,16 +41,24 @@ pub const MD_LINE_HEIGHT: f32 = 22.75;
 const MD_LIST_INDENT: f32 = 20.0;
 /// Blockquote rail inset (T3 `padding-left: .8rem`).
 const MD_QUOTE_INSET: f32 = 12.8;
-/// Default code block metrics; the rendered size comes from the theme.
-pub const CODE_TEXT_SIZE: f32 = 12.5;
-pub const CODE_LINE_HEIGHT: f32 = 18.0;
-/// Line height as a multiple of the code size, so a user-chosen size keeps the
-/// default's row rhythm.
+/// Default code block metrics; the rendered size comes from the theme. T3 sets
+/// fences at 13px on `leading-snug` (1.375), so a user-chosen size keeps that
+/// row rhythm.
+pub const CODE_TEXT_SIZE: f32 = 13.0;
+pub const CODE_LINE_HEIGHT: f32 = 17.875;
 const CODE_LINE_HEIGHT_RATIO: f32 = CODE_LINE_HEIGHT / CODE_TEXT_SIZE;
-pub const CODE_PADDING_X: f32 = 12.0;
-pub const CODE_PADDING_Y: f32 = 10.0;
-const CODE_HEADER_HEIGHT: f32 = 28.0;
-const CODE_ACTION_SIZE: f32 = 22.0;
+/// Fence body padding (T3 `pre { padding: .8rem .9rem }`).
+pub const CODE_PADDING_X: f32 = 14.4;
+pub const CODE_PADDING_Y: f32 = 12.8;
+/// The header shares the code's surface: no rule, no fill. T3 insets it
+/// `pt-1.5 pr-1.5 pl-3` around 24px actions, so the lane is 6 + 24.
+const CODE_HEADER_PAD_TOP: f32 = 6.0;
+const CODE_HEADER_PAD_RIGHT: f32 = 6.0;
+const CODE_HEADER_PAD_LEFT: f32 = 12.0;
+const CODE_ACTION_SIZE: f32 = 24.0;
+const CODE_ACTION_RADIUS: f32 = 8.0;
+const CODE_ACTION_ICON: f32 = 12.0;
+const CODE_HEADER_HEIGHT: f32 = CODE_HEADER_PAD_TOP + CODE_ACTION_SIZE;
 const CODE_SCROLLBAR_HIT_HEIGHT: f32 = 10.0;
 
 // Table metrics — T3's `.chat-markdown table` on mugen-markdown's column
@@ -1223,12 +1231,13 @@ pub fn inline_code_border(theme: &Theme) -> Hsla {
 }
 /// Chip geometry (paint-only, never in layout): T3's 6px radius on a box that
 /// extends past the glyphs by [`INLINE_CODE_PAD_X`] next to whitespace (T3
-/// pads the run 5.6px; gpui cannot pad inline text) and only
+/// pads the run 5.6px, but gpui cannot pad inline text and a wider box eats
+/// the surrounding space character) and only
 /// [`INLINE_CODE_PAD_TIGHT_X`] beside punctuation, so a neighbouring comma or
 /// bracket is not run over by the border. y insets from the line box.
 pub const INLINE_CODE_RADIUS: f32 = 6.0;
-pub const INLINE_CODE_PAD_X: f32 = 3.5;
-pub const INLINE_CODE_PAD_TIGHT_X: f32 = 1.0;
+pub const INLINE_CODE_PAD_X: f32 = 2.0;
+pub const INLINE_CODE_PAD_TIGHT_X: f32 = 0.5;
 pub const INLINE_CODE_INSET_Y: f32 = 2.4;
 /// Hairline border width of the chip.
 const INLINE_CODE_BORDER: f32 = 1.0;
@@ -2369,7 +2378,7 @@ fn code_icon_action(
     div()
         .id(id)
         .size(px(CODE_ACTION_SIZE))
-        .rounded(px(6.0))
+        .rounded(px(CODE_ACTION_RADIUS))
         .flex()
         .items_center()
         .justify_center()
@@ -2377,7 +2386,7 @@ fn code_icon_action(
         .bg(crate::motion::hover_blend(
             &fade_key,
             gpui::transparent_black(),
-            crate::theme::ink(0.08),
+            theme.control_hover(),
         ))
         .on_hover(crate::motion::hover_listener(fade_key))
         .on_click(move |_, window, cx| {
@@ -2387,7 +2396,7 @@ fn code_icon_action(
         .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label.into())).into())
         .child(
             crate::icons::icon(icon_path)
-                .size(px(13.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.text_muted),
         )
         .into_any_element()
@@ -2407,7 +2416,7 @@ fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyEle
         })
         .child(
             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                .size(px(13.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.warning_muted),
         )
         .into_any_element()
@@ -2428,7 +2437,7 @@ fn code_copy_button(
             .id(SharedString::from(fade_key.clone()))
             .h(px(CODE_ACTION_SIZE))
             .px(px(6.0))
-            .rounded(px(5.0))
+            .rounded(px(CODE_ACTION_RADIUS))
             .flex()
             .flex_row()
             .items_center()
@@ -2437,10 +2446,10 @@ fn code_copy_button(
             .bg(crate::motion::hover_blend(
                 &fade_key,
                 gpui::transparent_black(),
-                crate::theme::ink(0.08),
+                theme.control_hover(),
             ))
             .on_hover(crate::motion::hover_listener(fade_key))
-            .text_size(px(10.5))
+            .text_size(px(11.0))
             .text_color(theme.text_muted)
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
@@ -2452,7 +2461,7 @@ fn code_copy_button(
                 } else {
                     crate::icons::COPY
                 })
-                .size(px(12.0))
+                .size(px(CODE_ACTION_ICON))
                 .text_color(theme.text_muted),
             )
             .when(copied, |el| el.child(SharedString::from("Copied")))
@@ -2472,20 +2481,20 @@ fn code_block_header(
         div()
             .h(px(CODE_HEADER_HEIGHT))
             .flex_none()
-            .pl(px(CODE_PADDING_X))
-            .pr(px(5.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(crate::theme::ink(0.02))
+            .pt(px(CODE_HEADER_PAD_TOP))
+            .pl(px(CODE_HEADER_PAD_LEFT))
+            .pr(px(CODE_HEADER_PAD_RIGHT))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .child(
+                // T3: the language label is mono 11px at 72% of the code tone.
                 div()
                     .min_w_0()
+                    .font_family(theme.font_mono.clone())
                     .text_size(px(11.0))
-                    .text_color(theme.text_muted)
+                    .text_color(theme.code_foreground().opacity(0.72))
                     .children(language.map(|lang| SharedString::from(lang.to_string()))),
             )
             .child(
@@ -2515,7 +2524,7 @@ fn code_block_frame(
         .flex()
         .flex_col()
         .rounded(px(10.0))
-        .bg(crate::theme::ink(0.035))
+        .bg(theme.code_surface())
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
@@ -2572,7 +2581,13 @@ fn render_code_block_source_with_actions(
                     .unwrap_or(&[]);
                 (
                     SharedString::from(line.to_string()),
-                    runs_for_syntax_line(line, spans, &mono, theme),
+                    runs_for_syntax_line_with_plain(
+                        line,
+                        spans,
+                        &mono,
+                        theme.code_foreground(),
+                        theme,
+                    ),
                 )
             })
             .collect();
@@ -2620,7 +2635,7 @@ fn render_code_block_source_with_actions(
         div()
             .id(SharedString::from(fade_key.clone()))
             .size(px(CODE_ACTION_SIZE))
-            .rounded(px(6.0))
+            .rounded(px(CODE_ACTION_RADIUS))
             .flex()
             .items_center()
             .justify_center()
@@ -2646,7 +2661,7 @@ fn render_code_block_source_with_actions(
             })
             .child(
                 crate::icons::icon(crate::icons::WRAP_TEXT)
-                    .size(px(13.0))
+                    .size(px(CODE_ACTION_ICON))
                     .text_color(theme.text_muted),
             )
     });
@@ -3853,6 +3868,22 @@ mod tests {
         assert_ne!(flat.runs[1].color, theme.accent);
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.prose_text());
+    }
+
+    #[test]
+    fn fence_chrome_follows_t3() {
+        assert_eq!(CODE_TEXT_SIZE, 13.0);
+        assert!((CODE_LINE_HEIGHT - CODE_TEXT_SIZE * 1.375).abs() < 1e-4);
+        assert_eq!((CODE_PADDING_X, CODE_PADDING_Y), (14.4, 12.8));
+        // The header shares the code surface: 6px above a 24px action lane.
+        assert_eq!(CODE_HEADER_HEIGHT, 30.0);
+        assert_eq!(CODE_ACTION_SIZE, 24.0);
+        for theme in [Theme::dark(), Theme::light()] {
+            // Built-in themes carry no code_background role: fences keep
+            // the quiet ink plate, plain code reads as full text.
+            assert_eq!(theme.code_surface(), theme.ink(0.035));
+            assert_eq!(theme.code_foreground(), theme.text);
+        }
     }
 
     #[test]

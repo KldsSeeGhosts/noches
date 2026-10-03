@@ -1749,6 +1749,13 @@ impl Theme {
         }
     }
 
+    /// Fence surface (T3 `code-background`): the theme's role when it has one,
+    /// else the quiet ink plate fences have always sat on.
+    pub fn code_surface(&self) -> Hsla {
+        self.explicit(|c| c.code_background)
+            .unwrap_or_else(|| self.ink(0.035))
+    }
+
     /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on
     /// dark). A deliberate product decision, not a missing role: links keep
     /// T3's blue rather than the accent (the [`Self::link`] fallback) or an
