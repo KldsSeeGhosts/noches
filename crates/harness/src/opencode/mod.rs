@@ -375,10 +375,12 @@ impl Harness for OpencodeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mcp_guard = controls.mcp.run_guard();
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
         let server = self.server(cwd.as_deref()).await?;
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        server.stderr_tail.retain_mcp(&controls.mcp);
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             server,
             event_tx,
             controls,
@@ -386,7 +388,11 @@ impl Harness for OpencodeHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             known_commands: self.commands_cache.get().cloned(),
-        }));
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
         })
@@ -409,6 +415,9 @@ struct Server {
     protocol: tokio::sync::OnceCell<Protocol>,
     /// Version the health endpoints reported, when the build exposes one.
     version: tokio::sync::OnceCell<ServerVersion>,
+    /// Runtime-owned registrations only. Never delete a user's MCP config.
+    mcp_cleanup: Vec<(reqwest::Method, String, Option<String>)>,
+    mcp_instructions: String,
 }
 
 /// The server version parsed from a version-bearing health answer. `number`
@@ -533,6 +542,8 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
             stderr_tail: crate::StderrTail::default(),
             protocol: tokio::sync::OnceCell::new(),
             version: tokio::sync::OnceCell::new(),
+            mcp_cleanup: Vec::new(),
+            mcp_instructions: String::new(),
         }
     }
 
@@ -589,7 +600,7 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::opencode", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::opencode", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
             });
@@ -608,6 +619,8 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
             stderr_tail,
             protocol: tokio::sync::OnceCell::new(),
             version: tokio::sync::OnceCell::new(),
+            mcp_cleanup: Vec::new(),
+            mcp_instructions: String::new(),
         };
 
         // Readiness: the server binds a few seconds into the process's life
@@ -765,9 +778,111 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
     }
 
     async fn shutdown(&mut self, kill_grace: Duration) {
+        for (method, path, directory) in std::mem::take(&mut self.mcp_cleanup) {
+            let request = self.request(method, &path).timeout(Duration::from_secs(2));
+            let _ = self
+                .scoped(request, directory.as_deref())
+                .await
+                .send()
+                .await;
+        }
         if let Some(child) = self.child.as_mut() {
             shutdown_child(child, kill_grace).await;
         }
+    }
+
+    async fn inject_mcp(
+        &mut self,
+        mcp: &crate::mcp::SessionMcpContext,
+        session: &str,
+        directory: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        if mcp.entries().is_empty() && mcp.instructions().is_empty() {
+            return Ok(());
+        }
+        if self.child.is_none() {
+            return Err(HarnessError::Protocol(
+                "refusing MCP injection into an externally managed OpenCode server".into(),
+            ));
+        }
+        let protocol = self.protocol().await;
+        use sha2::Digest;
+        let scope = format!("{:x}", sha2::Sha256::digest(session.as_bytes()));
+        for entry in mcp.entries() {
+            let name = format!("noches-{}-{}", entry.name, &scope[..12]);
+            let config = match &entry.transport {
+                crate::mcp::McpTransport::Stdio { command, args, env } => {
+                    let mut command_line = vec![command.to_string_lossy().into_owned()];
+                    command_line.extend(args.iter().cloned());
+                    json!({"type":"local","command":command_line,"environment":env})
+                }
+                crate::mcp::McpTransport::StreamableHttp { url, headers } => json!({
+                    "type":"remote","url":url,"headers":headers,"oauth":false
+                }),
+            };
+            let (method, path, body, cleanup_method, cleanup_path) = match protocol {
+                Protocol::V1 => (
+                    reqwest::Method::POST,
+                    "/mcp".into(),
+                    json!({"name":name,"config":config}),
+                    reqwest::Method::POST,
+                    format!("/mcp/{name}/disconnect"),
+                ),
+                Protocol::V2 => (
+                    reqwest::Method::PUT,
+                    format!("/api/experimental/mcp/{name}"),
+                    json!({"config":config}),
+                    reqwest::Method::DELETE,
+                    format!("/api/experimental/mcp/{name}"),
+                ),
+            };
+            let request = self
+                .request(method, &path)
+                .json(&body)
+                .timeout(CALL_TIMEOUT);
+            let response = self
+                .scoped(request, directory)
+                .await
+                .send()
+                .await
+                .map_err(|_| {
+                    HarnessError::Protocol("OpenCode MCP registration transport failed".into())
+                })?;
+            if !response.status().is_success() {
+                return Err(HarnessError::Protocol(format!(
+                    "OpenCode MCP registration failed: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            self.mcp_cleanup
+                .push((cleanup_method, cleanup_path, directory.map(str::to_owned)));
+        }
+        self.mcp_instructions = mcp.instructions().into();
+        if protocol == Protocol::V2 && !self.mcp_instructions.is_empty() {
+            let path =
+                format!("/api/experimental/session/{session}/instructions/entries/noches-mcp");
+            let request = self
+                .request(reqwest::Method::PUT, &path)
+                .json(&json!({"value":self.mcp_instructions}))
+                .timeout(CALL_TIMEOUT);
+            let response = self
+                .scoped(request, directory)
+                .await
+                .send()
+                .await
+                .map_err(|_| {
+                    HarnessError::Protocol("OpenCode instructions transport failed".into())
+                })?;
+            if !response.status().is_success() {
+                return Err(HarnessError::Protocol(format!(
+                    "OpenCode instructions failed: HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            self.mcp_cleanup
+                .push((reqwest::Method::DELETE, path, directory.map(str::to_owned)));
+        }
+        Ok(())
     }
 
     /// Session lookup for resume; both wires answer with the info object
@@ -1308,12 +1423,13 @@ async fn run_session(session: Session) {
         known_commands,
     } = session;
     let RunControls {
-        browser: _,
+        mcp,
         request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
     let dir = directory.as_deref();
@@ -1340,6 +1456,7 @@ async fn run_session(session: Session) {
             }
             None => create_session(&server, dir).await?,
         };
+        server.inject_mcp(&mcp, &session_id, dir).await?;
 
         // Provider catalog: resolves the model's advertised reasoning
         // variants so the requested effort only rides models that have it.
@@ -2148,6 +2265,8 @@ async fn post_prompt(
                     stderr_tail: crate::StderrTail::default(),
                     protocol,
                     version: tokio::sync::OnceCell::new(),
+                    mcp_cleanup: Vec::new(),
+                    mcp_instructions: String::new(),
                 };
                 // The command endpoint blocks for the whole turn; the bus
                 // carries the real events - but a REJECTED command emits no
@@ -2177,7 +2296,7 @@ async fn post_prompt(
             return Ok(());
         }
     }
-    let (path, body) = match protocol {
+    let (path, mut body) = match protocol {
         Protocol::V1 => (
             format!("/session/{session_id}/prompt_async"),
             prompt_body(
@@ -2192,6 +2311,9 @@ async fn post_prompt(
             prompt_body_v2(prompt, attachments),
         ),
     };
+    if protocol == Protocol::V1 && !server.mcp_instructions.is_empty() {
+        body["system"] = json!([server.mcp_instructions]);
+    }
     let server = Server {
         child: None,
         base: server.base.clone(),
@@ -2200,6 +2322,8 @@ async fn post_prompt(
         stderr_tail: crate::StderrTail::default(),
         protocol: server.protocol.clone(),
         version: tokio::sync::OnceCell::new(),
+        mcp_cleanup: Vec::new(),
+        mcp_instructions: String::new(),
     };
     let bus_tx = bus_tx.clone();
     let dir = dir.map(str::to_owned);
@@ -2678,6 +2802,8 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     stderr_tail: crate::StderrTail::default(),
                     protocol: protocol_cell,
                     version: tokio::sync::OnceCell::new(),
+                    mcp_cleanup: Vec::new(),
+                    mcp_instructions: String::new(),
                 };
                 let allowed = auto_approve
                     || (permission_input)(vec![question.clone()])
@@ -2757,6 +2883,8 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     stderr_tail: crate::StderrTail::default(),
                     protocol: protocol_cell,
                     version: tokio::sync::OnceCell::new(),
+                    mcp_cleanup: Vec::new(),
+                    mcp_instructions: String::new(),
                 };
                 let reply = match rx.await {
                     Ok(answers) => {

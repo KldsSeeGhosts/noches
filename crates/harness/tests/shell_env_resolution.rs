@@ -131,7 +131,7 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
         };
         let (steering, receiver) = tokio::sync::mpsc::channel(1);
         let controls = zeron_harness::RunControls {
-            browser: None,
+            mcp: Default::default(),
             request_input: Box::new(|_| panic!("fixture requires no input")),
             steering: receiver,
             interrupt: zeron_harness::CancellationToken::new(),

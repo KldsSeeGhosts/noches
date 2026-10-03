@@ -53,7 +53,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        browser: None,
+        mcp: Default::default(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -1390,11 +1390,14 @@ async fn registers_browser_mcp_in_session_new() {
     std::fs::write(&fixture, source).unwrap();
     std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut controls, _steer, _token) = controls();
-    controls.browser = Some(zeron_browser::Connection {
-        executable: "/Applications/Noches App/zeron".into(),
-        socket: "/tmp/browser-test/control.sock".into(),
-        session: "session-browser".into(),
-    });
+    controls.mcp = controls
+        .mcp
+        .with_browser(&zeron_browser::Connection {
+            executable: "/Applications/Noches App/zeron".into(),
+            socket: "/tmp/browser-test/control.sock".into(),
+            session: "session-browser".into(),
+        })
+        .unwrap();
     let provider = AcpHarness::grok().with_executable(fixture);
     let events = run_to_end(&provider, request("scenario:happy"), controls).await;
     assert!(

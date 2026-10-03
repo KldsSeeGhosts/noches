@@ -19,7 +19,7 @@ async fn real_pi_mock_lifecycle() {
         let (steer, steering) = mpsc::channel(8);
         let token = CancellationToken::new();
         let controls = RunControls {
-            browser: None,
+            mcp: Default::default(),
             computer_use_socket: None,
             steering,
             interrupt: token.clone(),

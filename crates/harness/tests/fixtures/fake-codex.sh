@@ -31,6 +31,9 @@ if has "$line" '"method":"config/read"'; then
   read -r line || exit 1
 fi
 thread_line="$line"
+if [ -n "$NOCHES_TEST_CODEX_CONFIG_WIRE" ]; then
+  printf '%s\n' "$thread_line" > "$NOCHES_TEST_CODEX_CONFIG_WIRE"
+fi
 if has "$line" '"method":"skills/list"'; then
   # Command discovery probe: answer with two cwd groups sharing one skill
   # (dedupe by name) and settle; no thread ever starts.

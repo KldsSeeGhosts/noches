@@ -24,18 +24,24 @@ use zeron_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum HarnessError {
-    #[error("harness binary not found: {0}")]
+    #[error("harness binary not found: {}", crate::redact::redact_registered(.0))]
     NotInstalled(String),
-    #[error("harness protocol error: {0}")]
+    #[error("harness protocol error: {}", crate::redact::redact_registered(.0))]
     Protocol(String),
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
-    #[error("adapter install failed: {0}")]
+    #[error("adapter install failed: {}", crate::redact::redact_registered(.0))]
     Install(String),
-    #[error("io: {0}")]
+    #[error("io: {}", crate::redact::redact_registered(&.0.to_string()))]
     Io(#[from] std::io::Error),
+}
+
+impl std::fmt::Debug for HarnessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
@@ -46,8 +52,9 @@ pub struct SteerMessage {
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
-    /// Host-provided connection to this conversation’s integrated browser.
-    pub browser: Option<zeron_browser::Connection>,
+    /// Host-local MCP servers, credentials, and session instructions. Never
+    /// copied into RunRequest/model options or any replicated document.
+    pub mcp: mcp::SessionMcpContext,
     /// Private engine socket for the managed `noches_cua` Pi tool. Absent
     /// when this run is not Pi, or when the Linux bridge could not start.
     pub computer_use_socket: Option<std::path::PathBuf>,
@@ -61,6 +68,39 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+}
+
+/// Redact while the runtime context is retained, BEFORE queuing an event.
+/// This protects embedders as well as the engine, including final diagnostics
+/// that a consumer reads after provider teardown has already completed.
+pub(crate) fn session_event_channel(
+    context: &mcp::SessionMcpContext,
+) -> (
+    mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    mpsc::Receiver<Result<AgentEvent, HarnessError>>,
+) {
+    let (tx, mut raw) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+    let (clean_tx, clean_rx) = mpsc::channel(256);
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _context = context;
+        loop {
+            let event = tokio::select! {
+                _ = clean_tx.closed() => break,
+                event = raw.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            let event = event.map(redact::redact_event).map_err(|error| {
+                HarnessError::Protocol(redact::redact_registered(&error.to_string()))
+            });
+            if clean_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    (tx, clean_rx)
 }
 
 #[async_trait]
@@ -124,6 +164,7 @@ pub mod codex;
 pub mod cursor;
 pub(crate) mod executable;
 pub(crate) mod jsonrpc;
+pub mod mcp;
 pub mod mock;
 pub mod opencode;
 pub mod process;
@@ -191,9 +232,18 @@ fn compose_path<'a>(
 pub(crate) struct StderrTail(
     std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<std::sync::Mutex<Option<mcp::SessionMcpContext>>>,
 );
 
 impl StderrTail {
+    /// Keep exact-value redaction alive until even a late stderr reader exits.
+    pub(crate) fn retain_mcp(&self, context: &mcp::SessionMcpContext) {
+        *self
+            .2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(context.clone());
+    }
+
     pub(crate) fn close(&self) {
         self.1.notify_one();
     }
@@ -207,6 +257,7 @@ impl StderrTail {
     const KEEP_BYTES: usize = 700;
 
     pub(crate) fn push(&self, line: &str) {
+        let line = crate::redact::redact_registered(line);
         let line = line.trim();
         if line.is_empty() {
             return;

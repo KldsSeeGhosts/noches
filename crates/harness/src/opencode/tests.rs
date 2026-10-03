@@ -1,5 +1,118 @@
 use super::*;
 
+#[tokio::test]
+async fn owned_mcp_registration_and_cleanup_match_both_wire_generations() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    for protocol in [Protocol::V1, Protocol::V2] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (records, mut recorded) = mpsc::unbounded_channel();
+        let serving = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let records = records.clone();
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut first = String::new();
+                    socket.read_line(&mut first).await.unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        socket.read_line(&mut line).await.unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some((key, value)) = line.split_once(':')
+                            && key.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).await.unwrap();
+                    records
+                        .send((
+                            first.trim().to_owned(),
+                            serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                        ))
+                        .unwrap();
+                    socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                });
+            }
+        });
+        let mut server = Server::attached(base);
+        server.protocol.set(protocol).unwrap();
+        let context = crate::mcp::SessionMcpContext::new(
+            vec![
+                crate::mcp::McpServerEntry::http(
+                    "scope",
+                    "http://127.0.0.1:1234/mcp",
+                    [(
+                        "Authorization".into(),
+                        "Bearer opencode-private-fixture-token".into(),
+                    )]
+                    .into(),
+                ),
+                crate::mcp::McpServerEntry::stdio("stdio", "/test/noches", vec!["mcp".into()]),
+            ],
+            "OpenCode session instructions".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            server
+                .inject_mcp(&context, "session", Some("/work"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("externally managed")
+        );
+        assert!(
+            recorded.try_recv().is_err(),
+            "external refusal must happen before network writes"
+        );
+        let mut child = Command::new("sleep");
+        child.arg("60").kill_on_drop(true);
+        server.child = Some(child.spawn().unwrap());
+        server
+            .inject_mcp(&context, "session", Some("/work"))
+            .await
+            .unwrap();
+        let (path, payload) = recorded.recv().await.unwrap();
+        assert_eq!(payload["config"]["type"], "remote");
+        assert_eq!(
+            payload["config"]["headers"]["Authorization"],
+            "Bearer opencode-private-fixture-token"
+        );
+        match protocol {
+            Protocol::V1 => assert!(path.starts_with("POST /mcp")),
+            Protocol::V2 => assert!(path.starts_with("PUT /api/experimental/mcp/noches-scope-")),
+        }
+        let (_, payload) = recorded.recv().await.unwrap();
+        assert_eq!(payload["config"]["command"], json!(["/test/noches", "mcp"]));
+        if protocol == Protocol::V2 {
+            let (path, payload) = recorded.recv().await.unwrap();
+            assert!(path.contains("/instructions/entries/noches-mcp"));
+            assert_eq!(payload["value"], "OpenCode session instructions");
+        }
+        assert_eq!(server.mcp_instructions, "OpenCode session instructions");
+        let guard = context.run_guard();
+        server.shutdown(Duration::from_millis(50)).await;
+        drop(guard);
+        assert!(context.is_revoked());
+        for _ in 0..if protocol == Protocol::V2 { 3 } else { 2 } {
+            let (path, _) = recorded.recv().await.unwrap();
+            assert!(if protocol == Protocol::V2 {
+                path.starts_with("DELETE ")
+            } else {
+                path.contains("/disconnect")
+            });
+        }
+        assert!(server.mcp_cleanup.is_empty());
+        serving.abort();
+    }
+}
+
 /// Real HTTP/SSE transport with explicitly ordered turn events. No provider or
 /// installed CLI is involved, so duplicate completion frames are reproducible.
 struct TurnWire {
@@ -185,7 +298,7 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
-                browser: None,
+                mcp: Default::default(),
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();

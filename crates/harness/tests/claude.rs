@@ -59,7 +59,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        browser: None,
+        mcp: Default::default(),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -291,7 +291,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
-        browser: None,
+        mcp: Default::default(),
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -708,7 +708,7 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\"\n",
+            "#!/bin/sh\ncapture={}\nprintf '%s\\n' \"$@\" > \"$capture\"\nprevious=''\nfor arg in \"$@\"; do\nif [ \"$previous\" = '--mcp-config' ]; then cat \"$arg\" >> \"$capture\"; fi\nprevious=\"$arg\"\ndone\nexec {} \"$@\"\n",
             zeron_browser::shell_quote(capture.to_str().unwrap()),
             zeron_browser::shell_quote(fixture_path().to_str().unwrap())
         ),
@@ -716,11 +716,14 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut controls, _steer, _token) = controls("Yes");
-    controls.browser = Some(zeron_browser::Connection {
-        executable: "/Applications/Noches App/zeron".into(),
-        socket: "/tmp/browser-test/control.sock".into(),
-        session: "session-browser".into(),
-    });
+    controls.mcp = controls
+        .mcp
+        .with_browser(&zeron_browser::Connection {
+            executable: "/Applications/Noches App/zeron".into(),
+            socket: "/tmp/browser-test/control.sock".into(),
+            session: "session-browser".into(),
+        })
+        .unwrap();
     let provider = ClaudeHarness::new().with_executable(wrapper);
     let events = run_to_end(&provider, request("scenario:happy"), controls).await;
     assert!(

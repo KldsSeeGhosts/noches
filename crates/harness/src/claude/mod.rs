@@ -419,12 +419,26 @@ impl ClaudeHarness {
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut controls = controls;
+        if title_only {
+            controls.mcp = Default::default();
+        }
+        let mcp_guard = controls.mcp.run_guard();
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
-        if !title_only && let Some(browser) = &controls.browser {
-            cmd.arg("--mcp-config").arg(
-                serde_json::json!({"mcpServers":{"noches_browser":browser.config()}}).to_string(),
-            );
+        let mcp_config = controls.mcp.claude_config()?;
+        if let Some(config) = &mcp_config {
+            cmd.arg("--mcp-config").arg(config.path());
+        }
+        if !title_only {
+            if !controls.mcp.allowed_tools().is_empty() {
+                cmd.arg("--allowedTools")
+                    .arg(controls.mcp.allowed_tools().join(","));
+            }
+            if !controls.mcp.instructions().is_empty() {
+                cmd.arg("--append-system-prompt")
+                    .arg(controls.mcp.instructions());
+            }
         }
         if title_only {
             cmd.args([
@@ -477,12 +491,13 @@ impl ClaudeHarness {
             .take()
             .ok_or_else(|| HarnessError::Protocol("claude child has no stdout".into()))?;
         let stderr_tail = crate::StderrTail::default();
+        stderr_tail.retain_mcp(&controls.mcp);
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::claude", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
             });
@@ -504,8 +519,8 @@ impl ClaudeHarness {
         );
         let _ = stdin_tx.send(StdinMsg::Line(first));
 
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             normalizer,
             title_only,
             child,
@@ -517,7 +532,12 @@ impl ClaudeHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+            _mcp_config: mcp_config,
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -643,6 +663,7 @@ struct Session {
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
+    _mcp_config: Option<tempfile::NamedTempFile>,
 }
 
 /// The per-run event loop: one task multiplexing stdout frames, the steering
@@ -660,14 +681,16 @@ async fn run_session(session: Session) {
         interrupt_grace,
         kill_grace,
         stderr_tail,
+        _mcp_config,
     } = session;
     let RunControls {
-        browser: _,
+        mcp,
         request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
     let request_input = Arc::new(request_input);
 
     let mut steering_open = true;
@@ -821,7 +844,8 @@ fn handle_control_request(
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
             target: "zeron_harness::claude",
-            "unhandled control_request subtype: {}", req.request.subtype
+            subtype = %crate::redact::redact_registered(&req.request.subtype),
+            "unhandled control_request subtype"
         );
         return;
     }
