@@ -4400,6 +4400,7 @@ impl Composer {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         cx.on_release(|this, cx| {
             this.input.update(cx, |input, _| input.cancel_dictation());
             this.release_queue_previews(cx);
@@ -4420,9 +4421,12 @@ impl Composer {
             }
         };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state - a pickers-side notify (refs
-        // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        // by the composer from picker state. Only semantic changes cross
+        // this boundary; model-popup animation samples belong to Pickers.
+        let pickers_observe = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::PickerPresentationChanged, cx| cx.notify(),
+        );
         let picker_focus = cx.subscribe(
             &pickers,
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
@@ -7324,13 +7328,17 @@ impl Composer {
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
-                    motion::hover_blend(
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
                         &format!("wizard-option-{ix}"),
                         crate::theme::ink(0.025),
                         crate::theme::ink(0.06),
                     )
                 })
-                .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    format!("wizard-option-{ix}"),
+                ))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
                 .child(
@@ -8071,12 +8079,16 @@ impl Render for Composer {
             .rounded_full()
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend(
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener(attach_hover_key))
+            .on_hover(motion::hover_listener_owned(
+                cx.entity_id(),
+                attach_hover_key,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -8485,6 +8497,7 @@ impl Render for Composer {
         } else {
             container
         };
+        motion::drive_hover_owner(cx.entity_id(), window);
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -8616,7 +8629,7 @@ mod tests {
                     room_gen: None,
                 }]);
                 state.selected_chat = Some("parent".into());
-                state.transcript = vec![SessionMessageEntry {
+                state.apply_transcript(vec![SessionMessageEntry {
                     id: "m1".into(),
                     role: MessageRole::Assistant,
                     parts: vec![MessagePart::Tool {
@@ -8641,7 +8654,7 @@ mod tests {
                     device_id: "dev".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
-                }];
+                }]);
                 cx.notify();
             });
             Host {

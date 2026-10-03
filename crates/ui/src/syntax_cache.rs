@@ -24,6 +24,7 @@ pub struct DocumentHighlightKey {
 
 impl DocumentHighlightKey {
     pub fn new(language: LanguageId, source: &str) -> Self {
+        crate::perf_trace::highlight_hash(source.len());
         Self {
             language,
             content_hash: Sha256::digest(source.as_bytes()).into(),
