@@ -718,6 +718,8 @@ pub struct UiSettings {
     pub code_font_size: f32,
     /// Independently selected light and dark theme variants.
     pub theme_selection: zeron_theme::ThemeSelection,
+    /// None automatically uses Pierre for Claude and Theme for other families.
+    pub syntax_colors: Option<zeron_theme::syntax_presets::SyntaxColors>,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
     /// Changes pane: wrap long source lines instead of scrolling horizontally.
@@ -802,6 +804,7 @@ impl Default for UiSettings {
             code_font_family: crate::typography::UiFontFamily::GeistMono,
             code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
             theme_selection: zeron_theme::ThemeSelection::default(),
+            syntax_colors: None,
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,
@@ -1563,7 +1566,10 @@ mod tests {
         };
         settings.save(dir.path()).unwrap();
         let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
-        assert!(text.contains(r#""settingsSection": "appearance""#), "{text}");
+        assert!(
+            text.contains(r#""settingsSection": "appearance""#),
+            "{text}"
+        );
         assert_eq!(
             UiSettings::load(dir.path()).settings_section,
             SettingsSection::Appearance
@@ -2099,6 +2105,7 @@ mod tests {
                 light: "catppuccin-latte".into(),
                 dark: "catppuccin-mocha".into(),
             },
+            syntax_colors: Some(zeron_theme::syntax_presets::SyntaxColors::Pierre),
             diff_split: true,
             diff_wrap: true,
             code_fences_fit_content: true,
@@ -2246,6 +2253,7 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.accent, zeron_theme::AccentSelection::ThemeDefault);
         assert_eq!(loaded.surface, zeron_theme::SurfacePreference::ThemeDefault);
+        assert_eq!(loaded.syntax_colors, None);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(loaded.sound_completion_enabled);

@@ -11,6 +11,7 @@ use gpui::{
     KeyDownEvent, ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div,
     img, prelude::*, px,
 };
+use zeron_theme::syntax_presets::SyntaxColors;
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
     AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
@@ -919,7 +920,7 @@ impl AppearancePage {
     fn open_import(&mut self, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             ComposerInput::with_context(
-                "Theme file, package.json, or extension folder",
+                "T3 or VS Code theme file, package.json, or extension folder",
                 "PaletteSearch",
                 cx,
             )
@@ -3067,6 +3068,35 @@ impl Render for AppearancePage {
         settings_rows.push(
             widgets::card_row(&theme, false)
                 .child(widgets::row_tile(&theme, icons::TUNING))
+                .child(div().flex_1().min_w_0()
+                    .child(widgets::row_title(&theme, "Syntax colours"))
+                    .child(widgets::meta_line(&theme, vec![div()
+                        .child("Code and diffs. Claude defaults to Pierre; other themes keep their palette.")
+                        .into_any_element()])))
+                .child(div().flex_none().flex().gap(px(6.0)).children(
+                    SyntaxColors::ALL.into_iter().map(|selection| {
+                        div()
+                            .id(SharedString::from(format!("syntax-{}", selection.label())))
+                            .px(px(10.0)).py(px(5.0)).rounded(px(6.0))
+                            .text_size(px(12.0))
+                            .text_color(if theme.syntax_colors == selection { theme.text } else { theme.text_muted })
+                            .bg(if theme.syntax_colors == selection { theme.element_active } else { gpui::transparent_black() })
+                            .cursor_pointer()
+                            .child(selection.label())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                                    settings.syntax_colors = Some(selection);
+                                });
+                                appearance::apply_registry_change(cx);
+                                cx.notify();
+                            }))
+                    })
+                ))
+                .into_any_element(),
+        );
+        settings_rows.push(
+            widgets::card_row(&theme, false)
+                .child(widgets::row_tile(&theme, icons::TUNING))
                 .child(
                     div()
                         .flex_1()
@@ -3455,11 +3485,11 @@ mod tests {
             registry
                 .variants_for(zeron_theme::Appearance::Light)
                 .count(),
-            10
+            11
         );
         assert_eq!(
             registry.variants_for(zeron_theme::Appearance::Dark).count(),
-            20
+            21
         );
     }
 
