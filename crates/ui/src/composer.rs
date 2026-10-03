@@ -36,7 +36,8 @@ use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
-use crate::settings::{ComposerSendBehavior, platform_combo};
+use crate::roles;
+use crate::settings::{ComposerSendBehavior, FollowUpBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
 mod dictation;
@@ -509,6 +510,9 @@ pub enum SendButtonMode {
     Send,
     /// Live run with text typed: queue for the next turn.
     Queue,
+    /// Live run with text typed, steering on: hand the message to the running
+    /// turn at its next step boundary instead of holding it.
+    Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
 }
@@ -570,6 +574,27 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Queue,
         (true, false) => SendButtonMode::Stop,
+    }
+}
+
+/// Resolve a busy-run send into Queue or Steer. `alternate` is the one-off
+/// gesture (Cmd/Ctrl-click, Cmd/Ctrl+Enter) that runs the other behaviour.
+/// Steering needs a harness that takes mid-turn input and a message without
+/// attachments; anything else quietly queues.
+pub fn follow_up_mode(
+    base: SendButtonMode,
+    behavior: FollowUpBehavior,
+    alternate: bool,
+    steerable: bool,
+) -> SendButtonMode {
+    if base != SendButtonMode::Queue {
+        return base;
+    }
+    let wants_steer = (behavior == FollowUpBehavior::Steer) != alternate;
+    if wants_steer && steerable {
+        SendButtonMode::Steer
+    } else {
+        SendButtonMode::Queue
     }
 }
 
@@ -3773,7 +3798,7 @@ impl Render for ComposerInput {
             theme
         };
         let text_color = if self.content.is_empty() {
-            theme.text_faint
+            roles::placeholder(theme)
         } else {
             theme.text
         };
@@ -4148,6 +4173,9 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// The next queued send should be handed to the live turn right after the
+    /// host accepts it. Consumed by [`Composer::send`].
+    pending_steer: bool,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -4514,6 +4542,7 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            pending_steer: false,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -6306,6 +6335,12 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
+        self.mode_for(false, cx)
+    }
+
+    /// The send action for the current draft. `alternate` flips the configured
+    /// follow-up behaviour for one send.
+    fn mode_for(&self, alternate: bool, cx: &App) -> SendButtonMode {
         if self.editing_queued.is_some() {
             return SendButtonMode::Send;
         }
@@ -6315,10 +6350,29 @@ impl Composer {
                 self.staged().len() + self.staged_appshots().len(),
                 self.staged_comments(cx).len(),
             );
-        send_button_mode(self.run_live(cx), has_text)
+        follow_up_mode(
+            send_button_mode(self.run_live(cx), has_text),
+            crate::settings::current(cx).follow_up_behavior,
+            alternate,
+            self.can_steer(cx),
+        )
+    }
+
+    /// Whether a send could be handed to the running turn: the harness takes
+    /// mid-turn input and nothing staged needs an upload (the host rejects
+    /// attachment-bearing steers).
+    fn can_steer(&self, cx: &App) -> bool {
+        self.staged().is_empty()
+            && self.staged_appshots().is_empty()
+            && self.pickers.read(cx).effective_harness_steers(cx)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        self.submit_with(false, cx);
+    }
+
+    /// Submit the draft; `alternate` swaps Queue and Steer for this send only.
+    fn submit_with(&mut self, alternate: bool, cx: &mut Context<Self>) {
         if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
             return;
         }
@@ -6340,7 +6394,7 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
-        match self.button_mode(cx) {
+        match self.mode_for(alternate, cx) {
             // Enter never stops a run: Stop mode implies an empty composer,
             // so a stray extra Enter right after sending landed an interrupt
             // on the just-dispatched prompt and the agent ate it silently
@@ -6352,6 +6406,11 @@ impl Composer {
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: keep the message queued until the current turn ends.
             SendButtonMode::Queue => self.send(text, true, cx),
+            // Busy: queue it, then hand it straight to the live turn.
+            SendButtonMode::Steer => {
+                self.pending_steer = true;
+                self.send(text, true, cx)
+            }
         }
     }
 
@@ -6371,7 +6430,14 @@ impl Composer {
             self.staged_comments(cx).len(),
         );
         match modified_submit_target(has_content) {
-            ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
+            // With Enter as the send key, the modifier chord is free to run the
+            // other follow-up behaviour; with the chord as the send key it IS
+            // the configured behaviour.
+            ModifiedSubmitTarget::SubmitContent => {
+                let alternate = crate::settings::current(cx).composer_send_behavior
+                    == ComposerSendBehavior::Enter;
+                self.submit_with(alternate, cx)
+            }
             ModifiedSubmitTarget::ActivateLatestQueued => self.activate_latest_queued(cx),
         }
     }
@@ -6382,6 +6448,7 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        let steer_after_queue = std::mem::take(&mut self.pending_steer) && queue;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             self.failure_key = None; // global - meaningful on every chat
@@ -7007,6 +7074,9 @@ impl Composer {
                         chat_id: err_chat_id.clone(),
                         message_id: message_id.clone(),
                     });
+                    if steer_after_queue {
+                        composer.steer_queued_now(message_id.clone(), cx);
+                    }
                 }
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
@@ -7475,49 +7545,105 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Zeron composer-actions.tsx: a size-7 filled circle - up-arrow to
-        // send/queue, a dark rounded square on the same light circle to stop.
-        match mode {
-            SendButtonMode::Stop => div()
+        // A size-7 filled circle: the action colour with a glyph per mode
+        // (arrow-up send, list-add queue, corner-arrow steer), or the danger
+        // plate with a white square to stop.
+        if mode == SendButtonMode::Stop {
+            let stop_key = composer_hover_key("stop", cx.entity_id());
+            return div()
                 .id("composer-stop")
                 .size(px(28.0))
                 .flex_none()
                 .rounded_full()
-                .bg(theme.text)
+                .bg(motion::hover_blend(
+                    &stop_key,
+                    theme.danger_strong,
+                    theme.danger_strong.opacity(0.88),
+                ))
+                .shadow(roles::send_shadow(theme.danger_strong))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
+                .on_hover(motion::hover_listener(stop_key))
+                .tooltip(crate::tooltip::text("Stop"))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
-                .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
-                .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Queue => {
-                // Share the submission guard with Enter, including pending
-                // edits and the new-session runnable-agent check.
-                let blocked = self.send_blocked(cx);
-                div()
-                    .id("composer-send")
-                    .debug_selector(|| "composer-send".into())
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(blocked, |el| el.opacity(0.35))
-                    .when(!blocked, |el| {
-                        el.cursor_pointer()
-                            .hover(|s| s.opacity(0.85))
-                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
-                    })
-                    .child(
-                        crate::icons::icon(crate::icons::ARROW_UP)
-                            .size(px(14.0))
-                            .text_color(theme.bg),
-                    )
-                    .into_any_element()
+                .child(div().size(px(12.0)).rounded(px(2.5)).bg(gpui::white()))
+                .into_any_element();
+        }
+        // Share the submission guard with Enter, including pending edits and
+        // the new-session runnable-agent check.
+        let blocked = self.send_blocked(cx);
+        let action = roles::action(theme);
+        let send_key = composer_hover_key("send", cx.entity_id());
+        let (glyph, glyph_size) = match mode {
+            SendButtonMode::Queue => (crate::icons::LIST_ADD, 16.0),
+            SendButtonMode::Steer => (crate::icons::ARROW_TURN_UP_RIGHT, 16.0),
+            _ => (crate::icons::ARROW_UP, 14.0),
+        };
+        let behavior = crate::settings::current(cx).composer_send_behavior;
+        let send_tooltip = self.send_tooltip(mode, behavior, cx);
+        div()
+            .id("composer-send")
+            .debug_selector(|| "composer-send".into())
+            .size(px(28.0))
+            .flex_none()
+            .rounded_full()
+            .bg(motion::hover_blend(&send_key, action, roles::action_hover(theme)))
+            .shadow(roles::send_shadow(action))
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(blocked, |el| el.opacity(crate::controls::DISABLED_OPACITY))
+            .when(!blocked, |el| {
+                el.cursor_pointer()
+                    .on_hover(motion::hover_listener(send_key))
+                    .active(|s| s.opacity(0.9))
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                        // Cmd/Ctrl-click runs the other follow-up behaviour.
+                        this.submit_with(event.modifiers().secondary(), cx)
+                    }))
+            })
+            .tooltip(send_tooltip)
+            .child(
+                crate::icons::icon(glyph)
+                    .size(px(glyph_size))
+                    .text_color(roles::on_action(theme)),
+            )
+            .into_any_element()
+    }
+
+    /// Hover note for the send circle: what a click does now, and what the
+    /// modifier gesture would do instead while the agent is working.
+    fn send_tooltip(
+        &self,
+        mode: SendButtonMode,
+        behavior: ComposerSendBehavior,
+        cx: &App,
+    ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+        let modifier: SharedString = if cfg!(target_os = "macos") {
+            "⌘↵".into()
+        } else {
+            "Ctrl+↵".into()
+        };
+        let steerable = self.can_steer(cx);
+        let (label, hint): (&'static str, Option<SharedString>) = match mode {
+            SendButtonMode::Queue if steerable => {
+                ("Queue for next turn", Some(format!("{modifier} steers").into()))
+            }
+            SendButtonMode::Queue => ("Queue for next turn", None),
+            SendButtonMode::Steer => (
+                "Steer the running turn",
+                Some(format!("{modifier} queues").into()),
+            ),
+            _ => ("Send", (behavior == ComposerSendBehavior::ModEnter).then(|| modifier.clone())),
+        };
+        let hint = hint.unwrap_or_default();
+        move |window, cx| {
+            if hint.is_empty() {
+                crate::tooltip::text(label)(window, cx)
+            } else {
+                crate::tooltip::shortcut(label, hint.clone())(window, cx)
             }
         }
     }
@@ -7576,7 +7702,7 @@ impl Render for Composer {
                 style.font_family = theme.font_sans.clone();
                 style.font_size = crate::typography::ui_rems(INPUT_TEXT_SIZE).into();
                 style.color = if input.content.is_empty() {
-                    theme.text_faint
+                    roles::placeholder(&theme)
                 } else {
                     theme.text
                 };
@@ -8073,7 +8199,7 @@ impl Render for Composer {
                 crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
             }
         } else {
-            theme.border
+            roles::composer_outline(&theme)
         };
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
@@ -8094,7 +8220,8 @@ impl Render for Composer {
             .border_color(pill_border)
             .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
             .when(!theme.is_frost(), |el| {
-                el.bg(theme.input_glass_bg()).shadow_lg()
+                el.bg(theme.input_glass_bg())
+                    .shadow(roles::composer_shadow(&theme))
             });
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
@@ -10225,6 +10352,30 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn follow_up_resolves_queue_or_steer_and_only_steers_when_it_can() {
+        use FollowUpBehavior::{Queue, Steer};
+        let busy = SendButtonMode::Queue;
+        // The configured behaviour, then the one-off alternate.
+        assert_eq!(follow_up_mode(busy, Queue, false, true), SendButtonMode::Queue);
+        assert_eq!(follow_up_mode(busy, Steer, false, true), SendButtonMode::Steer);
+        assert_eq!(follow_up_mode(busy, Queue, true, true), SendButtonMode::Steer);
+        assert_eq!(follow_up_mode(busy, Steer, true, true), SendButtonMode::Queue);
+        // A harness that cannot take mid-turn input (or a draft with
+        // attachments) always queues, whichever way it was asked.
+        assert_eq!(follow_up_mode(busy, Steer, false, false), SendButtonMode::Queue);
+        assert_eq!(follow_up_mode(busy, Queue, true, false), SendButtonMode::Queue);
+        // Idle and stop never change.
+        assert_eq!(
+            follow_up_mode(SendButtonMode::Send, Steer, true, true),
+            SendButtonMode::Send
+        );
+        assert_eq!(
+            follow_up_mode(SendButtonMode::Stop, Steer, true, true),
+            SendButtonMode::Stop
+        );
     }
 
     #[test]

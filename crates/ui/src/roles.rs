@@ -50,6 +50,19 @@ pub(crate) fn secondary_fill() -> Hsla {
     ink(0.06)
 }
 
+/// Placeholder text. The shared `text_faint` is the AA-checked placeholder
+/// tone today; the Claude family tunes it separately from icon-muted.
+pub(crate) fn placeholder(theme: &Theme) -> Hsla {
+    // TODO(D1): theme.placeholder
+    theme.text_faint
+}
+
+/// Outline of the composer plate.
+pub(crate) fn composer_outline(theme: &Theme) -> Hsla {
+    // TODO(D1): theme.composer_outline
+    theme.border
+}
+
 /// Inset focus ring: an edge-only accent line, so it costs no layout and never
 /// paints behind a translucent fill (drop shadows do; see
 /// [`crate::theme::card_selected_shadows`]).
@@ -74,6 +87,43 @@ fn drop(offset_y: f32, blur: f32, spread: f32, alpha: f32) -> BoxShadow {
     }
 }
 
+/// The composer plate's elevation (R5 §2.7). Light lifts with one long soft
+/// drop; dark has no drop (it would vanish on the canvas) and takes a 1px
+/// top highlight instead.
+pub(crate) fn composer_shadow(theme: &Theme) -> Vec<BoxShadow> {
+    match theme.appearance {
+        Appearance::Light => vec![drop(12.0, 28.0, -18.0, 0.40)],
+        Appearance::Dark => vec![BoxShadow {
+            color: hsla(0.0, 0.0, 1.0, 0.06),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(0.0),
+            inset: true,
+        }],
+    }
+}
+
+/// The send/stop circle: a 1px top highlight plus a tight shadow tinted with
+/// the plate colour so it sits on the surface instead of floating.
+pub(crate) fn send_shadow(plate: Hsla) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: plate.opacity(0.24),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(2.0),
+            spread_radius: px(0.0),
+            inset: false,
+        },
+        BoxShadow {
+            color: hsla(0.0, 0.0, 1.0, 0.16),
+            offset: point(px(0.0), px(1.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(0.0),
+            inset: true,
+        },
+    ]
+}
+
 /// Tooltip elevation: one soft layer (T3 `shadow-md/5`).
 pub(crate) fn tooltip_shadow(theme: &Theme) -> Vec<BoxShadow> {
     match theme.appearance {
@@ -90,6 +140,7 @@ mod tests {
     fn shadow_recipes_are_single_layers() {
         for theme in [Theme::dark(), Theme::light()] {
             assert_eq!(tooltip_shadow(&theme).len(), 1);
+            assert_eq!(composer_shadow(&theme).len(), 1);
             assert!(focus_ring(&theme)[0].inset);
         }
     }

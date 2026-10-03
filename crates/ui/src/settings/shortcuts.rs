@@ -15,7 +15,8 @@ use crate::popover::{self, ScrollRailHost};
 mod appshots_page;
 use crate::settings::widgets;
 use crate::settings::{
-    ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke, display_combo,
+    ComposerSendBehavior, FollowUpBehavior, KeymapConfig, ShortcutId, combo_from_keystroke,
+    display_combo,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -686,6 +687,87 @@ impl Render for ShortcutsPage {
                     )
                     .child(send_behavior_control),
             );
+        // Follow-up behaviour lives in the settings store directly (like the
+        // typography choices): the composer reads it live, and the shell's
+        // `sync_independent_settings` keeps its own copy from clobbering it.
+        let follow_up = crate::settings::current(cx).follow_up_behavior;
+        let modifier_chord = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+        let follow_up_row = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .min_h(px(84.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(&theme, "While the agent is working"))
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .max_w(px(430.0))
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .line_height(px(17.0))
+                                .text_color(theme.text_muted.opacity(0.65))
+                                .child(SharedString::from(format!(
+                                    "Queue holds a message for the next turn. Steer hands it to the running turn at its next step, on agents that support it. {modifier_chord}-click the send button, or press {modifier_chord}+Enter, to do the other one for a single message."
+                                ))),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("composer-follow-up-behavior")
+                        .flex()
+                        .flex_row()
+                        .rounded(px(9.0))
+                        .p(px(2.0))
+                        .bg(crate::theme::ink(0.04))
+                        .children(
+                            [
+                                (FollowUpBehavior::Queue, "Queue"),
+                                (FollowUpBehavior::Steer, "Steer"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ix, (behavior, label))| {
+                                let selected = follow_up == behavior;
+                                div()
+                                    .id(("composer-follow-up-option", ix))
+                                    .min_w(px(72.0))
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .text_color(if selected {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .when(selected, |el| {
+                                        el.bg(theme.bg)
+                                            .border_1()
+                                            .border_color(theme.border.opacity(0.8))
+                                    })
+                                    .when(!selected, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|s| s.text_color(theme.text))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                crate::settings::update(
+                                                    crate::settings::SavePolicy::Immediate,
+                                                    cx,
+                                                    |settings| settings.follow_up_behavior = behavior,
+                                                );
+                                                cx.notify();
+                                            }))
+                                    })
+                                    .child(SharedString::from(label))
+                            }),
+                        ),
+                ),
+        );
         // One card per group, each under its small section label — the flat
         // 16-row table read as one undifferentiated wall. `ix` (the id's
         // position in ALL) keys the interactive elements, so ids stay unique
@@ -805,6 +887,7 @@ impl Render for ShortcutsPage {
                                     }),
                             )
                             .child(send_behavior_row.mt(px(32.0)))
+                            .child(follow_up_row)
                             .child(
                                 div()
                                     .mt(px(28.0))

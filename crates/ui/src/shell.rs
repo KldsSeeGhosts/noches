@@ -4346,6 +4346,7 @@ impl Shell {
     fn sync_independent_settings(&mut self, cx: &App) {
         let current = settings::current(cx);
         self.settings.dictation_enabled = current.dictation_enabled;
+        self.settings.follow_up_behavior = current.follow_up_behavior;
         self.settings.dictation_input = current.dictation_input;
         self.settings.window_geometry = current.window_geometry;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;

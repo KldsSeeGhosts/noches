@@ -1207,6 +1207,18 @@ impl Composer {
         );
     }
 
+    /// Hand one queued message to the live turn without interrupting it. The
+    /// row stays queued if the host cannot steer (unsupported harness, a sync
+    /// that has not landed yet), so a failed steer never loses the text.
+    pub(crate) fn steer_queued_now(&mut self, id: String, cx: &mut Context<Self>) {
+        self.queue_rpc(
+            methods::STEER_QUEUED_MESSAGE_NOW,
+            serde_json::json!({ "id": id }),
+            "Couldn't steer that message",
+            cx,
+        );
+    }
+
     /// Execute the same resolved action advertised on the row. Both pointer
     /// clicks and the empty-composer Enter gesture come through here.
     fn activate_queued_primary(

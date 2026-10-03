@@ -1116,6 +1116,18 @@ impl Pickers {
             .map(|d| SharedString::from(d.name.clone()))
     }
 
+    /// Whether the resolved harness can take a prompt inside the running turn
+    /// (the "Steer" send mode needs it). `false` until the catalog loads.
+    pub fn effective_harness_steers(&self, cx: &App) -> bool {
+        let Some(harness) = self.effective_harness(cx) else {
+            return false;
+        };
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .is_some_and(|d| d.steers_mid_turn())
+    }
+
     // ---- open/close ----
 
     /// The picker that's open AND interactive — `None` while one animates out.
