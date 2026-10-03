@@ -6362,12 +6362,12 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(self.content_width * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
+                                .bg(theme.message_surface())
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .p(px(USER_BUBBLE_PADDING))
                                 .text_size(crate::typography::ui_rems(14.0))
                                 .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
-                                .text_color(theme.text)
+                                .text_color(theme.message_foreground())
                                 .when(pending, |el| el.opacity(0.65))
                                 .child(self.render_user_body(
                                     &row.id, ix, text, mentions, &theme, window, cx,
@@ -7548,7 +7548,7 @@ fn user_bubble_text(
     let body_run = |len: usize| TextRun {
         len,
         font: gpui::font(theme.font_sans.clone()),
-        color: theme.text,
+        color: theme.message_foreground(),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -7556,7 +7556,7 @@ fn user_bubble_text(
     let chip_run = |len: usize| TextRun {
         len,
         font: gpui::font(theme.font_mono.clone()),
-        color: theme.code_text,
+        color: theme.message_foreground(),
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -7575,7 +7575,7 @@ fn user_bubble_text(
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    let wash = theme.code_wash;
+    let wash = theme.code_chip_fill();
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
     let underlay = canvas(

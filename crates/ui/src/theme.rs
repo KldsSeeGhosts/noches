@@ -1704,50 +1704,55 @@ impl Theme {
     }
 }
 
-/// Transcript tokens derived from today's roles.
-///
-/// TODO(D1): each helper below derives the value D1's theme role will carry
-/// directly (`message`, `link`, `code_background`, `icon_muted`, ...); swap the
-/// body for the role field when the theme foundation lands.
+/// Transcript tokens: each reads the theme's optional role when it carries one
+/// (an imported T3 theme such as Claude) and otherwise derives a neutral
+/// equivalent from the base roles, so built-in themes stay quiet.
 impl Theme {
+    /// The explicit override of an optional role, if the theme set one.
+    fn explicit(&self, role: impl FnOnce(&ThemeColors) -> Option<ModelColor>) -> Option<Hsla> {
+        self.optional_colors
+            .as_ref()
+            .and_then(role)
+            .map(model_color)
+    }
+
     /// Assistant body copy: the text tone at 80% over the canvas (T3 renders
     /// prose as `text-foreground/80`), flattened to an opaque tone so the chip
     /// and veil layers never double-darken it. Headings and strong runs stay
     /// at full [`Self::text`].
-    // TODO(D1): use theme.message_text / keep derived
     pub fn prose_text(&self) -> Hsla {
         flatten(self.text.opacity(0.80), self.bg)
     }
 
-    /// Inline-code chip fill: a quiet neutral plate (T3 `--muted` behind
-    /// `code`). Derived from the ink ladder so it reads on every canvas.
-    // TODO(D1): use theme.muted
+    /// Inline-code chip fill (T3 `--muted` behind `code`): the theme's `muted`
+    /// role when it has one, else a quiet neutral plate from the ink ladder.
     pub fn code_chip_fill(&self) -> Hsla {
-        self.ink(0.07)
+        self.explicit(|c| c.muted).unwrap_or_else(|| self.ink(0.07))
     }
 
-    /// Glyph tone for tool rows and chevrons (T3 `icon-muted`): the quietest
-    /// legible neutral.
-    // TODO(D1): use theme.icon_muted
-    pub fn icon_muted(&self) -> Hsla {
-        self.text_faint
-    }
-
-    /// Hover plate under a Calm tool row (T3 `hover:bg-accent/20`): a whisper
-    /// of neutral ink.
-    // TODO(D1): use theme.accent_surface at 20%
+    /// Hover plate under a Calm tool row (T3 `hover:bg-accent/20`): the
+    /// `accent_surface` role at 20% when the theme has one, else a whisper of
+    /// neutral ink (the accent-wash fallback would tint every built-in theme).
     pub fn row_hover_fill(&self) -> Hsla {
-        self.ink(0.06)
+        match self.explicit(|c| c.accent_surface) {
+            Some(surface) => surface.opacity(0.2),
+            None => self.ink(0.06),
+        }
     }
 
-    /// Plate behind expanded tool output (T3 `bg-muted/40`).
-    // TODO(D1): use theme.muted at 40%
+    /// Plate behind expanded tool output (T3 `bg-muted/40`): the `muted` role
+    /// at 40% when the theme has one, else neutral ink.
     pub fn detail_panel_fill(&self) -> Hsla {
-        self.ink(0.045)
+        match self.explicit(|c| c.muted) {
+            Some(muted) => muted.opacity(0.4),
+            None => self.ink(0.045),
+        }
     }
 
-    /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on dark).
-    // TODO(D1): use theme.link
+    /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on
+    /// dark). A deliberate product decision, not a missing role: links keep
+    /// T3's blue rather than the accent (the [`Self::link`] fallback) or an
+    /// imported theme's `updateForeground`.
     pub fn link_text(&self) -> Hsla {
         gpui::rgb(match self.appearance {
             Appearance::Light => 0x1447e6,
