@@ -957,52 +957,17 @@ fn sidebar_footer_button(
     label: &'static str,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    let motion_key = format!("{id}-motion");
-    div()
-        .id(id)
-        .role(gpui::Role::Button)
-        .aria_label(label)
-        .flex_none()
-        .size(px(26.0))
-        .rounded(px(7.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(motion::hover_blend(
-            &motion_key,
-            crate::theme::wash(0.0),
-            theme.glass_hover(),
-        ))
-        .on_hover(motion::hover_listener(motion_key.clone()))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
-        .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .child(icon(glyph).size(px(15.0)).text_color(motion::hover_blend(
-            &motion_key,
-            theme.text_muted,
-            theme.text,
-        )))
-}
-
-/// Plain one-line tooltip for sidebar icon buttons.
-struct SidebarTooltip(&'static str);
-
-impl Render for SidebarTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(crate::typography::ui_rems(11.0))
-            .text_color(theme.text)
-            .child(self.0)
-    }
+    crate::controls::icon_button(
+        id,
+        theme,
+        crate::controls::Variant::Ghost,
+        crate::controls::Size::Sm,
+        glyph,
+        label,
+    )
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .tooltip(crate::tooltip::text(label))
+    .tooltip_show_delay(crate::tooltip::SHOW_DELAY)
 }
 
 /// Compact title-first thread: 8px + 20px title + 4px gap + 16px context + 8px.
@@ -1147,27 +1112,6 @@ impl Render for SurfaceTabGhost {
     }
 }
 
-struct SurfaceTabTooltip {
-    text: SharedString,
-}
-
-impl Render for SurfaceTabTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let card = div()
-            .max_w(px(380.0))
-            .px(px(9.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::popover::surface_bg(theme))
-            .text_size(px(10.5))
-            .text_color(theme.text_muted)
-            .child(self.text.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
-    }
-}
 /// Drag marker for the terminal-panel height handle.
 struct TerminalResize;
 
@@ -6639,7 +6583,7 @@ impl Shell {
                 .id(SharedString::from(format!("{row_id}-state")))
                 .role(gpui::Role::Image)
                 .aria_label(label)
-                .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
+                .tooltip(crate::tooltip::text(label))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -9818,13 +9762,8 @@ impl Shell {
                 .role(gpui::Role::Button)
                 .aria_label(accessible_label)
                 .when_some(detail, |chip, detail| {
-                    chip.tooltip(move |_, cx| {
-                        cx.new(|_| SurfaceTabTooltip {
-                            text: detail.clone(),
-                        })
-                        .into()
-                    })
-                    .tooltip_show_delay(Duration::from_millis(350))
+                    chip.tooltip(crate::tooltip::text(detail.clone()))
+                        .tooltip_show_delay(Duration::from_millis(350))
                 })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,

@@ -1216,53 +1216,18 @@ impl Render for HistoryRefTooltip {
             .max()
             .unwrap_or_default();
         let width = (longest as f32 * 6.4 + 16.0).clamp(72.0, 360.0);
-        div()
+        let card = crate::tooltip::surface(theme)
             .w(px(width))
-            .px(px(8.0))
-            .py(px(6.0))
             .flex()
             .flex_col()
             .gap(px(3.0))
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text_muted)
-            .children(self.descriptions.iter().cloned().map(|description| {
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .whitespace_nowrap()
-                    .font_family(theme.font_mono.clone())
-                    .child(description)
-            }))
-    }
-}
-
-struct HistoryAuthorTooltip {
-    name: SharedString,
-}
-
-impl Render for HistoryAuthorTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let width = (self.name.chars().count() as f32 * 6.2 + 16.0).clamp(72.0, 260.0);
-        div()
-            .w(px(width))
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .truncate()
-            .whitespace_nowrap()
-            .text_size(px(11.0))
-            .text_color(theme.text_muted)
-            .child(self.name.clone())
+            .children(
+                self.descriptions
+                    .iter()
+                    .cloned()
+                    .map(|description| crate::tooltip::mono_line(theme, description)),
+            );
+        crate::tooltip::frost(card)
     }
 }
 
@@ -3828,12 +3793,7 @@ impl GitHistory {
                                     .child(initial),
                             )
                         })
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| HistoryAuthorTooltip {
-                                name: tooltip_name.clone(),
-                            })
-                            .into()
-                        })
+                        .tooltip(crate::tooltip::text(tooltip_name.clone()))
                         .tooltip_show_delay(Duration::from_millis(300)),
                 )
             })

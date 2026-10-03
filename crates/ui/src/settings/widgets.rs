@@ -435,7 +435,7 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
         .flex_row()
         .items_center()
         .gap(px(6.0))
-        .rounded(px(8.0))
+        .rounded(px(crate::controls::Size::Sm.radius()))
         .px(px(10.0))
         .py(px(6.0))
         .text_size(crate::typography::ui_rems(12.0))
@@ -446,7 +446,8 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
 pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefinement {
-    s.bg(ink(0.06)).text_color(theme.text)
+    s.bg(crate::roles::control_hover(theme))
+        .text_color(theme.text)
 }
 
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border
@@ -509,69 +510,7 @@ pub fn warning_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::D
         .child(div().min_w_0().child(message.into()))
 }
 
-/// A one-line hover note for settings controls (reset times, icon-only
-/// actions), in the same frosted chip as the rest of the app's tooltips.
-pub struct TextTooltip {
-    text: SharedString,
-    above: bool,
-}
-
-impl gpui::Render for TextTooltip {
-    fn render(
-        &mut self,
-        _window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl gpui::IntoElement {
-        let theme = Theme::of(cx);
-        let card = div()
-            .max_w(px(320.0))
-            .px(px(9.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::popover::surface_bg(theme))
-            .text_size(px(11.0))
-            .text_color(theme.text_muted)
-            .child(self.text.clone());
-        let card = crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card);
-        if !self.above {
-            return card.into_any_element();
-        }
-        // Overflow upward so the chip doesn't cover the next sidebar row.
-        div()
-            .h(px(0.0))
-            .flex()
-            .flex_col()
-            .justify_end()
-            .child(div().relative().bottom(px(20.0)).child(card))
-            .into_any_element()
-    }
-}
-
-/// `.tooltip(...)` builder for a [`TextTooltip`].
-pub fn text_tooltip(
-    text: impl Into<SharedString>,
-) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
-    let text: SharedString = text.into();
-    move |_, cx| {
-        cx.new(|_| TextTooltip {
-            text: text.clone(),
-            above: false,
-        })
-        .into()
-    }
-}
-
-pub fn text_tooltip_above(
-    text: impl Into<SharedString>,
-) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
-    let text: SharedString = text.into();
-    move |_, cx| {
-        cx.new(|_| TextTooltip {
-            text: text.clone(),
-            above: true,
-        })
-        .into()
-    }
-}
+/// `.tooltip(...)` builders kept under their settings-era names; the card
+/// itself is the app-wide [`crate::tooltip`] surface.
+pub use crate::tooltip::text as text_tooltip;
+pub use crate::tooltip::text_above as text_tooltip_above;

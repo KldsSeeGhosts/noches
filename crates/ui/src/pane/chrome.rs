@@ -37,6 +37,7 @@ use gpui::{
 };
 use zeron_workspace::{PaneId, PaneMode, TabId, ViewId};
 
+use crate::controls;
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::shell::Shell;
@@ -45,25 +46,6 @@ use crate::theme::Theme;
 
 use super::hit_test::DragSource;
 use super::{SplitDragGhost, TabSplitDrag};
-
-struct ChromeTooltip(&'static str);
-
-impl gpui::Render for ChromeTooltip {
-    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0)
-    }
-}
 
 /// The pane header's session metadata: the mono context line and the bound
 /// session's display state. Replaces the old buddy avatar (rule 5: no
@@ -213,26 +195,20 @@ pub(crate) fn pane_header(
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
     let control = |key: String, path: &'static str, label: &'static str| {
-        div()
-            .id(SharedString::from(key.clone()))
-            .size(px(24.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(5.0))
-            .role(gpui::Role::Button)
-            .aria_label(label)
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                cx.stop_propagation();
-                window.prevent_default();
-            })
-            .tooltip(move |_, cx| cx.new(|_| ChromeTooltip(label)).into())
-            .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.wash(0.12)))
-            .on_hover(motion::hover_listener(key))
-            // GPUI SVGs require their own color; a parent div's tint is ignored.
-            .child(icon(path).size(px(14.0)).text_color(theme.text_muted))
+        controls::icon_button(
+            key,
+            theme,
+            controls::Variant::Ghost,
+            controls::Size::Xs,
+            path,
+            label,
+        )
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            cx.stop_propagation();
+            window.prevent_default();
+        })
+        .tooltip(crate::tooltip::text(label))
     };
     div()
         .id(SharedString::from(format!("pane-header-{}", pane.0)))
@@ -519,7 +495,7 @@ pub(crate) fn tab_strip(
                         .cursor_pointer()
                         .role(gpui::Role::Button)
                         .aria_label("Close tab")
-                        .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Close tab")).into())
+                        .tooltip(crate::tooltip::text("Close tab"))
                         .bg(motion::hover_blend(
                             &close_hover_key,
                             gpui::transparent_black(),
@@ -539,28 +515,22 @@ pub(crate) fn tab_strip(
     // trigger's press position.
     let plus_key = format!("ws-tab-add-{}", view.0);
     strip = strip.child(
-        div()
-            .id(SharedString::from(plus_key.clone()))
-            .size(px(20.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .role(gpui::Role::Button)
-            .aria_label("Add tab")
-            .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Add tab")).into())
-            .bg(motion::hover_blend(&plus_key, gpui::transparent_black(), theme.wash(0.09)))
-            .on_hover(motion::hover_listener(plus_key))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.open_workspace_tool_picker_for_tab(view, event.position, cx);
-                }),
-            )
-            .child(icon(icons::PLUS).size(px(14.0)).text_color(theme.text_muted)),
+        controls::icon_button(
+            plus_key,
+            theme,
+            controls::Variant::Ghost,
+            controls::Size::Micro,
+            icons::PLUS,
+            "Add tab",
+        )
+        .tooltip(crate::tooltip::text("Add tab"))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_workspace_tool_picker_for_tab(view, event.position, cx);
+            }),
+        ),
     );
     strip.into_any_element()
 }

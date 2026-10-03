@@ -541,25 +541,6 @@ pub const APPSHOT_IMAGE_MAX_WIDTH: f32 = 320.0;
 pub const APPSHOT_IMAGE_MAX_HEIGHT: f32 = 132.0;
 pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
 
-struct AppshotActionTooltip(SharedString);
-
-impl Render for AppshotActionTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0.clone())
-    }
-}
-
 /// Give ordinary captures a shared height while their width follows the
 /// source window. Extreme panoramas and narrow composers cap width without
 /// cropping. Explicit dimensions also bound the native image while decoding.
@@ -3424,23 +3405,19 @@ struct MentionPathTooltip {
 
 impl Render for MentionPathTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
+        let theme = &Theme::of(cx).for_popup();
+        // The anchor maths in `mention_tooltip_*` assume this exact height, so
+        // the shared surface keeps its look but pins the box.
+        let card = crate::tooltip::surface(theme)
+            .h(px(MENTION_TOOLTIP_HEIGHT))
+            .py(px(0.0))
+            .max_w(px(crate::tooltip::MAX_WIDTH_MONO))
+            .flex()
+            .items_center()
+            .child(crate::tooltip::mono_line(theme, self.path.clone()));
         motion::fade_quick(
             ("file-mention-path-tooltip", self.activation),
-            div()
-                .h(px(MENTION_TOOLTIP_HEIGHT))
-                .max_w(px(480.0))
-                .flex()
-                .items_center()
-                .px(px(8.0))
-                .rounded(px(5.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(theme.surface_raised)
-                .font_family(theme.font_mono.clone())
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(self.path.clone()),
+            div().child(crate::tooltip::frost(card)),
         )
     }
 }
@@ -5246,10 +5223,7 @@ impl Composer {
                 .overflow_hidden()
                 .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::ink(0.045)))
-                .tooltip(move |_, cx| {
-                    cx.new(|_| AppshotActionTooltip(preview_label.clone()))
-                        .into()
-                })
+                .tooltip(crate::tooltip::text(preview_label.clone()))
                 .role(gpui::Role::Button)
                 .aria_label(preview_aria)
                 .tab_index(0)
@@ -5364,10 +5338,7 @@ impl Composer {
                     .shadow_sm()
                     .opacity(0.0)
                     .group_hover(group, |style| style.opacity(1.0))
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| AppshotActionTooltip(remove_label.clone()))
-                            .into()
-                    })
+                    .tooltip(crate::tooltip::text(remove_label.clone()))
                     .role(gpui::Role::Button)
                     .aria_label(remove_aria)
                     .tab_index(0)

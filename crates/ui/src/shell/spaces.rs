@@ -333,25 +333,6 @@ pub(super) struct SidebarViewMenu {
     focus: FocusHandle,
 }
 
-struct SidebarViewOptionsTooltip;
-
-impl Render for SidebarViewOptionsTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(crate::typography::ui_rems(11.0))
-            .text_color(theme.text)
-            .child("Sidebar view options")
-    }
-}
-
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
     ByDevice,
@@ -1359,7 +1340,7 @@ impl Shell {
                     }
                 }
             }))
-            .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
+            .tooltip(crate::tooltip::text("Sidebar view options"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::SORT)
@@ -1398,7 +1379,7 @@ impl Shell {
             .hover(|el| el.bg(theme.glass_hover()))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_command_palette(window, cx)))
-            .tooltip(|_, cx| cx.new(|_| super::SidebarTooltip("Search")).into())
+            .tooltip(crate::tooltip::text("Search"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::MAGNIFER)

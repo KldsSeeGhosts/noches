@@ -52,27 +52,6 @@ fn queue_mutation_acknowledged(method: &str, reply: &serde_json::Value) -> bool 
     reply.get(field).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
-struct QueueActionTooltip {
-    label: SharedString,
-}
-
-impl Render for QueueActionTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let card = div()
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::popover::surface_bg(theme))
-            .text_size(px(10.5))
-            .text_color(theme.text_muted)
-            .child(self.label.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
-    }
-}
-
 /// Compact, borderless rows inside the queue's single glass surface.
 const ROW_HEIGHT: f32 = 36.0;
 const QUEUE_TEXT_SIZE: f32 = 12.5;
@@ -973,12 +952,7 @@ impl Composer {
             .when(!enabled, |el| {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.45)
             })
-            .tooltip(move |_, cx| {
-                cx.new(|_| QueueActionTooltip {
-                    label: label.into(),
-                })
-                .into()
-            })
+            .tooltip(crate::tooltip::text(label))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(glyph)
@@ -1033,12 +1007,7 @@ impl Composer {
                     })
             })
             .when(!enabled, |el| el.opacity(0.45))
-            .tooltip(move |_, cx| {
-                cx.new(|_| QueueActionTooltip {
-                    label: tooltip.into(),
-                })
-                .into()
-            })
+            .tooltip(crate::tooltip::text(tooltip))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(if show_shortcut {
                 div()

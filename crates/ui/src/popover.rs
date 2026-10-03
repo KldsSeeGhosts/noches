@@ -933,7 +933,7 @@ pub fn key_cap(_theme: &Theme) -> gpui::Div {
         .items_center()
         .justify_center()
         .gap(px(4.0))
-        .bg(ink(0.05))
+        .bg(crate::roles::secondary_fill())
 }
 
 /// The tiny verb after a key-cap.
@@ -1022,7 +1022,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .px(px(5.0))
         .py(px(1.0))
         .rounded(px(5.0))
-        .bg(ink(0.05))
+        .bg(crate::roles::secondary_fill())
         .text_size(crate::typography::ui_rems(10.0))
         .font_family(theme.font_mono.clone())
         .text_color(theme.text_muted)
