@@ -108,8 +108,18 @@ pub struct TaskUi {
 
 #[derive(Clone)]
 pub struct MediaUi {
-    pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramUi>>,
-    pub image: Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>,
+    pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramView>>,
+    /// `None` keeps inline images in their ordinary text rendering.
+    pub image: Option<Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>>,
+}
+
+/// How a Mermaid fence presents itself on the owning surface.
+pub enum DiagramView {
+    /// The ordinary source fence, unchanged (no diagram is available yet).
+    Source,
+    /// The source fence, flagged with the reason it cannot be drawn.
+    Failed(SharedString),
+    Diagram(DiagramUi),
 }
 
 pub struct DiagramUi {
@@ -317,7 +327,7 @@ impl Render for CodeScrollbarDragGhost {
     }
 }
 
-struct CodeBlockTooltip(&'static str);
+struct CodeBlockTooltip(SharedString);
 
 impl Render for CodeBlockTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -330,9 +340,10 @@ impl Render for CodeBlockTooltip {
             .border_color(theme.border_strong)
             .bg(theme.surface_raised)
             .shadow_md()
+            .max_w(px(360.0))
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 
@@ -862,7 +873,10 @@ fn render_table(
                 TableAlign::Center => cell.text_center(),
                 TableAlign::Right => cell.text_right(),
             };
-            if opts.media.is_some()
+            if opts
+                .media
+                .as_ref()
+                .is_some_and(|media| media.image.is_some())
                 && all[r]
                     .get(c)
                     .is_some_and(|runs| runs.iter().any(|run| run.style.image.is_some()))
@@ -1706,7 +1720,7 @@ fn text_element(
     opts: &RenderOptions,
     theme: &Theme,
 ) -> AnyElement {
-    if let Some(media) = &opts.media {
+    if let Some(image_ui) = opts.media.as_ref().and_then(|media| media.image.as_ref()) {
         if runs.iter().any(|run| run.style.image.is_some()) {
             let mut elements = Vec::new();
             let mut start = 0;
@@ -1724,7 +1738,7 @@ fn text_element(
                             theme,
                         ));
                     }
-                    elements.push((media.image)(
+                    elements.push(image_ui(
                         image,
                         format!("{}-image-{ix}-{index}", opts.row_key).into(),
                         theme,
@@ -1921,7 +1935,27 @@ fn render_code_block(
     if language.is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
         if let Some(handler) = opts.media.as_ref().and_then(|media| media.diagram.as_ref()) {
             let frame_id: SharedString = format!("{}-mermaid-{ix}", opts.row_key).into();
-            let diagram = handler(code, frame_id.clone(), theme);
+            let diagram = match handler(code, frame_id.clone(), theme) {
+                DiagramView::Source => {
+                    return render_code_block_source(
+                        language, code, top_ix, ix, opts, theme, highlight,
+                    );
+                }
+                DiagramView::Failed(reason) => {
+                    let notice = code_notice(format!("{frame_id}-failure").into(), reason, theme);
+                    return render_code_block_source_with_actions(
+                        language,
+                        code,
+                        top_ix,
+                        ix,
+                        opts,
+                        theme,
+                        highlight,
+                        vec![notice],
+                    );
+                }
+                DiagramView::Diagram(diagram) => diagram,
+            };
             let toggle = diagram.toggle_source.clone();
             let toggle_action = code_icon_action(
                 format!("{frame_id}-source-toggle").into(),
@@ -1985,11 +2019,31 @@ fn code_icon_action(
             cx.stop_propagation();
             handler(window, cx);
         })
-        .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label)).into())
+        .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label.into())).into())
         .child(
             crate::icons::icon(icon_path)
                 .size(px(13.0))
                 .text_color(theme.text_muted),
+        )
+        .into_any_element()
+}
+
+/// A passive header marker whose tooltip explains why a fence stays source.
+fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(CODE_ACTION_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |_, cx| {
+            let message = message.clone();
+            cx.new(move |_| CodeBlockTooltip(message)).into()
+        })
+        .child(
+            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                .size(px(13.0))
+                .text_color(theme.warning_muted),
         )
         .into_any_element()
 }
@@ -2214,11 +2268,14 @@ fn render_code_block_source_with_actions(
             })
             .tooltip(move |_, cx| {
                 cx.new(move |_| {
-                    CodeBlockTooltip(if fit_content {
-                        "Use horizontal scrolling"
-                    } else {
-                        "Fit content"
-                    })
+                    CodeBlockTooltip(
+                        if fit_content {
+                            "Use horizontal scrolling"
+                        } else {
+                            "Fit content"
+                        }
+                        .into(),
+                    )
                 })
                 .into()
             })
@@ -2977,6 +3034,68 @@ mod tests {
         super::super::selection::clear_if_owner(before_key);
         assert!(before_bounds.top() < first_bounds.top());
         assert!(second_bounds.bottom() < after_bounds.bottom());
+    }
+
+    #[gpui::test]
+    fn pending_and_failed_mermaid_fences_keep_the_original_selectable_source(
+        cx: &mut TestAppContext,
+    ) {
+        struct MermaidSourceHarness {
+            failed: bool,
+        }
+        impl Render for MermaidSourceHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let mut opts = RenderOptions::settled("mermaid-source-test".into());
+                let failed = self.failed;
+                opts.media = Some(MediaUi {
+                    image: None,
+                    diagram: Some(Rc::new(move |_, _, _| {
+                        if failed {
+                            DiagramView::Failed("Diagram render timed out".into())
+                        } else {
+                            DiagramView::Source
+                        }
+                    })),
+                });
+                render_code_block(
+                    Some("mermaid"),
+                    "flowchart TD\nA --> B",
+                    0,
+                    0,
+                    &opts,
+                    &theme,
+                    None,
+                )
+            }
+        }
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (view, cx) = cx.add_window_view(|_, _| MermaidSourceHarness { failed: false });
+        cx.simulate_resize(size(px(640.0), px(240.0)));
+        for failed in [false, true] {
+            view.update(cx, |view, cx| {
+                view.failed = failed;
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let first = "mermaid-source-test-code0-line0";
+            let last = "mermaid-source-test-code0-line1";
+            selection_test_bounds(first);
+            let bounds = selection_test_bounds(last);
+            super::super::selection::begin(first, 0);
+            assert!(update_drag_at(point(
+                bounds.right(),
+                bounds.top() + px(9.0)
+            )));
+            let selected = super::super::selection::selected_text();
+            super::super::selection::end_active_drag();
+            super::super::selection::clear_if_owner(first);
+            assert_eq!(selected.as_deref(), Some("flowchart TD\nA --> B"));
+        }
     }
 
     #[gpui::test]

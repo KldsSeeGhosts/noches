@@ -110,6 +110,11 @@ it should also be MIT licensed. Zeron is distributed under MIT terms.
 
 ## mermaid-rs-renderer
 
+The pinned MIT-licensed renderer, version 0.3.1, is used for file previews and
+chat diagrams. Its optional CLI and PNG features are disabled. Chat rendering
+adds no third-party dependencies; generated SVG uses the existing GPUI/usvg
+image preparation path.
+
 MIT License
 
 Copyright (c) 2026 mermaid-rs-renderer contributors

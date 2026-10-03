@@ -35,6 +35,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    MermaidRender,
     #[cfg(unix)]
     /// Control this conversation's integrated Chromium browser with JSON.
     Browser {
@@ -139,6 +141,14 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    // Rendering is a disposable, bounded worker, not an engine launch. Keep
+    // stdout protocol-only and do not attach a console or initialize the UI.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "mermaid-render")
+    {
+        return zeron_ui::markdown::mermaid::run_helper().map_err(anyhow::Error::msg);
+    }
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
@@ -218,6 +228,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Some(Command::MermaidRender) => unreachable!(),
         #[cfg(unix)]
         Some(Command::Browser { .. } | Command::BrowserMcp { .. }) => unreachable!(),
         Some(Command::Headless) => {
