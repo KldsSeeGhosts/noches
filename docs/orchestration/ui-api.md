@@ -75,6 +75,13 @@ They are passive: no result acknowledgement, provider start, or cancellation.
 - `ListProviderInstances {}` refreshes and returns the canonical inventory,
   models/options/readiness. Existing `ListModels {harness}` is unchanged.
 
+`CancelDelegatedTask {chatId, taskId}` is the one UI write: the signed-in user's
+Stop of an app-owned task of parent `chatId`. It is `task_cancel` under the
+parent chat's authority (no provider session), resolves on acceptance
+(`{"taskId", "status":"cancel_requested"}`) and never acknowledges a result. A
+settled task replies with its terminal status and disposes completion delivery,
+exactly like the MCP tool.
+
 `GetOrchestrationState` shape:
 
 ```json
@@ -99,6 +106,8 @@ They are passive: no result acknowledgement, provider start, or cancellation.
     "result": "PONG",
     "latestResult": "PONG",
     "latestTerminalRunId": "run:...",
+    "startedAt": "2026-10-03T10:00:00Z",
+    "completedAt": "2026-10-03T10:00:09Z",
     "completionDelivery": {"state": "acknowledged"}
   }]
 }

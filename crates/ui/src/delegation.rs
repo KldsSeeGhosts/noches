@@ -477,80 +477,338 @@ pub fn child_banner(
 }
 
 // ---------------------------------------------------------------------------
+// Wire shapes (docs/orchestration/ui-api.md)
+// ---------------------------------------------------------------------------
+
+/// One `ListOrchestrationThreads` row: the registry discovery summary.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationThread {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub lineage: WireLineage,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    /// Publication version; moves whenever the thread's projection does.
+    #[serde(default)]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireLineage {
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    /// `subagent` or `fork`.
+    #[serde(default)]
+    pub relationship_to_parent: Option<String>,
+}
+
+/// `GetOrchestrationState`'s `uiState`, reduced to what the UI draws.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationState {
+    #[serde(default)]
+    pub tasks: Vec<WireTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTask {
+    pub task_id: String,
+    pub child_thread_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub status: DelegatedStatus,
+    pub work_state: DelegatedWorkState,
+    /// The immutable result of the original delegated run.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// A later qualifying child run's result, when there is one.
+    #[serde(default)]
+    pub latest_result: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl WireTask {
+    /// `fallback_title` is the child chat's registry title.
+    fn into_task(self, parent: &str, fallback_title: Option<&str>) -> DelegatedTask {
+        let title = self
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| fallback_title.map(str::to_owned))
+            .unwrap_or_else(|| "Agent".to_owned());
+        DelegatedTask {
+            task_id: self.task_id,
+            parent_chat_id: parent.to_owned(),
+            child_chat_id: self.child_thread_id,
+            title,
+            // Filled from the child chat's own config when the snapshot is
+            // applied; the engine reports an instance id, not a brand.
+            harness: None,
+            model: self.model,
+            effort: None,
+            status: self.status,
+            work_state: self.work_state,
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            result: self.latest_result.or(self.result),
+            progress: None,
+            // `task_cancel` accepts any unsettled task; the engine refuses a
+            // task with no interruptible run and the Stop is simply dropped.
+            cancellable: !self.status.settled(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapter
 // ---------------------------------------------------------------------------
 
-/// The engine read API, as the UI needs it.
-///
-/// TODO(O-G): `docs/orchestration/ui-api.md` and its RPC supersede this shape.
-/// Swap [`EngineDelegationApi`]'s two calls for the real read/watch RPC and
-/// `task_cancel`; nothing above this trait changes.
+/// The two passive reads the snapshot is composed from.
+pub trait OrchestrationReads: Send + Sync {
+    /// `ListOrchestrationThreads`.
+    fn threads(&self) -> BoxFuture<'static, Result<Vec<OrchestrationThread>, String>>;
+    /// `GetOrchestrationState {chatId}`; `None` for a chat the engine has no
+    /// projection for.
+    fn state(
+        &self,
+        chat_id: String,
+    ) -> BoxFuture<'static, Result<Option<OrchestrationState>, String>>;
+}
+
+/// Parents whose state was already read, keyed by the publication versions
+/// they were read at. A parent is re-read only when its own or a child's
+/// version moved, or the caller names it (a live task owns its own progress).
+#[derive(Debug, Default, Clone)]
+pub struct SnapshotCache {
+    parents: HashMap<String, (Vec<(String, i64)>, Vec<DelegatedTask>)>,
+}
+
+/// Compose one [`DelegationSnapshot`]: links from the registry lineage, task
+/// lists from `GetOrchestrationState` for each parent that changed or is in
+/// `always` (selected chats and parents with live work).
+pub async fn compose_snapshot(
+    reads: &dyn OrchestrationReads,
+    always: &[String],
+    mut cache: SnapshotCache,
+) -> Result<(DelegationSnapshot, SnapshotCache), String> {
+    let threads = reads.threads().await?;
+    let threads: Vec<_> = threads
+        .into_iter()
+        .filter(|t| t.deleted_at.is_none())
+        .collect();
+    let by_id: HashMap<&str, &OrchestrationThread> =
+        threads.iter().map(|t| (t.id.as_str(), t)).collect();
+    let mut children: HashMap<&str, Vec<&OrchestrationThread>> = HashMap::new();
+    let mut links = Vec::new();
+    for thread in &threads {
+        let Some(parent) = thread.lineage.parent_thread_id.as_deref() else {
+            continue;
+        };
+        match thread.lineage.relationship_to_parent.as_deref() {
+            Some("subagent") => children.entry(parent).or_default().push(thread),
+            Some("fork") => links.push(ThreadLink {
+                chat_id: thread.id.clone(),
+                parent_chat_id: parent.to_owned(),
+                kind: ThreadLinkKind::Fork,
+            }),
+            _ => {}
+        }
+    }
+    // Always-read parents that have children, plus every parent whose version
+    // fingerprint moved; each is read once, concurrently.
+    let fingerprint = |parent: &str, kids: &[&OrchestrationThread]| {
+        let mut fp: Vec<(String, i64)> = kids.iter().map(|k| (k.id.clone(), k.version)).collect();
+        fp.sort();
+        fp.push((
+            parent.to_owned(),
+            by_id.get(parent).map_or(0, |t| t.version),
+        ));
+        fp
+    };
+    let mut stale = Vec::new();
+    for (parent, kids) in &children {
+        let fresh = fingerprint(parent, kids);
+        let current = cache
+            .parents
+            .get(*parent)
+            .is_some_and(|(seen, _)| *seen == fresh);
+        if !current || always.iter().any(|id| id == parent) {
+            stale.push((parent.to_string(), fresh));
+        }
+    }
+    let reads_done = futures::future::join_all(stale.iter().map(|(parent, _)| {
+        let call = reads.state(parent.clone());
+        async move { call.await }
+    }))
+    .await;
+    for ((parent, fresh), state) in stale.into_iter().zip(reads_done) {
+        // One parent failing keeps its last tasks rather than blanking the UI.
+        let Ok(state) = state else { continue };
+        let tasks = state
+            .unwrap_or_default()
+            .tasks
+            .into_iter()
+            .map(|task| {
+                let child_title = by_id
+                    .get(task.child_thread_id.as_str())
+                    .and_then(|t| t.title.as_deref());
+                task.into_task(&parent, child_title)
+            })
+            .collect();
+        cache.parents.insert(parent, (fresh, tasks));
+    }
+    cache
+        .parents
+        .retain(|parent, _| children.contains_key(parent.as_str()));
+    let tasks = cache
+        .parents
+        .values()
+        .flat_map(|(_, tasks)| tasks.iter().cloned())
+        .collect();
+    Ok((DelegationSnapshot { tasks, links }, cache))
+}
+
+/// The engine read/cancel API, as the UI needs it.
 pub trait DelegationApi: Send + Sync + 'static {
-    /// One consistent read of every task and fork link the UI shows.
-    fn snapshot(&self) -> BoxFuture<'static, Result<DelegationSnapshot, String>>;
-    /// `task_cancel`. Resolves on *acceptance* (`cancel_requested`), never on
-    /// terminal confirmation: the snapshot reports that.
-    fn cancel_task(&self, task_id: String) -> BoxFuture<'static, Result<(), String>>;
+    /// One consistent read of every task and fork link the UI shows. `always`
+    /// names parents to re-read regardless of version (selected / live).
+    fn snapshot(
+        &self,
+        always: Vec<String>,
+        cache: SnapshotCache,
+    ) -> BoxFuture<'static, Result<(DelegationSnapshot, SnapshotCache), String>>;
+    /// `task_cancel` for `task_id` owned by `parent_chat_id`. Resolves on
+    /// *acceptance* (`cancel_requested`), never on terminal confirmation: the
+    /// snapshot reports that.
+    fn cancel_task(
+        &self,
+        parent_chat_id: String,
+        task_id: String,
+    ) -> BoxFuture<'static, Result<(), String>>;
 }
 
 /// No read API wired: the UI shows native subagents only.
 pub struct NullDelegationApi;
 
 impl DelegationApi for NullDelegationApi {
-    fn snapshot(&self) -> BoxFuture<'static, Result<DelegationSnapshot, String>> {
-        Box::pin(async { Ok(DelegationSnapshot::default()) })
+    fn snapshot(
+        &self,
+        _always: Vec<String>,
+        cache: SnapshotCache,
+    ) -> BoxFuture<'static, Result<(DelegationSnapshot, SnapshotCache), String>> {
+        Box::pin(async move { Ok((DelegationSnapshot::default(), cache)) })
     }
-    fn cancel_task(&self, _task_id: String) -> BoxFuture<'static, Result<(), String>> {
+    fn cancel_task(&self, _: String, _: String) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Err("delegated tasks are unavailable".to_owned()) })
     }
 }
 
 /// Reads the snapshot from a JSON file (`NOCHES_DELEGATION_FIXTURE`), for
-/// headed visual QA against the mock engine. Cancel rewrites nothing: the
+/// headed visual QA without an engine run. Cancel rewrites nothing: the
 /// fixture is the engine, and a test edits the file to settle the task.
 pub struct FixtureDelegationApi {
     pub path: std::path::PathBuf,
 }
 
 impl DelegationApi for FixtureDelegationApi {
-    fn snapshot(&self) -> BoxFuture<'static, Result<DelegationSnapshot, String>> {
+    fn snapshot(
+        &self,
+        _always: Vec<String>,
+        cache: SnapshotCache,
+    ) -> BoxFuture<'static, Result<(DelegationSnapshot, SnapshotCache), String>> {
         let path = self.path.clone();
         Box::pin(async move {
             let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            serde_json::from_str(&text).map_err(|e| e.to_string())
+            let snapshot = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            Ok((snapshot, cache))
         })
     }
-    fn cancel_task(&self, _task_id: String) -> BoxFuture<'static, Result<(), String>> {
+    fn cancel_task(&self, _: String, _: String) -> BoxFuture<'static, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
 }
 
-/// The engine RPC, once it exists.
-///
-/// TODO(O-G): method names below are placeholders for the ui-api RPC. Until
-/// the engine serves them the call errors and the sync loop backs off.
+/// The live engine: `ListOrchestrationThreads`, `GetOrchestrationState` and
+/// `CancelDelegatedTask` (user-authority `task_cancel`).
 pub struct EngineDelegationApi {
     pub engine: crate::state::EngineHandle,
 }
 
-impl DelegationApi for EngineDelegationApi {
-    fn snapshot(&self) -> BoxFuture<'static, Result<DelegationSnapshot, String>> {
+impl OrchestrationReads for EngineDelegationApi {
+    fn threads(&self) -> BoxFuture<'static, Result<Vec<OrchestrationThread>, String>> {
         let engine = self.engine.clone();
         Box::pin(async move {
             let value = engine
                 .client()
-                .call(UI_API_SNAPSHOT, serde_json::json!({}))
+                .call(
+                    zeron_rpc::methods::LIST_ORCHESTRATION_THREADS,
+                    serde_json::json!({}),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             serde_json::from_value(value).map_err(|e| e.to_string())
         })
     }
-    fn cancel_task(&self, task_id: String) -> BoxFuture<'static, Result<(), String>> {
+
+    fn state(
+        &self,
+        chat_id: String,
+    ) -> BoxFuture<'static, Result<Option<OrchestrationState>, String>> {
+        let engine = self.engine.clone();
+        Box::pin(async move {
+            let value = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::GET_ORCHESTRATION_STATE,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            // An unadopted replica chat answers `null`.
+            if value.is_null() {
+                return Ok(None);
+            }
+            serde_json::from_value(value)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+impl DelegationApi for EngineDelegationApi {
+    fn snapshot(
+        &self,
+        always: Vec<String>,
+        cache: SnapshotCache,
+    ) -> BoxFuture<'static, Result<(DelegationSnapshot, SnapshotCache), String>> {
+        let reads = EngineDelegationApi {
+            engine: self.engine.clone(),
+        };
+        Box::pin(async move { compose_snapshot(&reads, &always, cache).await })
+    }
+
+    fn cancel_task(
+        &self,
+        parent_chat_id: String,
+        task_id: String,
+    ) -> BoxFuture<'static, Result<(), String>> {
         let engine = self.engine.clone();
         Box::pin(async move {
             engine
                 .client()
-                .call(UI_API_TASK_CANCEL, serde_json::json!({ "taskId": task_id }))
+                .call(
+                    zeron_rpc::methods::CANCEL_DELEGATED_TASK,
+                    serde_json::json!({ "chatId": parent_chat_id, "taskId": task_id }),
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -571,7 +829,7 @@ pub async fn with_timeout<T>(
     }
 }
 
-/// Env var naming a snapshot JSON file for headed QA against the mock engine.
+/// Env var naming a snapshot JSON file for headed QA without an engine run.
 pub const FIXTURE_ENV: &str = "NOCHES_DELEGATION_FIXTURE";
 
 pub fn fixture_configured() -> bool {
@@ -600,10 +858,6 @@ pub fn select_api(
         _ => fallback.clone(),
     }
 }
-
-/// TODO(O-G): replace with the `ui-api.md` method names.
-pub const UI_API_SNAPSHOT: &str = "OrchestrationUiSnapshot";
-pub const UI_API_TASK_CANCEL: &str = "OrchestrationTaskCancel";
 
 #[cfg(test)]
 mod tests {
@@ -882,5 +1136,246 @@ mod tests {
             W::ResultAvailable
         );
         assert_eq!(W::WaitingForChildren.label(), "Waiting for children");
+    }
+
+    // ----- real ui-api composition ----------------------------------------
+
+    use std::sync::Mutex;
+
+    /// Serves canned `ListOrchestrationThreads` / `GetOrchestrationState`
+    /// answers and records which parents were read.
+    struct StubReads {
+        threads: Mutex<Vec<OrchestrationThread>>,
+        states: Mutex<HashMap<String, serde_json::Value>>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl StubReads {
+        fn new(threads: Vec<OrchestrationThread>) -> Self {
+            Self {
+                threads: Mutex::new(threads),
+                states: Mutex::default(),
+                reads: Mutex::default(),
+            }
+        }
+        fn read_log(&self) -> Vec<String> {
+            std::mem::take(&mut self.reads.lock().unwrap())
+        }
+    }
+
+    impl OrchestrationReads for StubReads {
+        fn threads(&self) -> BoxFuture<'static, Result<Vec<OrchestrationThread>, String>> {
+            let threads = self.threads.lock().unwrap().clone();
+            Box::pin(async move { Ok(threads) })
+        }
+        fn state(
+            &self,
+            chat_id: String,
+        ) -> BoxFuture<'static, Result<Option<OrchestrationState>, String>> {
+            self.reads.lock().unwrap().push(chat_id.clone());
+            let value = self.states.lock().unwrap().get(&chat_id).cloned();
+            Box::pin(async move {
+                value
+                    .map(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+                    .transpose()
+            })
+        }
+    }
+
+    fn thread(id: &str, parent: Option<(&str, &str)>, version: i64) -> OrchestrationThread {
+        OrchestrationThread {
+            id: id.into(),
+            title: Some(format!("title {id}")),
+            lineage: WireLineage {
+                parent_thread_id: parent.map(|(p, _)| p.into()),
+                relationship_to_parent: parent.map(|(_, r)| r.into()),
+            },
+            deleted_at: None,
+            version,
+        }
+    }
+
+    fn parent_state(status: &str, work: &str, result: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "threadId": "parent", "version": 3, "workState": "waiting_for_children",
+            "tasks": [{
+                "taskId": "node:task-1", "childThreadId": "child", "title": null,
+                "providerInstanceId": "claudeAgent", "model": "claude-haiku-4-5",
+                "status": status, "workState": work, "result": result,
+                "latestResult": result, "latestTerminalRunId": null,
+                "completionDelivery": {"state": "acknowledged"},
+                "startedAt": "2026-10-03T10:00:00Z", "completedAt": null
+            }]
+        })
+    }
+
+    #[test]
+    fn compose_maps_the_real_state_shape_into_tasks_and_links() {
+        let reads = StubReads::new(vec![
+            thread("parent", None, 3),
+            thread("child", Some(("parent", "subagent")), 2),
+            thread("fork", Some(("parent", "fork")), 1),
+        ]);
+        reads
+            .states
+            .lock()
+            .unwrap()
+            .insert("parent".into(), parent_state("running", "working", None));
+        let (snapshot, _) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], SnapshotCache::default()))
+                .unwrap();
+        assert_eq!(snapshot.tasks.len(), 1);
+        let task = &snapshot.tasks[0];
+        assert_eq!(task.task_id, "node:task-1");
+        assert_eq!(task.parent_chat_id, "parent");
+        assert_eq!(task.child_chat_id, "child");
+        // A null task title falls back to the child chat's registry title.
+        assert_eq!(task.title, "title child");
+        assert_eq!(task.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!((task.status, task.work_state), (S::Running, W::Working));
+        assert!(task.cancellable && task.started_at.is_some());
+        assert_eq!(
+            snapshot.links,
+            vec![ThreadLink {
+                chat_id: "fork".into(),
+                parent_chat_id: "parent".into(),
+                kind: ThreadLinkKind::Fork
+            }]
+        );
+        // The index treats the real child as a delegated, read-only chat.
+        let index = DelegationIndex::build(snapshot, None);
+        assert!(index.is_delegated_child("child"));
+        assert_eq!(index.forks_of("parent"), ["fork".to_owned()]);
+    }
+
+    #[test]
+    fn latest_result_wins_and_a_settled_task_is_not_cancellable() {
+        let wire: WireTask = serde_json::from_value(serde_json::json!({
+            "taskId": "t", "childThreadId": "c", "status": "completed",
+            "workState": "result_available", "result": "PONG", "latestResult": "PONG 2"
+        }))
+        .unwrap();
+        let task = wire.into_task("p", None);
+        assert_eq!(task.result.as_deref(), Some("PONG 2"));
+        assert_eq!(task.title, "Agent");
+        assert!(!task.cancellable && !task.active());
+        assert_eq!(task.phase(), SubagentPhase::Done);
+    }
+
+    #[test]
+    fn work_state_waiting_for_children_keeps_a_completed_task_active() {
+        let wire: WireTask = serde_json::from_value(serde_json::json!({
+            "taskId": "t", "childThreadId": "c", "status": "completed",
+            "workState": "waiting_for_children"
+        }))
+        .unwrap();
+        assert!(wire.into_task("p", None).active());
+    }
+
+    #[test]
+    fn compose_rereads_only_parents_whose_versions_moved_or_are_named() {
+        let reads = StubReads::new(vec![
+            thread("parent", None, 3),
+            thread("child", Some(("parent", "subagent")), 2),
+            thread("other", None, 1),
+            thread("other-child", Some(("other", "subagent")), 1),
+        ]);
+        {
+            let mut states = reads.states.lock().unwrap();
+            states.insert("parent".into(), parent_state("running", "working", None));
+            states.insert(
+                "other".into(),
+                serde_json::json!({"tasks": [{"taskId": "o", "childThreadId": "other-child",
+                    "status": "completed", "workState": "result_available"}]}),
+            );
+        }
+        let (_, cache) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], SnapshotCache::default()))
+                .unwrap();
+        let mut first = reads.read_log();
+        first.sort();
+        assert_eq!(first, ["other", "parent"]);
+        // Nothing moved: no reads at all.
+        let (_, cache) = futures::executor::block_on(compose_snapshot(&reads, &[], cache)).unwrap();
+        assert!(reads.read_log().is_empty());
+        // A named parent is re-read regardless (live progress).
+        let (_, cache) =
+            futures::executor::block_on(compose_snapshot(&reads, &["parent".into()], cache))
+                .unwrap();
+        assert_eq!(reads.read_log(), ["parent"]);
+        // A child's version moving re-reads only its parent.
+        reads.threads.lock().unwrap()[1].version = 9;
+        reads.states.lock().unwrap().insert(
+            "parent".into(),
+            parent_state("completed", "result_available", Some("PONG")),
+        );
+        let (snapshot, cache) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], cache)).unwrap();
+        assert_eq!(reads.read_log(), ["parent"]);
+        let done = snapshot.tasks.iter().find(|t| t.task_id == "node:task-1");
+        assert_eq!(done.unwrap().result.as_deref(), Some("PONG"));
+        assert_eq!(snapshot.tasks.len(), 2);
+        // A parent that loses its children leaves the cache.
+        reads
+            .threads
+            .lock()
+            .unwrap()
+            .retain(|t| t.id != "other-child");
+        let (snapshot, _) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], cache)).unwrap();
+        assert_eq!(snapshot.tasks.len(), 1);
+    }
+
+    #[test]
+    fn compose_skips_deleted_threads_and_unadopted_parents() {
+        let mut gone = thread("child", Some(("parent", "subagent")), 2);
+        gone.deleted_at = Some("2026-10-03T10:00:00Z".into());
+        let reads = StubReads::new(vec![
+            thread("parent", None, 3),
+            gone,
+            thread("c2", Some(("replica", "subagent")), 1),
+        ]);
+        // `replica` answers null (an unadopted replica chat).
+        let (snapshot, _) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], SnapshotCache::default()))
+                .unwrap();
+        assert!(snapshot.tasks.is_empty() && snapshot.links.is_empty());
+    }
+
+    #[test]
+    fn a_failed_parent_read_keeps_its_last_tasks() {
+        struct Flaky(Mutex<bool>, StubReads);
+        impl OrchestrationReads for Flaky {
+            fn threads(&self) -> BoxFuture<'static, Result<Vec<OrchestrationThread>, String>> {
+                self.1.threads()
+            }
+            fn state(
+                &self,
+                chat_id: String,
+            ) -> BoxFuture<'static, Result<Option<OrchestrationState>, String>> {
+                if *self.0.lock().unwrap() {
+                    return Box::pin(async { Err("rpc down".to_owned()) });
+                }
+                self.1.state(chat_id)
+            }
+        }
+        let inner = StubReads::new(vec![
+            thread("parent", None, 3),
+            thread("child", Some(("parent", "subagent")), 2),
+        ]);
+        inner
+            .states
+            .lock()
+            .unwrap()
+            .insert("parent".into(), parent_state("running", "working", None));
+        let reads = Flaky(Mutex::new(false), inner);
+        let (_, cache) =
+            futures::executor::block_on(compose_snapshot(&reads, &[], SnapshotCache::default()))
+                .unwrap();
+        *reads.0.lock().unwrap() = true;
+        let (snapshot, _) =
+            futures::executor::block_on(compose_snapshot(&reads, &["parent".into()], cache))
+                .unwrap();
+        assert_eq!(snapshot.tasks.len(), 1);
     }
 }

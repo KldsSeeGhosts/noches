@@ -527,6 +527,10 @@ impl AppState {
     /// Runs only on a doc update, never from a selector/render. Child-doc
     /// changes rebuild only parents that actually reference that document.
     pub(crate) fn refresh_subagents(&mut self, doc_id: &str) {
+        // A delegated parent or child transcript moved: its task state may too.
+        if self.delegation.has_parent(doc_id) || self.delegation.is_delegated_child(doc_id) {
+            self.nudge_delegation();
+        }
         let parents = self
             .subagent_parents
             .get(doc_id)
@@ -547,6 +551,17 @@ impl AppState {
         &mut self,
         snapshot: crate::delegation::DelegationSnapshot,
     ) -> bool {
+        let mut snapshot = snapshot;
+        // The engine reports a provider instance, not a brand: take the mark
+        // from the child chat's own config.
+        for task in snapshot.tasks.iter_mut().filter(|t| t.harness.is_none()) {
+            task.harness = self
+                .chats
+                .iter()
+                .find(|chat| chat.id == task.child_chat_id)
+                .and_then(|chat| chat.config.as_ref())
+                .map(|config| config.harness);
+        }
         let next = crate::delegation::DelegationIndex::build(snapshot, Some(&self.delegation));
         let affected: HashSet<String> = self
             .delegation
@@ -2418,6 +2433,48 @@ mod tests {
         assert_eq!(out[0].model.as_deref(), Some("claude-opus"));
         assert_eq!(link.effort.as_deref(), Some("High"));
         assert_eq!(link.harness, Some(zeron_proto::HarnessId::ClaudeCode));
+    }
+
+    #[test]
+    fn delegation_sync_is_nudged_by_updates_and_only_heartbeats_while_work_is_live() {
+        let mut state = AppState::new();
+        let mut nudges = state.take_delegation_nudges().expect("first take");
+        assert!(state.take_delegation_nudges().is_none(), "single consumer");
+        let nudged = |rx: &mut futures::channel::mpsc::UnboundedReceiver<()>| {
+            let mut any = false;
+            while rx.try_next().is_ok_and(|n| n.is_some()) {
+                any = true;
+            }
+            any
+        };
+        assert!(!nudged(&mut nudges));
+        // A chat-row frame (a new child chat, a parent's publication) nudges.
+        state.apply_chats(vec![]);
+        assert!(nudged(&mut nudges));
+        assert!(!state.delegation_busy() && state.delegation_always_parents().is_empty());
+
+        state.apply_delegation_snapshot(snapshot(vec![
+            delegated("a", "p1", DS::Running, DW::Working),
+            delegated("b", "p2", DS::Completed, DW::ResultAvailable),
+        ]));
+        assert!(state.delegation_busy());
+        // Only the parent with live work is re-read on every pass.
+        assert_eq!(state.delegation_always_parents(), ["p1"]);
+        // A delegated child's or parent's transcript moving nudges; a stranger does not.
+        state.refresh_subagents("child-a");
+        assert!(nudged(&mut nudges));
+        state.refresh_subagents("p2");
+        assert!(nudged(&mut nudges));
+        state.refresh_subagents("unrelated");
+        assert!(!nudged(&mut nudges));
+        // Settled: no heartbeat, nothing to force-read.
+        state.apply_delegation_snapshot(snapshot(vec![delegated(
+            "a",
+            "p1",
+            DS::Completed,
+            DW::ResultAvailable,
+        )]));
+        assert!(!state.delegation_busy() && state.delegation_always_parents().is_empty());
     }
 
     #[test]

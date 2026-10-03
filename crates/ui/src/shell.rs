@@ -1847,7 +1847,7 @@ pub struct Shell {
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     /// Per-chat Agents-panel state: Previous open/closed and lineage paging.
     pub(crate) agents_ui: std::collections::HashMap<String, crate::subagents::PanelUi>,
-    /// The engine read API for delegated tasks (TODO(O-G): `ui-api.md`).
+    /// The engine read/cancel API for delegated tasks (`ui-api.md`).
     delegation_api: std::sync::Arc<dyn crate::delegation::DelegationApi>,
     _delegation_sync: Task<()>,
     /// Per-chat sidebar child-row count last rendered - diffs kick the
@@ -4010,55 +4010,87 @@ impl Shell {
         }
     }
 
-    /// Poll the delegation read API into the update-owned index. The cadence
-    /// follows the work: brisk while anything is active, slow when idle, and
-    /// backing off when the API is not served yet.
-    /// TODO(O-G): replace the poll with the ui-api watch stream.
+    /// Keep the update-owned delegation index in step with the engine.
+    ///
+    /// The engine has no task watch stream (`docs/orchestration/ui-api.md`):
+    /// reads are passive and meant to follow ordinary workspace/transcript
+    /// updates. So a pass runs when `AppState` nudges (chat rows, selection,
+    /// a delegated transcript, sessions), debounced. Only while a task is live
+    /// does a short heartbeat refresh its progress; an idle app does no reads.
     fn spawn_delegation_sync(
         state: &Entity<AppState>,
         fallback: std::sync::Arc<dyn crate::delegation::DelegationApi>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        use futures::StreamExt as _;
         let state = state.clone();
         cx.spawn(async move |this, cx| {
+            let mut nudges = state.update(cx, |state, _| state.take_delegation_nudges());
+            let mut cache = crate::delegation::SnapshotCache::default();
             let mut failures = 0u32;
             loop {
                 // Stop with the window.
                 if this.update(cx, |_, _| ()).is_err() {
                     break;
                 }
-                let api = crate::delegation::select_api(
-                    state.read_with(cx, |s, _| s.engine().cloned()),
-                    &fallback,
-                );
+                // Anything that arrives while this pass reads wakes the next.
+                if let Some(rx) = nudges.as_mut() {
+                    while rx.try_next().is_ok_and(|n| n.is_some()) {}
+                }
+                let (engine, always) = state.read_with(cx, |s, _| {
+                    (s.engine().cloned(), s.delegation_always_parents())
+                });
+                let api = crate::delegation::select_api(engine, &fallback);
                 let result = crate::delegation::with_timeout(
-                    api.snapshot(),
+                    api.snapshot(always, cache.clone()),
                     cx.background_executor(),
                     Duration::from_secs(10),
                 )
                 .await;
-                let busy = match result {
-                    Ok(snapshot) => {
+                match result {
+                    Ok((snapshot, next)) => {
                         failures = 0;
-                        let busy = snapshot.tasks.iter().any(|t| t.phase().active());
+                        cache = next;
                         state.update(cx, |state, cx| {
                             if state.apply_delegation_snapshot(snapshot) {
                                 cx.notify();
                             }
                         });
-                        busy
                     }
-                    Err(_) => {
-                        failures = failures.saturating_add(1);
-                        false
+                    Err(_) => failures = failures.saturating_add(1),
+                }
+                let busy = state.read_with(cx, |s, _| s.delegation_busy());
+                let timeout = match (failures, busy, nudges.is_some()) {
+                    (0, true, _) => Some(Duration::from_millis(2000)),
+                    (0, false, true) => None,
+                    (0, false, false) => Some(Duration::from_secs(5)),
+                    (n, _, _) => Some(Duration::from_secs(5 * u64::from(n.min(12)))),
+                };
+                let woke = async {
+                    match nudges.as_mut() {
+                        Some(rx) => rx.next().await.is_some(),
+                        None => futures::future::pending().await,
                     }
                 };
-                let wait = match (failures, busy) {
-                    (0, true) => Duration::from_millis(1500),
-                    (0, false) => Duration::from_secs(5),
-                    (n, _) => Duration::from_secs(5 * u64::from(n.min(12))),
+                let woke = match timeout {
+                    Some(timeout) => {
+                        futures::pin_mut!(woke);
+                        match futures::future::select(woke, cx.background_executor().timer(timeout))
+                            .await
+                        {
+                            futures::future::Either::Left((open, _)) => open,
+                            futures::future::Either::Right(_) => true,
+                        }
+                    }
+                    None => woke.await,
                 };
-                cx.background_executor().timer(wait).await;
+                if !woke {
+                    break;
+                }
+                // Debounce a burst of row/transcript updates into one read.
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
             }
         })
     }
@@ -4067,11 +4099,19 @@ impl Shell {
     /// "Stopping"; the terminal state arrives with the next snapshot.
     pub(crate) fn stop_delegated_task(&mut self, task_id: String, cx: &mut Context<Self>) {
         let state = self.state.clone();
+        let Some(parent) = state
+            .read(cx)
+            .delegation
+            .task_by_id(&task_id)
+            .map(|task| task.parent_chat_id.clone())
+        else {
+            return;
+        };
         let call = crate::delegation::select_api(
             self.state.read(cx).engine().cloned(),
             &self.delegation_api,
         )
-        .cancel_task(task_id.clone());
+        .cancel_task(parent, task_id.clone());
         cx.spawn(async move |_, cx| {
             let result = crate::delegation::with_timeout(
                 call,
@@ -4083,6 +4123,8 @@ impl Shell {
                 Ok(()) => {
                     state.update(cx, |state, cx| {
                         state.mark_delegated_cancel_requested(&task_id);
+                        // The terminal state follows on the next read.
+                        state.nudge_delegation();
                         cx.notify();
                     });
                 }

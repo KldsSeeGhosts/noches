@@ -55,29 +55,40 @@ from `SessionState`; only Running pulses.
 - Hover uses the owner-scoped drivers (`controls::button` / `icon_button` with the surface's
   entity id); tooltips are the shared `tooltip::lines` cards, built per hover.
 
-## Data source and the O-G seam
+## Data source
 
-`docs/orchestration/ui-api.md` (sibling agent O-G, `orch/wave2`) did not exist when this was
-written. The UI therefore depends only on the `DelegationApi` trait:
+The UI reads the passive ui-api (`docs/orchestration/ui-api.md`) and nothing else; it depends on
+the `DelegationApi` trait:
 
 ```rust
 trait DelegationApi {
-    fn snapshot(&self) -> BoxFuture<'static, Result<DelegationSnapshot, String>>;
-    fn cancel_task(&self, task_id: String) -> BoxFuture<'static, Result<(), String>>;
+    fn snapshot(&self, always: Vec<String>, cache: SnapshotCache)
+        -> BoxFuture<'static, Result<(DelegationSnapshot, SnapshotCache), String>>;
+    fn cancel_task(&self, parent_chat_id: String, task_id: String) -> BoxFuture<'static, Result<(), String>>;
 }
 ```
 
-- `NullDelegationApi`: default. Native subagents only.
-- `EngineDelegationApi`: calls placeholder RPC names (`OrchestrationUiSnapshot`,
-  `OrchestrationTaskCancel`) marked `TODO(O-G)`. Until the engine serves them the sync loop
-  backs off to 60 s and the UI behaves like Null.
-- `FixtureDelegationApi`: reads a snapshot JSON from `NOCHES_DELEGATION_FIXTURE` for headed QA
-  (`/Volumes/DevDrive/AiStack/noches-t3-program/qa-orch-ui.sh`).
+- `EngineDelegationApi` composes the snapshot (`compose_snapshot`) from two passive RPCs:
+  `ListOrchestrationThreads` gives child → parent links (`lineage.relationshipToParent` =
+  `subagent` | `fork`) and per-thread publication `version`; `GetOrchestrationState {chatId}`
+  gives each parent's task list (`taskId`, `childThreadId`, `status`, `workState`, `result` /
+  `latestResult`, `startedAt`, `completedAt`). A parent is re-read only when its own or a child's
+  version moved, or it is selected / owns live work (`SnapshotCache`).
+- Stop is `CancelDelegatedTask {chatId, taskId}`: the engine's user-authority `task_cancel` under
+  the parent chat (`DelegationService::cancel_for_user`). It resolves on acceptance
+  (`cancel_requested`); the terminal state arrives with the next read. It never acknowledges a
+  result.
+- `NullDelegationApi`: before the engine connects. `FixtureDelegationApi`: a snapshot JSON from
+  `NOCHES_DELEGATION_FIXTURE` for headed QA without a run.
 
-The merge is a small swap: point `EngineDelegationApi` at the real read/watch RPC and `task_cancel`,
-replace the poll in `Shell::spawn_delegation_sync` with the watch stream, and map the real
-projection into `DelegationSnapshot`. `DelegatedStatus`/`DelegatedWorkState` already convert from
-`OrchestratorMcpDelegatedTaskStatus` / `…WorkState`. Nothing above the trait changes.
+There is no task watch stream (the ui-api asks readers to follow ordinary workspace/transcript
+updates). `Shell::spawn_delegation_sync` therefore wakes on `AppState::nudge_delegation`, sent from
+chat-row frames (a new child chat, a parent's publication), selection, session changes and a
+delegated parent/child transcript update, debounced 150 ms. A 2 s heartbeat runs only while a
+task is live (progress is read-only state); an idle app does no delegation reads.
+
+The child chat is a regular workspace chat. Its transcript is the ordinary chat transcript
+(`WatchDocMessages`); the index marks it read-only and swaps the composer for the child banner.
 
 ## Not done
 

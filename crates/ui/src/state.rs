@@ -883,6 +883,11 @@ pub struct AppState {
     /// Delegated (app-owned) tasks and fork links, indexed on update by
     /// [`Self::apply_delegation_snapshot`]; read by every subagent surface.
     pub(crate) delegation: crate::delegation::DelegationIndex,
+    /// Wakes the delegation sync when something it reads may have moved
+    /// (chat rows, selection, a parent/child transcript). The receiver is
+    /// taken once by the shell's sync task.
+    delegation_nudge: futures::channel::mpsc::UnboundedSender<()>,
+    delegation_nudge_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
     /// Pending-message queues keyed by chat id for pane-fixed composers.
     /// Independent of `selected_chat`: a pane keeps reading its own queue
     /// while another chat is selected.
@@ -956,6 +961,7 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let (delegation_nudge, delegation_nudge_rx) = futures::channel::mpsc::unbounded();
         Self {
             remote_host: None,
             remote_connection: None,
@@ -1007,6 +1013,8 @@ impl AppState {
             subagent_presentations: HashMap::new(),
             subagent_parents: HashMap::new(),
             delegation: Default::default(),
+            delegation_nudge,
+            delegation_nudge_rx: Some(delegation_nudge_rx),
             pane_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
             terminal_panels: HashMap::new(),
@@ -1207,12 +1215,56 @@ impl AppState {
         self.review_comment_flushes.contains_key(key)
     }
 
+    // ---- delegation sync ----
+
+    /// Ask the delegation sync to re-read. Coalesced by the receiver.
+    pub(crate) fn nudge_delegation(&self) {
+        let _ = self.delegation_nudge.unbounded_send(());
+    }
+
+    pub(crate) fn take_delegation_nudges(
+        &mut self,
+    ) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
+        self.delegation_nudge_rx.take()
+    }
+
+    /// Parents the sync re-reads on every pass: the selected chat (or its
+    /// parent, for a child) and every parent with live work, whose progress
+    /// the engine only reports on read.
+    pub(crate) fn delegation_always_parents(&self) -> Vec<String> {
+        let mut parents: Vec<String> = self
+            .delegation
+            .parents()
+            .filter(|parent| self.delegation.tasks_for(parent).iter().any(|t| t.active()))
+            .cloned()
+            .collect();
+        if let Some(selected) = &self.selected_chat {
+            parents.push(selected.clone());
+            if let Some(link) = self.delegation.link_for(selected) {
+                parents.push(link.parent_chat_id.clone());
+            }
+        }
+        parents.sort();
+        parents.dedup();
+        parents
+    }
+
+    /// Whether any delegated task is live (the sync keeps a heartbeat only
+    /// then; an idle app does no delegation reads).
+    pub(crate) fn delegation_busy(&self) -> bool {
+        self.delegation
+            .parents()
+            .any(|parent| self.delegation.tasks_for(parent).iter().any(|t| t.active()))
+    }
+
     // ---- reducers (pure) ----
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
+        // A new child chat or a parent's publication arrives as a chat row.
+        self.nudge_delegation();
         self.transcript_cache
             .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
         if let Some(selected) = &self.selected_chat
@@ -1254,6 +1306,9 @@ impl AppState {
             .collect();
         let changed = self.session_presentation.as_ref() != Some(&presentation)
             || self.session_presence_presentation != presence;
+        if changed {
+            self.nudge_delegation();
+        }
         self.session_presentation = Some(presentation);
         self.session_presence_presentation = presence;
         self.replace_sessions(sessions);
@@ -2594,6 +2649,7 @@ impl AppState {
         if let Some(id) = &chat_id {
             self.focus_chat_sync(id, cx);
         }
+        self.nudge_delegation();
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
