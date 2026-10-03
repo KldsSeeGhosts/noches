@@ -39,6 +39,10 @@ enum Command {
     MermaidRender,
     /// Serve opt-in session-control tools over MCP stdio.
     Mcp,
+    /// Forward a session-scoped MCP server over stdio (host-local bindings).
+    AcpMcpBridge,
+    /// ACP terminal fallback for providers that do not surface injected tools.
+    AcpMcpCall { tool: String, arguments: String },
     #[cfg(unix)]
     /// Control this conversation's integrated Chromium browser with JSON.
     Browser {
@@ -143,6 +147,16 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    // MCP fast path: do not initialize logging, UI, or engine state.
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "acp-mcp-bridge" | "acp-mcp-call"))
+    {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        return tokio::runtime::Runtime::new()?
+            .block_on(zeron_harness::mcp::bridge::cli(&args))
+            .map_err(|e| anyhow::anyhow!(zeron_harness::redact::redact_output(&e.to_string())));
+    }
     // Rendering is a disposable, bounded worker, not an engine launch. Keep
     // stdout protocol-only and do not attach a console or initialize the UI.
     if std::env::args_os()
@@ -154,6 +168,27 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
+    match &cli.command {
+        Some(Command::AcpMcpBridge) => {
+            return tokio::runtime::Runtime::new()?
+                .block_on(zeron_harness::mcp::bridge::cli(&["acp-mcp-bridge".into()]))
+                .map_err(|e| {
+                    anyhow::anyhow!(zeron_harness::redact::redact_output(&e.to_string()))
+                });
+        }
+        Some(Command::AcpMcpCall { tool, arguments }) => {
+            return tokio::runtime::Runtime::new()?
+                .block_on(zeron_harness::mcp::bridge::cli(&[
+                    "acp-mcp-call".into(),
+                    tool.clone(),
+                    arguments.clone(),
+                ]))
+                .map_err(|e| {
+                    anyhow::anyhow!(zeron_harness::redact::redact_output(&e.to_string()))
+                });
+        }
+        _ => {}
+    }
     if matches!(cli.command, Some(Command::Mcp)) {
         return tokio::runtime::Runtime::new()?.block_on(zeron_mcp::run());
     }
@@ -237,6 +272,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(unix)]
         Some(Command::Browser { .. } | Command::BrowserMcp { .. }) => unreachable!(),
         Some(Command::Mcp) => unreachable!(),
+        Some(Command::AcpMcpBridge | Command::AcpMcpCall { .. }) => unreachable!(),
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -279,10 +315,17 @@ fn main() -> anyhow::Result<()> {
         },
         None => {
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-            let remote = match cli.connection.or_else(|| std::env::var("NOCHES_CONNECTION").ok()) {
-                Some(name) => Some(zeron_rpc::remote::Connections::load(&paths::data_dir())?.hosts.into_iter()
-                    .find(|h| h.id == name || h.name == name)
-                    .ok_or_else(|| anyhow::anyhow!("Saved connection not found: {name}"))?),
+            let remote = match cli
+                .connection
+                .or_else(|| std::env::var("NOCHES_CONNECTION").ok())
+            {
+                Some(name) => Some(
+                    zeron_rpc::remote::Connections::load(&paths::data_dir())?
+                        .hosts
+                        .into_iter()
+                        .find(|h| h.id == name || h.name == name)
+                        .ok_or_else(|| anyhow::anyhow!("Saved connection not found: {name}"))?,
+                ),
                 None => None,
             };
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
