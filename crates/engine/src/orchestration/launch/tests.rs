@@ -9,6 +9,8 @@ fn pending_ids_are_strict() {
 }
 
 use super::{HostLaunchService, LaunchOperation, ToolError};
+#[path = "ui_details_tests.rs"]
+mod ui_details_tests;
 use crate::mcp::auth::InvocationScope;
 use crate::orchestration::launch_service::{LaunchService, LaunchThreadIntake, SendFailure};
 use crate::orchestration::service::CallerScope;

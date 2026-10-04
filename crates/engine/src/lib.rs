@@ -549,6 +549,7 @@ impl EngineCore {
         .with_previews(self.previews.clone());
         if let Some(host) = &self.orchestration_host {
             rpc = rpc.with_delegation(host.service.clone());
+            rpc = rpc.with_pull_requests(host.pull_requests.clone());
             rpc = rpc.with_scheduler(host.scheduler.clone());
             if let Some(launch) = &host.launch {
                 rpc = rpc.with_launch(launch.clone());

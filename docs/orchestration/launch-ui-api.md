@@ -5,6 +5,13 @@ the read API acknowledges a task, sends a message or starts a provider.
 Typed clients are `RpcClient::{launch_projects,launch_state,control_worktree_setup}`.
 Types live in `zeron_proto::launch`; new fields are serde-defaulted.
 
+Desktop handoff uses `HandoffThreadWorktree {chatId, targetDeviceId, input}`,
+where `input` is the generated `T3WorktreeHandoffInput`.
+`RpcClient::handoff_thread_worktree` enters the same handoff workflow under
+owner-user authority: checkout locks, binding CAS, setup gate, continuation,
+and provider detach are shared with MCP. Blank base refs and continuation
+prompts are omitted, not submitted as null or as an empty continuation.
+
 - `ListLaunchProjects {}` → `LaunchProjects { projects: Project[] }`.
   Projects retain the exact T3 nested settings/scripts shape. Existing owned
   Noches spaces are adopted with their original space id, so navigation does

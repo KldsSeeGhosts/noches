@@ -673,6 +673,12 @@ impl HostLaunchService {
 
     pub(crate) async fn handoff(&self, scope: &InvocationScope, input: Value) -> Value {
         let tid = scope.caller.thread_id.0.clone();
+        self.handoff_for_user(&tid, input).await
+    }
+
+    /// Owner-user entry point; shares the MCP handoff's locks, CAS and continuation.
+    pub(crate) async fn handoff_for_user(&self, tid: &str, input: Value) -> Value {
+        let tid = tid.to_string();
         if !lock(&self.in_flight).insert(tid.clone()) {
             return worktree_failure(
                 "handoff_in_progress",

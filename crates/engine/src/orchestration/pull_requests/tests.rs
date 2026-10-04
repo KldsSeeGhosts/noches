@@ -1,5 +1,7 @@
 // T3 conformance tests below are source-oracle ports, not live host traces.
 use super::watch::*;
+#[path = "ui_details_tests.rs"]
+mod ui_details_tests;
 use super::*;
 use crate::orchestration::{command::Command, store::WriteBoundary};
 use crate::source_control::ChangeRequestError;

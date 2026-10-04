@@ -19,6 +19,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
+pub mod details;
 pub mod device_room;
 pub mod git_actions;
 pub mod launch;
@@ -58,6 +59,8 @@ pub mod methods {
     /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.
     pub const RESTORE_FILE_CHECKPOINT: &str = "RestoreFileCheckpoint";
     pub const GET_THREAD_PULL_REQUESTS: &str = "GetThreadPullRequests";
+    pub const CHANGE_THREAD_PULL_REQUEST: &str = "ChangeThreadPullRequest";
+    pub const HANDOFF_THREAD_WORKTREE: &str = "HandoffThreadWorktree";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
     /// `task_cancel` under host authority. Resolves on acceptance, not on the
     /// terminal state, which `GetOrchestrationState` reports.

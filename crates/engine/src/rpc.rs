@@ -592,6 +592,7 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    pull_requests: Option<std::sync::Arc<crate::orchestration::pull_requests::PullRequestService>>,
     git_actions: Option<crate::orchestration::git_actions::GitActionsService>,
     launch: Option<std::sync::Arc<crate::orchestration::launch::HostLaunchService>>,
     orchestration: Option<crate::orchestration::Store>,
@@ -645,6 +646,7 @@ impl EngineRpc {
             },
         };
         Self {
+            pull_requests: None,
             git_actions: None,
             orchestration: None,
             launch: None,
@@ -718,6 +720,14 @@ impl EngineRpc {
         service: std::sync::Arc<crate::orchestration::launch::HostLaunchService>,
     ) -> Self {
         self.launch = Some(service);
+        self
+    }
+
+    pub fn with_pull_requests(
+        mut self,
+        service: std::sync::Arc<crate::orchestration::pull_requests::PullRequestService>,
+    ) -> Self {
+        self.pull_requests = Some(service);
         self
     }
 
@@ -1230,14 +1240,18 @@ fn should_invalidate_link(error: &RpcError) -> bool {
 fn forward_deadline(method: &str) -> std::time::Duration {
     use std::time::Duration;
     match method {
-        methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
-            Duration::from_secs(15 * 60)
-        }
+        methods::CLONE_REPO
+        | methods::FETCH_ALL
+        | methods::APPLY_UPDATE
+        | methods::HANDOFF_THREAD_WORKTREE => Duration::from_secs(15 * 60),
         // Destructive and multi-step filesystem work: the host lets a started
         // discard run to completion even after the caller is gone, so a short
         // relay deadline would surface a still-running discard as a definite
         // failure. Give it room instead.
-        methods::CREATE_WORKTREE | methods::DISCARD_WORKING_TREE => Duration::from_secs(120),
+        methods::CREATE_WORKTREE
+        | methods::DISCARD_WORKING_TREE
+        | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
+        | methods::RESTORE_FILE_CHECKPOINT => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1260,6 +1274,12 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::GET_THREAD_PULL_REQUESTS
+            | methods::CHANGE_THREAD_PULL_REQUEST
+            | methods::HANDOFF_THREAD_WORKTREE
+            | methods::GET_THREAD_TRANSFER_STATE
+            | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
+            | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
             | methods::LIST_PROVIDER_INSTANCES
             | methods::GET_PROVIDER_INSTANCE_SETTINGS
@@ -1923,6 +1943,33 @@ impl RpcService for EngineRpc {
                     }
                 };
                 RpcReply::value(&state)
+            }
+            methods::CHANGE_THREAD_PULL_REQUEST => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let service = self
+                    .pull_requests
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Pull request service unavailable.".into()))?;
+                crate::orchestration::ui_details::change_pr(
+                    service,
+                    &self.workspace,
+                    parse_params(params)?,
+                )
+                .await
+            }
+            methods::HANDOFF_THREAD_WORKTREE => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let service = self
+                    .launch
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                crate::orchestration::ui_details::handoff(service, parse_params(params)?).await
             }
             methods::LIST_PROVIDER_INSTANCES => {
                 self.registry
@@ -3626,6 +3673,31 @@ mod tests {
         .expect("ui param shape");
         assert_eq!(p.account_id, "acct-1");
         assert_eq!(p.harness, HarnessId::ClaudeCode);
+    }
+
+    #[test]
+    fn desktop_details_methods_are_owner_forwardable() {
+        for method in [
+            methods::GET_THREAD_PULL_REQUESTS,
+            methods::CHANGE_THREAD_PULL_REQUEST,
+            methods::GET_LAUNCH_STATE,
+            methods::CONTROL_WORKTREE_SETUP,
+            methods::HANDOFF_THREAD_WORKTREE,
+            methods::GET_THREAD_TRANSFER_STATE,
+            methods::PREVIEW_FILE_CHECKPOINT_RESTORE,
+            methods::RESTORE_FILE_CHECKPOINT,
+        ] {
+            assert!(forwardable(method), "{method}");
+            assert!(!is_stream_method(method), "{method}");
+        }
+        assert_eq!(
+            forward_deadline(methods::HANDOFF_THREAD_WORKTREE),
+            std::time::Duration::from_secs(900)
+        );
+        assert_eq!(
+            forward_deadline(methods::RESTORE_FILE_CHECKPOINT),
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[test]

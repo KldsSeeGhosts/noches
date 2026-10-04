@@ -37,6 +37,39 @@ pub async fn invoke(
     name: &str,
     args: Value,
 ) -> Result<Value, PrError> {
+    invoke_with_source(
+        service,
+        caller,
+        name,
+        args,
+        zeron_proto::orchestration::ThreadPullRequestLinkSource::Agent,
+    )
+    .await
+}
+
+pub(crate) async fn invoke_for_user(
+    service: &PullRequestService,
+    caller: &CallerScope,
+    name: &str,
+    args: Value,
+) -> Result<Value, PrError> {
+    invoke_with_source(
+        service,
+        caller,
+        name,
+        args,
+        zeron_proto::orchestration::ThreadPullRequestLinkSource::Manual,
+    )
+    .await
+}
+
+async fn invoke_with_source(
+    service: &PullRequestService,
+    caller: &CallerScope,
+    name: &str,
+    args: Value,
+    source: zeron_proto::orchestration::ThreadPullRequestLinkSource,
+) -> Result<Value, PrError> {
     let failed = || PrError::new(failure_tag(name));
     let thread = service
         .kernel
@@ -64,11 +97,7 @@ pub async fn invoke(
     match name {
         "link_pull_request" => {
             let already = service
-                .link(
-                    &caller.thread_id,
-                    target.clone(),
-                    zeron_proto::orchestration::ThreadPullRequestLinkSource::Agent,
-                )
+                .link(&caller.thread_id, target.clone(), source)
                 .await
                 .map_err(|_| failed())?;
             let mut value = serde_json::to_value(target).unwrap();

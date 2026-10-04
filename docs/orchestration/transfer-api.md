@@ -8,6 +8,9 @@ remain the generated T3 contracts. No gpui UI is implemented in this slice.
 
 Types live in `zeron_proto::transfer`. RPC method strings are in
 `zeron_rpc::methods`. These names and camelCase fields are stable.
+Typed desktop clients are `RpcClient::{thread_transfer_state,
+preview_file_checkpoint_restore, restore_file_checkpoint}`, each requiring
+the chat's owner device and sending `targetDeviceId`.
 
 | RPC | Params | Result |
 | --- | --- | --- |

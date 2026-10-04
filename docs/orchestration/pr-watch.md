@@ -104,6 +104,12 @@ then the chat's recorded repository root/cwd.
 
 RPC: `GetThreadPullRequests {"chatId":"thread"}`.
 Typed UI client: `RpcClient::thread_pull_requests(&str)`.
+Owner-routed desktop read: `RpcClient::thread_pull_requests_on(chat, owner)`.
+Desktop mutations use `ChangeThreadPullRequest` with
+`{chatId, targetDeviceId, target: LinkPullRequestInput, watching: bool | null}`.
+`null` links manually; `true` watches; `false` unwatches without removing the
+link. `RpcClient::change_thread_pull_request` shares the existing PR service's
+target validation and verbatim T3 errors, under owner-user authority.
 Owner read: `Store::ui_pull_requests(&ThreadId)`.
 Wire type: `zeron_proto::pull_requests::ThreadPullRequestsUi`.
 

@@ -34,6 +34,7 @@ pub mod threads;
 pub mod transfer;
 pub mod transfer_service;
 pub mod ui;
+pub(crate) mod ui_details;
 pub mod ui_git_actions;
 pub mod ui_launch;
 pub mod ui_provider_instances;
