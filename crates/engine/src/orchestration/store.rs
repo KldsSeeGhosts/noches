@@ -11,7 +11,10 @@ use super::event::{APPLICATION_EVENT_VERSION, Envelope, encode_component, iso};
 use super::projection::{self, ThreadProjection, decode};
 use super::{Error, Result};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("schema_launch.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBoundary {
