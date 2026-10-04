@@ -270,7 +270,10 @@ impl PullRequestHost for GitHubHost {
             "state":state,"title":pr["title"],"headBranch":pr["headRefName"],"baseBranch":pr["baseRefName"],
             "isDraft":pr["isDraft"],"updatedAt":pr["updatedAt"],"syncedAt":crate::orchestration::event::iso(crate::now_ms()).map_err(|_| ChangeRequestError::Decode)?,
             "closedAt":pr["closedAt"],"mergedAt":pr["mergedAt"],"mergeability":mergeability,"checksState":checks_state,
-            "author":{"login":pr["author"]["login"],"name":null,"avatarUrl":pr["author"]["avatarUrl"]},
+            "author":match pr["author"]["login"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(login) => json!({"login":login,"name":null,"avatarUrl":pr["author"]["avatarUrl"]}),
+                None => Value::Null,
+            },
             "additions":pr["additions"],"deletions":pr["deletions"],"changedFiles":pr["changedFiles"],
             "reviewDecision":match pr["reviewDecision"].as_str() { Some("APPROVED") => json!("approved"), Some("CHANGES_REQUESTED") => json!("changes-requested"), Some("REVIEW_REQUIRED") => json!("review-required"), _ => Value::Null }
         })).map_err(|_| ChangeRequestError::Decode)?;

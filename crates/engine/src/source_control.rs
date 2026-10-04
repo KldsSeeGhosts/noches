@@ -1642,9 +1642,13 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
                 {"number":8,"head":{"ref":"upper"},"state":"open"}
             ]
         }]);
+        let mut deleted_author = response.clone();
+        deleted_author["data"]["repository"]["pullRequest"]["author"] = serde_json::Value::Null;
         let runner = FakeProcessRunner::with_responses([
             command_success(serde_json::to_vec(&response).unwrap()),
             command_success(serde_json::to_vec(&stack).unwrap()),
+            command_success(serde_json::to_vec(&deleted_author).unwrap()),
+            command_success(b"[]".to_vec()),
         ]);
         let host = GitHubHost::with_cli(GitHubCli::with_runner(runner.clone()));
         let read = host
@@ -1674,6 +1678,23 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         assert_eq!(
             runner.requests()[1].args.last().unwrap(),
             "repos/acme/web/stacks?pull_request=7"
+        );
+        let deleted = host
+            .read(
+                Path::new("/checkout"),
+                &Identity {
+                    host: "github.com".into(),
+                    repository: "acme/web".into(),
+                    number: 7,
+                    url: "https://github.com/acme/web/pull/7".into(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(deleted.snapshot).unwrap()["author"],
+            serde_json::Value::Null
         );
     }
 
