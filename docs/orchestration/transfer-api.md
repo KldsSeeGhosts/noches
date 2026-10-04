@@ -154,8 +154,32 @@ Remaining parity work, not claimed complete:
   seam: currently uncertainty conservatively refuses restore.
 - Sparse checkout/submodule checkpoint parity: capture/restore explicitly refuse
   these checkouts until their private-index policy is ported. Live
-  macOS/Windows/provider validation remains unverified.
+  provider/Windows validation and macOS visual QA remain unverified; the
+  macOS unit, filesystem, and mocked-provider suites below have been exercised.
 
 Tests mirror `ContextHandoffBudget.test.ts`, `ContextHandoffDelivery.ts`,
 `ThreadForkService`, and `CheckpointRestoreSafety` cases from the pinned T3
 reference, covering portions of R3 C25/C26 rather than claiming every scenario.
+
+## Post-merge local validation
+
+After merging `orch/wave3`, the requested `linux-test.sh` wrapper runs locally
+on macOS, with `LINUX_TARGET=target-w3-transfer` (no SSH).
+
+- Engine `--lib orchestration::`: 162 passed, 0 failed, 1 ignored. Includes
+  transactional `ThreadService` merge refusals and both pre-merge SQLite
+  upgrade histories, alongside transfer/checkpoint mirrors.
+- Engine integrations: `diff_sync_churn` 3, `message_queue` 25,
+  `orchestration_bootstrap` 2, `orchestration_mcp` 1, `restart_resume` 8 passed
+  (1 live test ignored); no failures.
+- Touched library suites: doc 117, harness 264, MCP 8, proto 42, RPC 22 passed;
+  no failures.
+- Proto `--test orchestration_oracle`: 14 passed; mocked Codex
+  `native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn`:
+  1 passed; no failures.
+- Explicit touched-file `rustfmt --check` and `git diff --check`: passed.
+
+The initial merged compile exposed six missing provider-instance fields in
+struct/event literals; these were fixed before the successful runs. The only
+remaining compiler warning is the pre-existing test-only `thread_local!` doc
+comment in `sessions.rs`. No desktop UI was changed.
