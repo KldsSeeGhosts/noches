@@ -43,6 +43,7 @@ pub enum Operation {
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
     Queue(Box<super::queue::QueueCommand>),
+    Thread(Box<super::threads::planner::ThreadOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,7 @@ impl Command {
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
             Operation::Queue(operation) => operation.command_type().into(),
+            Operation::Thread(operation) => operation.command_type().into(),
         })
     }
 }
@@ -416,6 +418,9 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
     if let Operation::Queue(operation) = &command.operation {
         return super::queue::plan(conn, command, operation, now);
     }
+    if let Operation::Thread(operation) = &command.operation {
+        return super::threads::planner::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
     }
@@ -526,6 +531,11 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
                     } else {
                         "thread.model-selection-updated"
                     }
+                }
+                OrchestrationV2Command::ProviderSwitch(set) => {
+                    thread.provider_instance_id = set.model_selection.instance_id.clone();
+                    thread.model_selection = set.model_selection.clone();
+                    "thread.provider-switched"
                 }
                 OrchestrationV2Command::ThreadUnarchive(_) => {
                     thread.archived_at = None;
@@ -707,6 +717,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
         Operation::Queue(_) => unreachable!("routed before the kernel subset"),
+        Operation::Thread(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

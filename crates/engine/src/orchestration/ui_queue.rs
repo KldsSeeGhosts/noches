@@ -195,7 +195,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
         pinned_at: time(&thread["pinnedAt"]),
         snoozed_until: (!blocked).then(|| time(&thread["snoozedUntil"])).flatten(),
         settled_at: (!blocked).then(|| time(&thread["settledAt"])).flatten(),
-        settled_by: if blocked {
+        settled_by: if blocked || thread["settledAt"].is_null() {
             None
         } else {
             match marker["settledBy"].as_str() {

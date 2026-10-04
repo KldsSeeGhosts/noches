@@ -20,8 +20,11 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod git_actions;
 pub mod remote;
+pub mod scheduled_tasks;
 mod server;
+mod threads;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -38,6 +41,8 @@ pub mod methods {
     pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
     pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
     pub const GET_QUEUE_STATE: &str = "GetQueueState";
+    pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
+    pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:

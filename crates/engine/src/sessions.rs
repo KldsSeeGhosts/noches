@@ -635,6 +635,13 @@ impl SessionsEngine {
         lock(&self.inner.statuses).values().any(is_active)
     }
 
+    /// Idle warm adapters can emit autonomous follow-ups without a new RPC.
+    /// Filesystem-maintenance authority must exclude these too, not just the
+    /// visible Working/AwaitingInput states.
+    pub(crate) fn has_live_harnesses(&self) -> bool {
+        !lock(&self.inner.runs).is_empty()
+    }
+
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()

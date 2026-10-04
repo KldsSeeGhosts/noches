@@ -11,20 +11,27 @@ mod delegation_live_tests;
 mod delegation_tests;
 pub mod effects;
 pub mod event;
+pub mod git_actions;
 pub mod mailbox;
 pub mod projection;
 pub mod queue;
 pub mod queue_service;
 pub mod recovery;
 pub mod runner;
+pub mod scheduler;
 pub mod service;
 pub mod store;
 pub mod sync_publish;
 pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod thread_service;
+pub mod threads;
 pub mod ui;
+pub mod ui_git_actions;
 pub mod ui_queue;
+pub mod ui_scheduler;
+pub mod ui_threads;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

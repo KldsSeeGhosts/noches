@@ -107,6 +107,9 @@ impl RunnerBridge {
                     effect.request,
                     EffectRequest::ProviderTurnStart { .. }
                         | EffectRequest::ManagedRunInterrupt { .. }
+                        | EffectRequest::ProviderTurnInterrupt { .. }
+                        | EffectRequest::ProviderTurnSteer { .. }
+                        | EffectRequest::ProviderTurnRestart { .. }
                 )
             {
                 // Owning process is gone and kernel recorded terminal disposal;
@@ -520,12 +523,19 @@ impl RunnerBridge {
             }
             // Queued runs may have newer ordinals without owning the provider.
             // Stop observing only once admission transfers this live binding.
-            if records(&current, "provider-thread").iter().any(|provider| {
-                run.provider_thread_id
-                    .as_ref()
-                    .is_some_and(|id| provider["id"] == id.0)
-                    && provider["lastRunOrdinal"].as_i64() != Some(run.ordinal)
-            }) {
+            if current
+                .runs
+                .iter()
+                .find(|r| r.id == run.id)
+                .is_none_or(|r| r.active_attempt_id != run.active_attempt_id)
+                || super::task::active_run(&current).is_some_and(|active| active.id != run.id)
+                || records(&current, "provider-thread").iter().any(|provider| {
+                    run.provider_thread_id
+                        .as_ref()
+                        .is_some_and(|id| provider["id"] == id.0)
+                        && provider["lastRunOrdinal"].as_i64() != Some(run.ordinal)
+                })
+            {
                 break;
             }
         }
@@ -595,8 +605,7 @@ impl RunnerBridge {
         cancellation: CancellationToken,
     ) -> Result<EffectOutcome> {
         match &effect.request {
-            EffectRequest::ProviderTurnSteer { .. }
-            | EffectRequest::ProviderSessionDetach { .. }
+            EffectRequest::ProviderSessionDetach { .. }
             | EffectRequest::RuntimeRequestRespond { .. }
             | EffectRequest::ThreadTitleGenerate { .. } => {
                 super::queue::effects::execute(self, effect).await
@@ -633,6 +642,116 @@ impl RunnerBridge {
                 .await?;
                 self.settle(&effect.thread_id, &run).await?;
                 Ok(EffectOutcome::Succeeded)
+            }
+            EffectRequest::ProviderTurnInterrupt {
+                provider_turn_id, ..
+            } => {
+                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
+                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                let Some(turn) = records(&projection, "provider-turn")
+                    .iter()
+                    .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running")
+                else {
+                    return Ok(EffectOutcome::Succeeded);
+                };
+                let Some(run) = projection
+                    .runs
+                    .iter()
+                    .find(|r| {
+                        r.active_attempt_id
+                            .as_ref()
+                            .is_some_and(|a| turn["runAttemptId"] == a.0)
+                            && !run_terminal(&r.status)
+                    })
+                    .cloned()
+                else {
+                    return Ok(EffectOutcome::Succeeded);
+                };
+                self.sessions
+                    .interrupt(&effect.thread_id.0)
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?;
+                drop(guards);
+                self.record_event(
+                    &effect.thread_id,
+                    &run,
+                    u64::MAX,
+                    AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    None,
+                )
+                .await?;
+                self.settle(&effect.thread_id, &run).await?;
+                Ok(EffectOutcome::Succeeded)
+            }
+            EffectRequest::ProviderTurnSteer {
+                message_id,
+                provider_turn_id,
+                ..
+            } => {
+                // Promotion consumes an existing queued message, and must
+                // never inherit ordinary send's late-steer/start fallback.
+                if super::queue::effects::is_promotion(&self.kernel.store, effect)? {
+                    return super::queue::effects::execute(self, effect).await;
+                }
+                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
+                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                let turn = records(&projection, "provider-turn")
+                    .iter()
+                    .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running");
+                if turn.is_none() {
+                    drop(guards);
+                    super::threads::runner::late_steer(&self.kernel, effect, message_id).await?;
+                    return Ok(EffectOutcome::Succeeded);
+                }
+                let message = records(&projection, "message")
+                    .iter()
+                    .find(|m| m["id"] == message_id.0)
+                    .ok_or_else(|| Error::Invariant("Steering message missing.".into()))?;
+                let outcome = self
+                    .sessions
+                    .steer(
+                        &effect.thread_id.0,
+                        message["text"].as_str().unwrap_or_default(),
+                        Some(message_id.0.clone()),
+                    )
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?;
+                drop(guards);
+                match outcome {
+                    SteerOutcome::Accepted => Ok(EffectOutcome::Succeeded),
+                    SteerOutcome::NotSteerable
+                        if !self.sessions.turn_in_flight(&effect.thread_id.0) =>
+                    {
+                        super::threads::runner::late_steer(&self.kernel, effect, message_id)
+                            .await?;
+                        Ok(EffectOutcome::Succeeded)
+                    }
+                    SteerOutcome::NotSteerable => Err(Error::Invariant(
+                        "Live provider refused active steering.".into(),
+                    )),
+                }
+            }
+            EffectRequest::ProviderTurnRestart { run_id, .. } => {
+                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                if !projection
+                    .runs
+                    .iter()
+                    .any(|r| &r.id == run_id && r.status == OrchestrationV2RunStatus::Starting)
+                {
+                    return Ok(EffectOutcome::Succeeded);
+                }
+                // The new attempt is already durable. The old observer's late
+                // terminal event is rejected by its attempt ownership guard.
+                self.sessions
+                    .interrupt(&effect.thread_id.0)
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?;
+                self.start(effect, run_id, cancellation).await
             }
             EffectRequest::DelegatedCompletionContinue {
                 parent_run_id,
@@ -865,9 +984,34 @@ pub(crate) fn plan_event(
             node["status"] = json!("running");
             plan.emit(command, "provider-thread.updated", &provider, now)?;
             plan.emit(command, "provider-turn.updated", &turn, now)?;
+            // Queued input materializes only on provider acceptance; the
+            // original queued run/message identities remain unchanged.
+            if let Some(message) = records(projection, "message")
+                .iter()
+                .find(|m| m["id"] == run["userMessageId"])
+                && !records(projection, "turn-item")
+                    .iter()
+                    .any(|i| i["type"] == "user_message" && i["messageId"] == message["id"])
+            {
+                let current: OrchestrationV2Run = serde_json::from_value(run.clone())?;
+                let intent = if projection
+                    .runs
+                    .iter()
+                    .find(|r| &r.id == run_id)
+                    .is_some_and(|r| r.queue_position.as_ref().is_some())
+                {
+                    "queued_turn"
+                } else {
+                    "turn_start"
+                };
+                let mut item =
+                    super::threads::planner::user_item(projection, &current, message, intent, now)?;
+                item["providerTurnId"] = json!(turn_id);
+                plan.emit(command, "turn-item.updated", &item, now)?;
+            }
         }
         AgentEvent::TextDelta { text } => {
-            let id = format!("message:assistant:{}", encode_component(&run_id.0));
+            let id = super::threads::planner::assistant_message_id(run_id, attempt_id);
             let mut message = records(projection, "message")
                 .iter()
                 .find(|message| message["id"] == id)
@@ -884,8 +1028,12 @@ pub(crate) fn plan_event(
             let next = format!("{}{}", message["text"].as_str().unwrap_or(""), text);
             message["text"] = json!(next);
             message["streaming"] = json!(true);
+            message["creationSource"] = json!("provider");
             message["updatedAt"] = json!(iso(now)?);
             plan.emit(command, "message.updated", &message, now)?;
+            super::threads::planner::assistant_item(
+                projection, command, plan, &message, &attempt, now,
+            )?;
             return Ok(());
         }
         AgentEvent::InputRequested { .. } | AgentEvent::PermissionRequested { .. } => {
@@ -928,7 +1076,7 @@ pub(crate) fn plan_event(
                     plan.emit(command, "subagent.updated", &task, now)?;
                 }
             }
-            let id = format!("message:assistant:{}", encode_component(&run_id.0));
+            let id = super::threads::planner::assistant_message_id(run_id, attempt_id);
             let mut message = records(projection, "message")
                 .iter()
                 .find(|message| message["id"] == id)
@@ -946,8 +1094,12 @@ pub(crate) fn plan_event(
                 message["text"] = json!(result);
             }
             message["streaming"] = json!(false);
+            message["creationSource"] = json!("provider");
             message["updatedAt"] = json!(iso(now)?);
             plan.emit(command, "message.updated", &message, now)?;
+            super::threads::planner::assistant_item(
+                projection, command, plan, &message, &attempt, now,
+            )?;
             if let Some(error) = error {
                 let item = json!({"id":format!("turn-item:error:{}",encode_component(&run_id.0)),"type":"error",
                     "threadId":projection.thread.id,"runId":run_id,"nodeId":root.id,"providerThreadId":provider["id"],

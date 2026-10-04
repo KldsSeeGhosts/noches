@@ -264,6 +264,21 @@ async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     request: RunRequest,
 ) -> Result<String, EngineError> {
+    collect_restricted_text(harness, request, false).await
+}
+
+pub(crate) async fn collect_source_control_text(
+    harness: &dyn zeron_harness::Harness,
+    request: RunRequest,
+) -> Result<String, EngineError> {
+    collect_restricted_text(harness, request, true).await
+}
+
+async fn collect_restricted_text(
+    harness: &dyn zeron_harness::Harness,
+    request: RunRequest,
+    source_control: bool,
+) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
     let interrupt = CancellationToken::new();
     let _cancel_on_drop = interrupt.clone().drop_guard();
@@ -280,12 +295,21 @@ async fn collect_text(
         interrupt: interrupt.clone(),
         computer_use_socket: None,
     };
-    let mut stream = harness.run_title(request, controls).await?;
+    let mut stream = if source_control {
+        harness.run_source_control(request, controls).await?
+    } else {
+        harness.run_title(request, controls).await?
+    };
     let mut text = String::new();
     let mut completed = false;
     while let Some(event) = stream.next().await {
         match event? {
-            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+            AgentEvent::TextDelta { text: delta } => {
+                if text.len().saturating_add(delta.len()) > 128 * 1024 {
+                    return Err(EngineError::Other("generated text exceeds limit".into()));
+                }
+                text.push_str(&delta);
+            }
             AgentEvent::ToolCall { .. } => {
                 return Err(EngineError::Other(
                     "title generation attempted to use a tool".into(),

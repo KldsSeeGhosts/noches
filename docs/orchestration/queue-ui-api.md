@@ -99,9 +99,13 @@ approve permissions, deliver messages, or execute on replicas.
 
 - `QueuePullRequestLinks`: `TODO(merge-pr-watch)` replaces the metadata link
   storage adapter with that slice's stack-aware link authority.
-- `QueueThreadDelivery`: `TODO(merge-threads)` replaces host strict steering/
-  question response/detach adapters with shared thread primitives. Provider
-  selection-transition negotiation also belongs at that seam: cross-instance
+- `QueueThreadDelivery`: retained `TODO(merge-threads)` after merging wave3.
+  `ThreadService` has no existing-message strict delivery, question-answer, or
+  provider detach primitive. `send` creates new ordinary message activity and
+  permits restart/late-steer follow-up; substituting it would duplicate the
+  promoted message or dispatch after the target run dies. Runner dispatch uses
+  the durable command receipt to keep ordinary send and promotion separate.
+  Provider selection-transition negotiation also belongs at that seam: cross-instance
   promotion currently refuses, rather than silently steering the old instance;
   session-restart promotion policies are not installed here.
 - `QueueDomain::settle_for_host(thread, source, now)` exposes guarded `Auto`

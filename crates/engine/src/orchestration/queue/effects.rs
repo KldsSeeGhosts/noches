@@ -8,9 +8,10 @@ use crate::orchestration::runner::RunnerBridge;
 use crate::orchestration::{Error, Result, task};
 use crate::{SessionsEngine, SteerOutcome};
 
-/// TODO(merge-threads): replace with the shared thread delivery primitive.
-/// It must remain strict noninterrupting steering, not SessionsEngine::steer
-/// (whose legacy routed-steer ledger can redispatch after a dying run).
+/// TODO(merge-threads): ThreadService has no existing-message delivery,
+/// question-answer, or detach primitive. Its send creates new activity and
+/// permits late-steer recovery/restart, unlike queue promotion. Retain this
+/// strict adapter until the shared boundary exposes these lower-level effects.
 #[async_trait]
 pub trait QueueThreadDelivery: Send + Sync {
     async fn steer(&self, thread: &str, message_id: String, text: &str) -> Result<bool>;
@@ -24,6 +25,13 @@ pub trait QueueThreadDelivery: Send + Sync {
 }
 
 pub struct HostThreadDelivery(pub SessionsEngine);
+
+pub(crate) fn is_promotion(store: &crate::orchestration::Store, effect: &Effect) -> Result<bool> {
+    Ok(store
+        .receipt(&effect.command_id)?
+        .is_some_and(|receipt| receipt.command_type == "queued-message.promote-to-steer"))
+}
+
 #[async_trait]
 impl QueueThreadDelivery for HostThreadDelivery {
     fn detach(&self, thread: &str, revoke_mcp: bool) {
@@ -131,11 +139,20 @@ pub(crate) async fn execute(bridge: &RunnerBridge, effect: &Effect) -> Result<Ef
                     && r.status == OrchestrationV2RunStatus::Running
                     && r.provider_thread_id.as_ref() == Some(provider_thread_id)
             });
-            let turn = task::records(&p, "provider-turn")
-                .iter()
-                .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running");
+            let turn = task::records(&p, "provider-turn").iter().find(|t| {
+                t["id"] == provider_turn_id.0
+                    && t["status"] == "running"
+                    && run.is_some_and(|r| {
+                        r.active_attempt_id
+                            .as_ref()
+                            .is_some_and(|a| t["runAttemptId"] == a.0)
+                            && r.root_node_id.as_ref().is_some_and(|n| t["nodeId"] == n.0)
+                    })
+            });
             let provider = task::records(&p, "provider-thread").iter().find(|t| {
-                t["id"] == provider_thread_id.0 && t["providerSessionId"] == provider_session_id.0
+                t["id"] == provider_thread_id.0
+                    && t["providerSessionId"] == provider_session_id.0
+                    && run.is_some_and(|r| t["lastRunOrdinal"] == r.ordinal)
             });
             if p.thread.archived_at.is_some()
                 || p.thread.deleted_at.is_some()

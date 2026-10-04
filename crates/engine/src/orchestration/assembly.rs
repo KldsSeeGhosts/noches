@@ -21,6 +21,73 @@ use super::{Error, Kernel, Result};
 use crate::mcp::auth::InvocationScope;
 use crate::{DocHost, HarnessRegistry, SessionsEngine, WorkspaceHost};
 
+// ── F1 git-actions host assembly (owned by git-actions slice) ──────────────
+pub struct GitActionsHost {
+    pub service: super::git_actions::GitActionsService,
+    stop: CancellationToken,
+    worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl GitActionsHost {
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble(
+        store: super::Store,
+        sessions: SessionsEngine,
+        terminals: crate::Terminals,
+        doc_host: DocHost,
+        workspace: WorkspaceHost,
+        registry: Arc<HarnessRegistry>,
+        repos: crate::Repos,
+        history_roots: Vec<(zeron_proto::git_actions::HistorySource, std::path::PathBuf)>,
+    ) -> anyhow::Result<Self> {
+        let service = super::git_actions::GitActionsService::new(
+            store,
+            repos,
+            sessions,
+            terminals,
+            doc_host,
+            workspace,
+            registry,
+            history_roots,
+        )?;
+        let stop = CancellationToken::new();
+        let token = stop.clone();
+        let worker_service = service.clone();
+        let worker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {},
+                }
+                worker_service.pull_tick().await;
+            }
+        });
+        Ok(Self {
+            service,
+            stop,
+            worker: std::sync::Mutex::new(Some(worker)),
+        })
+    }
+    pub async fn shutdown(&self) {
+        self.stop.cancel();
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+        }
+        self.service.shutdown().await;
+    }
+}
+impl Drop for GitActionsHost {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+// ── End F1 assembly ──────────────────────────────────────────────────────
+
 pub struct HostCatalog(pub Arc<HarnessRegistry>);
 
 #[async_trait]
@@ -30,6 +97,7 @@ impl DelegationTargets for HostCatalog {
         parent: &OrchestrationV2AppThread,
         target: Option<&DelegateTaskInputTarget>,
     ) -> std::result::Result<ResolvedTarget, ToolError> {
+        self.0.provider_instances.refresh_all(&self.0).await;
         let target = target
             .map(serde_json::to_value)
             .transpose()
@@ -104,7 +172,8 @@ pub fn capabilities(harness: &dyn zeron_harness::Harness) -> OrchestrationV2Prov
             "canForkThread":false,"canForkFromTurn":false,"canForkFromSubagentThread":false,"exposesNativeThreadId":false},
         "turns":{"exposesNativeTurnId":false,"emitsTurnStarted":true,"emitsTurnCompleted":true,
             "supportsInterrupt":true,"supportsActiveSteering":harness.supports_steering() && harness.steering_mode() == zeron_proto::SteeringMode::StepBoundary,
-            "supportsSteeringByInterruptRestart":false,"supportsQueuedMessages":true,"terminalStatusQuality":"strong"},
+            "supportsSteeringByInterruptRestart":!matches!(harness.id(), zeron_proto::HarnessId::ClaudeCode | zeron_proto::HarnessId::Pi),
+            "supportsQueuedMessages":true,"terminalStatusQuality":"strong"},
         "streaming":{"streamsAssistantText":true,"streamsReasoning":false,"streamsToolOutput":false,
             "streamsPlanText":false,"emitsMessageCompleted":true},
         "tools":{"exposesToolItemIds":false,"emitsToolStarted":false,"emitsToolCompleted":false,
@@ -170,6 +239,7 @@ pub struct OrchestrationHost {
     pub bridge: Arc<RunnerBridge>,
     /// The same service the MCP tools call; the UI's user-authority Stop uses it.
     pub service: Arc<DelegationService>,
+    pub scheduler: Arc<super::scheduler::Scheduler>,
     stop: CancellationToken,
     workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -224,8 +294,26 @@ impl OrchestrationHost {
             targets: catalog,
         });
         sessions.mcp_server().set_service(service.clone());
+        // BEGIN wave3 threads: shared controls, passive read model, MCP facade.
+        sessions.mcp_server().toolkit.set_thread_service(Arc::new(
+            super::threads::KernelThreadService {
+                kernel: kernel.clone(),
+                delegation: service.clone(),
+            },
+        ));
+        // END wave3 threads.
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
+        // BEGIN scheduler slice (TODO(merge-threads): install send/launch adapter).
+        let scheduler = Arc::new(super::scheduler::Scheduler::new(
+            kernel.store.clone(),
+            Arc::new(super::scheduler::UnavailableDispatch),
+        ));
+        scheduler.recover()?;
+        sessions
+            .mcp_server()
+            .toolkit
+            .set_scheduler(scheduler.clone());
         let mut workers = bridge.spawn_workers(stop.clone());
         // ── P4b queue/questions/lifecycle assembly ───────────────────────────
         let queue_domain = Arc::new(super::queue::QueueDomain::new(kernel.clone()));
@@ -255,6 +343,8 @@ impl OrchestrationHost {
             }
         }));
         // ── end P4b assembly ────────────────────────────────────────────────
+        workers.push(scheduler.spawn(stop.clone()));
+        // END scheduler slice.
         let publisher = PublicationWorker {
             store: kernel.store.clone(),
             publisher: Arc::new(ChatPublisher {
@@ -283,6 +373,7 @@ impl OrchestrationHost {
         Ok(Self {
             bridge,
             service,
+            scheduler,
             stop,
             workers: std::sync::Mutex::new(workers),
         })
