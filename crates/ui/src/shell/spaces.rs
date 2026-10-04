@@ -18,6 +18,7 @@ use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing
 const ARCHIVED_INITIAL_ROWS: usize = 10;
 const ARCHIVED_PAGE_ROWS: usize = 25;
 
+#[derive(Clone)]
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
@@ -121,6 +122,98 @@ struct SidebarProjection {
     entries: Vec<SidebarEntry>,
 }
 
+#[derive(Clone, PartialEq)]
+struct SidebarProjectionSettings {
+    filter: Option<String>,
+    sort: SidebarSort,
+    organization: SidebarOrganization,
+    branch: bool,
+    pull_request: bool,
+}
+
+impl From<&UiSettings> for SidebarProjectionSettings {
+    fn from(settings: &UiSettings) -> Self {
+        Self {
+            filter: settings.space_filter.clone(),
+            sort: settings.sidebar_sort,
+            organization: settings.sidebar_organization,
+            branch: settings.sidebar_show_branch,
+            pull_request: settings.sidebar_show_pull_request,
+        }
+    }
+}
+
+pub(super) struct SidebarProjectionCache {
+    fingerprint: u64,
+    settings: SidebarProjectionSettings,
+    valid_until: chrono::DateTime<Utc>,
+    projection: std::sync::Arc<SidebarProjection>,
+    source_lengths: (usize, usize, usize),
+}
+
+/// Check only row inputs on a state notification/deadline, never transcript
+/// contents. Unchanged streaming/hover/popup frames reuse the sorted projection.
+fn sidebar_source_fingerprint(state: &AppState, now: chrono::DateTime<Utc>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    state.local_device_id.hash(&mut hash);
+    matches!(
+        state.engine().map(|engine| engine.mode()),
+        Some(EngineMode::InProcess)
+    )
+    .hash(&mut hash);
+    for space in &state.spaces {
+        (
+            &space.id,
+            &space.device_id,
+            &space.path,
+            &space.name,
+            &space.checkout_id,
+        )
+            .hash(&mut hash);
+    }
+    for device in &state.devices {
+        (&device.id, &device.name).hash(&mut hash);
+    }
+    for chat in &state.chats {
+        (
+            &chat.id,
+            &chat.device_id,
+            &chat.title,
+            chat.archived,
+            &chat.cwd,
+            &chat.branch,
+            &chat.checkout_id,
+            &chat.space_id,
+            chat.last_message_at,
+            chat.created_at,
+            chat.last_seen_at,
+            chat.config.as_ref().map(|config| config.harness),
+        )
+            .hash(&mut hash);
+        crate::change_requests::conversation_branch(chat, &state.spaces).hash(&mut hash);
+        (
+            state.display_status_for(chat, now) as u8,
+            state.send_queued(&chat.id, now),
+            state.send_undelivered(&chat.id, now),
+        )
+            .hash(&mut hash);
+        if let Some(request) = state.change_request_for_chat(chat) {
+            (
+                &request.provider,
+                request.number,
+                &request.title,
+                &request.url,
+                request.state as u8,
+                &request.base_ref,
+                &request.head_ref,
+            )
+                .hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+
 impl SidebarProjection {
     /// Flat chat ids in the exact order the entries draw.
     fn visible_chat_ids(&self) -> Vec<String> {
@@ -191,7 +284,7 @@ fn sidebar_rows(
             let queued = state.send_queued(&chat.id, now);
             ActiveChatRow {
                 status,
-                chat: chat.clone(),
+                chat,
                 badge,
                 project,
                 branch,
@@ -331,25 +424,6 @@ pub(super) struct SidebarViewMenu {
     /// pressed.
     active: Option<usize>,
     focus: FocusHandle,
-}
-
-struct SidebarViewOptionsTooltip;
-
-impl Render for SidebarViewOptionsTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(crate::typography::ui_rems(11.0))
-            .text_color(theme.text)
-            .child("Sidebar view options")
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -632,9 +706,17 @@ impl popover::ScrollRailHost for Shell {
 
 impl Shell {
     pub(super) fn reveal_sidebar_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
-        let active = sidebar_rows(self.state.read(cx), &self.settings, Utc::now())
-            .into_iter()
-            .find(|row| row.chat.id == chat_id);
+        // Commands can run in the same update as a workspace mutation,
+        // before its observer effect. Query the current inputs for reveal.
+        self.sidebar_source_dirty.set(true);
+        let projection = self.sidebar_projection(cx);
+        let active = projection.entries.iter().find_map(|entry| match entry {
+            SidebarEntry::Row(row) if row.chat.id == chat_id => Some((**row).clone()),
+            SidebarEntry::Group { rows, .. } => {
+                rows.iter().find(|row| row.chat.id == chat_id).cloned()
+            }
+            _ => None,
+        });
         let mut reveal = None;
         if let Some(row) = active {
             // Needs-you and running rows float outside the collapsible groups.
@@ -698,7 +780,7 @@ impl Shell {
         rows
     }
 
-    pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
         }
@@ -755,6 +837,14 @@ impl Shell {
                 },
             )
             .into_any_element()
+    }
+
+    fn sidebar_body_mounted(&self, key: &str, open: bool) -> bool {
+        open || (!self.reduced_motion
+            && self
+                .sidebar_disclosure_motion
+                .get(key)
+                .is_some_and(|motion| motion.animating()))
     }
 
     fn sidebar_disclosure_chevron(&self, key: &str, open: bool, theme: &Theme) -> AnyElement {
@@ -1217,7 +1307,8 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .text_size(crate::typography::ui_rems(12.0))
             // Rule 4: filters read NORMAL weight.
-            .text_color(motion::hover_blend(
+            .text_color(motion::hover_blend_owned(
+                self.sidebar_pane.entity_id(),
                 "spaces-filter",
                 theme.text_muted,
                 theme.text,
@@ -1225,13 +1316,17 @@ impl Shell {
             .bg(if open {
                 theme.glass_hover()
             } else {
-                motion::hover_blend(
+                motion::hover_blend_owned(
+                    self.sidebar_pane.entity_id(),
                     "spaces-filter",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover(),
                 )
             })
-            .on_hover(motion::hover_listener("spaces-filter"))
+            .on_hover(motion::hover_listener_owned(
+                self.sidebar_pane.entity_id(),
+                "spaces-filter",
+            ))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -1359,7 +1454,7 @@ impl Shell {
                     }
                 }
             }))
-            .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
+            .tooltip(crate::tooltip::text("Sidebar view options"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::SORT)
@@ -1398,7 +1493,7 @@ impl Shell {
             .hover(|el| el.bg(theme.glass_hover()))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_command_palette(window, cx)))
-            .tooltip(|_, cx| cx.new(|_| super::SidebarTooltip("Search")).into())
+            .tooltip(crate::tooltip::text("Search"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::MAGNIFER)
@@ -1621,13 +1716,44 @@ impl Shell {
     /// The ordered sidebar entries as plain data, computed once per render.
     /// Both the drawn list and the keyboard order consume it, so their order
     /// cannot drift.
-    fn sidebar_projection(&self, cx: &Context<Self>) -> SidebarProjection {
+    fn sidebar_projection(&self, cx: &Context<Self>) -> std::sync::Arc<SidebarProjection> {
         let state = self.state.read(cx);
-        project_sidebar(
+        let now = Utc::now();
+        let settings = SidebarProjectionSettings::from(&self.settings);
+        let source_lengths = (state.chats.len(), state.spaces.len(), state.devices.len());
+        let mut cache = self.sidebar_projection_cache.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && !self.sidebar_source_dirty.get()
+            && now < cached.valid_until
+            && cached.settings == settings
+            && cached.source_lengths == source_lengths
+        {
+            return cached.projection.clone();
+        }
+        self.sidebar_source_dirty.set(false);
+        let fingerprint = sidebar_source_fingerprint(state, now);
+        let valid_until = state.next_display_refresh(now);
+        if let Some(cached) = cache.as_mut()
+            && cached.fingerprint == fingerprint
+            && cached.settings == settings
+        {
+            cached.valid_until = valid_until;
+            cached.source_lengths = source_lengths;
+            return cached.projection.clone();
+        }
+        let projection = std::sync::Arc::new(project_sidebar(
             sidebar_rows(state, &self.settings, Utc::now()),
             self.settings.sidebar_organization,
             state.local_device_id.as_deref(),
-        )
+        ));
+        *cache = Some(SidebarProjectionCache {
+            fingerprint,
+            settings,
+            valid_until,
+            projection: projection.clone(),
+            source_lengths,
+        });
+        projection
     }
 
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
@@ -1648,14 +1774,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let projection = {
-            let state = self.state.read(cx);
-            project_sidebar(
-                sidebar_rows(state, &self.settings, now),
-                self.settings.sidebar_organization,
-                state.local_device_id.as_deref(),
-            )
-        };
+        let projection = self.sidebar_projection(cx);
+        let pane_open: std::collections::HashSet<String> = self
+            .workspace
+            .chat_pane_sessions()
+            .into_iter()
+            .filter_map(|(_, chat)| chat)
+            .collect();
 
         let selected = self.state.read(cx).selected_chat.clone();
         // Re-checked at render so the chips drop the FRAME a popover opens,
@@ -1667,7 +1792,7 @@ impl Shell {
         // chip always names the key that opens its row.
         let mut slot = 0usize;
         let mut rendered = Vec::new();
-        for entry in projection.entries {
+        for entry in &projection.entries {
             match entry {
                 SidebarEntry::Heading(section) => {
                     let (key, label, dot) = match section {
@@ -1690,12 +1815,13 @@ impl Shell {
                 }
                 SidebarEntry::Row(row) => {
                     rendered.push(self.render_active_chat_row(
-                        *row,
+                        (**row).clone(),
                         now,
                         slot,
                         jump_hints,
                         &keymap,
                         selected.as_deref(),
+                        &pane_open,
                         theme,
                         cx,
                     ));
@@ -1706,18 +1832,46 @@ impl Shell {
                     space_id,
                     rows,
                 } => {
-                    let mut rendered_rows = Vec::with_capacity(rows.len());
+                    let collapse_key = format!("device:{device_id}:{space_id}");
+                    let motion_key = format!("group:{collapse_key}");
+                    let is_empty = rows.is_empty();
+                    let collapsed =
+                        !is_empty && self.sidebar_collapsed_groups.contains(&collapse_key);
+                    let mounted = self.sidebar_body_mounted(&motion_key, !collapsed);
+                    let mut rendered_rows = Vec::new();
+                    let mut rows_height = 0.0;
                     for row in rows {
-                        rendered_rows.push(self.render_active_chat_row(
-                            row,
-                            now,
-                            slot,
-                            jump_hints,
-                            &keymap,
-                            selected.as_deref(),
-                            theme,
-                            cx,
-                        ));
+                        if mounted {
+                            let rendered = self.render_active_chat_row(
+                                row.clone(),
+                                now,
+                                slot,
+                                jump_hints,
+                                &keymap,
+                                selected.as_deref(),
+                                &pane_open,
+                                theme,
+                                cx,
+                            );
+                            rows_height += rendered.1;
+                            rendered_rows.push(rendered);
+                        } else {
+                            let child_rows = self
+                                .sidebar_sub_rows
+                                .get(&row.chat.id)
+                                .copied()
+                                .unwrap_or(0);
+                            rows_height += super::chat_row_height()
+                                + if child_rows == 0 {
+                                    0.0
+                                } else {
+                                    crate::subagents::SIDEBAR_CHILD_GAP
+                                        + child_rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT
+                                        + crate::subagents::SIDEBAR_CHILD_PAD_BOTTOM
+                                };
+                        }
+                        // Preserve the logical jump/reveal order even when a
+                        // settled collapsed body isn't instantiated.
                         slot += 1;
                     }
 
@@ -1725,8 +1879,8 @@ impl Shell {
                         let state = self.state.read(cx);
                         let device_label = state.device_name(&device_id).map(str::to_string);
                         match state
-                            .space_row(&space_id)
-                            .filter(|space| space.device_id == device_id)
+                            .space_row(space_id)
+                            .filter(|space| &space.device_id == device_id)
                         {
                             Some(space) => (
                                 space.display_name().to_string(),
@@ -1742,22 +1896,20 @@ impl Shell {
                     };
                     // Groups only exist under ByDevice, so the collapse key is
                     // always device-scoped.
-                    let collapse_key = format!("device:{device_id}:{space_id}");
-                    let motion_key = format!("group:{collapse_key}");
                     // A group with no settled rows has nothing to disclose: its
                     // header stays for the scoped "+", but it draws no chevron,
                     // no toggle, and no body inset (so the section boundary
                     // below it stays the ordinary 12px gap).
-                    let is_empty = rendered_rows.is_empty();
-                    let collapsed =
-                        !is_empty && self.sidebar_collapsed_groups.contains(&collapse_key);
-                    let row_count = rendered_rows.len();
+                    let row_count = rows.len();
                     let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
-                        + rendered_rows
-                            .iter()
-                            .map(|(_, height, _)| *height)
-                            .sum::<f32>()
+                        + rows_height
                         + SIDEBAR_LIST_GAP * row_count.saturating_sub(1) as f32;
+                    if !collapsed
+                        && let Some(tween) = self.sidebar_disclosure_motion.get_mut(&motion_key)
+                        && tween.animating()
+                    {
+                        tween.to = body_height;
+                    }
                     self.begin_queued_sidebar_reveal(&motion_key, !collapsed, body_height);
                     let label = if collapsed {
                         format!("{label} ({row_count})")
@@ -1859,7 +2011,7 @@ impl Shell {
                                     ),
                             )
                         });
-                    let element = if is_empty {
+                    let element = if is_empty || !mounted {
                         div()
                             .w_full()
                             .flex()
@@ -1914,6 +2066,7 @@ impl Shell {
         jump_hints: bool,
         keymap: &KeymapConfig,
         selected: Option<&str>,
+        pane_open: &std::collections::HashSet<String>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> (String, f32, AnyElement) {
@@ -1947,22 +2100,15 @@ impl Shell {
         // Nested child rows: running subagents only, and only under cards
         // whose transcript is actually open (selected or pinned to a pane) -
         // the selector can only read loaded transcripts anyway.
-        let pane_open = self
-            .workspace
-            .chat_pane_sessions()
-            .iter()
-            .any(|(_, session)| session.as_deref() == Some(chat.id.as_str()));
-        let sub_summaries = if is_selected || pane_open {
-            let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat.id);
-            summaries
-                .iter()
-                .filter(|s| s.status == crate::subagents::SubagentPhase::Running)
-                .cloned()
-                .collect::<Vec<_>>()
+        let sub_summaries = if is_selected || pane_open.contains(&chat.id) {
+            Some(crate::subagents::subagents_for(
+                self.state.read(cx),
+                &chat.id,
+            ))
         } else {
-            Vec::new()
+            None
         };
-        let running_count = sub_summaries.len();
+        let running_count = sub_summaries.as_ref().map_or(0, |s| s.running().len());
         // +1 extra row's height when the running set overflows the 3-row
         // cap (the `+N more` line). Children sit INSIDE the card (after
         // the context line), so their block also carries the 2px gap and 4px bottom
@@ -2003,7 +2149,7 @@ impl Shell {
             });
             let content = crate::subagents::sidebar_children(
                 &chat.id,
-                &sub_summaries,
+                sub_summaries.as_ref().unwrap().running(),
                 now,
                 theme,
                 cx.entity_id(),
@@ -2025,6 +2171,7 @@ impl Shell {
             harness,
             status,
             is_selected,
+            pane_open.contains(&chat.id) && !is_selected,
             false,
             jump_label,
             None,
@@ -2107,9 +2254,12 @@ impl Shell {
                 cx.notify();
             }));
         let section = div().flex().flex_col().child(header);
-        let body = {
+        let body = if !self.sidebar_body_mounted("archived", open) {
+            div().into_any_element()
+        } else {
             let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
+            // Same tiers as the live rows: focused < hover is never inverted.
+            let selected_wash = theme.sidebar_active();
             let mut list = div()
                 .flex()
                 .flex_col()
@@ -2174,9 +2324,12 @@ impl Shell {
                         )
                         .into_any_element()
                 } else {
+                    // Settled time is tertiary metadata: mono 11px, faint
+                    // (control-plane rule 3), like the live rows' time.
                     div()
+                        .font_family(theme.font_mono.clone())
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_faint)
                         .child(time_ago)
                         .into_any_element()
                 };
@@ -2200,7 +2353,7 @@ impl Shell {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.sidebar_hover())))
                         .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
                             if *entered {
                                 if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
@@ -3708,12 +3861,7 @@ impl Shell {
                         .child(popover::dialog_field(input.into_any_element())),
                 )
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
                                 .id("rename-space-cancel")
@@ -3762,12 +3910,7 @@ impl Shell {
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
                                 .id("delete-space-cancel")
@@ -3802,6 +3945,120 @@ mod tests {
     };
     use crate::settings::{SidebarOrganization, SidebarSort};
     use zeron_proto::ChatIndicator;
+
+    #[gpui::test]
+    fn sidebar_projection_reuses_data_and_prunes_settled_collapsed_bodies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let handle = cx.add_window(|_, cx| {
+            Shell::new(
+                cx.new(|_| AppState::new()),
+                EngineBootConfig {
+                    remote: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        handle
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.chats = (0..1000)
+                        .map(|index| chat(&format!("chat-{index:04}")))
+                        .collect();
+                });
+                shell.settings.sidebar_organization = SidebarOrganization::ByDevice;
+                shell.sidebar_source_dirty.set(true);
+                let first = shell.sidebar_projection(cx);
+                assert_eq!(first.visible_chat_ids().len(), 1000);
+                assert!(std::sync::Arc::ptr_eq(
+                    &first,
+                    &shell.sidebar_projection(cx)
+                ));
+                // An unrelated transcript notification does not re-sort rows.
+                shell
+                    .state
+                    .update(cx, |state, _| state.transcript_revision += 1);
+                shell.sidebar_source_dirty.set(true);
+                assert!(std::sync::Arc::ptr_eq(
+                    &first,
+                    &shell.sidebar_projection(cx)
+                ));
+                shell
+                    .state
+                    .update(cx, |state, _| state.chats[0].title = Some("Renamed".into()));
+                shell.sidebar_source_dirty.set(true);
+                let renamed = shell.sidebar_projection(cx);
+                assert!(!std::sync::Arc::ptr_eq(&first, &renamed));
+
+                shell
+                    .sidebar_collapsed_groups
+                    .insert("device:device:".into());
+                shell.sidebar_sub_rows.clear();
+                let theme = Theme::of(cx).clone();
+                let rendered = shell.render_active_rows(&theme, cx);
+                assert_eq!(rendered.len(), 1, "the grouped header remains");
+                assert!(
+                    shell.sidebar_sub_rows.is_empty(),
+                    "no hidden row bodies constructed"
+                );
+                assert_eq!(shell.sidebar_visible_order(cx), renamed.visible_chat_ids());
+
+                shell.reduced_motion = false;
+                shell.begin_sidebar_disclosure_motion("group:device:device:", 100.0, 0.0);
+                assert!(shell.sidebar_body_mounted("group:device:device:", false));
+                shell.render_active_rows(&theme, cx);
+                assert_eq!(
+                    shell.sidebar_sub_rows.len(),
+                    1000,
+                    "closing keeps its children"
+                );
+                shell
+                    .sidebar_disclosure_motion
+                    .get_mut("group:device:device:")
+                    .unwrap()
+                    .started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
+                shell.sidebar_sub_rows.clear();
+                shell.render_active_rows(&theme, cx);
+                assert!(
+                    shell.sidebar_sub_rows.is_empty(),
+                    "settled close prunes its children"
+                );
+                shell.reduced_motion = true;
+                shell.begin_sidebar_disclosure_motion("archived", 100.0, 0.0);
+                assert!(!shell.sidebar_body_mounted("archived", false));
+
+                shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+                assert!(!std::sync::Arc::ptr_eq(
+                    &renamed,
+                    &shell.sidebar_projection(cx)
+                ));
+                shell.settings.space_filter = Some("absent".into());
+                assert!(shell.sidebar_visible_order(cx).is_empty());
+            })
+            .unwrap();
+    }
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])

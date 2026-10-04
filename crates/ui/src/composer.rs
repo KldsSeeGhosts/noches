@@ -33,10 +33,11 @@ use zeron_rpc::{RpcError, methods};
 
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
+use crate::elevation;
 use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
-use crate::settings::{ComposerSendBehavior, platform_combo};
+use crate::settings::{ComposerSendBehavior, FollowUpBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
 mod dictation;
@@ -324,7 +325,7 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
-/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`]); the blank-
+/// starts exactly one 180ms ease-out morph ([`motion::FLIP`]); the blank-
 /// thread handoff swaps in the coordinated 420ms route-transition spec. Both use the
 /// manual-drive pattern from shell.rs `WidthTween` - never `with_animation`,
 /// whose element-id keying replays tweens on remount, round-6 §1–3.
@@ -354,7 +355,7 @@ impl FlipMorph {
         Self {
             from,
             start_ms,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         }
     }
 
@@ -510,6 +511,9 @@ pub enum SendButtonMode {
     Send,
     /// Live run with text typed: queue for the next turn.
     Queue,
+    /// Live run with text typed, steering on: hand the message to the running
+    /// turn at its next step boundary instead of holding it.
+    Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
 }
@@ -542,25 +546,6 @@ pub const APPSHOT_IMAGE_MAX_WIDTH: f32 = 320.0;
 pub const APPSHOT_IMAGE_MAX_HEIGHT: f32 = 132.0;
 pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
 
-struct AppshotActionTooltip(SharedString);
-
-impl Render for AppshotActionTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0.clone())
-    }
-}
-
 /// Give ordinary captures a shared height while their width follows the
 /// source window. Extreme panoramas and narrow composers cap width without
 /// cropping. Explicit dimensions also bound the native image while decoding.
@@ -590,6 +575,27 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Queue,
         (true, false) => SendButtonMode::Stop,
+    }
+}
+
+/// Resolve a busy-run send into Queue or Steer. `alternate` is the one-off
+/// gesture (Cmd/Ctrl-click, Cmd/Ctrl+Enter) that runs the other behaviour.
+/// Steering needs a harness that takes mid-turn input and a message without
+/// attachments; anything else quietly queues.
+pub fn follow_up_mode(
+    base: SendButtonMode,
+    behavior: FollowUpBehavior,
+    alternate: bool,
+    steerable: bool,
+) -> SendButtonMode {
+    if base != SendButtonMode::Queue {
+        return base;
+    }
+    let wants_steer = (behavior == FollowUpBehavior::Steer) != alternate;
+    if wants_steer && steerable {
+        SendButtonMode::Steer
+    } else {
+        SendButtonMode::Queue
     }
 }
 
@@ -3425,23 +3431,19 @@ struct MentionPathTooltip {
 
 impl Render for MentionPathTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
+        let theme = &Theme::of(cx).for_popup();
+        // The anchor maths in `mention_tooltip_*` assume this exact height, so
+        // the shared surface keeps its look but pins the box.
+        let card = crate::tooltip::surface(theme)
+            .h(px(MENTION_TOOLTIP_HEIGHT))
+            .py(px(0.0))
+            .max_w(px(crate::tooltip::MAX_WIDTH_MONO))
+            .flex()
+            .items_center()
+            .child(crate::tooltip::mono_line(theme, self.path.clone()));
         motion::fade_quick(
             ("file-mention-path-tooltip", self.activation),
-            div()
-                .h(px(MENTION_TOOLTIP_HEIGHT))
-                .max_w(px(480.0))
-                .flex()
-                .items_center()
-                .px(px(8.0))
-                .rounded(px(5.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(theme.surface_raised)
-                .font_family(theme.font_mono.clone())
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(self.path.clone()),
+            div().child(crate::tooltip::frost(card)),
         )
     }
 }
@@ -3797,7 +3799,7 @@ impl Render for ComposerInput {
             theme
         };
         let text_color = if self.content.is_empty() {
-            theme.text_faint
+            theme.placeholder()
         } else {
             theme.text
         };
@@ -4172,6 +4174,9 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// The next queued send should be handed to the live turn right after the
+    /// host accepts it. Consumed by [`Composer::send`].
+    pending_steer: bool,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -4401,6 +4406,7 @@ impl Composer {
     }
 
     fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
+        motion::init_hover_owner(cx);
         cx.on_release(|this, cx| {
             this.input.update(cx, |input, _| input.cancel_dictation());
             this.release_queue_previews(cx);
@@ -4421,9 +4427,12 @@ impl Composer {
             }
         };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
-        // by the composer from picker state - a pickers-side notify (refs
-        // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        // by the composer from picker state. Only semantic changes cross
+        // this boundary; model-popup animation samples belong to Pickers.
+        let pickers_observe = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::PickerPresentationChanged, cx| cx.notify(),
+        );
         let picker_focus = cx.subscribe(
             &pickers,
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
@@ -4541,6 +4550,7 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            pending_steer: false,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -5250,10 +5260,7 @@ impl Composer {
                 .overflow_hidden()
                 .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::ink(0.045)))
-                .tooltip(move |_, cx| {
-                    cx.new(|_| AppshotActionTooltip(preview_label.clone()))
-                        .into()
-                })
+                .tooltip(crate::tooltip::text(preview_label.clone()))
                 .role(gpui::Role::Button)
                 .aria_label(preview_aria)
                 .tab_index(0)
@@ -5368,10 +5375,7 @@ impl Composer {
                     .shadow_sm()
                     .opacity(0.0)
                     .group_hover(group, |style| style.opacity(1.0))
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| AppshotActionTooltip(remove_label.clone()))
-                            .into()
-                    })
+                    .tooltip(crate::tooltip::text(remove_label.clone()))
                     .role(gpui::Role::Button)
                     .aria_label(remove_aria)
                     .tab_index(0)
@@ -6339,6 +6343,12 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
+        self.mode_for(false, cx)
+    }
+
+    /// The send action for the current draft. `alternate` flips the configured
+    /// follow-up behaviour for one send.
+    fn mode_for(&self, alternate: bool, cx: &App) -> SendButtonMode {
         if self.editing_queued.is_some() {
             return SendButtonMode::Send;
         }
@@ -6348,10 +6358,29 @@ impl Composer {
                 self.staged().len() + self.staged_appshots().len(),
                 self.staged_comments(cx).len(),
             );
-        send_button_mode(self.run_live(cx), has_text)
+        follow_up_mode(
+            send_button_mode(self.run_live(cx), has_text),
+            crate::settings::current(cx).follow_up_behavior,
+            alternate,
+            self.can_steer(cx),
+        )
+    }
+
+    /// Whether a send could be handed to the running turn: the harness takes
+    /// mid-turn input and nothing staged needs an upload (the host rejects
+    /// attachment-bearing steers).
+    fn can_steer(&self, cx: &App) -> bool {
+        self.staged().is_empty()
+            && self.staged_appshots().is_empty()
+            && self.pickers.read(cx).effective_harness_steers(cx)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        self.submit_with(false, cx);
+    }
+
+    /// Submit the draft; `alternate` swaps Queue and Steer for this send only.
+    fn submit_with(&mut self, alternate: bool, cx: &mut Context<Self>) {
         if self
             .input
             .update(cx, |input, cx| input.finish_dictation(true, cx))
@@ -6376,7 +6405,7 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
-        match self.button_mode(cx) {
+        match self.mode_for(alternate, cx) {
             // Enter never stops a run: Stop mode implies an empty composer,
             // so a stray extra Enter right after sending landed an interrupt
             // on the just-dispatched prompt and the agent ate it silently
@@ -6388,6 +6417,11 @@ impl Composer {
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: keep the message queued until the current turn ends.
             SendButtonMode::Queue => self.send(text, true, cx),
+            // Busy: queue it, then hand it straight to the live turn.
+            SendButtonMode::Steer => {
+                self.pending_steer = true;
+                self.send(text, true, cx)
+            }
         }
     }
 
@@ -6410,7 +6444,14 @@ impl Composer {
             self.staged_comments(cx).len(),
         );
         match modified_submit_target(has_content) {
-            ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
+            // With Enter as the send key, the modifier chord is free to run the
+            // other follow-up behaviour; with the chord as the send key it IS
+            // the configured behaviour.
+            ModifiedSubmitTarget::SubmitContent => {
+                let alternate = crate::settings::current(cx).composer_send_behavior
+                    == ComposerSendBehavior::Enter;
+                self.submit_with(alternate, cx)
+            }
             ModifiedSubmitTarget::ActivateLatestQueued => self.activate_latest_queued(cx),
         }
     }
@@ -6421,6 +6462,7 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        let steer_after_queue = std::mem::take(&mut self.pending_steer) && queue;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             self.failure_key = None; // global - meaningful on every chat
@@ -7058,6 +7100,9 @@ impl Composer {
                         chat_id: err_chat_id.clone(),
                         message_id: message_id.clone(),
                     });
+                    if steer_after_queue {
+                        composer.steer_queued_now(message_id.clone(), cx);
+                    }
                 }
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
@@ -7346,13 +7391,17 @@ impl Composer {
                 .bg(if picked {
                     crate::theme::ink(0.09)
                 } else {
-                    motion::hover_blend(
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
                         &format!("wizard-option-{ix}"),
                         crate::theme::ink(0.025),
                         crate::theme::ink(0.06),
                     )
                 })
-                .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    format!("wizard-option-{ix}"),
+                ))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
                 .child(
@@ -7526,49 +7575,115 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
-        // Zeron composer-actions.tsx: a size-7 filled circle - up-arrow to
-        // send/queue, a dark rounded square on the same light circle to stop.
-        match mode {
-            SendButtonMode::Stop => div()
+        // A size-7 filled circle: the action colour with a glyph per mode
+        // (arrow-up send, list-add queue, corner-arrow steer), or the danger
+        // plate with a white square to stop.
+        if mode == SendButtonMode::Stop {
+            let stop_key = composer_hover_key("stop", cx.entity_id());
+            return div()
                 .id("composer-stop")
                 .size(px(28.0))
                 .flex_none()
                 .rounded_full()
-                .bg(theme.text)
+                .bg(motion::hover_blend_owned(
+                    cx.entity_id(),
+                    &stop_key,
+                    theme.danger_strong,
+                    theme.danger_strong.opacity(0.88),
+                ))
+                .shadow(elevation::send_shadow(theme.danger_strong))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
+                .on_hover(motion::hover_listener_owned(cx.entity_id(), stop_key))
+                .tooltip(crate::tooltip::text("Stop"))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
-                .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
-                .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Queue => {
-                // Share the submission guard with Enter, including pending
-                // edits and the new-session runnable-agent check.
-                let blocked = self.send_blocked(cx);
-                div()
-                    .id("composer-send")
-                    .debug_selector(|| "composer-send".into())
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(blocked, |el| el.opacity(0.35))
-                    .when(!blocked, |el| {
-                        el.cursor_pointer()
-                            .hover(|s| s.opacity(0.85))
-                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
-                    })
-                    .child(
-                        crate::icons::icon(crate::icons::ARROW_UP)
-                            .size(px(14.0))
-                            .text_color(theme.bg),
-                    )
-                    .into_any_element()
+                .child(div().size(px(12.0)).rounded(px(2.5)).bg(gpui::white()))
+                .into_any_element();
+        }
+        // Share the submission guard with Enter, including pending edits and
+        // the new-session runnable-agent check.
+        let blocked = self.send_blocked(cx);
+        let action = theme.action();
+        let send_key = composer_hover_key("send", cx.entity_id());
+        let (glyph, glyph_size) = match mode {
+            SendButtonMode::Queue => (crate::icons::LIST_ADD, 16.0),
+            SendButtonMode::Steer => (crate::icons::ARROW_TURN_UP_RIGHT, 16.0),
+            _ => (crate::icons::ARROW_UP, 14.0),
+        };
+        let behavior = crate::settings::current(cx).composer_send_behavior;
+        let send_tooltip = self.send_tooltip(mode, behavior, cx);
+        div()
+            .id("composer-send")
+            .debug_selector(|| "composer-send".into())
+            .size(px(28.0))
+            .flex_none()
+            .rounded_full()
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
+                &send_key,
+                action,
+                theme.action_hover(),
+            ))
+            .shadow(elevation::send_shadow(action))
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(blocked, |el| el.opacity(crate::controls::DISABLED_OPACITY))
+            .when(!blocked, |el| {
+                el.cursor_pointer()
+                    .on_hover(motion::hover_listener_owned(cx.entity_id(), send_key))
+                    .active(|s| s.opacity(0.9))
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                        // Cmd/Ctrl-click runs the other follow-up behaviour.
+                        this.submit_with(event.modifiers().secondary(), cx)
+                    }))
+            })
+            .tooltip(send_tooltip)
+            .child(
+                crate::icons::icon(glyph)
+                    .size(px(glyph_size))
+                    .text_color(theme.on_action()),
+            )
+            .into_any_element()
+    }
+
+    /// Hover note for the send circle: what a click does now, and what the
+    /// modifier gesture would do instead while the agent is working.
+    fn send_tooltip(
+        &self,
+        mode: SendButtonMode,
+        behavior: ComposerSendBehavior,
+        cx: &App,
+    ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+        let modifier: SharedString = if cfg!(target_os = "macos") {
+            "⌘↵".into()
+        } else {
+            "Ctrl+↵".into()
+        };
+        let steerable = self.can_steer(cx);
+        let (label, hint): (&'static str, Option<SharedString>) = match mode {
+            SendButtonMode::Queue if steerable => (
+                "Queue for next turn",
+                Some(format!("{modifier} steers").into()),
+            ),
+            SendButtonMode::Queue => ("Queue for next turn", None),
+            SendButtonMode::Steer => (
+                "Steer the running turn",
+                Some(format!("{modifier} queues").into()),
+            ),
+            _ => (
+                "Send",
+                (behavior == ComposerSendBehavior::ModEnter).then(|| modifier.clone()),
+            ),
+        };
+        let hint = hint.unwrap_or_default();
+        move |window, cx| {
+            if hint.is_empty() {
+                crate::tooltip::text(label)(window, cx)
+            } else {
+                crate::tooltip::shortcut(label, hint.clone())(window, cx)
             }
         }
     }
@@ -7627,7 +7742,7 @@ impl Render for Composer {
                 style.font_family = theme.font_sans.clone();
                 style.font_size = crate::typography::ui_rems(INPUT_TEXT_SIZE).into();
                 style.color = if input.content.is_empty() {
-                    theme.text_faint
+                    theme.placeholder()
                 } else {
                     theme.text
                 };
@@ -8095,12 +8210,16 @@ impl Render for Composer {
             .rounded_full()
             .cursor_pointer()
             // zeron composer-actions.tsx attach: `transition-colors`.
-            .bg(motion::hover_blend(
+            .bg(motion::hover_blend_owned(
+                cx.entity_id(),
                 &attach_hover_key,
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener(attach_hover_key))
+            .on_hover(motion::hover_listener_owned(
+                cx.entity_id(),
+                attach_hover_key,
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
@@ -8126,7 +8245,7 @@ impl Render for Composer {
                 crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
             }
         } else {
-            theme.border
+            theme.composer_outline()
         };
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
@@ -8147,7 +8266,8 @@ impl Render for Composer {
             .border_color(pill_border)
             .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
             .when(!theme.is_frost(), |el| {
-                el.bg(theme.input_glass_bg()).shadow_lg()
+                el.bg(theme.input_glass_bg())
+                    .shadow(elevation::composer_shadow(&theme))
             });
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
@@ -8509,6 +8629,7 @@ impl Render for Composer {
         } else {
             container
         };
+        motion::drive_hover_owner(cx.entity_id(), window);
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -8640,7 +8761,7 @@ mod tests {
                     room_gen: None,
                 }]);
                 state.selected_chat = Some("parent".into());
-                state.transcript = vec![SessionMessageEntry {
+                state.apply_transcript(vec![SessionMessageEntry {
                     id: "m1".into(),
                     role: MessageRole::Assistant,
                     parts: vec![MessagePart::Tool {
@@ -8665,7 +8786,7 @@ mod tests {
                     device_id: "dev".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
-                }];
+                }]);
                 cx.notify();
             });
             Host {
@@ -10059,7 +10180,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         // Starts exactly at the committed height…
         let mut prev = m.height(124.0, 0.0);
@@ -10079,7 +10200,7 @@ mod tests {
         let down = FlipMorph {
             from: 124.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         assert!(down.height(49.0, 90.0) < 124.0);
         assert!(down.height(49.0, 90.0) > 49.0);
@@ -10090,7 +10211,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         let mid = m.height(124.0, 90.0);
         assert!(mid > 49.0 && mid < 124.0);
@@ -10119,7 +10240,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         assert_eq!(
             flip_morph_step(Some(m), false, 80.0, 50.0, false, true),
@@ -10186,7 +10307,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
-            spec: motion::COLLAPSE,
+            spec: motion::FLIP,
         };
         // Auto-grow can move the target mid-morph: evaluation tracks the
         // live value instead of finishing on a stale height.
@@ -10278,6 +10399,48 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn follow_up_resolves_queue_or_steer_and_only_steers_when_it_can() {
+        use FollowUpBehavior::{Queue, Steer};
+        let busy = SendButtonMode::Queue;
+        // The configured behaviour, then the one-off alternate.
+        assert_eq!(
+            follow_up_mode(busy, Queue, false, true),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            follow_up_mode(busy, Steer, false, true),
+            SendButtonMode::Steer
+        );
+        assert_eq!(
+            follow_up_mode(busy, Queue, true, true),
+            SendButtonMode::Steer
+        );
+        assert_eq!(
+            follow_up_mode(busy, Steer, true, true),
+            SendButtonMode::Queue
+        );
+        // A harness that cannot take mid-turn input (or a draft with
+        // attachments) always queues, whichever way it was asked.
+        assert_eq!(
+            follow_up_mode(busy, Steer, false, false),
+            SendButtonMode::Queue
+        );
+        assert_eq!(
+            follow_up_mode(busy, Queue, true, false),
+            SendButtonMode::Queue
+        );
+        // Idle and stop never change.
+        assert_eq!(
+            follow_up_mode(SendButtonMode::Send, Steer, true, true),
+            SendButtonMode::Send
+        );
+        assert_eq!(
+            follow_up_mode(SendButtonMode::Stop, Steer, true, true),
+            SendButtonMode::Stop
+        );
     }
 
     #[test]
@@ -10502,21 +10665,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn attachment_hover_fades_are_scoped_to_each_composer(cx: &mut gpui::TestAppContext) {
+    fn attachment_and_send_hover_fades_are_owned_by_each_composer(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let selected = cx.new(|cx| Composer::new(state.clone(), cx));
         let pane = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
-        let selected_key = composer_hover_key("attach", selected.entity_id());
-        let pane_key = composer_hover_key("attach", pane.entity_id());
-        assert_ne!(selected_key, pane_key);
-        motion::set_hover(&selected_key, true, true);
-        assert_eq!(motion::hover_t(&selected_key), 1.0);
-        assert_eq!(motion::hover_t(&pane_key), 0.0);
-        motion::set_hover(&pane_key, true, true);
-        motion::set_hover(&selected_key, false, true);
-        assert_eq!(motion::hover_t(&selected_key), 0.0);
-        assert_eq!(motion::hover_t(&pane_key), 1.0);
-        motion::set_hover(&pane_key, false, true);
+        let selected_owner = selected.entity_id();
+        let pane_owner = pane.entity_id();
+        for control in ["attach", "send", "stop"] {
+            let selected_key = composer_hover_key(control, selected_owner);
+            let pane_key = composer_hover_key(control, pane_owner);
+            assert_ne!(selected_key, pane_key);
+            motion::set_hover_owned(selected_owner, &selected_key, true, true);
+            assert_eq!(motion::hover_t_owned(selected_owner, &selected_key), 1.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &pane_key), 0.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &selected_key), 0.0);
+            motion::set_hover_owned(pane_owner, &pane_key, true, true);
+            motion::set_hover_owned(selected_owner, &selected_key, false, true);
+            assert_eq!(motion::hover_t_owned(selected_owner, &selected_key), 0.0);
+            assert_eq!(motion::hover_t_owned(pane_owner, &pane_key), 1.0);
+            motion::set_hover_owned(pane_owner, &pane_key, false, true);
+        }
     }
 
     #[gpui::test]

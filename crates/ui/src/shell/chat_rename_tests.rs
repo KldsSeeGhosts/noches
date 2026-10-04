@@ -376,3 +376,25 @@ fn rename_refuses_hidden_or_missing_rows(cx: &mut TestAppContext) {
         assert!(shell.chat_rename.is_none());
     });
 }
+
+#[gpui::test]
+fn header_rename_works_without_a_visible_sidebar_row_and_stays_out_of_it(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    shell.update(cx, |shell, cx| {
+        // The sidebar filter hides the row, which refuses a sidebar rename...
+        shell.settings.space_filter = Some("elsewhere".into());
+        shell.open_rename_chat_in_header("older".into(), cx);
+        // ...but the header editor opens anyway, and only the header sees it.
+        assert!(shell.chat_rename.is_some());
+        assert!(shell.header_rename_input_for("older").is_some());
+        assert!(shell.rename_input_for("older").is_none());
+        assert_eq!(
+            shell.header_rename().map(|(id, _)| id).as_deref(),
+            Some("older")
+        );
+        assert!(shell.header_rename_input_for("newer").is_none());
+        // Opening the thread menu from the title cancels nothing else.
+        shell.open_chat_title_menu("older".into(), gpui::point(px(10.0), px(10.0)), cx);
+        assert!(shell.header_title_menu_task.is_none());
+    });
+}

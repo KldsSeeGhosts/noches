@@ -31,12 +31,13 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement, Styled as _,
+    AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement,
+    Styled as _, div, px,
 };
 use zeron_workspace::{PaneId, PaneMode, TabId, ViewId};
 
+use crate::controls;
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::shell::Shell;
@@ -46,23 +47,15 @@ use crate::theme::Theme;
 use super::hit_test::DragSource;
 use super::{SplitDragGhost, TabSplitDrag};
 
-struct ChromeTooltip(&'static str);
-
-impl gpui::Render for ChromeTooltip {
-    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0)
-    }
+/// The bound chat behind a pane header: what its title and project badge act
+/// on. `None` for unbound panes (the new-chat canvas), which stay static.
+#[derive(Clone)]
+pub(crate) struct HeaderChat {
+    pub chat_id: String,
+    /// The project (space) the chat belongs to, when it has one.
+    pub space_id: Option<String>,
+    /// The inline rename editor while a header rename is open.
+    pub rename: Option<gpui::Entity<crate::composer::ComposerInput>>,
 }
 
 /// The pane header's session metadata: the mono context line and the bound
@@ -203,6 +196,7 @@ pub(crate) fn pane_header(
     mark: TabMark,
     meta: &PaneMeta,
     badge: Option<AnyElement>,
+    chat: Option<HeaderChat>,
     closable: bool,
     focused: bool,
     show_changes: bool,
@@ -213,26 +207,21 @@ pub(crate) fn pane_header(
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
     let control = |key: String, path: &'static str, label: &'static str| {
-        div()
-            .id(SharedString::from(key.clone()))
-            .size(px(24.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(5.0))
-            .role(gpui::Role::Button)
-            .aria_label(label)
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                cx.stop_propagation();
-                window.prevent_default();
-            })
-            .tooltip(move |_, cx| cx.new(|_| ChromeTooltip(label)).into())
-            .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.wash(0.12)))
-            .on_hover(motion::hover_listener(key))
-            // GPUI SVGs require their own color; a parent div's tint is ignored.
-            .child(icon(path).size(px(14.0)).text_color(theme.text_muted))
+        controls::icon_button(
+            key,
+            cx.entity_id(),
+            theme,
+            controls::Variant::Ghost,
+            controls::Size::Xs,
+            path,
+            label,
+        )
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            cx.stop_propagation();
+            window.prevent_default();
+        })
+        .tooltip(crate::tooltip::text(label))
     };
     div()
         .id(SharedString::from(format!("pane-header-{}", pane.0)))
@@ -291,22 +280,38 @@ pub(crate) fn pane_header(
         )
         // Title: UI face, 13px MEDIUM (rule 4: MEDIUM is the pane title's
         // weight). It truncates and may shrink; the context below gives up
-        // space first.
-        .child(
-            div()
-                .flex_initial()
-                .min_w_0()
-                .truncate()
-                .text_size(crate::typography::ui_rems(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                // Focus cue (rule 3): the focused title is full-strength text;
-                // unfocused panes rest muted. No border, no size change.
-                .text_color(if focused { theme.text } else { theme.text_muted })
-                .child(title),
-        )
+        // space first. A bound title is interactive: click opens the thread
+        // menu after a beat, double-click renames in place, right-click opens
+        // it at once, and a chevron fades in on hover.
+        .child(pane_title(pane, title, focused, chat.as_ref(), theme, cx))
         // Project identity (rule 1): the bound chat's 14px badge, right after
-        // the title. Unbound panes carry none.
-        .when_some(badge, |el, badge| el.child(badge))
+        // the title. Clicking it starts a new session in that project.
+        .when_some(badge, |el, badge| {
+            let space_id = chat.as_ref().and_then(|chat| chat.space_id.clone());
+            match space_id {
+                Some(space_id) => {
+                    let hover = theme.control_hover();
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("pane-badge-{}", pane.0)))
+                            .flex_none()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_new_session_in_space(space_id.clone(), cx);
+                            }))
+                            .child(badge),
+                    )
+                }
+                None => el.child(badge),
+            }
+        })
         // Context: mono 11px text_faint, `{project}:{branch}` (plus the remote
         // device); it owns the remaining row and truncates first. With no
         // session the spacer keeps the controls right-aligned.
@@ -331,9 +336,8 @@ pub(crate) fn pane_header(
         // live activity line already says it) so it only shows on unfocused
         // panes; Awaiting input / Failed stay visible everywhere.
         .when_some(
-            status_label(meta.state, theme).filter(|_| {
-                !(focused && matches!(meta.state, SessionState::Working))
-            }),
+            status_label(meta.state, theme)
+                .filter(|_| !(focused && matches!(meta.state, SessionState::Working))),
             |el, label| el.child(label),
         )
         .when_some(action_control, |el, action| el.child(action))
@@ -342,49 +346,130 @@ pub(crate) fn pane_header(
         .when(show_changes || closable, |row| {
             row.child(
                 div()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                // The right-pane toggle lives on the pane header - the
-                // window-wide chat header that used to carry it is gone.
-                // Shown only on the focused session-bound pane so idle
-                // panes stay quiet.
-                .when(show_changes, |el| {
-                    el.child(
-                        control(
-                            format!("pane-changes-{}", pane.0),
-                            icons::SIDEBAR_MINIMALISTIC,
-                            "Toggle right sidebar",
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    // The right-pane toggle lives on the pane header - the
+                    // window-wide chat header that used to carry it is gone.
+                    // Shown only on the focused session-bound pane so idle
+                    // panes stay quiet.
+                    .when(show_changes, |el| {
+                        el.child(
+                            control(
+                                format!("pane-changes-{}", pane.0),
+                                icons::SIDEBAR_MINIMALISTIC,
+                                "Toggle right sidebar",
+                            )
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_right_pane(cx);
+                            })),
                         )
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_right_pane(cx);
-                        })),
-                    )
-                })
-                .when(closable, |el| {
-                    el.child(
-                        control(
-                            format!("pane-close-{}", pane.0),
-                            icons::CLOSE,
-                            "Close pane",
+                    })
+                    .when(closable, |el| {
+                        el.child(
+                            control(format!("pane-close-{}", pane.0), icons::CLOSE, "Close pane")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    // The chip's own click must not double-fire
+                                    // through the pane's click-to-focus bubble path.
+                                    cx.stop_propagation();
+                                    this.close_workspace_pane(pane, cx);
+                                    window.prevent_default();
+                                    let _ = event;
+                                })),
                         )
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, event, window, cx| {
-                            // The chip's own click must not double-fire
-                            // through the pane's click-to-focus bubble path.
-                            cx.stop_propagation();
-                            this.close_workspace_pane(pane, cx);
-                            window.prevent_default();
-                            let _ = event;
-                        })),
-                    )
-                }),
+                    }),
             )
         })
+        .into_any_element()
+}
+
+/// The header title: static for an unbound pane, otherwise the interactive
+/// thread title (menu, inline rename, hover chevron).
+fn pane_title(
+    pane: PaneId,
+    title: SharedString,
+    focused: bool,
+    chat: Option<&HeaderChat>,
+    theme: &Theme,
+    cx: &Context<'_, Shell>,
+) -> AnyElement {
+    let color = if focused {
+        theme.text
+    } else {
+        theme.text_muted
+    };
+    let Some(chat) = chat else {
+        return div()
+            .flex_initial()
+            .min_w_0()
+            .truncate()
+            .text_size(crate::typography::ui_rems(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            // Focus cue (rule 3): the focused title is full-strength text;
+            // unfocused panes rest muted. No border, no size change.
+            .text_color(color)
+            .child(title)
+            .into_any_element();
+    };
+    if let Some(input) = chat.rename.clone() {
+        return div()
+            .flex_initial()
+            .min_w(px(120.0))
+            .max_w(px(280.0))
+            .w(px(240.0))
+            .child(crate::shell::chat_title_editor(
+                SharedString::from(format!("pane-title-editor-{}", pane.0)),
+                input,
+                theme,
+            ))
+            .into_any_element();
+    }
+    let group = SharedString::from(format!("pane-title-group-{}", pane.0));
+    let (click_id, menu_id) = (chat.chat_id.clone(), chat.chat_id.clone());
+    div()
+        .id(SharedString::from(format!("pane-title-{}", pane.0)))
+        .group(group.clone())
+        .flex_initial()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(13.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        // The header's drag and the pane's focus-on-press must not swallow
+        // the title's own clicks.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_chat_title_menu(menu_id.clone(), event.position, cx);
+            }),
+        )
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if event.click_count() >= 2 {
+                this.open_rename_chat_in_header(click_id.clone(), cx);
+            } else if let Some(position) = event.mouse_position() {
+                this.schedule_chat_title_menu(click_id.clone(), position, cx);
+            }
+        }))
+        .child(div().min_w_0().truncate().child(title))
+        .child(
+            icon(icons::ALT_ARROW_DOWN)
+                .size(px(12.0))
+                .text_color(theme.icon_muted())
+                .opacity(0.0)
+                .group_hover(group, |s| s.opacity(1.0)),
+        )
         .into_any_element()
 }
 
@@ -446,12 +531,20 @@ pub(crate) fn tab_strip(
                 .bg(if chip.active {
                     theme.wash(0.09)
                 } else {
-                    motion::hover_blend(&chip_hover_key, gpui::transparent_black(), theme.wash(0.07))
+                    motion::hover_blend_owned(
+                        cx.entity_id(),
+                        &chip_hover_key,
+                        gpui::transparent_black(),
+                        theme.wash(0.07),
+                    )
                 })
                 .when(chip.active, |el| {
                     el.border_1().border_color(theme.hairline(0.09))
                 })
-                .on_hover(motion::hover_listener(chip_hover_key.clone()))
+                .on_hover(motion::hover_listener_owned(
+                    cx.entity_id(),
+                    chip_hover_key.clone(),
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.switch_workspace_tab(view, tab, cx);
                 }))
@@ -509,7 +602,10 @@ pub(crate) fn tab_strip(
                 // of the only view is an engine-guarded no-op).
                 .child(
                     div()
-                        .id(SharedString::from(format!("ws-tab-close-{}-{}", view.0, tab.0)))
+                        .id(SharedString::from(format!(
+                            "ws-tab-close-{}-{}",
+                            view.0, tab.0
+                        )))
                         .size(px(14.0))
                         .flex_none()
                         .flex()
@@ -519,18 +615,26 @@ pub(crate) fn tab_strip(
                         .cursor_pointer()
                         .role(gpui::Role::Button)
                         .aria_label("Close tab")
-                        .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Close tab")).into())
-                        .bg(motion::hover_blend(
+                        .tooltip(crate::tooltip::text("Close tab"))
+                        .bg(motion::hover_blend_owned(
+                            cx.entity_id(),
                             &close_hover_key,
                             gpui::transparent_black(),
                             theme.wash(0.14),
                         ))
-                        .on_hover(motion::hover_listener(close_hover_key))
+                        .on_hover(motion::hover_listener_owned(
+                            cx.entity_id(),
+                            close_hover_key,
+                        ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_workspace_tab(view, tab, cx);
                         }))
-                        .child(icon(icons::CLOSE).size(px(11.0)).text_color(theme.text_muted)),
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(11.0))
+                                .text_color(theme.text_muted),
+                        ),
                 ),
         );
     }
@@ -539,28 +643,23 @@ pub(crate) fn tab_strip(
     // trigger's press position.
     let plus_key = format!("ws-tab-add-{}", view.0);
     strip = strip.child(
-        div()
-            .id(SharedString::from(plus_key.clone()))
-            .size(px(20.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .role(gpui::Role::Button)
-            .aria_label("Add tab")
-            .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Add tab")).into())
-            .bg(motion::hover_blend(&plus_key, gpui::transparent_black(), theme.wash(0.09)))
-            .on_hover(motion::hover_listener(plus_key))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.open_workspace_tool_picker_for_tab(view, event.position, cx);
-                }),
-            )
-            .child(icon(icons::PLUS).size(px(14.0)).text_color(theme.text_muted)),
+        controls::icon_button(
+            plus_key,
+            cx.entity_id(),
+            theme,
+            controls::Variant::Ghost,
+            controls::Size::Micro,
+            icons::PLUS,
+            "Add tab",
+        )
+        .tooltip(crate::tooltip::text("Add tab"))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.open_workspace_tool_picker_for_tab(view, event.position, cx);
+            }),
+        ),
     );
     strip.into_any_element()
 }
@@ -656,14 +755,26 @@ mod tests {
             tab_mark(PaneMode::Chat, Some("claude")).tint,
             Some(icons::claude_brand())
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("codex")).icon, Some(icons::OPENAI_MARK));
-        assert_eq!(tab_mark(PaneMode::Chat, Some("devin")).icon, Some(icons::DEVIN_MARK));
-        assert_eq!(tab_mark(PaneMode::Chat, Some("pi")).icon, Some(icons::PI_MARK));
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("codex")).icon,
+            Some(icons::OPENAI_MARK)
+        );
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("devin")).icon,
+            Some(icons::DEVIN_MARK)
+        );
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("pi")).icon,
+            Some(icons::PI_MARK)
+        );
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("opencode")).icon,
             Some(icons::OPENCODE_MARK)
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("cursor")).icon, Some(icons::CURSOR_MARK));
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("cursor")).icon,
+            Some(icons::CURSOR_MARK)
+        );
     }
 
     #[test]
@@ -672,7 +783,10 @@ mod tests {
         // was an illegible smudge; the composer's harness pick supplies the
         // real identity at render time). Terminal panes keep their glyph.
         assert_eq!(tab_mark(PaneMode::Chat, None).icon, None);
-        assert_eq!(tab_mark(PaneMode::Terminal, None).icon, Some(icons::TERMINAL));
+        assert_eq!(
+            tab_mark(PaneMode::Terminal, None).icon,
+            Some(icons::TERMINAL)
+        );
         assert_eq!(tab_mark(PaneMode::Chat, None).tint, None);
         // Unknown provider strings fall through to the mode mark, never panic.
         assert_eq!(tab_mark(PaneMode::Chat, Some("holographic")).icon, None);
@@ -682,7 +796,10 @@ mod tests {
     fn tool_picker_rows_advertise_the_real_entry_points() {
         use crate::pane::TOOL_PICKER_ROWS;
         let kinds: Vec<_> = TOOL_PICKER_ROWS.iter().map(|row| row.kind).collect();
-        assert_eq!(kinds, vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]);
+        assert_eq!(
+            kinds,
+            vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]
+        );
         assert!(TOOL_PICKER_ROWS.iter().all(|row| !row.label.is_empty()));
     }
 }

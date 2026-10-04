@@ -1,6 +1,7 @@
 //! Durable custom-theme library and the bridge into the active runtime registry.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, Global};
@@ -16,6 +17,7 @@ pub struct ThemeLibraryState {
     pub data_dir: PathBuf,
     pub library: CustomThemeLibrary,
     pub load_warning: Option<String>,
+    entries: Arc<Vec<Arc<CustomThemeEntry>>>,
 }
 
 impl Global for ThemeLibraryState {}
@@ -30,16 +32,18 @@ pub fn init(data_dir: impl Into<PathBuf>, cx: &mut App) {
         }
     };
     library.install_runtime();
+    let entries = Arc::new(library.entries.iter().cloned().map(Arc::new).collect());
     cx.set_global(ThemeLibraryState {
         data_dir,
         library,
         load_warning,
+        entries,
     });
 }
 
-pub fn entries(cx: &App) -> Vec<CustomThemeEntry> {
+pub fn entries(cx: &App) -> Arc<Vec<Arc<CustomThemeEntry>>> {
     cx.try_global::<ThemeLibraryState>()
-        .map(|state| state.library.entries.clone())
+        .map(|state| state.entries.clone())
         .unwrap_or_default()
 }
 
@@ -155,12 +159,21 @@ fn persist_and_activate(state: &mut ThemeLibraryState, next: CustomThemeLibrary)
             .collect(),
     );
     state.library = next;
+    state.entries = Arc::new(
+        state
+            .library
+            .entries
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .collect(),
+    );
     state.load_warning = None;
     Ok(())
 }
 
 fn reconcile_and_refresh(cx: &mut App) {
-    let registry = ThemeRegistry::active();
+    let (_, registry) = ThemeRegistry::snapshot();
     let selected = appearance::themes(cx);
     for appearance_kind in [Appearance::Light, Appearance::Dark] {
         let model = if appearance_kind.is_light() {
@@ -192,6 +205,7 @@ mod tests {
             data_dir: blocking_file,
             library: original.clone(),
             load_warning: Some("previous warning".into()),
+            entries: Arc::default(),
         };
         let mut next = original.clone();
         next.entries.push(CustomThemeEntry {

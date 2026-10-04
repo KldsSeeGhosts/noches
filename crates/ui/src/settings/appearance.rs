@@ -2,15 +2,17 @@
 //! and the optional interactive accent overlay.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
     KeyDownEvent, ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div,
     img, prelude::*, px,
 };
+use zeron_theme::syntax_presets::SyntaxColors;
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
     AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
@@ -32,7 +34,8 @@ struct ImportDialog {
     focus: FocusHandle,
     focus_pending: bool,
     mode: InstallMode,
-    compilation: Option<SourceCompilation>,
+    compilation: Option<Arc<SourceCompilation>>,
+    previews: Arc<HashMap<String, Theme>>,
     selected: HashSet<String>,
     review_variant: Option<String>,
     error: Option<SharedString>,
@@ -285,6 +288,158 @@ impl AppearancePage {
         );
     }
 
+    /// Panel animation duration: a short ladder over the 0-400ms range the
+    /// motion catalog accepts. Off is the default (T3's).
+    fn render_panel_animation(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        const STEPS: [(u16, &str); 5] = [
+            (0, "Off"),
+            (100, "100ms"),
+            (200, "200ms"),
+            (300, "300ms"),
+            (400, "400ms"),
+        ];
+        let current = crate::settings::current(cx).panel_animation_ms;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(24.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(widgets::field_label(theme, "Panel animations"))
+                    .child(
+                        div()
+                            .max_w(px(520.0))
+                            .text_size(typography::ui_rems(12.0))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "How long the sidebar, panes and terminal take to open and close. Menus and dialogs always animate.",
+                            ),
+                    ),
+            )
+            .when(current != 0, |row| {
+                row.child(widgets::reset_button(theme, "panel-animation-reset", cx.entity_id()).on_click(
+                    cx.listener(|_, _, _, cx| {
+                        crate::motion::set_panel_animation_ms(0);
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Immediate,
+                            cx,
+                            |settings| settings.panel_animation_ms = 0,
+                        );
+                        cx.notify();
+                    }),
+                ))
+            })
+            .child(
+                div()
+                    .id("panel-animation-steps")
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .rounded(px(9.0))
+                    .p(px(2.0))
+                    .bg(crate::theme::ink(0.04))
+                    .children(STEPS.into_iter().map(|(ms, label)| {
+                        let selected = current == ms;
+                        div()
+                            .id(("panel-animation-step", usize::from(ms)))
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(if selected { theme.text } else { theme.text_muted })
+                            .when(selected, |el| {
+                                el.bg(theme.bg)
+                                    .border_1()
+                                    .border_color(theme.border.opacity(0.8))
+                            })
+                            .when(!selected, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.text_color(theme.text))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        crate::motion::set_panel_animation_ms(ms);
+                                        crate::settings::update(
+                                            crate::settings::SavePolicy::Immediate,
+                                            cx,
+                                            |settings| settings.panel_animation_ms = ms,
+                                        );
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(SharedString::from(label))
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// "Transcript tool rows": the Calm | Tree picker. Each card previews its
+    /// look with a few mock rows; selection persists immediately and the open
+    /// transcripts remeasure on their next frame.
+    fn render_tool_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::settings::ToolRowStyle;
+        let current = crate::settings::transcript_tool_rows(cx);
+        let cards = ToolRowStyle::ALL
+            .into_iter()
+            .map(|style| {
+                widgets::option_card(
+                    theme,
+                    match style {
+                        ToolRowStyle::Calm => icons::CHECKLIST,
+                        ToolRowStyle::Tree => icons::WIDGET,
+                    },
+                    style.label(),
+                    style == current,
+                    tool_rows_preview(style, theme),
+                )
+                .id(SharedString::from(format!(
+                    "transcript-tool-rows-{}",
+                    style.label()
+                )))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |s| {
+                        s.transcript_tool_rows = style
+                    });
+                    cx.refresh_windows();
+                    cx.notify();
+                }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(widgets::field_label(theme, "Transcript tool rows"))
+                    .child(
+                        div()
+                            .max_w(px(520.0))
+                            .text_size(typography::ui_rems(12.0))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "Calm lists tool calls as a flat log. Tree keeps the connected \
+                                 rail with tinted icons.",
+                            ),
+                    ),
+            )
+            .child(widgets::option_card_row().children(cards))
+    }
+
     fn render_transcript_width(
         &self,
         theme: &Theme,
@@ -455,6 +610,7 @@ impl AppearancePage {
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
+        crate::motion::init_hover_owner(cx);
         // `PaletteSearch` binds text-editing keys only — arrows/Enter/Escape
         // stay unbound and bubble from the input to the menu card's own key
         // handler. `Submitted` never fires here, so Enter has exactly one path.
@@ -919,7 +1075,7 @@ impl AppearancePage {
     fn open_import(&mut self, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             ComposerInput::with_context(
-                "Theme file, package.json, or extension folder",
+                "T3 or VS Code theme file, package.json, or extension folder",
                 "PaletteSearch",
                 cx,
             )
@@ -938,6 +1094,7 @@ impl AppearancePage {
                         .is_some_and(|(compilation, source)| compilation.path != *source)
                 {
                     dialog.compilation = None;
+                    dialog.previews = Arc::default();
                     dialog.selected.clear();
                     dialog.review_variant = None;
                     dialog.error = None;
@@ -964,6 +1121,7 @@ impl AppearancePage {
             focus_pending: true,
             mode: InstallMode::Snapshot,
             compilation: None,
+            previews: Arc::default(),
             selected: HashSet::new(),
             review_variant: None,
             error: None,
@@ -995,7 +1153,24 @@ impl AppearancePage {
                 // Mapping diagnostics are useful, but they are an advanced
                 // inspection surface rather than part of the happy path.
                 dialog.review_variant = None;
-                dialog.compilation = Some(compilation);
+                dialog.previews = Arc::new(
+                    compilation
+                        .family
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            (
+                                variant.id.clone(),
+                                Theme::from_variant(
+                                    variant,
+                                    AccentSelection::ThemeDefault,
+                                    SurfacePreference::ThemeDefault,
+                                ),
+                            )
+                        })
+                        .collect(),
+                );
+                dialog.compilation = Some(Arc::new(compilation));
                 dialog.error = None;
             }
             Err(error) => dialog.error = Some(error.to_string().into()),
@@ -1077,7 +1252,7 @@ impl AppearancePage {
             return;
         };
         let selected = dialog.selected.iter().cloned().collect::<Vec<_>>();
-        match theme_library::install(compilation.clone(), &selected, dialog.mode, cx) {
+        match theme_library::install(compilation.as_ref().clone(), &selected, dialog.mode, cx) {
             Ok(_) => self.import_dialog = None,
             Err(error) => {
                 dialog.compilation = Some(compilation);
@@ -1488,12 +1663,7 @@ fn compact_action(
         .text_size(crate::typography::ui_rems(11.5))
 }
 
-fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
-    let theme = Theme::from_variant(
-        variant,
-        AccentSelection::ThemeDefault,
-        SurfacePreference::ThemeDefault,
-    );
+fn import_scene_preview(theme: &Theme) -> AnyElement {
     div()
         .w_full()
         .h(px(86.0))
@@ -1783,25 +1953,31 @@ impl AppearancePage {
                 let active = family == effective;
                 let focused = family == selected;
                 let label = SharedString::from(family.label().to_owned());
-                popover::menu_row_nav(theme, active, focused, format!("{slug}-font-option-{ix}"))
-                    .id(SharedString::from(format!("{slug}-font-option-{ix}")))
-                    .when(available, |row| {
-                        row.on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_selected_font(kind, family.clone());
-                            this.commit_font(kind, cx);
-                        }))
-                    })
-                    .when(!available, |row| row.opacity(0.45))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(div().w(px(18.0)).flex_none().when(active, |slot| {
-                        slot.child(
-                            icons::icon(icons::CHECK)
-                                .size(px(14.0))
-                                .text_color(theme.accent),
-                        )
+                popover::menu_row_nav_owned(
+                    cx.entity_id(),
+                    theme,
+                    active,
+                    focused,
+                    format!("{slug}-font-option-{ix}"),
+                )
+                .id(SharedString::from(format!("{slug}-font-option-{ix}")))
+                .when(available, |row| {
+                    row.on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_selected_font(kind, family.clone());
+                        this.commit_font(kind, cx);
                     }))
-                    .into_any_element()
+                })
+                .when(!available, |row| row.opacity(0.45))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(div().w(px(18.0)).flex_none().when(active, |slot| {
+                    slot.child(
+                        icons::icon(icons::CHECK)
+                            .size(px(14.0))
+                            .text_color(theme.accent),
+                    )
+                }))
+                .into_any_element()
             })
             .collect();
 
@@ -1937,7 +2113,8 @@ impl AppearancePage {
             .iter()
             .enumerate()
             .map(|(ix, label)| {
-                popover::menu_row_nav(
+                popover::menu_row_nav_owned(
+                    cx.entity_id(),
                     theme,
                     ix == current,
                     ix == selected,
@@ -2024,7 +2201,7 @@ impl AppearancePage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let registry = ThemeRegistry::active();
+        let (_, registry) = ThemeRegistry::snapshot();
         let selected_id = selections
             .variant_id(model_appearance(appearance_kind))
             .to_owned();
@@ -2141,7 +2318,8 @@ impl AppearancePage {
                                 AccentSelection::ThemeDefault,
                                 theme.surface_preference,
                             );
-                            popover::menu_row(
+                            popover::menu_row_owned(
+                                cx.entity_id(),
                                 theme,
                                 active,
                                 SharedString::from(format!(
@@ -2204,6 +2382,7 @@ impl AppearancePage {
         let focus = dialog.focus.clone();
         let mode = dialog.mode;
         let compilation = dialog.compilation.clone();
+        let previews = dialog.previews.clone();
         let selected = dialog.selected.clone();
         let review_variant = dialog.review_variant.clone();
         let error = dialog.error.clone();
@@ -2375,11 +2554,9 @@ impl AppearancePage {
                     "Light"
                 };
                 let report = compilation.reports.get(&variant.id);
-                let sample = Theme::from_variant(
-                    variant,
-                    AccentSelection::ThemeDefault,
-                    SurfacePreference::ThemeDefault,
-                );
+                let sample = previews
+                    .get(&variant.id)
+                    .expect("compiled theme has a preview");
                 main = main.child(
                     div()
                         .id(SharedString::from(format!("theme-import-row-{variant_id}")))
@@ -2495,7 +2672,7 @@ impl AppearancePage {
                                     .pt(px(10.0))
                                     .border_t_1()
                                     .border_color(hairline)
-                                    .child(import_scene_preview(variant)),
+                                    .child(import_scene_preview(sample)),
                             )
                             .when_some(report, |row, report| row.child(report_panel(theme, report)))
                         }),
@@ -2706,8 +2883,9 @@ impl AppearancePage {
     ) -> Option<AnyElement> {
         let entry_id = self.review_entry.as_ref()?;
         let entry = theme_library::entries(cx)
-            .into_iter()
-            .find(|entry| &entry.id == entry_id)?;
+            .iter()
+            .find(|entry| &entry.id == entry_id)?
+            .clone();
         let mut card = popover::dialog_card(theme)
             .id("theme-review-card")
             .w(px(660.0))
@@ -2727,7 +2905,16 @@ impl AppearancePage {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(SharedString::from(variant.name.clone())),
                 )
-                .child(import_scene_preview(variant));
+                .child(import_scene_preview(&Theme::for_selection(
+                    if variant.appearance.is_dark() {
+                        Appearance::Dark
+                    } else {
+                        Appearance::Light
+                    },
+                    &variant.id,
+                    AccentSelection::ThemeDefault,
+                    SurfacePreference::ThemeDefault,
+                )));
             if let Some(report) = entry.reports.get(&variant.id) {
                 card = card.child(report_panel(theme, report));
             }
@@ -2751,7 +2938,7 @@ impl AppearancePage {
 
     fn render_library_entry(
         &mut self,
-        entry: CustomThemeEntry,
+        entry: Arc<CustomThemeEntry>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2901,7 +3088,8 @@ impl AppearancePage {
     ) -> Vec<AnyElement> {
         let entries = theme_library::entries(cx);
         let (linked, imported): (Vec<_>, Vec<_>) = entries
-            .into_iter()
+            .iter()
+            .cloned()
             .partition(|entry| entry.source.is_linked());
         let mut rows = vec![
             widgets::card_row(theme, false)
@@ -3064,6 +3252,35 @@ impl Render for AppearancePage {
             })
             .collect::<Vec<_>>();
         let mut settings_rows = theme_rows;
+        settings_rows.push(
+            widgets::card_row(&theme, false)
+                .child(widgets::row_tile(&theme, icons::TUNING))
+                .child(div().flex_1().min_w_0()
+                    .child(widgets::row_title(&theme, "Syntax colours"))
+                    .child(widgets::meta_line(&theme, vec![div()
+                        .child("Code and diffs. Claude defaults to Pierre; other themes keep their palette.")
+                        .into_any_element()])))
+                .child(div().flex_none().flex().gap(px(6.0)).children(
+                    SyntaxColors::ALL.into_iter().map(|selection| {
+                        div()
+                            .id(SharedString::from(format!("syntax-{}", selection.label())))
+                            .px(px(10.0)).py(px(5.0)).rounded(px(6.0))
+                            .text_size(px(12.0))
+                            .text_color(if theme.syntax_colors == selection { theme.text } else { theme.text_muted })
+                            .bg(if theme.syntax_colors == selection { theme.element_active } else { gpui::transparent_black() })
+                            .cursor_pointer()
+                            .child(selection.label())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                                    settings.syntax_colors = Some(selection);
+                                });
+                                appearance::apply_registry_change(cx);
+                                cx.notify();
+                            }))
+                    })
+                ))
+                .into_any_element(),
+        );
         settings_rows.push(
             widgets::card_row(&theme, false)
                 .child(widgets::row_tile(&theme, icons::TUNING))
@@ -3343,6 +3560,8 @@ impl Render for AppearancePage {
             );
         }
         font_section = font_section.child(self.render_transcript_width(&theme, window, cx));
+        font_section = font_section.child(self.render_panel_animation(&theme, cx));
+        font_section = font_section.child(self.render_tool_rows(&theme, cx));
         for kind in FontKind::ALL {
             let (requested, effective) = (kind.requested(cx), kind.effective(cx));
             if requested != effective {
@@ -3362,6 +3581,7 @@ impl Render for AppearancePage {
         }
 
         let scrollbar = popover::rail(self, "appearance-page-scrollbar", &theme, cx);
+        crate::motion::drive_hover_owner(cx.entity_id(), window);
         div()
             .id("appearance-page-host")
             .on_drag_move(cx.listener(
@@ -3436,6 +3656,86 @@ impl Render for AppearancePage {
     }
 }
 
+/// A miniature of one tool-row look for its option card: glyph tiles and text
+/// bars standing in for rows (Calm: flat lines with a hover plate; Tree: a
+/// connected rail with elbows). Paints no backdrop, so the card's own rounded
+/// frame stays intact.
+fn tool_rows_preview(style: crate::settings::ToolRowStyle, theme: &Theme) -> AnyElement {
+    use crate::settings::ToolRowStyle;
+    let bar = |width: f32| {
+        div()
+            .h(px(6.0))
+            .w(px(width))
+            .rounded(px(3.0))
+            .bg(theme.text_muted.opacity(0.35))
+    };
+    let widths = [124.0, 92.0, 148.0];
+    match style {
+        ToolRowStyle::Calm => div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(4.0))
+            .px(px(18.0))
+            .children(widths.into_iter().enumerate().map(|(ix, width)| {
+                div()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .rounded(px(6.0))
+                    .when(ix == 1, |row| row.bg(theme.row_hover_fill()))
+                    .child(
+                        div()
+                            .size(px(10.0))
+                            .rounded(px(3.0))
+                            .bg(theme.icon_muted().opacity(0.8)),
+                    )
+                    .child(bar(width))
+            }))
+            .into_any_element(),
+        ToolRowStyle::Tree => div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(30.0))
+                    .top(px(30.0))
+                    .h(px(88.0))
+                    .w(px(1.0))
+                    .bg(theme.hairline(0.2)),
+            )
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(14.0))
+                    .pl(px(30.0))
+                    .children(widths.into_iter().map(|width| {
+                        div()
+                            .h(px(14.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().w(px(12.0)).h(px(1.0)).bg(theme.hairline(0.2)))
+                            .child(
+                                div()
+                                    .size(px(10.0))
+                                    .rounded(px(3.0))
+                                    .bg(theme.accent.opacity(0.7)),
+                            )
+                            .child(bar(width - 24.0))
+                    })),
+            )
+            .into_any_element(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3455,11 +3755,11 @@ mod tests {
             registry
                 .variants_for(zeron_theme::Appearance::Light)
                 .count(),
-            10
+            11
         );
         assert_eq!(
             registry.variants_for(zeron_theme::Appearance::Dark).count(),
-            20
+            21
         );
     }
 
@@ -3619,7 +3919,8 @@ mod tests {
     #[test]
     fn pixel_sizes_render_whole_and_fractional_values() {
         assert_eq!(format_px(13.0), "13 px");
-        assert_eq!(format_px(typography::CODE_FONT_SIZE_DEFAULT), "12.5 px");
+        assert_eq!(format_px(12.5), "12.5 px");
+        assert_eq!(format_px(typography::CODE_FONT_SIZE_DEFAULT), "13 px");
         assert_eq!(
             typography::clamp_font_size(typography::FONT_SIZE_MAX + 1.0),
             typography::FONT_SIZE_MAX

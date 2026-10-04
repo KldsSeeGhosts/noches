@@ -343,6 +343,7 @@ impl Shell {
                     harness,
                     state.display_status_for(chat, Utc::now()),
                     ix == active,
+                    false,
                     chat.archived,
                     None,
                     Some(&query),
