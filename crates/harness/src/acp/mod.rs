@@ -885,6 +885,7 @@ enum Launch {
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
+    launch: crate::instance::InstanceLaunch,
     spec: AcpAgentSpec,
     executable: Option<PathBuf>,
     /// Override of the agent's on-disk sessions root (grok's
@@ -916,6 +917,7 @@ pub struct AcpHarness {
 impl AcpHarness {
     fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
+            launch: Default::default(),
             spec,
             executable: None,
             sessions_root: None,
@@ -1145,6 +1147,19 @@ impl AcpHarness {
         self
     }
 
+    pub fn with_instance_launch(mut self, launch: crate::instance::InstanceLaunch) -> Self {
+        if self.spec.id == HarnessId::Grok
+            && let Some(home) = launch
+                .environment
+                .get("HOME")
+                .or_else(|| launch.environment.get("USERPROFILE"))
+        {
+            self.sessions_root = Some(PathBuf::from(home).join(".grok").join("sessions"));
+        }
+        self.launch = launch;
+        self
+    }
+
     /// Test seam: tail subagent transcripts from this sessions root instead
     /// of the agent's real one (`~/.grok/sessions`).
     #[doc(hidden)]
@@ -1322,6 +1337,7 @@ impl AcpHarness {
         let mut cmd = Command::new(&exe);
         cmd.args(launch_args).args(args);
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply(&mut cmd);
         Ok(cmd)
     }
 
@@ -1525,6 +1541,7 @@ impl AcpHarness {
         if self.spec.id == HarnessId::Antigravity {
             cmd.env("GEMINI_HOME", antigravity_paths::home()?);
         }
+        self.launch.apply_launch(&mut cmd);
         // A parent shell may export stale computer-use launch variables. Pi
         // sets fresh values through extra_env; every other agent must not inherit them.
         for key in [
@@ -2092,7 +2109,7 @@ impl Harness for AcpHarness {
             let (exe, _) = self.resolve_program(false).await?;
             return self
                 .devin_models
-                .refresh(&exe, self.model_discovery_timeout)
+                .refresh(&exe, self.model_discovery_timeout, &self.launch)
                 .await;
         }
         let requested_at = Instant::now();
@@ -3668,6 +3685,7 @@ async fn run_session(session: Session) {
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
+            instance_id: None,
             harness,
             model: request.model.clone().unwrap_or_default(),
             tools: Vec::new(),
@@ -3685,7 +3703,6 @@ async fn run_session(session: Session) {
         && !send(
             &event_tx,
             AgentEvent::AvailableCommands {
-            instance_id: None,
                 commands: init_commands,
             },
         )

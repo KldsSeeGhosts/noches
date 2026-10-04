@@ -89,6 +89,7 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
 /// The Cursor harness. Construct with [`CursorHarness::new`]; tests point it
 /// at a fake shim process with [`CursorHarness::with_executable`].
 pub struct CursorHarness {
+    launch: crate::instance::InstanceLaunch,
     /// Test seam: run this program AS the shim instead of node+managed SDK.
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
@@ -100,6 +101,7 @@ pub struct CursorHarness {
 impl Default for CursorHarness {
     fn default() -> Self {
         Self {
+            launch: Default::default(),
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -122,6 +124,19 @@ impl CursorHarness {
         Self::default()
     }
 
+    pub fn with_instance_launch(mut self, launch: crate::instance::InstanceLaunch) -> Self {
+        self.launch = launch;
+        self
+    }
+
+    fn state_root(&self) -> PathBuf {
+        self.launch
+            .environment
+            .get("ZERON_CURSOR_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(state::state_root)
+    }
+
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
         self
@@ -139,6 +154,7 @@ impl CursorHarness {
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         cmd.arg("models")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -252,7 +268,10 @@ impl Harness for CursorHarness {
     /// is an error, never a fabricated two-model success.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.models_cache
-            .get(catalog::credential_context, || self.discover_models())
+            .get(
+                || catalog::credential_context(&self.launch.environment),
+                || self.discover_models(),
+            )
             .await
     }
 
@@ -274,7 +293,7 @@ impl Harness for CursorHarness {
             request.interaction_mode,
         )?;
         let lease = if self.executable.is_none() {
-            Some(state::Lease::acquire(&state::state_root(), request.resume.as_deref()).await?)
+            Some(state::Lease::acquire(&self.state_root(), request.resume.as_deref()).await?)
         } else {
             None
         };
@@ -282,9 +301,10 @@ impl Harness for CursorHarness {
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
         if lease.is_some() {
-            cmd.env("ZERON_CURSOR_STATE_DIR", state::state_root());
+            cmd.env("ZERON_CURSOR_STATE_DIR", self.state_root());
         }
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -569,6 +589,7 @@ async fn run_session(session: Session) {
                                 .map(str::to_owned)
                                 .unwrap_or_else(|| request_model.clone());
                             if !send(AgentEvent::SessionStarted {
+                                instance_id: None,
                                 harness: HarnessId::Cursor,
                                 model,
                                 tools: Vec::new(),
@@ -589,7 +610,6 @@ async fn run_session(session: Session) {
                                     session_id = %crate::redact::redact_registered(session_id.as_deref().unwrap_or("")),
                                     error = %crate::redact::redact_registered(&frame.get("error").or_else(|| frame.get("message")).unwrap_or(&serde_json::Value::Null).to_string()),
                                     "Cursor SDK run failed");
-                                instance_id: None,
                             }
                             for ev in map_shim_frame(&frame, interrupted) {
                                 let is_done = matches!(ev, AgentEvent::Done { .. });

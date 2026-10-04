@@ -85,6 +85,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 /// The Claude Code harness. Construct with [`ClaudeHarness::new`]; tests point
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
+    launch: crate::instance::InstanceLaunch,
     executable: Option<PathBuf>,
     /// Grace between the interrupt control request and SIGTERM.
     interrupt_grace: Duration,
@@ -98,6 +99,7 @@ pub struct ClaudeHarness {
 impl Default for ClaudeHarness {
     fn default() -> Self {
         Self {
+            launch: Default::default(),
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -109,6 +111,11 @@ impl Default for ClaudeHarness {
 impl ClaudeHarness {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_instance_launch(mut self, launch: crate::instance::InstanceLaunch) -> Self {
+        self.launch = launch;
+        self
     }
 
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
@@ -148,6 +155,7 @@ impl ClaudeHarness {
     fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_environment(&mut cmd, exe);
+        self.launch.apply_launch(&mut cmd);
         cmd.args([
             "--print",
             "--input-format",
@@ -232,6 +240,7 @@ impl ClaudeHarness {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         cmd.args([
             "--print",
             "--input-format",
@@ -382,6 +391,7 @@ impl Harness for ClaudeHarness {
         let executable = self.resolve_executable()?;
         let mut command = tokio::process::Command::new(&executable);
         crate::compose_child_environment(&mut command, &executable);
+        self.launch.apply(&mut command);
         command
             .args(["auth", "status", "--json"])
             .kill_on_drop(true);

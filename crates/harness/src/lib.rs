@@ -15,6 +15,7 @@
 //! wires don't have (decision record: docs/research/acp.md).
 
 use async_trait::async_trait;
+pub mod instance;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
