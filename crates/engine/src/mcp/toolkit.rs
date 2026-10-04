@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +29,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            scheduler: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -43,6 +45,16 @@ impl Toolkit {
 
     pub fn set_service(&self, service: Arc<dyn OrchestratorService>) {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
+    }
+
+    pub fn set_scheduler(
+        &self,
+        service: Arc<dyn crate::orchestration::scheduler::service::SchedulerService>,
+    ) {
+        *self
+            .scheduler
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -184,6 +196,7 @@ impl Toolkit {
             ));
         }
         if let Some(task) = &scope.task_id
+            && name != "run_scheduled_task_now"
             && args
                 .get("taskId")
                 .and_then(Value::as_str)
@@ -192,6 +205,18 @@ impl Toolkit {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
         match input {
+            input @ (OrchestrationToolInput::ScheduleTask(_)
+            | OrchestrationToolInput::ListScheduledTasks(_)
+            | OrchestrationToolInput::UpdateScheduledTask(_)
+            | OrchestrationToolInput::DeleteScheduledTask(_)
+            | OrchestrationToolInput::RunScheduledTaskNow(_)) => {
+                crate::orchestration::scheduler::mcp::dispatch(
+                    &self.scheduler,
+                    scope.caller.clone(),
+                    input,
+                )
+                .await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances

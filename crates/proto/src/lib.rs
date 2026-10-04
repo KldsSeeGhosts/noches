@@ -11,6 +11,7 @@ pub mod orchestration_mcp;
 pub mod preview;
 pub mod provider_instance;
 pub mod runtime_policy;
+pub mod scheduler;
 pub mod thread_lifecycle;
 pub mod view;
 pub mod workspace;

@@ -15,6 +15,7 @@ pub mod mailbox;
 pub mod projection;
 pub mod recovery;
 pub mod runner;
+pub mod scheduler;
 pub mod service;
 pub mod store;
 pub mod sync_publish;
@@ -22,6 +23,7 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod ui;
+pub mod ui_scheduler;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

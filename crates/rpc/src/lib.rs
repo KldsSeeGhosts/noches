@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 pub mod remote;
+pub mod scheduled_tasks;
 mod server;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
