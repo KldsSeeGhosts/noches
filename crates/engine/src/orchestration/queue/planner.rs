@@ -61,7 +61,7 @@ pub(crate) fn plan(
             queue_mutation(&mut plan, command, &p, op, now)?
         }
         "t3_pending_request_respond" => respond(&mut plan, command, &p, &op.input, false, now)?,
-        "t3_thread_update" => metadata(&mut plan, command, &p, &op.input, now)?,
+        "t3_thread_update" => metadata(&mut plan, command, &p, op, now)?,
         "t3_thread_organize" | "host.unsnooze_due" | "host.acknowledge_woke" => {
             organize(conn, &mut plan, command, &p, op, now)?
         }
@@ -509,9 +509,10 @@ fn metadata(
     plan: &mut Plan,
     command: &Command,
     p: &ThreadProjection,
-    input: &Value,
+    op: &QueueCommand,
     now: i64,
 ) -> Result<()> {
+    let input = &op.input;
     let mut thread = serde_json::to_value(&p.thread)?;
     match input["action"].as_str() {
         Some("rename") => {
@@ -524,11 +525,14 @@ fn metadata(
                 kind: TitleKind::Regenerate,
             });
         }
-        Some("link_pull_request") => {
-            thread["linkedPullRequest"] = input["resolvedPullRequest"].clone()
-        }
-        Some("unlink_pull_request") => {
-            thread["linkedPullRequest"] = input["resolvedPullRequest"].clone()
+        Some("link_pull_request" | "unlink_pull_request") => {
+            let mut authority = p.thread.clone();
+            op.links.update_metadata(
+                &mut authority,
+                serde_json::from_value(input["resolvedPullRequest"].clone())?,
+                &iso(now)?,
+            )?;
+            thread = serde_json::to_value(authority)?;
         }
         _ => return Err(refuse("Invalid metadata action.")),
     }

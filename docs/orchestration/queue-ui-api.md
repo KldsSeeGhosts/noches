@@ -100,7 +100,7 @@ approve permissions, deliver messages, or execute on replicas.
 
 ## Merge seams and validation scope
 
-- `QueuePullRequestLinks`: `TODO(merge-pr-watch)` replaces the metadata link
+- `PullRequestLinks::update_metadata`: merged PR authority replaces the metadata link
   storage adapter with that slice's stack-aware link authority.
 - `QueueThreadDelivery`: retained `TODO(merge-threads)` after merging wave3.
   `ThreadService` has no existing-message strict delivery, question-answer, or

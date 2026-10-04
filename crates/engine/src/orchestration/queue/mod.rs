@@ -19,19 +19,30 @@ use zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode as Code;
 
 use super::command::{Command, Operation};
 use super::projection::{self, ThreadProjection};
-use super::queue_service::{MetadataPullRequestLinks, QueuePullRequestLinks, QueueService};
+use super::pull_requests::{PullRequestLinks, PullRequestService};
+use super::queue_service::QueueService;
 use super::service::{CallerScope, ToolError};
 use super::{Error, Kernel, ReceiptStatus, Result, task};
 
 pub(crate) use planner::plan;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QueueCommand {
     pub caller: Option<CallerScope>,
     pub name: String,
     pub input: Value,
+    pub links: Arc<dyn PullRequestLinks>,
 }
 
+impl std::fmt::Debug for QueueCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueCommand")
+            .field("caller", &self.caller)
+            .field("name", &self.name)
+            .field("input", &self.input)
+            .finish_non_exhaustive()
+    }
+}
 impl QueueCommand {
     pub(crate) fn command_type(&self) -> &str {
         match self.name.as_str() {
@@ -60,14 +71,17 @@ impl QueueCommand {
 
 pub struct QueueDomain {
     pub kernel: Kernel,
-    pub links: Arc<dyn QueuePullRequestLinks>,
+    pub links: Arc<dyn PullRequestLinks>,
 }
 
 impl QueueDomain {
     pub fn new(kernel: Kernel) -> Self {
         Self {
+            links: Arc::new(PullRequestService {
+                kernel: kernel.clone(),
+                host: Arc::new(super::pull_requests::host::GitHubHost::default()),
+            }),
             kernel,
-            links: Arc::new(MetadataPullRequestLinks),
         }
     }
 
@@ -99,6 +113,7 @@ impl QueueDomain {
                 caller,
                 name: name.into(),
                 input,
+                links: self.links.clone(),
             })),
         };
         self.kernel.dispatch(&command, now).await
@@ -261,8 +276,10 @@ impl QueueDomain {
         Ok(count)
     }
 
-    /// TODO(merge-pr-watch): settlement/watch workers use this host-authority
-    /// entry point, sharing the same guard and source transaction as user settle.
+    /// Host-authority entry point for user/settings lifecycle settlement.
+    /// TODO(merge-pr-watch): PR settlement still needs this planner's Auto
+    /// lifecycle marker and provider detach, inside its sequence-fenced source
+    /// transaction; calling this unfenced entry point afterward is not safe.
     pub async fn settle_for_host(
         &self,
         thread: ThreadId,
@@ -542,7 +559,8 @@ impl QueueService for QueueDomain {
             CommandId(format!("mcp:{}", uuid::Uuid::new_v4()))
         };
         let mut input = input;
-        // Link transformation is pure; storage stays inside the transaction.
+        // Resolution is data-only. The PR authority transforms fresh state in
+        // the receipt transaction after access and idempotency checks.
         if metadata
             && matches!(
                 input["action"].as_str(),
@@ -557,11 +575,7 @@ impl QueueService for QueueDomain {
             if link.is_object() {
                 link["projectId"] = json!(p.thread.project_id);
             }
-            let mut thread = json!({});
-            self.links
-                .update(&mut thread, link)
-                .map_err(|_| unavailable())?;
-            input["resolvedPullRequest"] = thread["linkedPullRequest"].clone();
+            input["resolvedPullRequest"] = link;
         }
         let receipt = self
             .mutate(

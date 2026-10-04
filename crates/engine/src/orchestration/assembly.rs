@@ -40,6 +40,7 @@ impl GitActionsHost {
         registry: Arc<HarnessRegistry>,
         repos: crate::Repos,
         history_roots: Vec<(zeron_proto::git_actions::HistorySource, std::path::PathBuf)>,
+        pull_requests: Option<Arc<dyn super::pull_requests::PullRequestLinks>>,
     ) -> anyhow::Result<Self> {
         let service = super::git_actions::GitActionsService::new(
             store,
@@ -51,6 +52,11 @@ impl GitActionsHost {
             registry,
             history_roots,
         )?;
+        if let Some(pull_requests) = pull_requests {
+            service.set_pr_linker(Arc::new(super::git_actions::UserPullRequestLinker(
+                pull_requests,
+            )));
+        }
         let stop = CancellationToken::new();
         let token = stop.clone();
         let worker_service = service.clone();
@@ -344,7 +350,14 @@ impl OrchestrationHost {
         // Start scheduling only after launch intake is installed below. A
         // first-tick unbound task must not race host assembly.
         // ── P4b queue/questions/lifecycle assembly ───────────────────────────
-        let queue_domain = Arc::new(super::queue::QueueDomain::new(kernel.clone()));
+        let pull_requests = Arc::new(super::pull_requests::PullRequestService {
+            kernel: kernel.clone(),
+            host: Arc::new(super::pull_requests::host::GitHubHost::default()),
+        });
+        let queue_domain = Arc::new(super::queue::QueueDomain {
+            kernel: kernel.clone(),
+            links: pull_requests.clone(),
+        });
         let queue_host = Arc::new(super::queue::host::HostQueue {
             domain: queue_domain.clone(),
             docs: doc_host.clone(),
@@ -373,10 +386,6 @@ impl OrchestrationHost {
         // ── end P4b assembly ────────────────────────────────────────────────
         // END scheduler slice.
         // -- PR links/watch/settlement (wave 3 pr-watch) --
-        let pull_requests = Arc::new(super::pull_requests::PullRequestService {
-            kernel: kernel.clone(),
-            host: Arc::new(super::pull_requests::host::GitHubHost::default()),
-        });
         sessions
             .mcp_server()
             .set_pull_requests(pull_requests.clone());

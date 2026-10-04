@@ -870,6 +870,7 @@ async fn successful_promotion_preserves_attachments_and_only_enqueues_steering()
                             driver: "mock".into(),
                             sender: "parent".into(),
                             target_run: Some(active.id.clone()),
+                            metadata: None,
                         },
                     ),
                 )),
@@ -1024,6 +1025,68 @@ async fn metadata_regeneration_link_unlink_and_noop_reorder() {
 }
 
 #[tokio::test]
+async fn metadata_pr_authority_is_atomic_replayable_and_preserves_sibling_and_watch() {
+    use crate::orchestration::pull_requests::identity::parse_url;
+    use crate::orchestration::store::WriteBoundary;
+    let f = Fixture::new();
+    let target = ThreadId("target".into());
+    let url = "https://github.com/KldsSeeGhosts/noches/pull/41";
+    let links = &f.service.links;
+    links
+        .link(
+            &target,
+            parse_url("https://github.com/KldsSeeGhosts/noches/pull/40").unwrap(),
+            ThreadPullRequestLinkSource::Stack,
+        )
+        .await
+        .unwrap();
+    links
+        .set_watching(&target, parse_url(url).unwrap(), true)
+        .await
+        .unwrap();
+    let input = json!({"threadId":"target","action":"link_pull_request","clientRequestId":"durable",
+        "pullRequest":{"repository":"KldsSeeGhosts/noches","number":41,"url":url}});
+    let before = links.links(&target).unwrap();
+    f.service
+        .kernel
+        .store
+        .inject_failure(WriteBoundary::BeforeCommit, 1);
+    assert!(f.call("t3_thread_update", input.clone()).await.is_err());
+    assert_eq!(links.links(&target).unwrap(), before);
+    f.service
+        .kernel
+        .store
+        .inject_failure(WriteBoundary::AfterCommit, 1);
+    assert!(f.call("t3_thread_update", input.clone()).await.is_err());
+    let committed = links.links(&target).unwrap();
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[1].source, ThreadPullRequestLinkSource::Manual);
+    assert!(committed[1].watch.as_ref().is_some());
+    let accepted = f.call("t3_thread_update", input.clone()).await.unwrap();
+    assert_eq!(
+        accepted["linkedPullRequest"]["repository"],
+        "KldsSeeGhosts/noches"
+    );
+    let unlinked = f
+        .call(
+            "t3_thread_update",
+            json!({"threadId":"target",
+        "action":"unlink_pull_request","clientRequestId":"remove"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlinked["linkedPullRequest"], Value::Null);
+    assert_eq!(links.links(&target).unwrap().len(), 1);
+    assert_eq!(
+        links.links(&target).unwrap()[0].source,
+        ThreadPullRequestLinkSource::Stack
+    );
+    // The old command result is stable; replay must not resurrect its link.
+    assert_eq!(f.call("t3_thread_update", input).await.unwrap(), accepted);
+    assert_eq!(links.links(&target).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn mcp_uses_pinned_schemas_trims_search_and_returns_named_failures() {
     let f = Fixture::new();
     let scope = crate::mcp::auth::InvocationScope {
@@ -1165,6 +1228,7 @@ async fn shared_thread_send_clears_synced_settlement_source_and_snooze() {
                             driver: "mock".into(),
                             sender: "parent".into(),
                             target_run: None,
+                            metadata: None,
                         },
                     ),
                 )),

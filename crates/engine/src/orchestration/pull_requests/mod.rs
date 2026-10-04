@@ -96,6 +96,41 @@ impl PrError {
 /// Methods are host-authority only, not agent-supplied cross-thread targeting.
 #[async_trait]
 pub trait PullRequestLinks: Send + Sync + 'static {
+    /// T3's legacy metadata command updates both link representations inside
+    /// its own receipt transaction, not through a second async command.
+    fn update_metadata(
+        &self,
+        thread: &mut OrchestrationV2AppThread,
+        linked: Option<ThreadLinkedPullRequest>,
+        now: &str,
+    ) -> Result<()> {
+        let mut links = links_of(thread);
+        let previous = thread
+            .linked_pull_request
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(legacy_identity);
+        let target = linked.as_ref().map(legacy_identity);
+        let watch = target.as_ref().and_then(|target| {
+            links
+                .iter()
+                .find(|link| chains::identity(link).key() == target.key())
+                .map(|link| link.watch.clone())
+        });
+        links.retain(|link| {
+            let key = chains::identity(link).key();
+            !previous.as_ref().is_some_and(|id| id.key() == key)
+                && !target.as_ref().is_some_and(|id| id.key() == key)
+        });
+        if let Some(target) = target {
+            let mut link = new_link(&target, ThreadPullRequestLinkSource::Manual, now);
+            link.watch = watch.unwrap_or(Optional::Absent);
+            links.push(link);
+        }
+        thread.linked_pull_request = Optional::Present(linked);
+        thread.pull_requests = Optional::Present(links);
+        Ok(())
+    }
     fn links(&self, thread: &ThreadId) -> Result<Vec<ThreadPullRequestLink>>;
     async fn link(
         &self,
@@ -116,6 +151,25 @@ pub trait PullRequestLinks: Send + Sync + 'static {
         name: &str,
         args: Value,
     ) -> std::result::Result<Value, PrError>;
+}
+
+fn legacy_identity(link: &ThreadLinkedPullRequest) -> Identity {
+    let parsed = identity::parse_url(&link.url).filter(|id| id.number == link.number);
+    if let Some(id) = parsed.as_ref()
+        && (id.host == "dev.azure.com" || id.host.contains(':'))
+    {
+        return id.clone();
+    }
+    Identity {
+        host: reqwest::Url::parse(&link.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase))
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "unknown".into()),
+        repository: link.repository.trim().to_lowercase(),
+        number: link.number,
+        url: link.url.clone(),
+    }
 }
 
 #[derive(Clone)]
@@ -178,15 +232,7 @@ pub fn links_of(thread: &OrchestrationV2AppThread) -> Vec<ThreadPullRequestLink>
         .as_ref()
         .and_then(Option::as_ref)
         .map(|legacy| {
-            let target = identity::parse_url(&legacy.url).unwrap_or_else(|| Identity {
-                host: reqwest::Url::parse(&legacy.url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unknown".into()),
-                repository: legacy.repository.to_lowercase(),
-                number: legacy.number,
-                url: legacy.url.clone(),
-            });
+            let target = legacy_identity(legacy);
             new_link(
                 &target,
                 ThreadPullRequestLinkSource::Manual,

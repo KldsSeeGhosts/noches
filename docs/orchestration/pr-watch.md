@@ -73,6 +73,15 @@ MCP uses `Agent`; sync-discovered native siblings use `Stack`. Targets use
 host-level canonical comparison. These methods do not modify the central
 `OrchestratorService` trait.
 
+The integrated queue calls `PullRequestLinks::update_metadata` inside its
+ordinary command receipt transaction. This synchronous authority operation
+mirrors T3's legacy metadata reducer: replace only the old/new scalar PR keys,
+retain unrelated links, preserve a re-linked PR's watch, clear its snapshot
+and stack, and return the exact legacy metadata result. It does not issue a
+second async link command or create a crash window between representations.
+Git-actions installs `UserPullRequestLinker` in host assembly; link failure
+retains the created URL and reports `uncertain`, never `prLinked: true`.
+
 `PullRequestHost` is the injectable host boundary; production GitHub reads
 reuse `source_control::GitHubCli::read_json`, its login PATH, bounded timeout/
 output, noninteractive environment and sanitized errors. GraphQL checks

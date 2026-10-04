@@ -351,6 +351,10 @@ impl EngineCore {
                     agent_accounts_config.codex_home.join("sessions"),
                 ),
             ],
+            orchestration_host.as_ref().map(|host| {
+                host.pull_requests.clone()
+                    as Arc<dyn orchestration::pull_requests::PullRequestLinks>
+            }),
         )
         .map_err(|error| EngineError::Other(error.to_string()))?;
         sessions.set_generated_images(
