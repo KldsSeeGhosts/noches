@@ -44,6 +44,10 @@ pub mod methods {
         ]
         .contains(&method)
     }
+
+    pub fn is_stream(method: &str) -> bool {
+        [WATCH_GIT_ACTION, WATCH_SCAN, WATCH_IMPORT].contains(&method)
+    }
 }
 
 use crate::{RpcClient, RpcError, RpcSubscription};
