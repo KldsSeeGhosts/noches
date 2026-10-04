@@ -22,6 +22,7 @@ mod client;
 pub mod device_room;
 pub mod remote;
 mod server;
+mod threads;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -34,6 +35,8 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
+    pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:

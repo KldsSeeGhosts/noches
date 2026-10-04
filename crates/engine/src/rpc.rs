@@ -1621,6 +1621,32 @@ impl RpcService for EngineRpc {
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())
             }
+            methods::GET_THREAD_SUMMARIES => {
+                let input: zeron_proto::orchestration_threads::ThreadSummariesRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_summaries(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_THREAD_TIMELINE => {
+                let input: zeron_proto::orchestration_threads::ThreadTimelineRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_timeline(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
             methods::CANCEL_DELEGATED_TASK => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
