@@ -4,6 +4,51 @@ Desktop syntax highlighting lives in the pure `zeron-syntax` crate. It detects l
 
 Markdown fences and tool diffs parse complete documents on GPUI's background executor. Changes first parses separate old/new hunk excerpts, then lazily asks the checkout host for checksum-bound complete sources. Deleted lines use the old document; added and context lines prefer the new document. A stale checksum or any visible-line mismatch discards the full result atomically.
 
+## Paint palettes
+
+Appearance's **Syntax colours: Theme | Pierre** selector is orthogonal to the
+workbench theme and interactive accent. With no saved preference, the Claude
+family uses Pierre and other families retain their authored Theme palette.
+An explicit selection persists across theme switches. T3 v1 role files have
+no syntax colors, so their imported Theme palette also starts from Pierre.
+
+`zeron_theme::syntax_presets::pierre(appearance)` contains the original light /
+dark colors, hand-mapped to all 31 `HighlightKind`s. `pierre_on` calls
+`Color::ensure_contrast` against actual code and diff backgrounds to enforce
+a documented **3.0:1 floor**. This intentionally keeps Pierre's softer syntax
+distinct from the legacy Theme palette's 4.5:1 chromatic-text gates. Low-contrast
+light cyan/gold and dark punctuation are adjusted toward a safe anchor;
+color is the only change. No italics, weights, sizing, or TextMate substring
+matching are imported. `Embedded` shares `Punctuation`; macro, label, and
+Markdown roles use the closest scope listed in the preset source.
+
+Provenance: extracted from `/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar`,
+tag `v0.0.46-nightly.20261003.2632`, 248 token rules per appearance.
+SHA-256 of each extracted compact JSON object:
+
+- Pierre light: `474d75304db71665e168a8feab3395cb2ec5d565e12f1815d03585fec2fb042b`
+- Pierre dark: `5a363b81b80bcfda24cee4bcc6c1d785ea81f000f782c19ba9dc27d5f77fc89e`
+
+Reproduce the report's extraction without editing the installed application:
+
+```python
+import json, re
+from pathlib import Path
+
+data = Path("/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar").read_bytes()
+for name in (b"pierre-light", b"pierre-dark"):
+    match = re.search(b'"name":"' + name + b'"', data)
+    start = data.rfind(b"{", max(0, match.start() - 200), match.start())
+    depth = 0
+    i = start
+    while True:
+        depth += (data[i] == 0x7b) - (data[i] == 0x7d)
+        if depth == 0:
+            break
+        i += 1
+    print(json.dumps(json.loads(data[start:i + 1]), indent=2))
+```
+
 ## Query composition and ownership
 
 Derived grammars must explicitly compose every compatible base and extension query in base-to-extension order. JavaScript uses the JavaScript query, JSX adds the JSX extension, TypeScript adds the TypeScript extension to JavaScript, and TSX combines all three. Query extensions must not be treated as standalone highlight definitions.

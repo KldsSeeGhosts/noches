@@ -37,9 +37,10 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use gpui::{App, Global, Hsla, SharedString, hsla};
 use serde::{Deserialize, Serialize};
 use zeron_syntax::HighlightKind;
+use zeron_theme::syntax_presets::{self, SyntaxColors};
 use zeron_theme::{
     AccentPreset, AccentSelection, Color as ModelColor, SurfacePreference, SurfaceTreatment,
-    ThemeRegistry, ThemeVariant,
+    ThemeColors, ThemeRegistry, ThemeVariant,
 };
 
 type PreviewKey = (Appearance, String, AccentSelection, SurfacePreference);
@@ -455,9 +456,15 @@ impl SyntaxPalette {
     }
 
     fn from_variant(variant: &ThemeVariant, fallback: Self) -> Self {
+        Self::from_colors(&variant.syntax, fallback)
+    }
+
+    fn from_colors(
+        colors: &std::collections::BTreeMap<String, ModelColor>,
+        fallback: Self,
+    ) -> Self {
         let color = |key: &str, fallback: Hsla| {
-            variant
-                .syntax
+            colors
                 .get(key)
                 .copied()
                 .map(model_color)
@@ -735,6 +742,7 @@ pub struct Theme {
     pub code_wash: Hsla,
     /// Shared paint-only syntax palette.
     pub syntax: SyntaxPalette,
+    pub syntax_colors: SyntaxColors,
     /// Diff: added lines.
     pub diff_add: Hsla,
     /// Diff: deleted lines.
@@ -764,6 +772,9 @@ pub struct Theme {
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
+    /// Source-neutral optional overrides; access through the semantic methods
+    /// below. None is the exact legacy derivation, not a new default palette.
+    optional_colors: Option<ThemeColors>,
 }
 
 #[derive(Debug, Clone)]
@@ -1118,7 +1129,7 @@ impl Theme {
             surface_card: grey(0x0e),
             surface_dialog: grey(0x10),
             surface_overlay: grey(0x16),
-            element_hover: hsla(0.0, 0.0, 0.92, 0.11),
+            element_hover: hsla(0.0, 0.0, 0.92, 0.05),
             element_active: hsla(0.0, 0.0, 0.92, 0.16),
             border: hsla(0.0, 0.0, 1.0, 0.08),
             border_strong: hsla(0.0, 0.0, 1.0, 0.14),
@@ -1157,6 +1168,7 @@ impl Theme {
                 neutral(0.60),
                 oklch(0.704, 0.191, 22.216),
             ),
+            syntax_colors: SyntaxColors::Theme,
             diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
@@ -1170,6 +1182,7 @@ impl Theme {
             terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
+            optional_colors: None,
         }
     }
 
@@ -1209,7 +1222,7 @@ impl Theme {
             surface_card: grey(0xff),
             surface_dialog: grey(0xff),
             surface_overlay: grey(0xff),
-            element_hover: hsla(0.0, 0.0, 0.10, 0.06),
+            element_hover: hsla(0.0, 0.0, 0.10, 0.045),
             element_active: hsla(0.0, 0.0, 0.10, 0.10),
             border: hsla(0.0, 0.0, 0.0, 0.10),
             border_strong: hsla(0.0, 0.0, 0.0, 0.17),
@@ -1259,6 +1272,7 @@ impl Theme {
                 neutral(0.48),
                 oklch(0.505, 0.213, 27.518),
             ),
+            syntax_colors: SyntaxColors::Theme,
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
@@ -1272,6 +1286,7 @@ impl Theme {
             terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
+            optional_colors: None,
         }
     }
 
@@ -1461,6 +1476,38 @@ impl Theme {
         theme.diff_hunk_bg = model_color(colors.diff_hunk);
         theme.terminal = TerminalColors::from_variant(variant);
         theme.font_ui = theme.font_sans.clone();
+        let mut optional = colors.clone();
+        if !is_curated_builtin {
+            let action = optional
+                .action
+                .unwrap_or(colors.solid)
+                .blend_over(colors.background);
+            let message = optional
+                .message_surface
+                .unwrap_or(colors.raised)
+                .blend_over(colors.background);
+            let code = optional
+                .code_background
+                .unwrap_or(colors.background)
+                .blend_over(colors.background);
+            for (color, backgrounds, floor) in [
+                (&mut optional.on_action, vec![action], 4.5),
+                (&mut optional.message_foreground, vec![message], 4.5),
+                (&mut optional.code_foreground, vec![code], 4.5),
+                (&mut optional.placeholder, vec![colors.input], 3.0),
+                (
+                    &mut optional.icon_muted,
+                    vec![colors.background, colors.shell],
+                    3.0,
+                ),
+                (&mut optional.link, vec![colors.background], 4.5),
+            ] {
+                if let Some(value) = color {
+                    *value = harden_model_foreground(*value, &backgrounds, floor, None);
+                }
+            }
+        }
+        theme.optional_colors = Some(optional);
         if !is_curated_builtin {
             theme.terminal.foreground = model_color(harden_model_foreground(
                 variant.terminal.foreground,
@@ -1485,6 +1532,7 @@ impl Theme {
             .is_some_and(|theme| theme.accent_color != accent);
         set_current_appearance(appearance);
         let next = Self::for_preferences(appearance, accent)
+            .with_syntax_colors(crate::settings::current(cx).syntax_colors)
             .with_font_sans(crate::typography::effective_family_name(cx))
             .with_font_mono(crate::typography::code_effective_family_name(cx))
             .with_font_terminal(crate::typography::terminal_effective_family_name(cx))
@@ -1547,6 +1595,7 @@ impl Theme {
     ) {
         let next =
             Self::for_selection(appearance, variant_id, accent_selection, surface_preference)
+                .with_syntax_colors(crate::settings::current(cx).syntax_colors)
                 .with_font_sans(crate::typography::effective_family_name(cx))
                 .with_font_mono(crate::typography::code_effective_family_name(cx))
                 .with_font_terminal(crate::typography::terminal_effective_family_name(cx))
@@ -1557,6 +1606,7 @@ impl Theme {
                 || theme.accent_selection != next.accent_selection
                 || theme.surface_preference != next.surface_preference
                 || theme.appearance != next.appearance
+                || theme.syntax_colors != next.syntax_colors
         });
         set_current_appearance(appearance);
         sync_gpui_base_scrollbar(&next, cx);
@@ -1584,6 +1634,135 @@ impl Theme {
     /// State wash at `alpha` — see [`wash`].
     pub fn wash(&self, alpha: f32) -> Hsla {
         wash_for(self.appearance, alpha)
+    }
+
+    fn semantic(
+        &self,
+        role: impl FnOnce(&ThemeColors) -> Option<ModelColor>,
+        fallback: Hsla,
+    ) -> Hsla {
+        self.optional_colors
+            .as_ref()
+            .and_then(role)
+            .map(model_color)
+            .unwrap_or(fallback)
+    }
+
+    pub fn action(&self) -> Hsla {
+        self.semantic(|c| c.action, self.solid)
+    }
+    pub fn on_action(&self) -> Hsla {
+        self.semantic(|c| c.on_action, self.on_solid)
+    }
+    pub fn action_hover(&self) -> Hsla {
+        self.semantic(|c| c.action_hover, self.solid.opacity(0.85))
+    }
+    pub fn control_hover(&self) -> Hsla {
+        self.semantic(|c| c.control_hover, self.element_hover)
+    }
+    pub fn sidebar_hover(&self) -> Hsla {
+        if self.is_frost() {
+            self.wash(if self.appearance.is_dark() {
+                0.05
+            } else {
+                0.045
+            })
+        } else {
+            self.semantic(|c| c.sidebar_hover, self.element_hover)
+        }
+    }
+    pub fn sidebar_selected(&self) -> Hsla {
+        let fallback = self.wash(if self.appearance.is_dark() {
+            0.075
+        } else {
+            0.065
+        });
+        if self.is_frost() {
+            fallback
+        } else {
+            self.semantic(|c| c.sidebar_selected, fallback)
+        }
+    }
+    pub fn sidebar_active(&self) -> Hsla {
+        let fallback = self.sidebar_selected();
+        if self.is_frost() {
+            self.wash(if self.appearance.is_dark() {
+                0.09
+            } else {
+                0.08
+            })
+        } else {
+            self.semantic(|c| c.sidebar_active, fallback)
+        }
+    }
+    pub fn placeholder(&self) -> Hsla {
+        self.semantic(|c| c.placeholder, self.text_faint)
+    }
+    pub fn composer_outline(&self) -> Hsla {
+        self.semantic(|c| c.composer_outline, self.border)
+    }
+    pub fn message_surface(&self) -> Hsla {
+        self.semantic(
+            |c| c.message_surface,
+            self.wash(if self.appearance.is_dark() {
+                0.08
+            } else {
+                0.04
+            }),
+        )
+    }
+    pub fn message_foreground(&self) -> Hsla {
+        self.semantic(|c| c.message_foreground, self.text)
+    }
+    pub fn code_background(&self) -> Hsla {
+        self.semantic(|c| c.code_background, self.bg)
+    }
+    pub fn code_foreground(&self) -> Hsla {
+        self.semantic(|c| c.code_foreground, self.text)
+    }
+    pub fn icon_muted(&self) -> Hsla {
+        self.semantic(|c| c.icon_muted, self.text_faint)
+    }
+    pub fn accent_surface(&self) -> Hsla {
+        self.semantic(|c| c.accent_surface, self.accent_wash)
+    }
+    pub fn danger_surface(&self) -> Hsla {
+        self.semantic(|c| c.danger_surface, self.danger.opacity(0.1))
+    }
+    pub fn warning_surface(&self) -> Hsla {
+        self.semantic(|c| c.warning_surface, self.warning.opacity(0.1))
+    }
+    pub fn link(&self) -> Hsla {
+        self.semantic(|c| c.link, self.accent)
+    }
+    pub fn muted(&self) -> Hsla {
+        self.semantic(|c| c.muted, self.surface_raised)
+    }
+
+    /// Orthogonal paint-only syntax selection; no parsing/layout cache changes.
+    pub fn with_syntax_colors(mut self, preference: Option<SyntaxColors>) -> Self {
+        let registry = ThemeRegistry::active();
+        let family_name = registry
+            .families
+            .iter()
+            .find(|family| family.id == self.family_id.as_ref())
+            .map(|family| family.name.as_str())
+            .unwrap_or(self.family_id.as_ref());
+        self.syntax_colors = SyntaxColors::resolve(preference, family_name);
+        if let Some(variant) = registry.variant(self.variant_id.as_ref()) {
+            self.syntax = SyntaxPalette::from_variant(variant, self.syntax);
+            if self.syntax_colors == SyntaxColors::Pierre {
+                let bg = variant.colors.background;
+                let code = variant.colors.code_background.unwrap_or(bg).blend_over(bg);
+                let add = variant.colors.diff_add.with_alpha(0.055).blend_over(bg);
+                let delete = variant.colors.diff_delete.with_alpha(0.055).blend_over(bg);
+                self.syntax = SyntaxPalette::from_colors(
+                    &syntax_presets::pierre_on(variant.appearance, &[code, bg, add, delete]),
+                    self.syntax,
+                );
+            }
+        }
+        self
     }
 }
 
@@ -1731,17 +1910,13 @@ fn band_for(appearance: Appearance) -> Hsla {
 }
 
 /// Selected-state glass treatment (tabs, session rows, space rows): a
-/// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
-/// the glass (user request). Dark: the 11% [`wash`]. Light: the tone-flipped
-/// wash at 6% — 11% black read too dark over the bright frost (user report;
-/// light also previously ran a near-opaque white chip, rejected the same
-/// way). Same fill as [`Theme::glass_hover`] — the ring in
-/// [`glass_selected_shadows`] is what distinguishes selection. Selection
+/// TRANSLUCENT wash the vibrancy reads through. Selected is deliberately one
+/// step above hover: dark 7.5%, light 6.5%. Selection
 /// *inside floating cards* is different — see [`card_selected_bg`].
 pub fn glass_selected_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.11),
-        Appearance::Light => wash(0.06),
+        Appearance::Dark => wash(0.075),
+        Appearance::Light => wash(0.065),
     }
 }
 
@@ -2227,6 +2402,11 @@ mod tests {
         variant.colors.text = variant.colors.background;
         variant.colors.text_muted = variant.colors.background;
         variant.colors.on_solid = variant.colors.solid;
+        variant.colors.action = Some(variant.colors.solid);
+        variant.colors.on_action = Some(variant.colors.solid);
+        variant.colors.code_background = Some(variant.colors.background);
+        variant.colors.code_foreground = Some(variant.colors.background);
+        variant.colors.placeholder = Some(variant.colors.input);
         variant.terminal.foreground = variant.terminal.background;
 
         let theme = Theme::from_variant(
@@ -2237,6 +2417,9 @@ mod tests {
         assert!(painted_contrast(theme.text, theme.bg) >= 4.5);
         assert!(painted_contrast(theme.text_muted, theme.bg) >= 4.5);
         assert!(painted_contrast(theme.on_solid, theme.solid) >= 4.5);
+        assert!(painted_contrast(theme.on_action(), theme.action()) >= 4.5);
+        assert!(painted_contrast(theme.code_foreground(), theme.code_background()) >= 4.5);
+        assert!(painted_contrast(theme.placeholder(), theme.input_bg) >= 3.0);
         assert!(painted_contrast(theme.terminal.foreground, theme.terminal.background) >= 4.5);
     }
 
@@ -2264,6 +2447,140 @@ mod tests {
                 "{} muted text",
                 variant.id
             );
+        }
+    }
+
+    #[test]
+    fn optional_roles_keep_legacy_builtin_derivations() {
+        for variant in ThemeRegistry::builtin()
+            .families
+            .iter()
+            .filter(|family| family.id != "claude")
+            .flat_map(|family| &family.variants)
+        {
+            let t = Theme::from_variant(
+                variant,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Opaque,
+            );
+            for (actual, expected) in [
+                (t.action(), t.solid),
+                (t.on_action(), t.on_solid),
+                (t.action_hover(), t.solid.opacity(0.85)),
+                (t.control_hover(), t.element_hover),
+                (t.sidebar_hover(), t.element_hover),
+                (t.placeholder(), t.text_faint),
+                (t.composer_outline(), t.border),
+                (t.message_foreground(), t.text),
+                (t.code_background(), t.bg),
+                (t.code_foreground(), t.text),
+                (t.icon_muted(), t.text_faint),
+                (t.accent_surface(), t.accent_wash),
+                (t.link(), t.accent),
+                (t.muted(), t.surface_raised),
+                (t.danger_surface(), t.danger.opacity(0.1)),
+                (t.warning_surface(), t.warning.opacity(0.1)),
+            ] {
+                assert_eq!(actual, expected, "{}", variant.id);
+            }
+            assert_eq!(
+                t.message_surface(),
+                t.wash(if t.appearance.is_dark() { 0.08 } else { 0.04 })
+            );
+            assert_eq!(t.sidebar_active(), t.sidebar_selected());
+        }
+    }
+
+    #[test]
+    fn claude_roles_and_frost_tiers_are_distinct() {
+        for (id, appearance, hover, selected, active) in [
+            ("claude-light", Appearance::Light, 0.045, 0.065, 0.08),
+            ("claude-dark", Appearance::Dark, 0.05, 0.075, 0.09),
+        ] {
+            let t = Theme::for_selection(
+                appearance,
+                id,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Opaque,
+            );
+            assert_ne!(t.sidebar_hover(), t.sidebar_selected());
+            assert_ne!(t.sidebar_selected(), t.sidebar_active());
+            assert_eq!(t.action(), t.solid);
+            assert_ne!(t.code_background(), t.bg);
+            let frosted = Theme::for_selection(
+                appearance,
+                id,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Frosted,
+            );
+            assert_eq!(frosted.sidebar_hover().a, hover);
+            assert_eq!(frosted.sidebar_selected().a, selected);
+            assert_eq!(frosted.sidebar_active().a, active);
+        }
+    }
+
+    #[test]
+    fn pierre_clears_code_and_diff_floor_for_every_builtin() {
+        let kinds = [
+            HighlightKind::Comment,
+            HighlightKind::Keyword,
+            HighlightKind::String,
+            HighlightKind::StringSpecial,
+            HighlightKind::Escape,
+            HighlightKind::Number,
+            HighlightKind::Boolean,
+            HighlightKind::Type,
+            HighlightKind::TypeBuiltin,
+            HighlightKind::Constructor,
+            HighlightKind::Function,
+            HighlightKind::FunctionBuiltin,
+            HighlightKind::Macro,
+            HighlightKind::Property,
+            HighlightKind::Constant,
+            HighlightKind::Variable,
+            HighlightKind::VariableSpecial,
+            HighlightKind::Parameter,
+            HighlightKind::Operator,
+            HighlightKind::Punctuation,
+            HighlightKind::Embedded,
+            HighlightKind::Tag,
+            HighlightKind::Attribute,
+            HighlightKind::Label,
+            HighlightKind::MarkupHeading,
+            HighlightKind::MarkupRaw,
+            HighlightKind::MarkupLink,
+            HighlightKind::MarkupReference,
+            HighlightKind::MarkupEmphasis,
+            HighlightKind::MarkupStrong,
+            HighlightKind::Invalid,
+        ];
+        for variant in ThemeRegistry::builtin()
+            .families
+            .iter()
+            .flat_map(|family| &family.variants)
+        {
+            let theme = Theme::from_variant(
+                variant,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Opaque,
+            )
+            .with_syntax_colors(Some(SyntaxColors::Pierre));
+            let backgrounds = [
+                flatten(theme.code_background(), theme.bg),
+                theme.bg,
+                flatten(theme.diff_add.opacity(0.055), theme.bg),
+                flatten(theme.diff_del.opacity(0.055), theme.bg),
+            ];
+            for kind in kinds {
+                for bg in backgrounds {
+                    let ratio = contrast_ratio(theme.syntax.color(kind), bg);
+                    assert!(
+                        ratio >= 3.0 - 0.02,
+                        "{} {kind:?} is {ratio:.2}:1",
+                        variant.id
+                    );
+                }
+            }
         }
     }
 
@@ -2875,7 +3192,11 @@ mod tests {
         let registry = ThemeRegistry::builtin();
         for family in &registry.families {
             for variant in &family.variants {
-                let theme = Theme::from_variant(variant, AccentSelection::ThemeDefault, SurfacePreference::ThemeDefault);
+                let theme = Theme::from_variant(
+                    variant,
+                    AccentSelection::ThemeDefault,
+                    SurfacePreference::ThemeDefault,
+                );
                 assert_eq!(theme.ok, theme.success);
                 assert_eq!(theme.working, theme.busy);
                 assert_eq!(theme.font_ui, theme.font_sans);

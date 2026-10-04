@@ -158,6 +158,11 @@ pub fn compile_source(path: &Path, options: CompileOptions) -> Result<SourceComp
     if let Some(package_json) = package_json {
         return compile_package(&path, &package_json, options);
     }
+    if let Ok(value) = serde_json::from_str::<Value>(&read_bounded(&path, "theme source")?)
+        && crate::t3::is_t3(&value)
+    {
+        return crate::t3::import_file(&path, options);
+    }
     compile_single_file(path, options)
 }
 
@@ -474,7 +479,7 @@ fn ensure_contained(path: &Path, root: &Path, kind: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_bounded(path: &Path, kind: &str) -> Result<String> {
+pub(crate) fn read_bounded(path: &Path, kind: &str) -> Result<String> {
     let size = fs::metadata(path)
         .with_context(|| format!("could not inspect {kind} {}", path.display()))?
         .len();
@@ -1114,7 +1119,7 @@ fn harden_foreground(
     resolved
 }
 
-fn ensure_contrast_across(
+pub(crate) fn ensure_contrast_across(
     color: Color,
     backgrounds: &[Color],
     minimum: f32,

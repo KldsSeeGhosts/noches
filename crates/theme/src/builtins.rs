@@ -59,6 +59,7 @@ pub fn builtin_registry() -> &'static ThemeRegistry {
             ),
             family("cobalt2", "Cobalt2", vec![cobalt2()]),
             family("andromeda", "Andromeda", vec![andromeda()]),
+            claude(),
         ],
     })
 }
@@ -120,7 +121,7 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
         card,
         dialog: card.mix(raised, if dark { 0.18 } else { 0.04 }),
         overlay: card.mix(raised, if dark { 0.34 } else { 0.02 }),
-        hover: border_tone.with_alpha(if dark { 0.11 } else { 0.06 }),
+        hover: border_tone.with_alpha(if dark { 0.05 } else { 0.045 }),
         active: accent.primary.with_alpha(if dark { 0.18 } else { 0.10 }),
         border: border_tone.with_alpha(if dark { 0.10 } else { 0.12 }),
         border_strong: border_tone.with_alpha(if dark { 0.18 } else { 0.22 }),
@@ -140,6 +141,25 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
         diff_add: success,
         diff_delete: danger,
         diff_hunk: accent.primary.with_alpha(if dark { 0.08 } else { 0.07 }),
+        action: None,
+        on_action: None,
+        action_hover: None,
+        control_hover: None,
+        sidebar_hover: None,
+        sidebar_selected: None,
+        sidebar_active: None,
+        placeholder: None,
+        composer_outline: None,
+        message_surface: None,
+        message_foreground: None,
+        code_background: None,
+        code_foreground: None,
+        icon_muted: None,
+        accent_surface: None,
+        danger_surface: None,
+        warning_surface: None,
+        link: None,
+        muted: None,
     };
     let terminal_background = c(seed.terminal_background);
     let mut variant = ThemeVariant {
@@ -224,6 +244,52 @@ fn source(id: &str, format: &str, url: &str, revision: &str, license: &str) -> T
 
 fn c(value: &str) -> Color {
     value.parse().expect("built-in theme colors are valid")
+}
+
+pub(crate) fn fallback_variant(appearance: Appearance) -> ThemeVariant {
+    if appearance.is_dark() {
+        zeron_dark()
+    } else {
+        zeron_light()
+    }
+}
+
+fn claude() -> ThemeFamily {
+    let mut family = crate::t3::import_str(
+        include_str!("../tests/fixtures/claude.json"),
+        "builtin:claude".into(),
+        crate::vscode::CompileOptions {
+            family_id: "claude".into(),
+            family_name: "Claude".into(),
+            source_url: "https://github.com/KldsSeeGhosts/noches/blob/dev/crates/theme/tests/fixtures/claude.json".into(),
+            revision: "user-palette-2026-10-03".into(),
+            license: "User-authored palette, included by permission".into(),
+        },
+    ).expect("checked-in Claude role file is valid").family;
+    for variant in &mut family.variants {
+        // Authored ANSI16, warm/desaturated to sit with the Claude workbench.
+        let ansi = if variant.appearance.is_dark() {
+            [
+                "#292824", "#d9534f", "#80b47a", "#d6ae58", "#6ba3d6", "#b18ac6", "#70b8b0",
+                "#d8d4c6", "#77746b", "#ee8b80", "#a4cd96", "#e7c779", "#9bc1e8", "#ceb0de",
+                "#9cd3ca", "#f0eee6",
+            ]
+        } else {
+            [
+                "#29261b", "#b53333", "#437b48", "#946b24", "#3b6fb6", "#855a9b", "#397e78",
+                "#6b6a63", "#85837a", "#9b2c2c", "#365f36", "#805916", "#2f5c99", "#704881",
+                "#2b6661", "#3d3929",
+            ]
+        };
+        variant.terminal.ansi =
+            ansi.map(|value| c(value).ensure_contrast(variant.terminal.background, 3.0));
+        variant.source.asset_hash.clear();
+        variant.source.asset_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&variant).expect("Claude serializes"))
+        );
+    }
+    family
 }
 
 const ANSI_DARK: [&str; 16] = [
