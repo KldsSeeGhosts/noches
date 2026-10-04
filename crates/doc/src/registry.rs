@@ -901,6 +901,10 @@ impl RegistryDoc {
                 "harnessSessionCwd",
                 opt_str(chat.harness_session_cwd.as_deref()),
             ),
+            (
+                "harnessSessionInstanceId",
+                json!(chat.harness_session_instance_id),
+            ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
             (
@@ -1165,6 +1169,46 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    pub fn set_chat_harness_session_instance(
+        &mut self,
+        chat_id: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("harnessSessionInstanceId", json!(instance))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_harness_session_binding(
+        &mut self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("harnessSessionId", json!(session_id)),
+                ("harnessSessionCwd", json!(cwd)),
+                ("harnessSessionInstanceId", json!(instance)),
+            ]),
+        );
+        Ok(true)
+    }
+
     /// Host-side sidebar freshness: preview + timestamp of the latest message.
     pub fn set_chat_last_message(
         &mut self,
@@ -1329,6 +1373,10 @@ impl RegistryDoc {
                     (
                         "harnessSessionCwd",
                         opt_str(chat.harness_session_cwd.as_deref()),
+                    ),
+                    (
+                        "harnessSessionInstanceId",
+                        json!(chat.harness_session_instance_id),
                     ),
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),

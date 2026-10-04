@@ -269,6 +269,7 @@ impl Tools {
             "MCP session creation cannot disable the sandbox"
         );
         let config = ChatConfig {
+            instance_id: None,
             harness,
             model: args.model,
             reasoning: args.reasoning,

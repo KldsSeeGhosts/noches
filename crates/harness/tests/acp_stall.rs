@@ -50,6 +50,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         computer_use_socket: None,
     };
     let request = RunRequest {
+        instance_id: None,
         prompt: "scenario:prompt-stall".into(),
         harness: None,
         model: None,

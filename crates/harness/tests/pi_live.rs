@@ -32,6 +32,7 @@ async fn real_pi_mock_lifecycle() {
             }),
         };
         let request = RunRequest {
+            instance_id: None,
             prompt: match scenario {
                 "boundary" => "slow-model",
                 "interrupt" | "mid-kill" => "slow-tool",

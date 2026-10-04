@@ -438,6 +438,46 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
+    pub fn set_chat_harness_session_instance(
+        &self,
+        chat_id: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert(
+            "harnessSessionInstanceId",
+            instance
+                .map(|id| LoroValue::from(id.as_ref()))
+                .unwrap_or(LoroValue::Null),
+        )?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    pub fn set_chat_harness_session_binding(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("harnessSessionId", session_id)?;
+        row.insert("harnessSessionCwd", cwd)?;
+        row.insert(
+            "harnessSessionInstanceId",
+            instance
+                .map(|id| LoroValue::from(id.as_ref()))
+                .unwrap_or(LoroValue::Null),
+        )?;
+        self.doc.commit();
+        Ok(true)
+    }
+
     /// Host-side sidebar freshness: preview + timestamp of the latest message.
     /// `false` when no such row.
     pub fn set_chat_last_message(
@@ -707,6 +747,8 @@ pub(crate) struct RawChat {
     #[serde(default)]
     harness_session_cwd: Option<String>,
     #[serde(default)]
+    harness_session_instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
+    #[serde(default)]
     space_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
@@ -749,6 +791,7 @@ impl From<RawChat> for Chat {
             created_at: dt(raw.created_at),
             harness_session_id: raw.harness_session_id,
             harness_session_cwd: raw.harness_session_cwd,
+            harness_session_instance_id: raw.harness_session_instance_id,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
@@ -846,6 +889,7 @@ mod tests {
             checkout_id: None,
             source_context: None,
             config: Some(ChatConfig {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: Some("mock-1".into()),
                 reasoning: None,
@@ -859,6 +903,7 @@ mod tests {
             created_at: ts(2_000),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -876,6 +921,34 @@ mod tests {
             checkout_id: None,
             created_at: ts(1_500),
         }
+    }
+
+    #[test]
+    fn instance_selection_and_native_session_owner_round_trip_through_loro() {
+        let local = WorkspaceDoc::new();
+        let mut row = chat("provider-chat", "host");
+        row.config.as_mut().unwrap().instance_id = Some("codex_proxy".into());
+        local.upsert_chat(&row).unwrap();
+        local
+            .set_chat_harness_session("provider-chat", "native", "/repo")
+            .unwrap();
+        local
+            .set_chat_harness_session_instance("provider-chat", Some(&"codex_proxy".into()))
+            .unwrap();
+        let remote = WorkspaceDoc::new();
+        remote
+            .doc()
+            .import(&local.export_snapshot().unwrap())
+            .unwrap();
+        let row = remote.read_chats().unwrap().remove(0);
+        assert_eq!(
+            row.config.unwrap().instance_id.unwrap().as_ref(),
+            "codex_proxy"
+        );
+        assert_eq!(
+            row.harness_session_instance_id.unwrap().as_ref(),
+            "codex_proxy"
+        );
     }
 
     fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
@@ -912,6 +985,7 @@ mod tests {
             serde_json::Value::String("1m".into()),
         );
         let config = ChatConfig {
+            instance_id: None,
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),

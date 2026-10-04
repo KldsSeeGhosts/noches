@@ -10,6 +10,7 @@ pub mod orchestration;
 pub mod orchestration_mcp;
 pub mod preview;
 pub mod provider_instance;
+pub mod provider_settings;
 pub mod runtime_policy;
 pub mod view;
 pub mod workspace;

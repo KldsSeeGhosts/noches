@@ -1486,6 +1486,7 @@ impl SessionsEngine {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
+                            instance_id: None,
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -3799,6 +3800,7 @@ mod tests {
             parent_tool_use_id: "tool-1".into(),
             event: Box::new(AgentEvent::ReasoningDelta {
                 text: String::new(),
+            instance_id: None,
             }),
         })
         .unwrap();
@@ -3825,3 +3827,4 @@ mod tests {
         core.sessions.shutdown().await;
     }
 }
+            instance_id: None,

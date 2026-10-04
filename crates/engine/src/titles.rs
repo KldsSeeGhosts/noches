@@ -392,6 +392,7 @@ mod tests {
         fn id(&self) -> HarnessId {
             HarnessId::ClaudeCode
         }
+            instance_id: None,
         fn display_name(&self) -> &str {
             "Title test"
         }

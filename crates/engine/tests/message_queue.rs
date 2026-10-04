@@ -108,6 +108,7 @@ impl Harness for HeldHarness {
         let mut finish = self.finish.subscribe();
         let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],
@@ -1537,6 +1538,7 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
     for send_now in [false, true] {
         let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
         let mut config = zeron_proto::ChatConfig {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: Some("old-model".into()),
             reasoning: Some(ReasoningLevel::Medium),

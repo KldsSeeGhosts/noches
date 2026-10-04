@@ -3685,6 +3685,7 @@ async fn run_session(session: Session) {
         && !send(
             &event_tx,
             AgentEvent::AvailableCommands {
+            instance_id: None,
                 commands: init_commands,
             },
         )

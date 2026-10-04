@@ -285,6 +285,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         checkout_id: None,
         source_context: None,
         config: Some(ChatConfig {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: Some("mock-1".into()),
             reasoning: None,
@@ -298,6 +299,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         created_at: ts(2_000),
         harness_session_id: None,
         harness_session_cwd: None,
+        harness_session_instance_id: None,
         space_id: None,
         last_seen_at: None,
         room_gen: None,

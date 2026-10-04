@@ -95,6 +95,7 @@ impl Harness for Mock {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             tx.send(Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 session_id: uuid::Uuid::new_v4().to_string(),
                 harness: HarnessId::Mock,
                 model: request.model.clone().unwrap(),

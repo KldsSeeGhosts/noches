@@ -785,6 +785,7 @@ pub(crate) fn plan_event(
             &AgentEvent::SessionStarted {
                 harness: zeron_proto::HarnessId::Mock, // not stored; driver is the exact binding above
                 model: run.model_selection.model.clone(),
+                instance_id: None,
                 tools: vec![],
                 cwd: projection.thread.worktree_path.clone().unwrap_or_default(),
                 session_id: native.into(),

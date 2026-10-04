@@ -47,6 +47,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         computer_use_socket: None,
     };
     let request = RunRequest {
+        instance_id: None,
         prompt: "hi".into(),
         harness: None,
         model: None,

@@ -927,6 +927,7 @@ impl WorkspaceHost {
             .iter()
             .any(|s| s.id == space_id || (s.device_id == device_id && s.path == path))
         {
+                harness_session_instance_id: None,
             return Ok(());
         }
         self.mutate(|doc| {

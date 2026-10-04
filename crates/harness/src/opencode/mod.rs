@@ -1618,6 +1618,7 @@ async fn run_session(session: Session) {
         .await
     {
         server.shutdown(kill_grace).await;
+            instance_id: None,
         return;
     }
 

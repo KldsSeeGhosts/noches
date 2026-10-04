@@ -589,6 +589,7 @@ async fn run_session(session: Session) {
                                     session_id = %crate::redact::redact_registered(session_id.as_deref().unwrap_or("")),
                                     error = %crate::redact::redact_registered(&frame.get("error").or_else(|| frame.get("message")).unwrap_or(&serde_json::Value::Null).to_string()),
                                     "Cursor SDK run failed");
+                                instance_id: None,
                             }
                             for ev in map_shim_frame(&frame, interrupted) {
                                 let is_done = matches!(ev, AgentEvent::Done { .. });

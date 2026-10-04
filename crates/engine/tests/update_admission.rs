@@ -88,6 +88,7 @@ async fn restart_preparation_retires_completed_warm_wrappers_before_ready() {
             "warm",
             HarnessId::Mock,
             RunRequest {
+                instance_id: None,
                 prompt: "complete then stay warm".into(),
                 harness: None,
                 model: None,
@@ -182,6 +183,7 @@ async fn restart_lease_blocks_terminals_preserves_commands_and_resumes_after_can
             "update-test",
             SessionCommandPayload::Run {
                 request: RunRequest {
+                    instance_id: None,
                     prompt: "queued during update".into(),
                     harness: None,
                     model: None,
