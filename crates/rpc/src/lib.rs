@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod pull_requests;
 pub mod remote;
 mod server;
 
@@ -36,6 +37,7 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
+    pub const GET_THREAD_PULL_REQUESTS: &str = "GetThreadPullRequests";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
     /// `task_cancel` under host authority. Resolves on acceptance, not on the
     /// terminal state, which `GetOrchestrationState` reports.
