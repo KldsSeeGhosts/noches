@@ -256,6 +256,7 @@ pub(crate) async fn execute(bridge: &RunnerBridge, effect: &Effect) -> Result<Ef
                     .sessions
                     .generate_orchestration_title(
                         provider.harness.id(),
+                        &p.thread.provider_instance_id,
                         &prompt,
                         p.thread.worktree_path.as_deref().unwrap_or(""),
                     )

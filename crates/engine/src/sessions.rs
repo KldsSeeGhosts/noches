@@ -501,13 +501,14 @@ impl SessionsEngine {
     pub(crate) async fn generate_orchestration_title(
         &self,
         harness: HarnessId,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
         prompt: &str,
         cwd: &str,
     ) -> Option<String> {
         self.inner
             .titles
             .get()?
-            .run_title_model(harness, prompt, cwd)
+            .run_title_model(harness, Some(instance), prompt, cwd)
             .await
     }
 
