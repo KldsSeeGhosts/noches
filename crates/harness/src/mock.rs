@@ -138,6 +138,70 @@ impl Harness for MockHarness {
 
     async fn run(
         &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Dev/testing knob: a prompt starting `QA-DELEGATE` makes the run call
+        // the engine's real `delegate_task` tool (async) before its script, so
+        // a headed rig can put a genuine app-owned child on screen. Only the
+        // prefix triggers it: the child prompt and the completion wake do not.
+        let delegate = request
+            .prompt
+            .strip_prefix("QA-DELEGATE")
+            .map(|task| task.trim().to_owned())
+            .map(|task| (task, controls.mcp.clone()));
+        let script = self.run_script(request, controls).await?;
+        let Some((task, mcp)) = delegate else {
+            return Ok(script);
+        };
+        let call = futures::stream::once(async move {
+            let text = match qa_delegate(&mcp, &task).await {
+                Ok(task_id) => format!("Delegated `{task_id}` to a child agent.\n\n"),
+                Err(error) => format!("Delegation failed: {error}\n\n"),
+            };
+            Ok(AgentEvent::TextDelta { text })
+        });
+        Ok(call.chain(script).boxed())
+    }
+}
+
+/// `delegate_task` over the run's scoped `t3-code` MCP server.
+async fn qa_delegate(mcp: &crate::mcp::SessionMcpContext, task: &str) -> Result<String, String> {
+    let server = mcp
+        .entries()
+        .iter()
+        .find(|server| server.name == "t3-code")
+        .ok_or("no t3-code MCP server in this run")?;
+    let crate::mcp::McpTransport::StreamableHttp { url, headers } = &server.transport else {
+        return Err("t3-code is not streamable HTTP".into());
+    };
+    let mut request = reqwest::Client::new().post(url).json(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "delegate_task", "arguments": {
+            "task": task, "mode": "async",
+            "clientRequestId": uuid::Uuid::new_v4().to_string()
+        }}
+    }));
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    let body: serde_json::Value = request
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let result = &body["result"]["structuredContent"];
+    result["taskId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| result.to_string())
+}
+
+impl MockHarness {
+    async fn run_script(
+        &self,
         _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {

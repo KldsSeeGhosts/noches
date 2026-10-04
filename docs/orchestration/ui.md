@@ -90,6 +90,13 @@ task is live (progress is read-only state); an idle app does no delegation reads
 The child chat is a regular workspace chat. Its transcript is the ordinary chat transcript
 (`WatchDocMessages`); the index marks it read-only and swaps the composer for the child banner.
 
+## Headed real-data QA
+
+`ZERON_HARNESS=mock` plus a prompt starting `QA-DELEGATE <task>` makes the mock harness call the
+engine's real `delegate_task` (async) over its scoped `t3-code` MCP server, so a genuine app-owned
+child, publication and completion wake appear in the headed app. Set `ZERON_MOCK_DELAY_MS` (e.g.
+`6000`) to hold the child live long enough to open it, tray, Stop and all.
+
 ## Not done
 
 - iOS parity (R3 §5.2).

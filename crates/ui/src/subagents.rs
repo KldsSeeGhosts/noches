@@ -850,6 +850,21 @@ fn banner_frame(theme: &Theme, margin: f32) -> gpui::Div {
 /// provider mark, model (medium), effort (muted), a self-ticking status,
 /// "Runs on its own", Stop while the task can take one, and a way back to
 /// the parent. The chat is read-only to the user; the engine runs it.
+/// The banner's state word. A stopped or failed task keeps `workState`
+/// `result_available` (it has a final transcript), but must not read as a
+/// finished result.
+pub(crate) fn banner_state_word(
+    task: &crate::delegation::DelegatedTask,
+    stopping: bool,
+) -> &'static str {
+    match (stopping, task.phase()) {
+        (true, _) => "Stopping\u{2026}",
+        (_, SubagentPhase::Failed) => "Failed",
+        (_, SubagentPhase::Stopped) => "Stopped",
+        _ => task.work_state.label(),
+    }
+}
+
 pub fn delegated_child_banner(
     key: &str,
     model: &crate::delegation::ChildBannerModel,
@@ -869,11 +884,7 @@ pub fn delegated_child_banner(
         finished: task.completed_at,
         active: phase.active(),
     };
-    let state_word = if model.stopping {
-        "Stopping\u{2026}"
-    } else {
-        task.work_state.label()
-    };
+    let state_word = banner_state_word(task, model.stopping);
     banner_frame(theme, 0.0)
         .child(
             icons::icon(mark)
@@ -2433,6 +2444,20 @@ mod tests {
         assert_eq!(out[0].model.as_deref(), Some("claude-opus"));
         assert_eq!(link.effort.as_deref(), Some("High"));
         assert_eq!(link.harness, Some(zeron_proto::HarnessId::ClaudeCode));
+    }
+
+    #[test]
+    fn banner_word_names_stopped_and_failed_tasks_not_result_available() {
+        let word = |status, work| banner_state_word(&delegated("a", "p", status, work), false);
+        assert_eq!(word(DS::Interrupted, DW::ResultAvailable), "Stopped");
+        assert_eq!(word(DS::Cancelled, DW::ResultAvailable), "Stopped");
+        assert_eq!(word(DS::Failed, DW::ResultAvailable), "Failed");
+        assert_eq!(word(DS::Completed, DW::ResultAvailable), "Result available");
+        assert_eq!(word(DS::Running, DW::Working), "Working");
+        assert_eq!(
+            banner_state_word(&delegated("a", "p", DS::Running, DW::Working), true),
+            "Stopping\u{2026}"
+        );
     }
 
     #[test]
