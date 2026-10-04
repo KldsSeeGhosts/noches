@@ -23,11 +23,11 @@ impl InstanceLaunch {
 
     /// Apply after host/shell environment composition, before app-owned MCP
     /// overrides. Each driver owns a separate value and discovery cache.
-    pub(crate) fn apply(&self, command: &mut tokio::process::Command) {
+    pub(crate) fn apply(&self, command: &mut crate::process::Command) {
         command.envs(&self.environment);
     }
 
-    pub(crate) fn apply_launch(&self, command: &mut tokio::process::Command) {
+    pub(crate) fn apply_launch(&self, command: &mut crate::process::Command) {
         self.apply(command);
         command.args(&self.args);
     }
@@ -65,11 +65,11 @@ mod tests {
             ..Default::default()
         }
         .with_secrets(vec!["instance-secret".into()]);
-        let mut first = tokio::process::Command::new("codex");
-        let second = tokio::process::Command::new("codex");
+        let mut first = crate::process::Command::new("codex");
+        let mut second = crate::process::Command::new("codex");
         launch.apply(&mut first);
-        assert!(first.as_std().get_envs().any(|(k, _)| k == "CODEX_HOME"));
-        assert!(!second.as_std().get_envs().any(|(k, _)| k == "CODEX_HOME"));
+        assert!(first.as_std_mut().get_envs().any(|(k, _)| k == "CODEX_HOME"));
+        assert!(!second.as_std_mut().get_envs().any(|(k, _)| k == "CODEX_HOME"));
         assert_eq!(
             crate::redact::redact_registered("instance-secret"),
             "[redacted]"
