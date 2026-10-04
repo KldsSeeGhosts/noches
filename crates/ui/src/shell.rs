@@ -579,12 +579,14 @@ pub enum SettingsSection {
     Dictation,
     Shortcuts,
     Appshots,
+    /// Scheduled tasks (T3 P7): run now, pause, delete.
+    Automations,
     Archived,
     Updates,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 12] = [
+    pub const ALL: [SettingsSection; 13] = [
         SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
@@ -595,6 +597,7 @@ impl SettingsSection {
         SettingsSection::Dictation,
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
+        SettingsSection::Automations,
         SettingsSection::Archived,
         SettingsSection::Updates,
     ];
@@ -613,6 +616,7 @@ impl SettingsSection {
             SettingsSection::Dictation => "Dictation",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
+            SettingsSection::Automations => "Automations",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Updates => "Updates",
         }
@@ -663,6 +667,9 @@ impl SettingsSection {
                 "working",
             ],
             SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
+            SettingsSection::Automations => {
+                &["schedule", "scheduled", "task", "cron", "recurring", "timer", "run"]
+            }
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
             SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
         }
@@ -707,6 +714,7 @@ impl SettingsSection {
             SettingsSection::Dictation => "dictation",
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Appshots => "appshots",
+            SettingsSection::Automations => "automations",
             SettingsSection::Archived => "archived",
             SettingsSection::Updates => "updates",
         }
@@ -728,6 +736,7 @@ impl SettingsSection {
             "dictation" | "voice" => SettingsSection::Dictation,
             "shortcuts" => SettingsSection::Shortcuts,
             "appshots" => SettingsSection::Appshots,
+            "automations" | "scheduled-tasks" => SettingsSection::Automations,
             "archived" => SettingsSection::Archived,
             "updates" => SettingsSection::Updates,
             _ => return None,
@@ -1884,6 +1893,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     connections_page: Option<Entity<ConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    automations_page: Option<Entity<crate::settings::automations::AutomationsPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2410,6 +2420,7 @@ impl Shell {
             devices_page: None,
             connections_page: None,
             archived_page: None,
+            automations_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -4200,9 +4211,17 @@ impl Shell {
             toggle_watch: pending("Pull request watch"),
             link_pull_request: pending("Linking pull requests"),
             commit: pending("Commit"),
-            run_automation: pending("Scheduled tasks"),
-            toggle_automation: pending("Scheduled tasks"),
-            manage_automations: pending("Scheduled tasks"),
+            run_automation: std::rc::Rc::new(|this, id, cx| {
+                this.state
+                    .update(cx, |state, cx| state.run_automation_now(&id, cx));
+            }),
+            toggle_automation: std::rc::Rc::new(|this, (id, enabled), cx| {
+                this.state
+                    .update(cx, |state, cx| state.set_automation_enabled(&id, enabled, cx));
+            }),
+            manage_automations: std::rc::Rc::new(|this, (), cx| {
+                this.open_settings(SettingsSection::Automations, cx);
+            }),
             restore_checkpoint: pending("Checkpoint restore"),
             retry_setup: pending("Worktree setup"),
             continue_setup: pending("Worktree setup"),
@@ -5141,6 +5160,18 @@ impl Shell {
                         });
                         page.clone().into_any_element()
                     }
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Automations => {
+                if self.automations_page.is_none() {
+                    let state = self.state.clone();
+                    self.automations_page = Some(cx.new(|cx| {
+                        crate::settings::automations::AutomationsPage::new(state, cx)
+                    }));
+                }
+                match &self.automations_page {
+                    Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
             }
@@ -6755,6 +6786,7 @@ impl Shell {
             SettingsSection::Dictation => icons::MICROPHONE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
+            SettingsSection::Automations => icons::CALENDAR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Updates => icons::RESTART,
         };
@@ -10199,6 +10231,21 @@ impl Shell {
                 RightSurface::Details => {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
+                    // Owner-routed: the chat's host device owns its automations.
+                    let owner = self
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
+                        .map(|chat| chat.device_id.clone());
+                    if let Some(owner) = owner
+                        && !self.state.read(cx).automations.watching(&owner)
+                    {
+                        self.state.update(cx, |state, cx| {
+                            state.ensure_automations_watch(&owner, cx)
+                        });
+                    }
                     let model =
                         crate::details::DetailsModel::for_chat(self.state.read(cx), &chat_id);
                     let ui = self.details_ui.get(&chat_id).cloned().unwrap_or_default();
@@ -15597,6 +15644,7 @@ mod settings_reopen_regressions {
             ("settings/shortcuts", SettingsSection::Shortcuts),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
+            ("settings/scheduled-tasks", SettingsSection::Automations),
             ("settings/updates", SettingsSection::Updates),
         ] {
             assert_eq!(

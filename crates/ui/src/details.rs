@@ -52,7 +52,11 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum SetupState {
     Running {
         command: String,
@@ -125,11 +129,28 @@ impl DetailsModel {
         }
         let mut model = Self::default();
         if let Some(chat) = chat {
-            model.workspace.branch = crate::change_requests::conversation_branch(chat, &state.spaces)
-                .map(str::to_string);
+            model.workspace.branch =
+                crate::change_requests::conversation_branch(chat, &state.spaces)
+                    .map(str::to_string);
             if state.local_device_id.as_deref() != Some(chat.device_id.as_str()) {
-                model.workspace.remote_device = state.device_name(&chat.device_id).map(str::to_string);
+                model.workspace.remote_device =
+                    state.device_name(&chat.device_id).map(str::to_string);
             }
+            model.automations = state
+                .automations
+                .for_thread(&chat.id)
+                .map(|row| Automation {
+                    id: row.id.clone(),
+                    title: row.title.clone(),
+                    cadence: row.cadence.clone(),
+                    next_run_at: row.next_run_at,
+                    enabled: row.enabled,
+                    last_run: row.last_run,
+                })
+                .collect();
+            model
+                .automations
+                .sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
             if let Some(summary) = state.change_request_for_chat(chat) {
                 model.pull_requests.push(PullRequestLink {
                     summary: summary.clone(),
@@ -186,7 +207,8 @@ pub fn details_panel_body(
     toggle_checkpoints: ShellAction<()>,
     cx: &Context<Shell>,
 ) -> AnyElement {
-    let mut sections: Vec<AnyElement> = vec![workspace_section(chat_id, model, now, theme, actions, cx)];
+    let mut sections: Vec<AnyElement> =
+        vec![workspace_section(chat_id, model, now, theme, actions, cx)];
     if !model.pull_requests.is_empty() {
         sections.push(version_control_section(chat_id, model, theme, actions, cx));
     }
@@ -261,7 +283,12 @@ fn row(id: SharedString, glyph: Option<&'static str>, theme: &Theme) -> gpui::St
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text.opacity(0.8))
         .when_some(glyph, |el, glyph| {
-            el.child(icon(glyph).size(px(16.0)).flex_none().text_color(theme.text_muted))
+            el.child(
+                icon(glyph)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
         })
 }
 
@@ -330,9 +357,11 @@ fn workspace_section(
         theme,
     );
     let checkout = match &workspace.worktree_branch {
-        Some(branch) => checkout
-            .child(div().flex_none().child("Worktree"))
-            .child(mono(branch.clone(), theme.text_muted, theme).min_w_0().truncate()),
+        Some(branch) => checkout.child(div().flex_none().child("Worktree")).child(
+            mono(branch.clone(), theme.text_muted, theme)
+                .min_w_0()
+                .truncate(),
+        ),
         None => checkout
             .child(label("Root checkout"))
             .when_some(workspace.branch.clone(), |el, branch| {
@@ -342,9 +371,13 @@ fn workspace_section(
     rows.push(checkout.into_any_element());
     if let Some(device) = &workspace.remote_device {
         rows.push(
-            row(format!("details-{chat_id}-device").into(), Some(icons::LAPTOP), theme)
-                .child(mono(device.clone(), theme.text_muted, theme))
-                .into_any_element(),
+            row(
+                format!("details-{chat_id}-device").into(),
+                Some(icons::LAPTOP),
+                theme,
+            )
+            .child(mono(device.clone(), theme.text_muted, theme))
+            .into_any_element(),
         );
     }
     match &workspace.setup {
@@ -352,7 +385,9 @@ fn workspace_section(
             command,
             started_at,
         }) => {
-            let sky = SessionState::Working.color(theme).unwrap_or(theme.text_muted);
+            let sky = SessionState::Working
+                .color(theme)
+                .unwrap_or(theme.text_muted);
             rows.push(
                 row(format!("details-{chat_id}-setup").into(), None, theme)
                     .child(
@@ -370,7 +405,12 @@ fn workspace_section(
                             )),
                     )
                     .child(div().flex_none().child("Setting up"))
-                    .child(mono(command.clone(), theme.text_faint, theme).flex_1().min_w_0().truncate())
+                    .child(
+                        mono(command.clone(), theme.text_faint, theme)
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                    )
                     .child(mono(
                         crate::shell::format_working_elapsed(
                             now.signed_duration_since(*started_at).num_seconds(),
@@ -478,7 +518,9 @@ fn version_control_section(
                     .into_any_element(),
             )
         } else if pr.checks_pending > 0 {
-            let sky = SessionState::Working.color(theme).unwrap_or(theme.text_muted);
+            let sky = SessionState::Working
+                .color(theme)
+                .unwrap_or(theme.text_muted);
             Some(
                 div()
                     .flex()
@@ -494,7 +536,11 @@ fn version_control_section(
                     .flex()
                     .items_center()
                     .gap(px(3.0))
-                    .child(icon(icons::CHECK).size(px(11.0)).text_color(theme.text_faint))
+                    .child(
+                        icon(icons::CHECK)
+                            .size(px(11.0))
+                            .text_color(theme.text_faint),
+                    )
                     .child(mono(pr.checks_passed.to_string(), theme.text_muted, theme))
                     .into_any_element(),
             )
@@ -502,42 +548,47 @@ fn version_control_section(
             None
         };
         rows.push(
-            hover_row(row(format!("details-{chat_id}-pr-{number}").into(), None, theme), theme)
-                .pr(px(4.0))
-                .child(crate::change_requests::pull_request_badge_with_query(
-                    format!("details-{chat_id}-pr-{number}-badge").into(),
-                    pr.summary.clone(),
-                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                    None,
+            hover_row(
+                row(format!("details-{chat_id}-pr-{number}").into(), None, theme),
+                theme,
+            )
+            .pr(px(4.0))
+            .child(crate::change_requests::pull_request_badge_with_query(
+                format!("details-{chat_id}-pr-{number}-badge").into(),
+                pr.summary.clone(),
+                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                None,
+                theme,
+            ))
+            .child(label(pr.summary.title.clone()))
+            .children(checks)
+            .child(
+                icon_action(
+                    format!("details-{chat_id}-pr-{number}-watch").into(),
+                    icons::EYE,
+                    if watching {
+                        "Stop watching"
+                    } else {
+                        "Watch for checks and reviews"
+                    },
                     theme,
-                ))
-                .child(label(pr.summary.title.clone()))
-                .children(checks)
-                .child(
-                    icon_action(
-                        format!("details-{chat_id}-pr-{number}-watch").into(),
-                        icons::EYE,
-                        if watching {
-                            "Stop watching"
-                        } else {
-                            "Watch for checks and reviews"
-                        },
-                        theme,
-                    )
-                    // Watching reads as a present eye; not watching recedes.
-                    .when(!watching, |el| el.opacity(0.45))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        watch(this, (number, !watching), cx)
-                    })),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| open(this, url.clone(), cx)))
-                .into_any_element(),
+                // Watching reads as a present eye; not watching recedes.
+                .when(!watching, |el| el.opacity(0.45))
+                .on_click(cx.listener(move |this, _, _, cx| watch(this, (number, !watching), cx))),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| open(this, url.clone(), cx)))
+            .into_any_element(),
         );
     }
     let commit = actions.commit.clone();
     rows.push(
         hover_row(
-            row(format!("details-{chat_id}-commit").into(), Some(icons::CHECKLIST), theme),
+            row(
+                format!("details-{chat_id}-commit").into(),
+                Some(icons::CHECKLIST),
+                theme,
+            ),
             theme,
         )
         .child(label("Commit…"))
@@ -581,8 +632,12 @@ fn automations_section(
     let rows = model.automations.iter().map(|task| {
         let dot = match task.last_run {
             RunStatus::Never => theme.text_faint,
-            RunStatus::Running => SessionState::Working.color(theme).unwrap_or(theme.text_faint),
-            RunStatus::Succeeded => SessionState::Completed.color(theme).unwrap_or(theme.text_faint),
+            RunStatus::Running => SessionState::Working
+                .color(theme)
+                .unwrap_or(theme.text_faint),
+            RunStatus::Succeeded => SessionState::Completed
+                .color(theme)
+                .unwrap_or(theme.text_faint),
             RunStatus::Failed => theme.danger,
         };
         let sub = match (task.enabled, task.next_run_at) {
@@ -596,7 +651,10 @@ fn automations_section(
         let toggle = actions.toggle_automation.clone();
         let enabled = task.enabled;
         div()
-            .id(SharedString::from(format!("details-{chat_id}-auto-{}", task.id)))
+            .id(SharedString::from(format!(
+                "details-{chat_id}-auto-{}",
+                task.id
+            )))
             .min_h(px(44.0))
             .w_full()
             .flex()
@@ -610,7 +668,11 @@ fn automations_section(
                     .relative()
                     .size(px(16.0))
                     .flex_none()
-                    .child(icon(icons::CALENDAR).size(px(16.0)).text_color(theme.text_muted))
+                    .child(
+                        icon(icons::CALENDAR)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
                     .child(
                         div()
                             .absolute()
@@ -649,7 +711,10 @@ fn automations_section(
             )
             .child(
                 crate::settings::widgets::toggle_switch(theme, enabled)
-                    .id(SharedString::from(format!("details-{chat_id}-auto-{}-switch", task.id)))
+                    .id(SharedString::from(format!(
+                        "details-{chat_id}-auto-{}-switch",
+                        task.id
+                    )))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         toggle(this, (toggle_id.clone(), !enabled), cx)
@@ -701,8 +766,16 @@ fn checkpoints_section(
                     div()
                         .flex()
                         .gap(px(4.0))
-                        .child(mono(format!("+{}", checkpoint.additions), theme.diff_add, theme))
-                        .child(mono(format!("−{}", checkpoint.deletions), theme.diff_del, theme)),
+                        .child(mono(
+                            format!("+{}", checkpoint.additions),
+                            theme.diff_add,
+                            theme,
+                        ))
+                        .child(mono(
+                            format!("−{}", checkpoint.deletions),
+                            theme.diff_del,
+                            theme,
+                        )),
                 )
                 .child(
                     icon_action(
@@ -725,12 +798,15 @@ fn checkpoints_section(
             format!("Show all · {total}")
         };
         rows.push(
-            hover_row(row(format!("details-{chat_id}-cp-more").into(), None, theme), theme)
-                .text_color(theme.text_muted)
-                .font_weight(FontWeight::NORMAL)
-                .child(label(label_text))
-                .on_click(cx.listener(move |this, _, _, cx| toggle(this, (), cx)))
-                .into_any_element(),
+            hover_row(
+                row(format!("details-{chat_id}-cp-more").into(), None, theme),
+                theme,
+            )
+            .text_color(theme.text_muted)
+            .font_weight(FontWeight::NORMAL)
+            .child(label(label_text))
+            .on_click(cx.listener(move |this, _, _, cx| toggle(this, (), cx)))
+            .into_any_element(),
         );
     }
     section("Checkpoints", Vec::new(), theme)
@@ -752,14 +828,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(model.pull_requests[0].checks_failed, 2);
-        assert!(matches!(model.workspace.setup, Some(SetupState::Running { .. })));
+        assert!(matches!(
+            model.workspace.setup,
+            Some(SetupState::Running { .. })
+        ));
     }
 
     #[test]
     fn relative_future_is_compact() {
         let now = Utc::now();
-        assert_eq!(relative_future(now + chrono::Duration::minutes(23), now), "in 23m");
-        assert_eq!(relative_future(now + chrono::Duration::hours(5), now), "in 5h");
-        assert_eq!(relative_future(now - chrono::Duration::hours(5), now), "in <1m");
+        assert_eq!(
+            relative_future(now + chrono::Duration::minutes(23), now),
+            "in 23m"
+        );
+        assert_eq!(
+            relative_future(now + chrono::Duration::hours(5), now),
+            "in 5h"
+        );
+        assert_eq!(
+            relative_future(now - chrono::Duration::hours(5), now),
+            "in <1m"
+        );
     }
 }
