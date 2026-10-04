@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod entities;
+pub mod git_actions;
 pub mod motion;
 pub mod orchestration;
 pub mod orchestration_mcp;

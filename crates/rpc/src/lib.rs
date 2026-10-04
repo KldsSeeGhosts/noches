@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod git_actions;
 pub mod remote;
 mod server;
 
