@@ -37,6 +37,56 @@ fn time(value: &Value) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
+/// The designer's cadence wording: the largest whole unit for intervals
+/// ("Every day", "Every 2h", "Every 15 min") and day-set names for fixed
+/// times ("Weekdays at 09:00", "Mon, Thu at 18:30"). `None` falls back to the
+/// engine's own label.
+pub fn cadence_label(schedule: &Value) -> Option<String> {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    match schedule["type"].as_str()? {
+        "interval" => {
+            let ms = schedule["everyMs"].as_i64()?;
+            let (minute, hour, day) = (60_000, 3_600_000, 86_400_000);
+            Some(if ms % day == 0 {
+                match ms / day {
+                    1 => "Every day".into(),
+                    n => format!("Every {n} days"),
+                }
+            } else if ms % hour == 0 {
+                match ms / hour {
+                    1 => "Every hour".into(),
+                    n => format!("Every {n}h"),
+                }
+            } else if ms % minute == 0 {
+                format!("Every {} min", ms / minute)
+            } else {
+                format!("Every {} sec", (ms as f64 / 1000.0).round())
+            })
+        }
+        "fixed_time" => {
+            let time = schedule["timeOfDay"].as_str()?;
+            let mut days: Vec<i64> = schedule["weekdays"]
+                .as_array()
+                .map(|d| d.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
+            days.sort_unstable();
+            days.dedup();
+            let set = match days.as_slice() {
+                [] => "Daily".to_string(),
+                [1, 2, 3, 4, 5] => "Weekdays".to_string(),
+                [0, 6] => "Weekends".to_string(),
+                days => days
+                    .iter()
+                    .filter_map(|d| DAYS.get(*d as usize).copied())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            Some(format!("{set} at {time}"))
+        }
+        _ => None,
+    }
+}
+
 /// Decode one `ScheduledTasksView` snapshot. Rows that don't parse are
 /// skipped rather than failing the whole list.
 pub fn decode_view(view: &Value) -> Vec<AutomationRow> {
@@ -57,7 +107,8 @@ pub fn decode_view(view: &Value) -> Vec<AutomationRow> {
                 project_id: task["projectId"].as_str().unwrap_or_default().to_string(),
                 thread_id: task["threadId"].as_str().map(str::to_string),
                 enabled: task["enabled"].as_bool().unwrap_or(false),
-                cadence: row["cadence"].as_str().unwrap_or_default().to_string(),
+                cadence: cadence_label(&task["schedule"])
+                    .unwrap_or_else(|| row["cadence"].as_str().unwrap_or_default().to_string()),
                 next_run_at: time(&task["nextRunAt"]),
                 last_run: match row["lastRun"]["status"].as_str() {
                     Some("running") => RunStatus::Running,
@@ -230,6 +281,37 @@ enum AutomationAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cadence_reads_in_whole_units() {
+        let label = |v: serde_json::Value| cadence_label(&v).unwrap();
+        assert_eq!(
+            label(serde_json::json!({"type":"interval","everyMs":86_400_000})),
+            "Every day"
+        );
+        assert_eq!(
+            label(serde_json::json!({"type":"interval","everyMs":7_200_000})),
+            "Every 2h"
+        );
+        assert_eq!(
+            label(serde_json::json!({"type":"interval","everyMs":900_000})),
+            "Every 15 min"
+        );
+        assert_eq!(
+            label(serde_json::json!({"type":"fixed_time","timeOfDay":"02:00"})),
+            "Daily at 02:00"
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"type":"fixed_time","timeOfDay":"09:00","weekdays":[5,1,2,3,4]})
+            ),
+            "Weekdays at 09:00"
+        );
+        assert_eq!(
+            label(serde_json::json!({"type":"fixed_time","timeOfDay":"18:30","weekdays":[4,1]})),
+            "Mon, Thu at 18:30"
+        );
+    }
 
     #[test]
     fn decodes_the_scheduler_view() {

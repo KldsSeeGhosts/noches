@@ -228,8 +228,11 @@ impl AppState {
                     }
                     Err(e) => row.error = Some(e.to_string()),
                 }
-                if let Some(error) = row.error.clone() {
-                    state.details.notice = Some(error);
+                // Passive reads never raise a notice: an empty section is the
+                // honest rendering of "nothing to show". Only user actions
+                // (watch, link, restore, handoff) surface their failures.
+                if let Some(error) = &row.error {
+                    tracing::debug!(chat = %key.1, %error, "details read failed");
                 }
                 if state.details.refresh_again.remove(&key) {
                     state.refresh_details(&key.1, true, cx);

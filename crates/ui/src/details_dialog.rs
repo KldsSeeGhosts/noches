@@ -95,7 +95,7 @@ impl DetailsDialog {
                 if matches!(kind, Kind::Link) {
                     "Pull request URL"
                 } else {
-                    "Branch"
+                    "feature/my-change"
                 },
                 cx,
             )
@@ -104,13 +104,13 @@ impl DetailsDialog {
             .with_text_metrics(11.0, 18.0)
         });
         let base = cx.new(|cx| {
-            ComposerInput::new("Base ref (default if empty)", cx)
+            ComposerInput::new("Default branch", cx)
                 .with_single_line()
                 .with_monospace()
                 .with_text_metrics(11.0, 18.0)
         });
         let prompt = cx.new(|cx| {
-            ComposerInput::new("Continuation prompt", cx)
+            ComposerInput::new("Optional message sent once the move finishes", cx)
                 .with_text_metrics(13.0, 18.0)
                 .with_max_visible_lines(6)
         });
@@ -301,11 +301,32 @@ impl Render for DetailsDialog {
                                 },
                             ))
                         }));
+                // Field labels match the Commit dialog: 11px MEDIUM muted.
+                let label = |text: &'static str| {
+                    div()
+                        .mb(px(-6.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child(text)
+                };
                 body = body
-                    .child(popover::dialog_body(&theme, "Branch"))
+                    .child(popover::dialog_body(
+                        &theme,
+                        "Creates a worktree on a new branch and moves this thread into it. Uncommitted changes stay in the current checkout.",
+                    ))
+                    .child(label("New branch"))
                     .child(dialog_field(&self.main, 1, 1, &theme, cx))
-                    .child(popover::dialog_body(&theme, "Base ref"))
-                    .child(tabs)
+                    // The local/origin choice qualifies the base ref, so it
+                    // sits on the ref's own row.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(label("Start from").mb(px(0.0)))
+                            .child(tabs),
+                    )
                     .child(dialog_field(&self.base, 1, 1, &theme, cx))
                     .child(
                         div()
@@ -332,6 +353,7 @@ impl Render for DetailsDialog {
                             )
                             .child("Run setup"),
                     )
+                    .child(label("Then continue with"))
                     .child(dialog_field(&self.prompt, 3, 6, &theme, cx));
             }
             Kind::Restore(_) => {
