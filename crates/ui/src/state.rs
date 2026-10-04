@@ -751,6 +751,9 @@ pub fn canvas_panel_key(space_id: Option<&str>) -> String {
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
+/// See [`AppState::apply_lifecycle_fixture`].
+pub const LIFECYCLE_FIXTURE_ENV: &str = "NOCHES_LIFECYCLE_FIXTURE";
+
 pub struct AppState {
     pub remote_host: Option<String>,
     pub remote_connection: Option<zeron_rpc::remote::ConnectionState>,
@@ -778,6 +781,9 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Pin/snooze/settle parking per chat id. A chat without an entry is
+    /// unpinned, awake and unsettled.
+    pub thread_lifecycles: HashMap<String, zeron_proto::ChatLifecycle>,
     sessions: Vec<Session>,
     /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
     /// ([`Self::replace_sessions`]) so [`Self::session_for`] is O(1) on the
@@ -975,6 +981,7 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            thread_lifecycles: HashMap::new(),
             sessions: Vec::new(),
             session_index: HashMap::new(),
             session_presentation: None,
@@ -1263,6 +1270,7 @@ impl AppState {
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
+        self.apply_lifecycle_fixture();
         // A new child chat or a parent's publication arrives as a chat row.
         self.nudge_delegation();
         self.transcript_cache
@@ -2169,6 +2177,47 @@ impl AppState {
     /// and the display-deadline sweep read them here.
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+
+    /// Headed-QA seam: `NOCHES_LIFECYCLE_FIXTURE` names a JSON object keyed by
+    /// chat TITLE (seeded ids are random) whose values are lifecycle records
+    /// with hour offsets from now: `{"pinnedHours", "snoozedHours",
+    /// "settledHours", "wokeHours"}`. Never set outside QA.
+    fn apply_lifecycle_fixture(&mut self) {
+        let Some(path) = std::env::var_os(LIFECYCLE_FIXTURE_ENV).filter(|p| !p.is_empty()) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(fixture) = serde_json::from_str::<HashMap<String, HashMap<String, f64>>>(&text)
+        else {
+            return;
+        };
+        let now = Utc::now();
+        let at = |hours: Option<&f64>| {
+            hours.map(|h| now + chrono::Duration::seconds((h * 3600.0) as i64))
+        };
+        for chat in &self.chats {
+            let Some(entry) = chat.title.as_ref().and_then(|title| fixture.get(title)) else {
+                continue;
+            };
+            self.thread_lifecycles
+                .entry(chat.id.clone())
+                .or_insert_with(|| zeron_proto::ChatLifecycle {
+                    pinned_at: at(entry.get("pinnedHours")),
+                    snoozed_until: at(entry.get("snoozedHours")),
+                    settled_at: at(entry.get("settledHours")),
+                    settled_by: entry
+                        .contains_key("settledHours")
+                        .then_some(zeron_proto::SettleSource::User),
+                    woke_at: at(entry.get("wokeHours")),
+                });
+        }
+    }
+
+    pub fn chat_lifecycle(&self, chat_id: &str) -> Option<&zeron_proto::ChatLifecycle> {
+        self.thread_lifecycles.get(chat_id)
     }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {

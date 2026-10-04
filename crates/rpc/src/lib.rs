@@ -41,6 +41,11 @@ pub mod methods {
     /// terminal state, which `GetOrchestrationState` reports.
     pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
+    /// Pin/snooze/settle/archive/mark-unread one chat under host authority,
+    /// `{chatId, action, snoozedUntil?}` (T3 `t3_thread_organize` semantics).
+    pub const ORGANIZE_THREAD: &str = "OrganizeThread";
+    /// Clear a woken snooze's attention marker, `{chatId}`.
+    pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";

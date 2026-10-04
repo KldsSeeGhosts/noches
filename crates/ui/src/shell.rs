@@ -72,6 +72,7 @@ mod chat_rename;
 mod chat_rename_tests;
 mod command_palette;
 mod file_mutations;
+mod lifecycle;
 mod panes;
 mod project_icon;
 #[cfg(test)]
@@ -178,6 +179,8 @@ pub(crate) fn restore_mounted_focus(
 enum ChatMenuPage {
     Root,
     Copy,
+    /// Snooze presets, opened from the Root row or the row's hover clock.
+    Snooze,
 }
 
 #[derive(Clone)]
@@ -6829,6 +6832,7 @@ impl Shell {
         // On screen in a pane that is not the focused one: the middle fill tier.
         visible: bool,
         archived: bool,
+        parking: lifecycle::RowParking,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
         // nine chips appear together instead of leaving a hole on whichever
@@ -6855,7 +6859,8 @@ impl Shell {
         };
         let corner_hovered = self.chat_status_hover.as_deref() == Some(row_id.as_str());
         let show_jump_hint = jump_label.is_some();
-        let show_archive = corner_hovered && !show_jump_hint;
+        // Hover actions take the corner's clock (live glyphs stay).
+        let show_actions = corner_hovered && !show_jump_hint;
         // One source of truth for state (status_palette.rs): send truth
         // overrides the engine's indicator, and the title weight, gutter bar,
         // icon, label and elapsed clock all read the same resolved state.
@@ -6970,7 +6975,7 @@ impl Shell {
                         .justify_center()
                         .child(glyph),
                 ));
-            if let Some(elapsed) = elapsed.filter(|_| !show_archive) {
+            if let Some(elapsed) = elapsed.filter(|_| !show_actions) {
                 slot = slot.child(
                     div()
                         .font_family(theme.font_mono.clone())
@@ -6983,18 +6988,168 @@ impl Shell {
                 );
             }
             slot.into_any_element()
-        } else if show_archive {
+        } else if parking.woke {
+            // A woken snooze keeps its signal until acknowledged. No new hue
+            // (rule 1): MEDIUM text and the alarm glyph carry it.
+            let woke_id = id.clone();
+            div()
+                .id(SharedString::from(format!("{row_id}-woke")))
+                .role(gpui::Role::Button)
+                .aria_label("Dismiss Woke notification")
+                .tooltip(crate::settings::widgets::text_tooltip_above(
+                    "Dismiss Woke notification",
+                ))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(16.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.acknowledge_woke(woke_id.clone(), cx);
+                }))
+                .child(icon(icons::BELL).size(px(12.0)).flex_none())
+                .child(SharedString::from("Woke"))
+                .into_any_element()
+        } else if show_actions {
             div().into_any_element()
         } else {
-            // Settled rows: the time is tertiary information - faint,
-            // regular weight, mono (rule 3), never competing with the title.
+            // Idle rows: the time is tertiary information - faint, regular
+            // weight, mono (rule 3), never competing with the title. Snoozed
+            // rows show when they come back; settled rows how long ago they
+            // wrapped up.
+            let label: SharedString = match (parking.snoozed_until, parking.settled_at) {
+                (Some(until), _) => lifecycle::wake_label(until, now).into(),
+                (None, Some(settled)) => format_time_ago(settled, now).into(),
+                (None, None) => time_ago.clone(),
+            };
             div()
                 .text_size(crate::typography::ui_rems(11.5))
                 .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
                 .font_family(theme.font_mono.clone())
-                .text_color(theme.text_faint)
-                .child(time_ago.clone())
+                .text_color(if parking.snoozed_until.is_some() {
+                    theme.text_muted
+                } else {
+                    theme.text_faint
+                })
+                .child(label)
                 .into_any_element()
+        };
+        // One quiet 20px icon button per hover action, in the archive pill's
+        // exact metrics. Every action stops propagation: it never selects the
+        // row or starts a drag.
+        let row_action = |key: &str, glyph: &'static str, label: &'static str| {
+            div()
+                .id(SharedString::from(format!("{row_id}-{key}")))
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .size(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .cursor_pointer()
+                .tooltip(crate::settings::widgets::text_tooltip_above(label))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
+        };
+        let live = session.label().is_some();
+        let actions: Vec<AnyElement> = if !show_actions || search_query.is_some() {
+            Vec::new()
+        } else if archived {
+            let archive_id = id.clone();
+            vec![
+                row_action(
+                    "archive",
+                    icons::ARCHIVE_UP_MINIMALISTIC,
+                    "Unarchive session",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_chat_archived(archive_id.clone(), false, cx);
+                }))
+                .into_any_element(),
+            ]
+        } else if parking.snoozed_until.is_some() {
+            let wake_id = id.clone();
+            vec![
+                row_action("wake", icons::ALARM_OFF, "Wake thread now")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.organize_chat(
+                            wake_id.clone(),
+                            lifecycle::OrganizeAction::Unsnooze,
+                            None,
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+            ]
+        } else if parking.settled_at.is_some() {
+            let unsettle_id = id.clone();
+            let archive_id = id.clone();
+            vec![
+                row_action("unsettle", icons::UNDO, "Un-settle thread")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.organize_chat(
+                            unsettle_id.clone(),
+                            lifecycle::OrganizeAction::Unsettle,
+                            None,
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+                row_action("archive", icons::ARCHIVE_MINIMALISTIC, "Archive session")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_chat_archived(archive_id.clone(), true, cx);
+                    }))
+                    .into_any_element(),
+            ]
+        } else {
+            let snooze_id = id.clone();
+            let mut actions = vec![
+                row_action("snooze", icons::CLOCK_CIRCLE, "Snooze thread")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.chat_menu.open(ChatMenuState {
+                                chat_id: snooze_id.clone(),
+                                position: event.position,
+                                page: ChatMenuPage::Snooze,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+            ];
+            // Settling live work is not offered: it would park nothing.
+            if !live {
+                let settle_id = id.clone();
+                actions.push(
+                    row_action("settle", icons::CHECK, "Settle thread")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.organize_chat(
+                                settle_id.clone(),
+                                lifecycle::OrganizeAction::Settle,
+                                None,
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                );
+            }
+            actions
         };
         // A stable slot prevents title jitter on hover. Live glyphs never
         // disappear behind an action; only their elapsed clock yields.
@@ -7011,46 +7166,7 @@ impl Shell {
             .justify_end()
             .gap(px(5.0))
             .child(corner_body)
-            .when(show_archive, |el| {
-                let archive_id = id.clone();
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("{row_id}-archive")))
-                        .role(gpui::Role::Button)
-                        .aria_label(if archived {
-                            "Unarchive session"
-                        } else {
-                            "Archive session"
-                        })
-                        .size(px(20.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.0))
-                        .hover(|s| s.bg(crate::theme::wash(0.10)))
-                        .cursor_pointer()
-                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
-                            "Unarchive session"
-                        } else {
-                            "Archive session"
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_chat_archived(archive_id.clone(), !archived, cx);
-                        }))
-                        .child(
-                            icon(if archived {
-                                icons::ARCHIVE_UP_MINIMALISTIC
-                            } else {
-                                icons::ARCHIVE_MINIMALISTIC
-                            })
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                        ),
-                )
-            })
+            .children(actions)
             .into_any_element();
         let text = theme.text;
         let select_id = id.clone();
@@ -7083,8 +7199,11 @@ impl Shell {
         let recede = session == SessionState::Working && !selected && !visible && sidebar_row;
         // Rule 4: titles are NORMAL weight; a card that needs you lifts to
         // MEDIUM and full-strength text. Everything else rests at 0.9.
-        let rest_text = if selected || needs_you || search_query.is_some() {
+        let rest_text = if selected || needs_you || parking.woke || search_query.is_some() {
             text
+        } else if parking.settled_at.is_some() {
+            // Settled history recedes until the pointer reaches it.
+            theme.text_muted
         } else {
             text.opacity(0.9)
         };
@@ -7228,13 +7347,42 @@ impl Shell {
                             .truncate()
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
-                            .when(needs_you, |el| el.font_weight(gpui::FontWeight::MEDIUM))
+                            .when(needs_you || parking.woke, |el| {
+                                el.font_weight(gpui::FontWeight::MEDIUM)
+                            })
                             .child(popover::search_highlight(
                                 title.clone(),
                                 search_query,
                                 theme,
                             ))
                             .into_any_element(),
+                    })
+                    .when(parking.pinned && search_query.is_none(), |el| {
+                        let unpin_id = id.clone();
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("{row_id}-pin")))
+                                .role(gpui::Role::Button)
+                                .aria_label("Unpin thread")
+                                .tooltip(crate::settings::widgets::text_tooltip_above(
+                                    "Unpin thread",
+                                ))
+                                .flex_none()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.organize_chat(
+                                        unpin_id.clone(),
+                                        lifecycle::OrganizeAction::Unpin,
+                                        None,
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    icon(icons::PIN).size(px(11.0)).text_color(theme.text_faint),
+                                ),
+                        )
                     })
                     .child(corner),
             )
@@ -7248,12 +7396,29 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(self.render_project_icon(
-                        badge,
-                        SIDEBAR_PROJECT_BADGE_SIZE,
-                        selected,
-                        cx,
-                    ))
+                    .child({
+                        let badge = self.render_project_icon(
+                            badge,
+                            SIDEBAR_PROJECT_BADGE_SIZE,
+                            selected,
+                            cx,
+                        );
+                        // Settled rows dim their project badge at rest and
+                        // restore it under the pointer (T3's settled tail).
+                        if parking.settled_at.is_some() && !selected {
+                            div()
+                                .flex_none()
+                                .opacity(motion::lerp(
+                                    0.4,
+                                    1.0,
+                                    motion::hover_t_owned(hover_owner, &fade_key),
+                                ))
+                                .child(badge)
+                                .into_any_element()
+                        } else {
+                            badge
+                        }
+                    })
                     .child(
                         div()
                             .max_w(px(if branch.is_some() { 88.0 } else { 140.0 }))
@@ -8452,6 +8617,29 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let lifecycle = self
+                .state
+                .read(cx)
+                .chat_lifecycle(&chat_id)
+                .cloned()
+                .unwrap_or_default();
+            let now = Utc::now();
+            let menu_chat = chat_id.clone();
+            let lifecycle_row = move |key: &str,
+                                      glyph: &'static str,
+                                      label: &'static str,
+                                      action: lifecycle::OrganizeAction,
+                                      theme: &Theme,
+                                      cx: &mut Context<Self>| {
+                let id = menu_chat.clone();
+                popover::menu_row(theme, false, format!("chat-menu-{key}-{menu_chat}"))
+                    .id(SharedString::from(format!("chat-menu-{key}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.organize_chat(id.clone(), action, None, cx)
+                    }))
+                    .child(icon(glyph).size(px(16.0)).text_color(theme.text_muted))
+                    .child(SharedString::from(label))
+            };
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -8470,6 +8658,74 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename")),
                     )
+                    .child(if lifecycle.pinned() {
+                        lifecycle_row(
+                            "unpin",
+                            icons::PIN,
+                            "Unpin",
+                            lifecycle::OrganizeAction::Unpin,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        lifecycle_row(
+                            "pin",
+                            icons::PIN,
+                            "Pin",
+                            lifecycle::OrganizeAction::Pin,
+                            &theme,
+                            cx,
+                        )
+                    })
+                    .child(if lifecycle.snoozed(now) {
+                        lifecycle_row(
+                            "wake",
+                            icons::ALARM_OFF,
+                            "Wake now",
+                            lifecycle::OrganizeAction::Unsnooze,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        popover::menu_row(&theme, false, format!("chat-menu-snooze-{chat_id}"))
+                            .id("chat-menu-snooze")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(menu) = this.chat_menu.open_mut() {
+                                    menu.page = ChatMenuPage::Snooze;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                icon(icons::CLOCK_CIRCLE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().child(SharedString::from("Snooze")))
+                            .child(
+                                icon(icons::ALT_ARROW_RIGHT)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                    })
+                    .child(if lifecycle.settled() {
+                        lifecycle_row(
+                            "unsettle",
+                            icons::UNDO,
+                            "Un-settle",
+                            lifecycle::OrganizeAction::Unsettle,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        lifecycle_row(
+                            "settle",
+                            icons::CHECK,
+                            "Settle",
+                            lifecycle::OrganizeAction::Settle,
+                            &theme,
+                            cx,
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
@@ -8516,6 +8772,60 @@ impl Shell {
                             )
                             .child(SharedString::from("Delete…")),
                     ),
+                ChatMenuPage::Snooze => {
+                    let mut menu = menu
+                        .child(
+                            popover::menu_row(&theme, false, format!("chat-snooze-back-{chat_id}"))
+                                .id("chat-snooze-back")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(menu) = this.chat_menu.open_mut() {
+                                        menu.page = ChatMenuPage::Root;
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(
+                                    icon(icons::ALT_ARROW_LEFT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Snooze")),
+                        )
+                        .child(popover::menu_separator());
+                    // Resolved at open time, so "In 1 hour" is relative to
+                    // the click, not to when the row mounted.
+                    for (index, preset) in lifecycle::snooze_presets(chrono::Local::now())
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let id = chat_id.clone();
+                        let until = preset.until;
+                        menu = menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-snooze-{index}-{chat_id}"),
+                            )
+                            .id(SharedString::from(format!("chat-snooze-{index}")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.organize_chat(
+                                    id.clone(),
+                                    lifecycle::OrganizeAction::Snooze,
+                                    Some(until),
+                                    cx,
+                                )
+                            }))
+                            .child(div().flex_1().child(SharedString::from(preset.label)))
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(preset.when)),
+                            ),
+                        );
+                    }
+                    menu
+                }
                 ChatMenuPage::Copy => {
                     let chat = self
                         .state
@@ -14829,6 +15139,7 @@ mod workspace_persistence {
                         true,
                         false,
                         false,
+                        Default::default(),
                         self.jump.then(|| {
                             if self.index == 5 {
                                 "Ctrl+Shift+A"
