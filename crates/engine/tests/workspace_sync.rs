@@ -65,6 +65,7 @@ impl Harness for ScriptedHarness {
         tokio::spawn(async move {
             let script = vec![
                 AgentEvent::SessionStarted {
+                    instance_id: None,
                     harness,
                     model: "scripted-1".into(),
                     tools: vec![],
@@ -145,6 +146,7 @@ where
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -460,6 +462,7 @@ async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
         .expect("create space");
 
     let request = RunRequest {
+        instance_id: None,
         cwd: wt.to_string_lossy().into_owned(),
         ..run_request("go do it")
     };
@@ -493,6 +496,7 @@ async fn claimed_chat_row_records_the_run_harness() {
     let core = assemble(dir.path(), "dev-a");
 
     let request = RunRequest {
+        instance_id: None,
         harness: Some(HarnessId::Cursor),
         ..run_request("go do it")
     };
@@ -561,6 +565,7 @@ async fn chat_config_selects_the_run_harness() {
             Some("space-cfg"),
             None,
             Some(ChatConfig {
+                instance_id: None,
                 harness: HarnessId::Cursor,
                 model: None,
                 reasoning: None,
@@ -716,6 +721,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 harness_session_id: Some("hs-9".into()),
                 room_gen: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
+                harness_session_instance_id: None,
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
             })

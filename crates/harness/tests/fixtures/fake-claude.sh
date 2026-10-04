@@ -7,6 +7,15 @@
 # mirror live captures from CLI 2.1.228. Driven by
 # crates/harness/tests/claude.rs.
 
+if [ "$1" = "auth" ]; then
+  if [ "$NOCHES_TEST_INSTANCE_SIGNED_OUT" = "true" ]; then
+    printf '%s\n' '{"loggedIn":false}'
+  else
+    printf '%s\n' '{"loggedIn":true}'
+  fi
+  exit 0
+fi
+
 read -r first || exit 1
 
 emit() { printf '%s\n' "$1"; }

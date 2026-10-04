@@ -143,11 +143,8 @@ impl RunnerInstances for HostCatalog {
         }
         let harness = self
             .0
-            .resolve(
-                instance
-                    .harness_id
-                    .ok_or_else(|| tool_error("Missing adapter."))?,
-            )
+            .provider_instances
+            .resolve_runtime(&self.0, id, true)
             .map_err(tool_error)?;
         Ok(RunnerProvider {
             capabilities: capabilities(harness.as_ref()),

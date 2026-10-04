@@ -334,6 +334,7 @@ impl RunnerBridge {
             .map(|value| serde_json::from_value::<zeron_proto::ReasoningLevel>(value.clone()))
             .transpose()?;
         let config = ChatConfig {
+            instance_id: Some(run.provider_instance_id.clone()),
             harness: harness.id(),
             model: Some(run.model_selection.model.clone()),
             reasoning,
@@ -401,7 +402,8 @@ impl RunnerBridge {
             }
         }
         let request: RunRequest = serde_json::from_value(json!({
-            "prompt":prompt,"harness":harness.id(),"model":run.model_selection.model,"reasoning":reasoning,
+            "prompt":prompt,"harness":harness.id(),"instanceId":run.provider_instance_id,
+            "model":run.model_selection.model,"reasoning":reasoning,
             "modelOptions":options,"cwd":cwd,"sandbox":"workspace-write","autoApprove":false,
             "runtimeMode":projection.thread.runtime_mode,"interactionMode":projection.thread.interaction_mode,"resume":null,"attachments":attachment_paths
         }))?;
@@ -937,6 +939,7 @@ pub(crate) fn plan_event(
             run_id,
             attempt_id,
             &AgentEvent::SessionStarted {
+                instance_id: Some(run.provider_instance_id.clone()),
                 harness: zeron_proto::HarnessId::Mock, // not stored; driver is the exact binding above
                 model: run.model_selection.model.clone(),
                 tools: vec![],

@@ -30,6 +30,7 @@ pub mod threads;
 pub mod ui;
 pub mod ui_git_actions;
 pub mod ui_launch;
+pub mod ui_provider_instances;
 pub mod ui_scheduler;
 pub mod ui_threads;
 

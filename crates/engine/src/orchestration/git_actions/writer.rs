@@ -54,18 +54,15 @@ impl GitActionsService {
             "Configured writer unavailable"
         );
         let harness_id = instance.harness_id.context("Writer has no adapter")?;
-        // TODO(merge-provider-instances): switch this seam to instance-specific
-        // adapter resolution. Never silently run a custom account via legacy CLI.
-        ensure!(
-            instance.provider_instance_id
-                == crate::provider_instances::legacy_instance_id(harness_id),
-            "Custom writer instance requires provider-instances merge"
-        );
         ensure!(
             zeron_harness::supports_titles(harness_id),
             "Writer lacks restricted text-generation support"
         );
-        let harness = self.0.registry.resolve(harness_id)?;
+        let harness = self.0.registry.provider_instances.resolve_runtime(
+            &self.0.registry,
+            &instance.provider_instance_id,
+            true,
+        )?;
         let cwd = Path::new(&checkout.cwd);
         let policy = match settings.style {
             WritingStyle::ConventionalCommits => "Use Conventional Commits for the commit subject. Write a concise factual PR title and summary.".into(),
@@ -108,6 +105,7 @@ impl GitActionsService {
         let request = RunRequest {
             prompt,
             harness: Some(harness_id),
+            instance_id: Some(instance.provider_instance_id.clone()),
             model: settings.model.clone(),
             reasoning: Some(zeron_proto::ReasoningLevel::Minimal),
             model_options: Default::default(),

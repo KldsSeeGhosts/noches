@@ -37,6 +37,7 @@ async fn restricted_remote_runs_refuse_unknown_capability_before_writes_or_forwa
             None,
             Some("old-host"),
             Some(zeron_proto::ChatConfig {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: None,
                 reasoning: None,
@@ -109,6 +110,7 @@ impl Harness for PermissionHarness {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let _ = tx.send(Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "fixture".into(),
                 tools: vec![],
@@ -195,6 +197,7 @@ async fn saved_mode_change_replaces_the_runtime_instead_of_steering_with_old_aut
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AuthorityHarness(seen.clone())));
     let mut config = zeron_proto::ChatConfig {
+        instance_id: None,
         harness: HarnessId::Mock,
         model: None,
         reasoning: None,
@@ -467,6 +470,7 @@ async fn start_failure_lands_in_the_transcript() {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -495,6 +499,7 @@ fn done(status: DoneStatus) -> AgentEvent {
 fn mock_script() -> Vec<AgentEvent> {
     vec![
         AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],
@@ -2515,6 +2520,7 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        instance_id: None,
         prompt,
         harness: None,
         model: Some("haiku".into()),
@@ -2589,6 +2595,7 @@ where
 #[tokio::test]
 async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     let mut script = vec![AgentEvent::SessionStarted {
+        instance_id: None,
         harness: HarnessId::Mock,
         model: "mock-1".into(),
         tools: vec![],
@@ -2718,6 +2725,7 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
     // (the mid-word transcript splits).
     let script = vec![
         AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],

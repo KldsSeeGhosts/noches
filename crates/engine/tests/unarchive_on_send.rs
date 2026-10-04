@@ -49,6 +49,7 @@ impl Harness for AckHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -100,6 +101,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 fn run_payload(message_id: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            instance_id: None,
             prompt: "back from the archive".into(),
             harness: None,
             model: None,

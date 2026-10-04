@@ -824,6 +824,7 @@ impl GitActionsService {
                     .unwrap_or_else(chrono::Utc::now),
                 harness_session_id: None,
                 harness_session_cwd: None,
+                harness_session_instance_id: None,
                 room_gen: Some(2),
                 space_id: Some(space_id.into()),
                 last_seen_at: None,
@@ -916,6 +917,7 @@ impl GitActionsService {
         self.0.registry.resolve(harness)?;
         let config = zeron_proto::ChatConfig {
             harness,
+            instance_id: None,
             model: None,
             reasoning: None,
             model_options: Default::default(),

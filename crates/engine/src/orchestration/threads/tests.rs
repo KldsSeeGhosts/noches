@@ -207,6 +207,7 @@ impl Fixture {
                             run_id: run.id.clone(),
                             attempt_id: run.active_attempt_id.clone().unwrap(),
                             event: zeron_proto::AgentEvent::SessionStarted {
+                                instance_id: None,
                                 harness: zeron_proto::HarnessId::Mock,
                                 model: "mock-1".into(),
                                 tools: vec![],
@@ -734,6 +735,7 @@ async fn only_complete_direct_child_terminal_result_acknowledges_delivery() {
     f.provider_event(
         id,
         zeron_proto::AgentEvent::SessionStarted {
+            instance_id: None,
             harness: zeron_proto::HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],

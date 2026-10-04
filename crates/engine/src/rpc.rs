@@ -91,7 +91,10 @@ struct ChatParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
-    harness: HarnessId,
+    #[serde(default)]
+    harness: Option<HarnessId>,
+    #[serde(default)]
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1258,6 +1261,13 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
+            | methods::LIST_PROVIDER_INSTANCES
+            | methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1798,6 +1808,20 @@ impl RpcService for EngineRpc {
                     .await;
                 RpcReply::value(&self.registry.provider_instances.snapshot(&self.registry))
             }
+            methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED => {
+                crate::orchestration::ui_provider_instances::dispatch(
+                    &self.registry,
+                    &self.sessions,
+                    method,
+                    params,
+                )
+                .await
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
@@ -1817,18 +1841,70 @@ impl RpcService for EngineRpc {
                     zeron_harness::AcpHarness::antigravity().sign_out(),
                 )
                 .await?;
+                // Compatibility UI toggles control the canonical identity,
+                // never all accounts/routes of the same driver.
+                let instance_id = crate::provider_instances::legacy_instance_id(p.harness);
+                if self
+                    .registry
+                    .provider_instances
+                    .config(&instance_id)
+                    .is_some()
+                {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::SET_PROVIDER_INSTANCE_ENABLED,
+                        serde_json::json!({"instanceId":instance_id,"enabled":p.enabled}),
+                    )
+                    .await?;
+                } else if p.enabled {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::CREATE_PROVIDER_INSTANCE,
+                        serde_json::json!({"instanceId":instance_id,"instance":{
+                            "driver":crate::provider_instances::legacy_driver(p.harness),
+                            "enabled":true,"config":{"legacyCatalogImport":true}
+                        }}),
+                    )
+                    .await?;
+                }
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let models = self
-                    .registry
-                    .provider_instances
-                    .refresh(&self.registry, p.harness)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let models = if let Some(instance) = p.instance_id {
+                    if let Some(harness) = p.harness
+                        && self
+                            .registry
+                            .provider_instances
+                            .snapshot(&self.registry)
+                            .iter()
+                            .find(|p| p.provider_instance_id == instance)
+                            .is_some_and(|p| p.harness_id != Some(harness))
+                    {
+                        return Err(RpcError::Failed(
+                            "Provider instance/driver mismatch.".into(),
+                        ));
+                    }
+                    self.registry
+                        .provider_instances
+                        .refresh_instance(&self.registry, &instance)
+                        .await
+                } else {
+                    self.registry
+                        .provider_instances
+                        .refresh(
+                            &self.registry,
+                            p.harness.ok_or_else(|| {
+                                RpcError::Failed("harness or instanceId is required.".into())
+                            })?,
+                        )
+                        .await
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
@@ -1839,9 +1915,27 @@ impl RpcService for EngineRpc {
                 // no listing (cursor, mock) fall through to the trait's
                 // empty default.
                 let p: ListModelsParams = parse_params(params)?;
+                if let (Some(instance), Some(harness)) = (&p.instance_id, p.harness)
+                    && self
+                        .registry
+                        .provider_instances
+                        .snapshot(&self.registry)
+                        .iter()
+                        .find(|p| &p.provider_instance_id == instance)
+                        .is_some_and(|p| p.harness_id != Some(harness))
+                {
+                    return Err(RpcError::Failed(
+                        "Provider instance/driver mismatch.".into(),
+                    ));
+                }
+                let instance = p
+                    .instance_id
+                    .or_else(|| p.harness.map(crate::provider_instances::legacy_instance_id))
+                    .ok_or_else(|| RpcError::Failed("harness or instanceId is required.".into()))?;
                 let harness = self
                     .registry
-                    .resolve(p.harness)
+                    .provider_instances
+                    .resolve_runtime(&self.registry, &instance, false)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
                     .commands()

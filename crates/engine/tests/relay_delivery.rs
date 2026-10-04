@@ -154,6 +154,7 @@ impl Harness for InstantHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Ok(futures::stream::iter([
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "instant-1".into(),
                 tools: vec![],
@@ -244,6 +245,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
     // grace elapses; the entry crosses the peer link instead.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
+            instance_id: None,
             prompt: "over the relay".into(),
             harness: None,
             model: None,
