@@ -52,6 +52,13 @@ if has "$line" '"method":"model/list"'; then
   emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"displayName\":\"GPT-5.6-Sol\",\"description\":\"Reliable agentic workhorse for everyday tasks.\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"ultra\"}],\"additionalSpeedTiers\":[],\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":null}}"
   exec sleep 30
 fi
+if has "$line" '"method":"thread/fork"'; then
+  has "$line" '"threadId":"native-source"' || exit 1
+  has "$line" '"lastTurnId":"stable-turn"' || exit 1
+  has "$line" '"approvalPolicy":"never"' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"native-fork\"}}}"
+  exec sleep 30
+fi
 if has "$line" '"method":"thread/resume"'; then
   if has "$line" '"threadId":"resume-with-child-v1"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-alpha\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-alpha\"]}]}]}}}"

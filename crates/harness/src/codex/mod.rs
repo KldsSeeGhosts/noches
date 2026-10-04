@@ -34,6 +34,7 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 pub(crate) mod catalog;
+mod lifecycle;
 mod mcp;
 mod normalize;
 mod subagents;
@@ -516,6 +517,9 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
 
 #[async_trait]
 impl Harness for CodexHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::Codex
     }
@@ -1028,7 +1032,19 @@ async fn run_session(session: Session) {
 
     let mut router = TurnRouter::default();
     match start_turn(&client, turn_params(&request.prompt)).await {
-        Ok(id) => router.adopt_started(id),
+        Ok(id) => {
+            if !id.is_empty() {
+                let _ = send(
+                    &event_tx,
+                    AgentEvent::NativeReference {
+                        thread_id: thread_id.clone(),
+                        turn_id: Some(id.clone()),
+                    },
+                )
+                .await;
+            }
+            router.adopt_started(id);
+        }
         Err(e) => {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
@@ -1090,7 +1106,15 @@ async fn run_session(session: Session) {
                     }
                 }
                 match method.as_str() {
-                    "turn/started" => router.note_started(turn_id(&params)),
+                    "turn/started" => {
+                        let native_turn = turn_id(&params);
+                        if !native_turn.is_empty() {
+                            let _ = send(&event_tx, AgentEvent::NativeReference {
+                                thread_id: thread_id.clone(), turn_id: Some(native_turn.clone()),
+                            }).await;
+                        }
+                        router.note_started(native_turn);
+                    },
 
                     "item/agentMessage/delta" => {
                         streamed_text.insert(item_id(&params));

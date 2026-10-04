@@ -420,6 +420,13 @@ pub enum DoneStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
+    /// Host-only durable native conversation boundary, not a visible message.
+    #[serde(rename_all = "camelCase")]
+    NativeReference {
+        thread_id: String,
+        #[serde(default)]
+        turn_id: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     SessionStarted {
         harness: HarnessId,

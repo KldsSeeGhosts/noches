@@ -55,6 +55,7 @@ use zeron_proto::{
 
 use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, shutdown_child};
+mod lifecycle;
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -315,6 +316,9 @@ impl OpencodeHarness {
 
 #[async_trait]
 impl Harness for OpencodeHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::Opencode
     }
@@ -2683,6 +2687,18 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 return BusOutcome::Continue;
             };
             if session == session_id {
+                if role == "user"
+                    && !send(
+                        event_tx,
+                        AgentEvent::NativeReference {
+                            thread_id: session.to_owned(),
+                            turn_id: Some(message.to_owned()),
+                        },
+                    )
+                    .await
+                {
+                    return BusOutcome::ConsumerGone;
+                }
                 main_feed
                     .assistant_messages
                     .entry(message.to_owned())
