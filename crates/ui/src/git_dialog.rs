@@ -43,6 +43,22 @@ pub fn parse_remote(url: &str) -> Option<Repository> {
     })
 }
 
+/// Progress text names commits by full SHA; the dialog reads them at the
+/// short length everywhere else uses.
+pub fn short_shas(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if bare.len() == 40 && bare.chars().all(|c| c.is_ascii_hexdigit()) {
+                word.replacen(bare, &bare[..7], 1)
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn chain_label(push: bool, pr: bool) -> &'static str {
     if push && pr {
         "Commit, push & open PR"
@@ -533,12 +549,14 @@ impl GitDialog {
             .read(cx)
             .measured_text_height()
             .clamp(min_lines as f32 * 18.0, max_lines as f32 * 18.0);
+        // Single-line fields sit inside 32px step rows; keep them 28px tall.
+        let pad_y = if max_lines == 1 { 4.0 } else { 8.0 };
         div()
             .w_full()
-            .h(px(height + 16.0))
+            .h(px(height + pad_y * 2.0))
             .overflow_hidden()
-            .px(px(12.0))
-            .py(px(8.0))
+            .px(px(if max_lines == 1 { 8.0 } else { 12.0 }))
+            .py(px(pad_y))
             .rounded(px(8.0))
             .border_1()
             .border_color(theme.border)
@@ -555,12 +573,13 @@ impl GitDialog {
                 self.remote
             })
         });
+        // The repository chip names `owner/repo` (the full URL is in its
+        // menu); the remote chip names the remote and dims its repo.
         let label = selected
             .map(|r| {
-                let parsed = parse_remote(&r.push_url);
                 if repository {
-                    parsed
-                        .map(|p| p.https)
+                    parse_remote(&r.push_url)
+                        .map(|p| p.owner_repo)
                         .unwrap_or_else(|| r.push_url.clone())
                 } else {
                     r.name.clone()
@@ -738,10 +757,15 @@ impl GitDialog {
                     .child("Open pull request into")
                     .child(
                         div()
-                            .w(px(120.0))
+                            .w(px(96.0))
+                            .flex_none()
                             .font_family(theme.font_mono.clone())
                             .child(self.field(&self.base, 1, 1, theme, cx)),
-                    ),
+                    )
+                    .when(self.pr, |row| {
+                        row.child(div().text_color(theme.text_muted).child("on"))
+                            .child(self.remote_chip(true, theme, cx))
+                    }),
             );
         if let Some(repository) = self.menu {
             let remotes = self
@@ -777,9 +801,18 @@ impl GitDialog {
             ));
         }
         if self.pr {
+            let label = |text: &'static str| {
+                div()
+                    .mb(px(-6.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(text)
+            };
             body = body
-                .child(self.remote_chip(true, theme, cx))
+                .child(label("Pull request title"))
                 .child(self.field(&self.title, 1, 1, theme, cx))
+                .child(label("Description"))
                 .child(self.field(&self.body, 6, 6, theme, cx));
         }
         body.into_any_element()
@@ -791,12 +824,18 @@ impl Render for GitDialog {
         let theme = Theme::of(cx).clone();
         let owner = cx.entity_id();
         let checkout = self.checkout.as_ref();
+        let committed = self.action.as_ref().and_then(|a| a.commit.clone());
         let header = checkout
             .map(|c| {
                 format!(
                     "{} · {}",
                     c.branch,
-                    c.head.chars().take(7).collect::<String>()
+                    committed
+                        .as_deref()
+                        .unwrap_or(&c.head)
+                        .chars()
+                        .take(7)
+                        .collect::<String>()
                 )
             })
             .unwrap_or_default();
@@ -831,7 +870,13 @@ impl Render for GitDialog {
                 );
             }
             Phase::Ready => body = body.child(self.ready_body(&theme, cx)),
-            Phase::Running => {
+            Phase::Running | Phase::Done | Phase::Failed => {
+                if self.phase == Phase::Failed {
+                    body = body.child(popover::dialog_body(
+                        &theme,
+                        "Check the repository before trying again.",
+                    ));
+                }
                 let action = self.action.clone().unwrap_or_default();
                 for (index, (label, status, text)) in progress_steps(&action, self.push, self.pr)
                     .into_iter()
@@ -880,57 +925,61 @@ impl Render for GitDialog {
                                     .truncate()
                                     .text_size(crate::typography::ui_rems(12.0))
                                     .text_color(theme.text_muted)
-                                    .child(text),
+                                    .child(short_shas(&text)),
                             ),
                     );
                 }
             }
-            Phase::Done | Phase::Failed => {
-                if self.phase == Phase::Failed {
-                    body = body.child(popover::dialog_body(
-                        &theme,
-                        "Check the repository before trying again.",
-                    ));
-                }
-                if let Some(action) = &self.action {
-                    if let Some(sha) = &action.commit {
-                        let sha = sha.clone();
-                        body = body.child(
-                            mono(sha.clone(), &theme, theme.text)
-                                .id("git-copy-sha")
-                                .cursor_pointer()
-                                .tooltip(crate::tooltip::text("Copy commit SHA"))
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        sha.clone(),
-                                    ))
-                                }),
-                        );
-                    }
-                    if let Some(url) = &action.pr_url {
-                        let url = url.clone();
-                        body = body
-                            .child(
-                                mono(url.clone(), &theme, theme.text)
-                                    .id("git-open-pr")
-                                    .cursor_pointer()
-                                    .on_click(move |_, _, cx| cx.open_url(&url)),
-                            )
-                            .child(mono(
-                                if action.pr_linked {
-                                    "Linked to thread"
-                                } else {
-                                    "Link pending"
-                                },
-                                &theme,
-                                theme.text_muted,
-                            ));
-                    }
-                }
+        }
+        // Results: the short SHA copies, the PR opens. Both stay quiet mono
+        // metadata; the step glyphs above already carry the state color.
+        if matches!(self.phase, Phase::Done | Phase::Failed)
+            && let Some(action) = self.action.as_ref().filter(|a| a.pr_url.is_some())
+        {
+            let result_row = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .mx(px(-8.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme.wash(0.06)))
+                    .child(div().flex_1().text_color(theme.text_muted).child(label))
+            };
+            let mut results = div()
+                .mt(px(4.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col();
+            if let Some(url) = &action.pr_url {
+                let open = url.clone();
+                let number = url
+                    .rsplit('/')
+                    .next()
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| url.clone());
+                results = results.child(
+                    result_row("git-open-pr", "Pull request")
+                        .tooltip(crate::tooltip::text(SharedString::from(url.clone())))
+                        .on_click(move |_, _, cx| cx.open_url(&open))
+                        .child(mono(number, &theme, theme.text))
+                        .child(
+                            icon(icons::ARROW_UP_RIGHT)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        ),
+                );
             }
+            body = body.child(results);
         }
         let ready = self.phase == Phase::Ready;
-        let running = self.phase == Phase::Running;
         let enabled = ready
             && self.preview.is_some()
             && checkout.is_some_and(|c| !c.staged_paths.is_empty())
@@ -946,27 +995,29 @@ impl Render for GitDialog {
         let footer = popover::dialog_footer(&theme)
             .child(
                 mono(
-                    if running {
-                        "Runs on the host. Closing this doesn't stop it."
-                    } else {
-                        "Hooks are skipped in this version"
+                    match self.phase {
+                        Phase::Running => "Runs on the host. Closing this doesn't stop it.",
+                        Phase::Done => "",
+                        _ => "Hooks are skipped in this version",
                     },
                     &theme,
                     theme.text_faint,
                 )
                 .flex_1(),
             )
-            .child(
-                controls::button(
-                    "git-cancel",
-                    owner,
-                    &theme,
-                    Variant::Ghost,
-                    Size::Md,
-                    if ready { "Cancel" } else { "Close" },
+            .when(self.phase != Phase::Done, |el| {
+                el.child(
+                    controls::button(
+                        "git-cancel",
+                        owner,
+                        &theme,
+                        Variant::Ghost,
+                        Size::Md,
+                        if ready { "Cancel" } else { "Close" },
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Closed))),
                 )
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(Closed))),
-            )
+            })
             .when(ready || self.phase == Phase::Done, |el| {
                 el.child(
                     controls::button(
@@ -1016,7 +1067,19 @@ impl Render for GitDialog {
                 div()
                     .flex()
                     .gap(px(0.0))
-                    .child(mono(header, &theme, theme.text_muted))
+                    .child(match committed.clone() {
+                        // Once committed, the sub-line names the new HEAD and
+                        // copies its full SHA.
+                        Some(sha) => mono(header, &theme, theme.text_muted)
+                            .id("git-copy-sha")
+                            .cursor_pointer()
+                            .tooltip(crate::tooltip::text("Copy commit SHA"))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone()))
+                            })
+                            .into_any_element(),
+                        None => mono(header, &theme, theme.text_muted).into_any_element(),
+                    })
                     .when(checkout.is_some_and(|c| c.dirty), |el| {
                         el.child(mono(" · unstaged changes", &theme, theme.text_faint))
                     }),
@@ -1064,6 +1127,15 @@ mod tests {
             assert!(parse_remote(url).is_none(), "{url}");
         }
     }
+    #[test]
+    fn progress_text_uses_short_shas() {
+        assert_eq!(
+            short_shas("Committed a6991899654ef3feb5a1586377f70f2d2f8cbcb3."),
+            "Committed a699189."
+        );
+        assert_eq!(short_shas("Pushed to origin"), "Pushed to origin");
+    }
+
     #[test]
     fn labels_require_separate_push_authorization() {
         assert_eq!(chain_label(false, false), "Commit");

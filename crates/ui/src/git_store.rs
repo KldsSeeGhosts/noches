@@ -57,6 +57,10 @@ pub fn skip_reason(reason: &str) -> String {
 }
 
 pub fn pull_summary(state: &PullState, now_ms: i64) -> String {
+    // While the policy is off there is nothing to report; the Switch says it.
+    if !state.policy.enabled {
+        return "Off".into();
+    }
     if let Some(reason) = &state.last_skip_reason {
         return format!("skipped · {}", skip_reason(reason));
     }
@@ -258,8 +262,12 @@ mod tests {
         let mut state = PullState {
             last_checked_at: Some(0),
             last_result: Some("skipped_up_to_date".into()),
+            last_skip_reason: Some("disabled".into()),
             ..Default::default()
         };
+        assert_eq!(pull_summary(&state, 120000), "Off");
+        state.policy.enabled = true;
+        state.last_skip_reason = None;
         assert_eq!(pull_summary(&state, 120000), "up to date · checked 2m ago");
         state.last_result = Some("pulled".into());
         assert_eq!(pull_summary(&state, 180000), "pulled · 3m ago");

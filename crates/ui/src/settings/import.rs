@@ -534,9 +534,12 @@ impl Render for ImportPage {
             .child(widgets::page_header(&theme, "Import CLI history", None))
             .child(widgets::page_subtitle(&theme, "Bring Claude Code and Codex sessions for a project into Noches. Nothing runs until you continue a session."))
             .child(div().mt(px(16.0)).flex().items_center().gap(px(8.0))
-                .child(controls::button("history-project", owner, &theme, Variant::Outline, Size::Sm, name)
+                // Project identity leads the name, as in the sidebar; Md so the
+                // chip and the Scan button share one height.
+                .child(controls::button("history-project", owner, &theme, Variant::Outline, Size::Md, "")
                     .when_some(selected_space, |el, space| el.child(
                         div().size(px(14.0)).child(crate::shell::project_monogram(space.display_name(), &space.id, &theme))))
+                    .child(name)
                     .child(icon(icons::ALT_ARROW_DOWN).size(px(12.0)).text_color(theme.text_muted))
                     .on_click(cx.listener(|page, _, _, cx| { page.project_menu = !page.project_menu; cx.notify(); })))
                 .child(controls::button("history-scan", owner, &theme, Variant::Primary, Size::Md, if resume { "Resume" } else { "Scan" })
@@ -704,13 +707,24 @@ impl Render for ImportPage {
                         list(self.list.clone(), cx.processor(Self::render_item)).size_full(),
                     ),
                 )
-                .child(
-                    div()
-                        .px(px(32.0))
-                        .py(px(14.0))
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(footer),
+                // The selection bar appears once a scan has something to
+                // import (or an import is running), never on an empty page.
+                .when(
+                    importing
+                        || project
+                            .scan
+                            .as_ref()
+                            .is_some_and(|scan| !scan.candidate_ids.is_empty()),
+                    |el| {
+                        el.child(
+                            div()
+                                .px(px(32.0))
+                                .py(px(14.0))
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(footer),
+                        )
+                    },
                 )
                 .children(confirm);
         motion::drive_hover_owner(owner, window);
