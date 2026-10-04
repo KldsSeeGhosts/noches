@@ -11,6 +11,12 @@ pub trait LaunchService: Send + Sync + 'static {
     async fn call(&self, scope: &InvocationScope, name: &str, input: Value) -> Value;
     /// Signed URLs are bearer capabilities independent of the MCP credential.
     async fn upload(&self, token: &str, bytes: &[u8]) -> (u16, Value);
+    /// Durable cleanup effects; None means only thread-owned setup terminals.
+    async fn cleanup(
+        &self,
+        thread: &str,
+        attachment_ids: Option<Vec<String>>,
+    ) -> Result<(), ToolError>;
 }
 
 /// TODO(merge-threads): replace with the threads slice's canonical intake.
