@@ -589,6 +589,7 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    git_actions: Option<crate::orchestration::git_actions::GitActionsService>,
     orchestration: Option<crate::orchestration::Store>,
     delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
     scheduler: Option<std::sync::Arc<crate::orchestration::scheduler::Scheduler>>,
@@ -640,6 +641,7 @@ impl EngineRpc {
             },
         };
         Self {
+            git_actions: None,
             orchestration: None,
             delegation: None,
             scheduler: None,
@@ -666,6 +668,22 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    pub fn with_git_actions(
+        mut self,
+        service: crate::orchestration::git_actions::GitActionsService,
+    ) -> Self {
+        self.git_actions = Some(service);
+        if !self
+            .engine_info
+            .capabilities
+            .iter()
+            .any(|c| c == "git-actions-v1")
+        {
+            self.engine_info.capabilities.push("git-actions-v1".into());
+        }
         self
     }
 
@@ -1001,7 +1019,9 @@ impl EngineRpc {
         if is_stream_method(method) {
             // Streams are unbounded by design (a quiet WATCH_* is healthy);
             // only unary calls below get the reply deadline.
-            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                || zeron_rpc::git_actions::methods::is_stream(method)
+            {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
                     Err(err) => {
@@ -1219,7 +1239,9 @@ const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
 fn forwardable(method: &str) -> bool {
-    if crate::orchestration::ui_scheduler::is_method(method) {
+    if crate::orchestration::ui_scheduler::is_method(method)
+        || zeron_rpc::git_actions::methods::handles(method)
+    {
         return true;
     }
     matches!(
@@ -1308,7 +1330,9 @@ fn forwardable(method: &str) -> bool {
 
 /// Forwardable methods whose reply is a stream (proxied item-by-item).
 fn is_stream_method(method: &str) -> bool {
-    if method == zeron_rpc::scheduled_tasks::methods::WATCH {
+    if method == zeron_rpc::scheduled_tasks::methods::WATCH
+        || zeron_rpc::git_actions::methods::is_stream(method)
+    {
         return true;
     }
     matches!(
@@ -1612,6 +1636,19 @@ impl RpcService for EngineRpc {
         }
         if AuthRpc::handles(method) {
             return Box::pin(AuthRpc::new(self.auth()?.clone()).handle(method, params)).await;
+        }
+        if zeron_rpc::git_actions::methods::handles(method) {
+            if let Some(cwd) = params.get("cwd").and_then(serde_json::Value::as_str) {
+                self.change_request_root(cwd).await?;
+            }
+            return crate::orchestration::git_actions::rpc::dispatch(
+                self.git_actions
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Git actions unavailable".into()))?,
+                method,
+                params,
+            )
+            .await;
         }
         let _work = if matches!(
             method,
@@ -3152,6 +3189,24 @@ impl RpcService for EngineRpc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_action_watches_route_as_streams_not_mutating_unary_calls() {
+        use zeron_rpc::git_actions::methods::*;
+        for method in [WATCH_GIT_ACTION, WATCH_SCAN, WATCH_IMPORT] {
+            assert!(super::forwardable(method));
+            assert!(super::is_stream_method(method));
+        }
+        for method in [
+            GET_GIT_STATUS,
+            PREVIEW_GIT,
+            START_GIT,
+            SET_PULL,
+            IMPORT_HISTORY,
+        ] {
+            assert!(super::forwardable(method));
+            assert!(!super::is_stream_method(method));
+        }
+    }
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

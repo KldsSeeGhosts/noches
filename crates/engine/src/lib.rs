@@ -128,6 +128,7 @@ pub struct EngineConfig {
 /// The assembled engine core — also constructible without the IPC server for tests
 /// and the in-process (headed) mode.
 pub struct EngineCore {
+    pub git_actions_host: orchestration::assembly::GitActionsHost,
     /// Profile-local V2 authority. The orchestration host registers services
     /// and starts workers after recovery; legacy session recovery never revives
     /// a chat already owned by this store.
@@ -322,6 +323,26 @@ impl EngineCore {
         // against this store and pushes staged bytes to remote hosts.
         doc_host.set_uploads(uploads.clone());
         let agent_accounts_config = AgentAccountsConfig::detect(data_dir);
+        let git_actions_host = orchestration::assembly::GitActionsHost::assemble(
+            orchestration.store.clone(),
+            sessions.clone(),
+            terminals.clone(),
+            doc_host.clone(),
+            workspace.clone(),
+            registry.clone(),
+            repos.clone(),
+            vec![
+                (
+                    zeron_proto::git_actions::HistorySource::ClaudeCode,
+                    agent_accounts_config.claude_config_dir.join("projects"),
+                ),
+                (
+                    zeron_proto::git_actions::HistorySource::Codex,
+                    agent_accounts_config.codex_home.join("sessions"),
+                ),
+            ],
+        )
+        .map_err(|error| EngineError::Other(error.to_string()))?;
         sessions.set_generated_images(
             uploads.clone(),
             agent_accounts_config.codex_home.join("generated_images"),
@@ -359,6 +380,7 @@ impl EngineCore {
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
+            git_actions_host,
             orchestration,
             orchestration_host,
             sessions,
@@ -509,6 +531,7 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_orchestration(self.orchestration.store.clone())
+        .with_git_actions(self.git_actions_host.service.clone())
         .with_previews(self.previews.clone());
         if let Some(host) = &self.orchestration_host {
             rpc = rpc.with_delegation(host.service.clone());
@@ -547,6 +570,7 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        self.git_actions_host.shutdown().await;
         if let Some(host) = &self.orchestration_host {
             host.shutdown().await;
         }
