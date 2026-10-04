@@ -14,6 +14,61 @@ pub(crate) fn sample(name: &str) -> Value {
     .unwrap();
     cases[name][0].clone()
 }
+
+#[test]
+fn premerge_slice_database_versions_reconcile_without_losing_metadata() {
+    for wave3 in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Arc::new(DocsStore::open(dir.path()).unwrap());
+        docs.with_connection(|conn| -> rusqlite::Result<()> {
+            conn.execute_batch(include_str!("../schema.sql"))?;
+            conn.execute_batch(
+                "CREATE TABLE orchestration_schema_migrations
+                 (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT;
+                 INSERT INTO orchestration_schema_migrations VALUES(1,1),(2,2);",
+            )?;
+            if wave3 {
+                conn.execute_batch(include_str!("../schema_scheduler.sql"))?;
+                conn.execute_batch(include_str!("../schema_git_actions.sql"))?;
+                conn.execute_batch(
+                    "INSERT INTO orchestration_schema_migrations VALUES(3,3);
+                     INSERT INTO git_actions_kv VALUES('test','retained','original');",
+                )?;
+            } else {
+                conn.execute_batch(include_str!("../schema_transfer.sql"))?;
+                conn.execute_batch(
+                    "INSERT INTO orchestration_transfer_delivery
+                     VALUES('retained','run:original',NULL,'inline_staged','{}');",
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        for _ in 0..2 {
+            let kernel = Kernel::open(docs.clone(), "host").unwrap();
+            kernel.store.read(|conn| {
+                for table in [
+                    "orchestration_file_checkpoints", "orchestration_transfer_delivery",
+                    "orchestration_scheduled_tasks", "orchestration_scheduled_runs", "git_actions_kv",
+                ] {
+                    let exists: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table], |row| row.get(0),
+                    )?;
+                    assert_eq!(exists, 1, "missing {table}, wave3={wave3}");
+                }
+                let retained: String = if wave3 {
+                    conn.query_row("SELECT value FROM git_actions_kv WHERE key='retained'", [], |row| row.get(0))?
+                } else {
+                    conn.query_row("SELECT target_run_id FROM orchestration_transfer_delivery WHERE transfer_id='retained'", [], |row| row.get(0))?
+                };
+                assert_eq!(retained, if wave3 { "original" } else { "run:original" });
+                Ok(())
+            }).unwrap();
+        }
+    }
+}
+
 pub(crate) fn fixture(cwd: &std::path::Path) -> (tempfile::TempDir, Kernel, OrchestrationV2Run) {
     let dir = tempfile::tempdir().unwrap();
     let kernel = Kernel::open(Arc::new(DocsStore::open(dir.path()).unwrap()), "host").unwrap();
@@ -142,6 +197,7 @@ async fn prepare(
 
 fn acceptance(cwd: &std::path::Path, native: &str) -> zeron_proto::AgentEvent {
     zeron_proto::AgentEvent::SessionStarted {
+        instance_id: None,
         harness: zeron_proto::HarnessId::Mock,
         model: "mock".into(),
         tools: vec![],

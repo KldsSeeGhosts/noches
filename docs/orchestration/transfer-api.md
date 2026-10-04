@@ -97,18 +97,26 @@ editors/Git processes do not participate.
 
 - `Store::{thread_transfers, transfer_ui_state, checkpoint_timeline,
   file_checkpoint}` are passive reads.
+- Idempotent domain DDL is reconciled on open, so independently numbered
+  pre-merge transfer and scheduler/git-actions databases acquire all domains
+  without dropping existing metadata.
 - `FileCheckpointService::{capture_turn, preview, restore}` owns immutable
   `refs/noches/checkpoints/...`, with separate-index `diff_sync` snapshots.
   Deterministic turn capture IDs and receipted publication recover a ref written
   before SQLite publication. Git objects/references are fsynced.
 - `transfer::ensure_start_allowed(transfers, thread, queued)` must run before
-  admission in the threads/queue planners. It is installed in existing ordinary
-  admission and task/queue-drain paths.
+  admission in the threads/queue planners. It is installed transactionally in
+  `ThreadService`'s send planner and task/queue-drain paths, and in ordinary
+  admission.
 - `transfer::delivery::TransferThreadAccess` is a local
-  `TODO(merge-threads)` history/read seam. The current adapter reads kernel
-  message/turn-item records and inherited fork history. Canonical comprehensive
-  activity/tool-item storage and the advertised paginated `t3_thread_read`
-  retrieval belong to the threads slice.
+  `TODO(merge-threads)` raw-history seam retained after merging `orch/wave3`.
+  `ThreadService::read` is not a semantic replacement: it returns paginated,
+  rendered/truncated activity text without raw tool/native fields or a pinned
+  through-run bound, and may acknowledge a delegated result. Transfer reads
+  must never acknowledge or import later source runs. The adapter reads the
+  threads slice's canonical kernel turn-items plus legacy message fallback and
+  inherited fork history. All actual thread read/send MCP tools now use the
+  real `ThreadService`; transfer delivery does not send a new user message.
 
 ## Implemented semantics and remaining parity work
 

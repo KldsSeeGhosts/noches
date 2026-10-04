@@ -568,8 +568,8 @@ pub(crate) fn inherited_items(
     visit(store, projection, &mut Default::default())
 }
 
-/// Must be called by the threads/queue slice BEFORE accepting a new run.
-/// TODO(merge-threads): use from its send and queued-start planners.
+/// Shared by ThreadService's transactional send planner, ordinary admission,
+/// and the queued-start planner BEFORE accepting a new run.
 pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool) -> Result<()> {
     let pending: Vec<_> = transfers
         .iter()

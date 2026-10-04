@@ -103,13 +103,17 @@ impl Store {
             }
             for (index, sql) in MIGRATIONS.iter().enumerate() {
                 let version = index as i64 + 1;
-                if version <= current {
+                if index == 0 && version <= current {
                     continue;
                 }
+                // Wave slices appended domain scripts independently, so a
+                // positional version can denote different domains before
+                // integration. Replay the IF-NOT-EXISTS domain DDL on open;
+                // the original, non-idempotent kernel schema runs only once.
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute_batch(sql)?;
                 tx.execute(
-                    "INSERT INTO orchestration_schema_migrations VALUES(?1,?2)",
+                    "INSERT OR IGNORE INTO orchestration_schema_migrations VALUES(?1,?2)",
                     params![version, crate::now_ms()],
                 )?;
                 tx.commit()?;

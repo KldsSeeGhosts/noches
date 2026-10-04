@@ -207,6 +207,7 @@ impl Fixture {
                             run_id: run.id.clone(),
                             attempt_id: run.active_attempt_id.clone().unwrap(),
                             event: zeron_proto::AgentEvent::SessionStarted {
+                                instance_id: None,
                                 harness: zeron_proto::HarnessId::Mock,
                                 model: "mock-1".into(),
                                 tools: vec![],
@@ -289,6 +290,115 @@ fn js_surrogate_slice_and_exact_wire_json() {
     assert!(encoded.contains(r#"\"text\":\"\\ud83d\""#));
     assert_eq!(wire::slice("A😀B", 2, 2).1, vec![0xde00, 0x42]);
     assert_eq!(wire::slice("A😀B", 100, 2), ("".into(), vec![], false));
+}
+
+/// Transfer admission must be identical through the merged ThreadService and
+/// ordinary/task paths, with no input or lifecycle writes on refusal.
+#[tokio::test]
+async fn transfer_merge_refusals_precede_thread_send_side_effects() {
+    use crate::orchestration::transfer::{SourcePoint, TransferOperation};
+
+    for (queued, children, detail) in [
+        (
+            true,
+            1,
+            "has a pending merge-back transfer; queued merge-back consumption is not implemented yet.",
+        ),
+        (
+            false,
+            2,
+            "has pending merge-back transfers from multiple forks.",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.running(false);
+        let mut parent_run = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs[0]
+            .clone();
+        parent_run.status = OrchestrationV2RunStatus::Completed;
+        f.emit("parent", "run.updated", json!(parent_run));
+        for index in 0..children {
+            let child = format!("fork:{index}");
+            let receipt = f
+                .service
+                .kernel
+                .transfer_command(
+                    &"parent".into(),
+                    format!("fork-command:{index}").into(),
+                    TransferOperation::Fork {
+                        target: child.clone().into(),
+                        source: SourcePoint::Run {
+                            run_id: parent_run.id.clone(),
+                        },
+                        title: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+            let mut run = parent_run.clone();
+            run.id = format!("run:{child}").into();
+            run.thread_id = child.clone().into();
+            f.emit(&child, "run.updated", json!(run));
+            let receipt = f
+                .service
+                .kernel
+                .transfer_command(
+                    &child.into(),
+                    format!("merge-command:{index}").into(),
+                    TransferOperation::MergeBack {
+                        target: "parent".into(),
+                        source: SourcePoint::Run { run_id: run.id },
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        }
+        if queued {
+            parent_run.status = OrchestrationV2RunStatus::Running;
+            f.emit("parent", "run.updated", json!(parent_run));
+        }
+        let before = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let error = f
+            .service
+            .send(
+                f.caller.clone(),
+                serde_json::from_value(json!({
+                    "threadId":"parent", "message":"Must not persist", "mode":"queue",
+                    "clientRequestId":"merge-refusal",
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("Unable to send to thread parent: Thread parent {detail}")
+        );
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(json!(after.thread), json!(before.thread));
+        assert_eq!(json!(after.runs), json!(before.runs));
+        assert_eq!(after.records, before.records);
+    }
 }
 
 #[test]
@@ -734,6 +844,7 @@ async fn only_complete_direct_child_terminal_result_acknowledges_delivery() {
     f.provider_event(
         id,
         zeron_proto::AgentEvent::SessionStarted {
+            instance_id: None,
             harness: zeron_proto::HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],

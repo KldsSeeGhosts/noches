@@ -11,8 +11,10 @@ use serde_json::{Value, json};
 use zeron_harness::{Harness, mcp::SessionMcpContext, session_lifecycle::NativeForkRequest};
 use zeron_proto::{RunRequest, orchestration::*};
 
-/// TODO(merge-threads): replace with the threads slice's history/read primitive.
-/// This trait is intentionally local; it cannot send or acknowledge task results.
+/// TODO(merge-threads): a raw, pinned-run, observational history primitive.
+/// ThreadService::read is not substitutable: its page is rendered/truncated
+/// text, lacks raw native/tool fields and a through-run bound, and can
+/// acknowledge a delegated result. This trait cannot send or acknowledge.
 #[async_trait]
 pub trait TransferThreadAccess: Send + Sync {
     async fn history(&self, thread: &ThreadId, through_run: &RunId) -> Result<Vec<Value>>;
@@ -52,7 +54,8 @@ pub(crate) fn local_items(projection: &ThreadProjection, ordinal: i64) -> Vec<Va
         .filter(|i| i["runId"].as_str().is_some_and(|id| runs.contains_key(id)))
         .cloned()
         .collect();
-    // Until threads owns a canonical timeline, ordinary runs have message rows.
+    // Canonical turn-items come from threads; legacy ordinary runs may still
+    // have only message rows. Preserve those without duplicating modern items.
     for message in super::super::task::records(projection, "message") {
         let Some(run) = message["runId"].as_str().and_then(|id| runs.get(id)) else {
             continue;
