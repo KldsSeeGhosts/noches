@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,7 @@ pub struct Store {
     pub(crate) cancellations: Arc<Cancellations>,
     pub(crate) publication_lane: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<Mutex<Option<(WriteBoundary, usize)>>>,
+    admission: Arc<OnceLock<super::adoption::RegistryAdmission>>,
 }
 
 impl Store {
@@ -141,6 +142,7 @@ impl Store {
             cancellations: Arc::default(),
             publication_lane: Arc::default(),
             failure: Arc::default(),
+            admission: Arc::default(),
         })
     }
 
@@ -200,7 +202,85 @@ impl Store {
     }
 
     pub fn thread(&self, id: &ThreadId) -> Result<Option<ThreadProjection>> {
+        self.thread_in_project(id, None)
+    }
+
+    pub(crate) fn stored_thread(&self, id: &ThreadId) -> Result<Option<ThreadProjection>> {
         self.read(|conn| projection::read_thread(conn, id))
+    }
+
+    pub(crate) fn install_admission(&self, admission: super::adoption::RegistryAdmission) {
+        let _ = self.admission.set(admission);
+    }
+
+    pub(crate) fn registry_unavailable(
+        &self,
+        id: &ThreadId,
+        project: Option<&zeron_proto::orchestration::ProjectId>,
+    ) -> bool {
+        self.admission
+            .get()
+            .is_some_and(|a| a.unavailable(id, project))
+    }
+
+    pub(crate) fn admit_project(
+        &self,
+        project: &zeron_proto::orchestration::ProjectId,
+    ) -> Result<()> {
+        if let Some(admission) = self.admission.get() {
+            for chat in admission
+                .workspace
+                .read_chats()
+                .map_err(|e| Error::Invariant(e.to_string()))?
+            {
+                if chat.device_id == self.host_id.as_ref()
+                    && super::adoption::project_id(&chat) == project.0
+                {
+                    self.thread_in_project(&ThreadId(chat.id), Some(project))?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Resolve outside the SQL connection. The stable adoption receipt and
+    /// immediate transaction fence independently racing handles/first calls.
+    pub(crate) fn thread_in_project(
+        &self,
+        id: &ThreadId,
+        project: Option<&zeron_proto::orchestration::ProjectId>,
+    ) -> Result<Option<ThreadProjection>> {
+        if self.registry_unavailable(id, project) {
+            return Ok(None);
+        }
+        let existing = self.read(|conn| projection::read_thread(conn, id))?;
+        if existing.is_some() {
+            return Ok(existing);
+        }
+        let Some(admission) = self.admission.get() else {
+            return Ok(None);
+        };
+        let Some((thread, messages)) = admission.prepare(id, project)? else {
+            return Ok(None);
+        };
+        let receipt = self.dispatch(
+            &Command {
+                id: CommandId(format!("registry-adopt:{}", encode_component(&id.0))),
+                thread_id: id.clone(),
+                operation: super::Operation::Adopt {
+                    legacy_chat_id: id.0.clone(),
+                    thread: Box::new(thread),
+                    messages,
+                },
+            },
+            crate::now_ms(),
+        )?;
+        // An ordinary turn could have created the projection after our read.
+        // Its existing identity wins; never overwrite or replay its input.
+        let current = self.read(|conn| projection::read_thread(conn, id))?;
+        if current.is_none() && receipt.status == ReceiptStatus::Rejected {
+            return Err(Error::Invariant(receipt.error.unwrap_or_default()));
+        }
+        Ok(current)
     }
 
     pub fn events(&self) -> Result<Vec<Envelope>> {

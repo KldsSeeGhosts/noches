@@ -79,6 +79,18 @@ pub(crate) fn visible(store: &Store, target: &ThreadProjection) -> Result<Vec<Ro
         let local_visible: Vec<_> = local_rows
             .iter()
             .filter(|row| {
+                // Ordinary intake may already have written the user doc entry
+                // when first admission snapshots history. Its real run item
+                // supersedes the imported, non-executable transcript row.
+                if row.item["runId"].is_null()
+                    && row.item["messageId"].is_string()
+                    && local_rows.iter().any(|other| {
+                        other.item["runId"].is_string()
+                            && other.item["messageId"] == row.item["messageId"]
+                    })
+                {
+                    return false;
+                }
                 let status = target
                     .runs
                     .iter()
@@ -374,6 +386,7 @@ impl Store {
         &self,
         project: &ProjectId,
     ) -> Result<Vec<OrchestratorMcpThreadListItem>> {
+        self.admit_project(project)?;
         let threads: Vec<ThreadProjection> = self.read(|conn| {
             let mut stmt = conn.prepare("SELECT id FROM orchestration_projection_threads")?;
             let ids = stmt

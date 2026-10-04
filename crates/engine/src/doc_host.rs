@@ -1062,6 +1062,25 @@ impl DocHost {
         }
     }
 
+    /// Observational migration read: never open a handle, join sync, drain
+    /// commands/queue, or start a provider merely because history is imported.
+    pub(crate) fn orchestration_history(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<SessionMessageEntry>, EngineError> {
+        let cached = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = cached {
+            return Ok(handle.doc().read_entries()?);
+        }
+        let Some(bytes) = self.inner.store.load_snapshot(chat_id)? else {
+            return Ok(vec![]);
+        };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes)
+            .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+        Ok(SessionDoc::from_doc(raw).read_entries()?)
+    }
+
     pub(crate) fn orchestration_queue_handles(&self) -> Vec<Arc<ChatDocHandle>> {
         lock(&self.inner.handles).values().cloned().collect()
     }

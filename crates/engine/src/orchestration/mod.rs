@@ -2,6 +2,7 @@
 //! `assembly` enables the production host by default. Opening only the kernel
 //! starts no workers; `runner` bridges its effects to ordinary sessions.
 
+pub(crate) mod adoption;
 pub mod assembly;
 pub mod checkpoint;
 pub mod command;
