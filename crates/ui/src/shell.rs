@@ -802,6 +802,9 @@ pub enum RightSurface {
     /// The chat's subagent inventory (Codex-style Agents panel) - one per
     /// panel key; lists Active and Done rows that open Subagent tabs.
     Agents,
+    /// Thread details (DESIGN-W3 §1): workspace, pull requests, automations
+    /// and checkpoints for the panel key's chat.
+    Details,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1850,6 +1853,7 @@ pub struct Shell {
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     /// Per-chat Agents-panel state: Previous open/closed and lineage paging.
     pub(crate) agents_ui: std::collections::HashMap<String, crate::subagents::PanelUi>,
+    pub(crate) details_ui: std::collections::HashMap<String, crate::details::DetailsUi>,
     /// The engine read/cancel API for delegated tasks (`ui-api.md`).
     delegation_api: std::sync::Arc<dyn crate::delegation::DelegationApi>,
     _delegation_sync: Task<()>,
@@ -2508,6 +2512,7 @@ impl Shell {
             activation_sub: None,
             _ticker: ticker,
             agents_ui: Default::default(),
+            details_ui: Default::default(),
             delegation_api,
             _delegation_sync: delegation_sync,
             _state_observation: observation,
@@ -3140,6 +3145,7 @@ impl Shell {
                     )
                 }),
                 RightSurface::Agents => Some((*surface, "Agents".into(), false, None)),
+                RightSurface::Details => Some((*surface, "Details".into(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -3161,6 +3167,7 @@ impl Shell {
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
             | RightSurface::Agents
+            | RightSurface::Details
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -3282,7 +3289,10 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Agents => {}
+            RightSurface::Subagent(_)
+            | RightSurface::Browser(_)
+            | RightSurface::Agents
+            | RightSurface::Details => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -4160,6 +4170,46 @@ impl Shell {
         }
     }
 
+    /// Open (or focus) the right pane's Details tab for the panel key's chat.
+    pub(crate) fn open_details_panel(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let tabs = self.right_tabs.entry(key).or_default();
+        if !tabs.contains(&RightSurface::Details) {
+            tabs.push(RightSurface::Details);
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        self.set_right_active(RightSurface::Details, cx);
+    }
+
+    fn details_panel_actions(&self) -> crate::details::DetailsActions {
+        // Engine-backed actions arrive with their slices (pr-watch,
+        // scheduler, transfer, launch, git-actions); until then they say so.
+        fn pending<T: 'static>(
+            what: &'static str,
+        ) -> std::rc::Rc<dyn Fn(&mut Shell, T, &mut Context<Shell>)> {
+            std::rc::Rc::new(move |this: &mut Shell, _: T, cx: &mut Context<Shell>| {
+                this.sidebar_notice =
+                    Some(format!("{what} is not available on this engine yet").into());
+                cx.notify();
+            })
+        }
+        crate::details::DetailsActions {
+            open_url: std::rc::Rc::new(|_, url, cx| cx.open_url(&url)),
+            toggle_watch: pending("Pull request watch"),
+            link_pull_request: pending("Linking pull requests"),
+            commit: pending("Commit"),
+            run_automation: pending("Scheduled tasks"),
+            toggle_automation: pending("Scheduled tasks"),
+            manage_automations: pending("Scheduled tasks"),
+            restore_checkpoint: pending("Checkpoint restore"),
+            retry_setup: pending("Worktree setup"),
+            continue_setup: pending("Worktree setup"),
+            move_to_worktree: pending("Worktree handoff"),
+        }
+    }
+
     /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
     pub(crate) fn toggle_agents_panel(&mut self, cx: &mut Context<Self>) {
         let key = self.panel_key(cx);
@@ -4290,7 +4340,7 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Agents | RightSurface::Picker => {}
+            RightSurface::Agents | RightSurface::Details | RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -6890,6 +6940,8 @@ impl Shell {
             (session, elapsed)
         };
         let needs_you = session.needs_you();
+        // Running or needing the user: never parked, never settled from hover.
+        let live_state = session.running() || needs_you;
         // The gutter bar speaks the state hue: indigo under an awaiting
         // session, danger under a failed one.
         let needs_you_color = session.color(theme).unwrap_or(theme.danger);
@@ -6919,7 +6971,18 @@ impl Shell {
                     .child(label)
                     .into_any_element()
             }
-        } else if let Some(label) = session.label() {
+        } else if let Some(label) = session
+            .label()
+            // A parked row tells its parking story (wake / settled time)
+            // instead of the unseen-completion check; live states still win.
+            .filter(|_| {
+                live_state
+                    || (!show_actions
+                        && parking.snoozed_until.is_none()
+                        && parking.settled_at.is_none()
+                        && !parking.woke)
+            })
+        {
             // Every live state keeps a 12px glyph in its state hue.
             // Queued stays neutral; Working earns the clock.
             let color = session.color(theme).unwrap_or(theme.text_muted);
@@ -7060,7 +7123,6 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
         };
-        let live = session.label().is_some();
         let actions: Vec<AnyElement> = if !show_actions || search_query.is_some() {
             Vec::new()
         } else if archived {
@@ -7133,7 +7195,7 @@ impl Shell {
                     .into_any_element(),
             ];
             // Settling live work is not offered: it would park nothing.
-            if !live {
+            if !live_state {
                 let settle_id = id.clone();
                 actions.push(
                     row_action("settle", icons::CHECK, "Settle thread")
@@ -8617,6 +8679,7 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let details_id = chat_id.clone();
             let lifecycle = self
                 .state
                 .read(cx)
@@ -8726,6 +8789,21 @@ impl Shell {
                             cx,
                         )
                     })
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-details-{chat_id}"))
+                            .id("chat-menu-details")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.open_chat(details_id.clone(), cx);
+                                this.open_details_panel(cx);
+                            }))
+                            .child(
+                                icon(icons::INFO_CIRCLE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Thread details")),
+                    )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
@@ -10118,6 +10196,29 @@ impl Shell {
                         cx,
                     )
                 }
+                RightSurface::Details => {
+                    let theme = Theme::of(cx).clone();
+                    let chat_id = self.panel_key(cx);
+                    let model =
+                        crate::details::DetailsModel::for_chat(self.state.read(cx), &chat_id);
+                    let ui = self.details_ui.get(&chat_id).cloned().unwrap_or_default();
+                    let actions = self.details_panel_actions();
+                    let toggle_chat = chat_id.clone();
+                    crate::details::details_panel_body(
+                        &chat_id,
+                        &model,
+                        &ui,
+                        Utc::now(),
+                        &theme,
+                        &actions,
+                        std::rc::Rc::new(move |this: &mut Shell, (), cx| {
+                            let ui = this.details_ui.entry(toggle_chat.clone()).or_default();
+                            ui.checkpoints_expanded = !ui.checkpoints_expanded;
+                            cx.notify();
+                        }),
+                        cx,
+                    )
+                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -10471,6 +10572,7 @@ impl Shell {
                     })
                     .unwrap_or(icons::LIST),
                 RightSurface::Subagent(_) | RightSurface::Agents => icons::BOT,
+                RightSurface::Details => icons::INFO_CIRCLE,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
