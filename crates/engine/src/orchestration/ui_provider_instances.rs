@@ -5,7 +5,19 @@ use zeron_proto::orchestration::Optional;
 use zeron_proto::provider_settings::*;
 use zeron_rpc::{RpcError, RpcReply, methods};
 
-fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RpcError> {
+fn parse<T: serde::de::DeserializeOwned>(mut params: Value) -> Result<T, RpcError> {
+    for key in ["instanceId", "newInstanceId"] {
+        if let Some(id) = params.get_mut(key) {
+            *id = Value::String(
+                id.as_str()
+                    .ok_or_else(|| {
+                        RpcError::Failed("Provider instance id must be a string.".into())
+                    })?
+                    .trim()
+                    .to_owned(),
+            );
+        }
+    }
     serde_json::from_value(params).map_err(|e| RpcError::Failed(e.to_string()))
 }
 
@@ -23,7 +35,7 @@ pub async fn dispatch(
             "instanceId"
         })
         .and_then(Value::as_str)
-        .map(zeron_proto::provider_instance::ProviderInstanceId::from);
+        .map(|id| zeron_proto::provider_instance::ProviderInstanceId::from(id.trim()));
     let _lifecycle = if let Some(id) = &gate_id {
         Some(catalog.lifecycle(id).await)
     } else {

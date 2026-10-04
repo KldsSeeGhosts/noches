@@ -45,6 +45,31 @@ fn validate(id: &ProviderInstanceId, config: &ProviderInstanceConfig) -> Result<
     Ok(())
 }
 
+fn normalize(
+    id: ProviderInstanceId,
+    mut config: ProviderInstanceConfig,
+) -> Result<(ProviderInstanceId, ProviderInstanceConfig), String> {
+    // Generated envelope types retain opaque config but their string aliases
+    // cannot express Effect's trim transforms. Mirror those at this boundary.
+    let id = ProviderInstanceId::from(id.as_ref().trim());
+    config.driver = ProviderDriverKind::from(config.driver.as_ref().trim());
+    for field in [&mut config.display_name, &mut config.accent_color] {
+        if let Optional::Present(value) = field {
+            *value = value.trim().to_owned();
+            if value.is_empty() {
+                return Err("Provider display name and accent color must be nonempty.".into());
+            }
+        }
+    }
+    if let Optional::Present(environment) = &mut config.environment {
+        for variable in environment {
+            variable.name = variable.name.trim().to_owned();
+        }
+    }
+    validate(&id, &config)?;
+    Ok((id, config))
+}
+
 fn enabled(config: &ProviderInstanceConfig) -> bool {
     config.enabled.as_ref().copied().unwrap_or(true)
         && !config
@@ -396,51 +421,57 @@ impl ProviderInstanceRegistry {
     }
 
     pub fn load(&self, harnesses: &HarnessRegistry, root: &Path) -> Result<(), String> {
-        let configs = match std::fs::read(root.join("provider-instances.json")) {
-            Ok(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                if value.is_array() {
-                    let rows: Vec<ProviderInstance> =
-                        serde_json::from_value(value).map_err(|e| e.to_string())?;
-                    legacy_configs(rows)?
-                } else {
-                    serde_json::from_value(value).map_err(|e| e.to_string())?
+        let configs: ProviderInstanceConfigMap =
+            match std::fs::read(root.join("provider-instances.json")) {
+                Ok(bytes) => {
+                    let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    if value.is_array() {
+                        let rows: Vec<ProviderInstance> =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        legacy_configs(rows)?
+                    } else {
+                        serde_json::from_value(value).map_err(|e| e.to_string())?
+                    }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let configured = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .configured
-                    .clone();
-                if let Some(configured) = configured {
-                    legacy_configs(configured)?
-                } else {
-                    let descriptors = harnesses.descriptors();
-                    let mock_rig = descriptors.iter().all(|d| d.id == HarnessId::Mock)
-                        || std::env::var("COMET_HARNESS").is_ok_and(|h| h == "mock");
-                    descriptors
-                        .into_iter()
-                        .filter(|d| {
-                            crate::registry::descriptor_enabled(d)
-                                || (mock_rig && d.id == HarnessId::Mock)
-                        })
-                        .map(|d| {
-                            let config = serde_json::from_value(json!({
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let configured = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .configured
+                        .clone();
+                    if let Some(configured) = configured {
+                        legacy_configs(configured)?
+                    } else {
+                        let descriptors = harnesses.descriptors();
+                        let mock_rig = descriptors.iter().all(|d| d.id == HarnessId::Mock)
+                            || std::env::var("COMET_HARNESS").is_ok_and(|h| h == "mock");
+                        descriptors
+                            .into_iter()
+                            .filter(|d| {
+                                crate::registry::descriptor_enabled(d)
+                                    || (mock_rig && d.id == HarnessId::Mock)
+                            })
+                            .map(|d| {
+                                let config = serde_json::from_value(json!({
                                 "driver":legacy_driver(d.id),"displayName":d.name,"enabled":true,
                                 "config":{"legacyCatalogImport":true}
                             }))
                             .expect("migration envelope");
-                            (legacy_instance_id(d.id), config)
-                        })
-                        .collect()
+                                (legacy_instance_id(d.id), config)
+                            })
+                            .collect()
+                    }
                 }
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-        for (id, config) in &configs {
-            validate(id, config)?;
+                Err(e) => return Err(e.to_string()),
+            };
+        let original_count = configs.len();
+        let configs: ProviderInstanceConfigMap = configs
+            .into_iter()
+            .map(|(id, config)| normalize(id, config))
+            .collect::<Result<_, _>>()?;
+        if configs.len() != original_count {
+            return Err("invalid or duplicate provider instance id".into());
         }
         persist(root, &configs)?;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -573,10 +604,10 @@ impl ProviderInstanceRegistry {
     pub fn write_instance(
         &self,
         id: ProviderInstanceId,
-        mut config: ProviderInstanceConfig,
+        config: ProviderInstanceConfig,
         create: bool,
     ) -> Result<(), String> {
-        validate(&id, &config)?;
+        let (id, mut config) = normalize(id, config)?;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut configs = state
             .configs
@@ -1058,6 +1089,41 @@ mod tests {
         assert_eq!(
             std::fs::read(root.path().join("provider-instances.json")).unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn config_envelope_uses_t3_schema_trimming_and_nonempty_validation() {
+        let registry = registry();
+        let root = tempfile::tempdir().unwrap();
+        let catalog = &registry.provider_instances;
+        catalog.load(&registry, root.path()).unwrap();
+        let config = serde_json::from_value(json!({
+            "driver":" mock ","displayName":" Personal ",
+            "environment":[{"name":" MODEL ","value":"exact/model"}]
+        }))
+        .unwrap();
+        catalog
+            .write_instance(" personal ".into(), config, true)
+            .unwrap();
+        let mut saved = catalog.config(&"personal".into()).unwrap();
+        assert_eq!(saved.driver.as_ref(), "mock");
+        assert_eq!(saved.display_name.as_ref().unwrap(), "Personal");
+        assert_eq!(saved.environment.as_ref().unwrap()[0].name, "MODEL");
+        saved.display_name = Optional::Present(" ".into());
+        assert!(
+            catalog
+                .write_instance("personal".into(), saved, false)
+                .is_err()
+        );
+        assert_eq!(
+            catalog
+                .config(&"personal".into())
+                .unwrap()
+                .display_name
+                .as_ref()
+                .unwrap(),
+            "Personal"
         );
     }
 
