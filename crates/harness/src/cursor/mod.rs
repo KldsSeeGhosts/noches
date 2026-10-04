@@ -265,6 +265,14 @@ impl Harness for CursorHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut controls = controls;
+        let mcp_guard = controls.mcp.run_guard();
+        controls.bind_browser()?;
+        let policy = crate::policy::compile(
+            HarnessId::Cursor,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
         let lease = if self.executable.is_none() {
             Some(state::Lease::acquire(&state::state_root(), request.resume.as_deref()).await?)
         } else {
@@ -301,12 +309,13 @@ impl Harness for CursorHarness {
             .take()
             .ok_or_else(|| HarnessError::Protocol("cursor shim has no stdout".into()))?;
         let stderr_tail = crate::StderrTail::default();
+        stderr_tail.retain_mcp(&controls.mcp);
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::cursor", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::cursor", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
             });
@@ -322,13 +331,19 @@ impl Harness for CursorHarness {
             // Typed parameter picks (thinking/context/effort/fast/…) — the
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
+            "runtimeMode": request.runtime_mode,
+            "interactionMode": request.interaction_mode,
+            "autoReview": policy.cursor_auto_review,
+            "sandboxEnabled": policy.cursor_sandbox,
             "resume": request.resume,
             "storeDir": lease.as_ref().and_then(|lease| lease.store_dir.as_ref()),
+            "mcpServers": controls.mcp.cursor_servers(),
+            "instructions": controls.mcp.instructions(),
         });
         let _ = stdin_tx.send(first.to_string());
 
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             lease,
             child,
             stdout_lines: BufReader::new(stdout).lines(),
@@ -340,7 +355,11 @@ impl Harness for CursorHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -481,12 +500,15 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        mcp,
+        request_permission: _request_permission,
         browser: _,
         request_input: _request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
 
     let mut assistant_message_id = new_message_id();
     let mut session_id: Option<String> = None;
@@ -564,8 +586,8 @@ async fn run_session(session: Session) {
                                 || frame.get("status").and_then(Value::as_str) == Some("error")
                             {
                                 tracing::warn!(target: "zeron_harness::cursor",
-                                    session_id = ?session_id,
-                                    error = ?frame.get("error").or_else(|| frame.get("message")),
+                                    session_id = %crate::redact::redact_registered(session_id.as_deref().unwrap_or("")),
+                                    error = %crate::redact::redact_registered(&frame.get("error").or_else(|| frame.get("message")).unwrap_or(&serde_json::Value::Null).to_string()),
                                     "Cursor SDK run failed");
                             }
                             for ev in map_shim_frame(&frame, interrupted) {
@@ -942,7 +964,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
             session_id: None,
         }],
         other => {
-            tracing::debug!(target: "zeron_harness::cursor", "unknown shim frame (skipped): {other}");
+            tracing::debug!(target: "zeron_harness::cursor", frame = %crate::redact::redact_registered(other), "unknown shim frame (skipped)");
             Vec::new()
         }
     }

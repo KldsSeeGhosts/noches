@@ -603,16 +603,15 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
 }
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
-/// preferred auto-approve choice: `allow_always` > `allow_once` > first.
+/// Full-access one-time choice. Never persist grants or select an unknown kind.
 pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
     let by_kind = |kind: &str| {
         options
             .iter()
             .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
     };
-    by_kind("allow_always")
-        .or_else(|| by_kind("allow_once"))
-        .or_else(|| options.first())
+    by_kind("allow_once")
+        .or_else(|| by_kind("reject_once"))
         .map(|o| str_field(o, "optionId"))
         .filter(|id| !id.is_empty())
 }
@@ -878,16 +877,20 @@ mod tests {
     }
 
     #[test]
-    fn permission_options_prefer_allow_always() {
+    fn permission_options_never_automatically_persist_grants() {
         let options = vec![
             json!({ "optionId": "once", "name": "Allow once", "kind": "allow_once" }),
             json!({ "optionId": "always", "name": "Always", "kind": "allow_always" }),
             json!({ "optionId": "no", "name": "Reject", "kind": "reject_once" }),
         ];
-        assert_eq!(preferred_allow_option(&options), Some("always".into()));
+        assert_eq!(preferred_allow_option(&options), Some("once".into()));
         let only_reject = vec![json!({ "optionId": "no", "kind": "reject_once" })];
         assert_eq!(preferred_allow_option(&only_reject), Some("no".into()));
         assert_eq!(preferred_allow_option(&[]), None);
+        assert_eq!(
+            preferred_allow_option(&[json!({"optionId":"always","kind":"allow_always"})]),
+            None
+        );
     }
 
     /// Cursor ACP opens tool cards with a display `title` before `rawInput`

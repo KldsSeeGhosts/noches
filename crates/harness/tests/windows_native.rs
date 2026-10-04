@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls};
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode, SandboxLevel};
 
 #[test]
 fn managed_process_protocol_progresses_with_one_blocking_worker() {
@@ -210,6 +210,9 @@ fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        // Pin the policy whose launch flags this fixture checks.
+        runtime_mode: RuntimeMode::FullAccess,
+        interaction_mode: Default::default(),
         auto_approve: false,
         attachments: Vec::new(),
         worktree: None,
@@ -225,7 +228,9 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
     let (steer_tx, steering) = mpsc::channel(4);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -250,7 +255,13 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
                 assert_eq!(Path::new(echoed["cwd"].as_str().unwrap()), cwd);
                 assert_eq!(
                     echoed["argv"],
-                    serde_json::json!(["--no-auto-update", "agent", "--no-leader", "stdio"])
+                    serde_json::json!([
+                        "--no-auto-update",
+                        "agent",
+                        "--no-leader",
+                        "--always-approve",
+                        "stdio"
+                    ])
                 );
                 if prompt == "wait-for-cancel" {
                     peer = Some(ProcessHandle::open(echoed["pid"].as_u64().unwrap() as u32));
@@ -320,7 +331,9 @@ async fn exercise_tree(prompt: &str, drop_stream: bool) {
     let (_steer, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (_, rx) = oneshot::channel();
             rx
@@ -467,6 +480,7 @@ async fn batch_overrides_launch_through_cmd() {
                 "--no-auto-update".into(),
                 "agent".into(),
                 "--no-leader".into(),
+                "--always-approve".into(),
                 "stdio".into(),
             ],
             HarnessId::ClaudeCode => vec!["--print".into()],
@@ -480,7 +494,9 @@ async fn batch_overrides_launch_through_cmd() {
         unsafe { std::env::set_var("ZERON_TEST_BATCH_ARGS_FILE", &received) };
         let (_steer, steering) = mpsc::channel(1);
         let controls = RunControls {
+            mcp: Default::default(),
             browser: None,
+            request_permission: zeron_harness::refuse_permissions(),
             request_input: Box::new(|_| {
                 let (tx, rx) = oneshot::channel();
                 let _ = tx.send(Vec::new());

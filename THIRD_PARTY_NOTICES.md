@@ -1,5 +1,40 @@
 # Third-party notices
 
+## T3 Code orchestration contracts
+
+The orchestration wire contracts, generated oracle fixtures, and source excerpts
+under `crates/proto/tests/t3_oracle` are derived from T3 Code,
+tag `v0.0.46-nightly.20261003.2632`,
+commit `f391794a35c604d57e166a3ab48d56fc6e4e469a`.
+The pinned repository's root `LICENSE` was verified as MIT:
+
+MIT License
+
+Copyright (c) 2026 T3 Tools Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The extracted MCP framework error schemas are derived from Effect
+`4.0.0-rc.115`, MIT, Copyright (c) 2023 Effectful Technologies Inc.
+The complete notice is retained in
+`crates/proto/tests/t3_oracle/fixtures/LICENSE.effect`.
+
 Zeron bundles the following syntax-highlighting components. Unless noted otherwise, their parsers and queries are consumed from the pinned Rust crates listed in `Cargo.lock`. The Kotlin highlight query is maintained as Zeron source code and is not attributed to the grammar crate.
 
 | Component | Version | License | Source |

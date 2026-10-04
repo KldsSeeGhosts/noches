@@ -1,0 +1,212 @@
+/// Empty schema, used only for maps with no possible values (empty tool input).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Never {}
+
+/// T3 delegated task identity is exactly its execution NodeId.
+pub type TaskId = NodeId;
+/// A queue entry is a queued Run, not a separately owned message lifecycle.
+pub type QueueEntry = OrchestrationV2Run;
+/// Shared runtime-policy interaction mode, also exposed by its T3 wire name.
+pub use crate::runtime_policy::InteractionMode;
+
+/// Effect's JSON number codec preserves non-finite JS numbers as named strings.
+/// Plain serde f64 would serialize them as null and silently change the wire.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum JsonNumber {
+    Finite(f64),
+    Special(JsonNumberSpecial),
+}
+impl Serialize for JsonNumber {
+    fn serialize<S: serde::Serializer>(&self,serializer:S)->Result<S::Ok,S::Error> {
+        match self {
+            Self::Finite(value) if value.is_finite()=>value.serialize(serializer),
+            Self::Finite(value) if value.is_nan()=>serializer.serialize_str("NaN"),
+            Self::Finite(value) if value.is_sign_negative()=>serializer.serialize_str("-Infinity"),
+            Self::Finite(_)=>serializer.serialize_str("Infinity"),
+            Self::Special(value)=>value.serialize(serializer),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JsonNumberSpecial {
+    #[serde(rename="Infinity")]
+    Infinity,
+    #[serde(rename="-Infinity")]
+    NegativeInfinity,
+    #[serde(rename="NaN")]
+    NaN,
+}
+impl JsonNumber {
+    pub fn as_f64(&self)->f64 {
+        match self {
+            Self::Finite(value)=>*value,
+            Self::Special(JsonNumberSpecial::Infinity)=>f64::INFINITY,
+            Self::Special(JsonNumberSpecial::NegativeInfinity)=>f64::NEG_INFINITY,
+            Self::Special(JsonNumberSpecial::NaN)=>f64::NAN,
+        }
+    }
+}
+
+/// Distinguishes an omitted key from a present value, including an explicit null
+/// when T is Option<U>. `Option<Option<U>>` alone loses this distinction in serde.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Optional<T> {
+    #[default]
+    Absent,
+    Present(T),
+}
+impl<T> Optional<T> {
+    pub fn is_absent(&self) -> bool { matches!(self, Self::Absent) }
+    pub fn as_ref(&self) -> Option<&T> {
+        match self { Self::Absent => None, Self::Present(value) => Some(value) }
+    }
+}
+impl<T: Serialize> Serialize for Optional<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Absent => serializer.serialize_unit(),
+            Self::Present(value) => value.serialize(serializer),
+        }
+    }
+}
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Optional<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
+}
+/// A required nullable field must still be present. Derive's Option special
+/// case otherwise accepts a missing key as null, contrary to the upstream shape.
+pub fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where D: serde::Deserializer<'de>, T: Deserialize<'de> {
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Compatibility decoding only: no scheduling, permission, or engine policy.
+pub fn normalize_contract(name: &str, mut value: serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::{Value, json};
+    match name {
+        "ProviderOptionSelections" => return normalize_option_selections(value, false),
+        "OrchestratorMcpTargetOptions" => return normalize_option_selections(value, true),
+        "ModelSelection" => {
+            let map=value.as_object_mut().ok_or("model selection must be an object")?;
+            if !map.contains_key("instanceId")
+                && let Some(provider)=map.get("provider").and_then(Value::as_str) {
+                map.insert("instanceId".into(),json!(provider));
+            }
+            trim_field(map,"model")?;
+            if let Some(options)=map.get_mut("options") {
+                *options=normalize_option_selections(options.take(),false)?;
+            }
+        }
+        "OrchestratorMcpScheduleTaskInput" => {
+            let map=value.as_object_mut().ok_or("schedule input must be an object")?;
+            trim_field(map,"prompt")?;
+            if let Some(schedule)=map.get_mut("schedule") {
+                if let Some(text)=schedule.as_str() {
+                    *schedule=serde_json::from_str(text).map_err(|e|format!("invalid schedule JSON: {e}"))?;
+                }
+                *schedule=normalize_contract("ScheduledTaskUpsertSchedule",schedule.take())?;
+            }
+        }
+        "ScheduledTaskSchedule" | "ScheduledTaskUpsertSchedule" => {
+            let map=value.as_object_mut().ok_or("schedule must be an object")?;
+            match map.get("type").and_then(Value::as_str) {
+                Some("interval") => {
+                    let interval=map.get("everyMs").and_then(Value::as_i64).ok_or("everyMs must be an integer")?;
+                    let min=if name=="ScheduledTaskUpsertSchedule" {60000} else {1};
+                    if interval<min { return Err(format!("everyMs must be >= {min}")); }
+                }
+                Some("fixed_time") => {
+                    trim_field(map,"timeOfDay")?;
+                    let time=map.get("timeOfDay").and_then(Value::as_str).ok_or("timeOfDay is required")?;
+                    let parts:Vec<_>=time.split(':').collect();
+                    if parts.len()!=2 || !(1..=2).contains(&parts[0].len()) || parts[1].len()!=2
+                        || !parts.iter().all(|p|p.bytes().all(|c|c.is_ascii_digit()))
+                        || parts[0].parse::<u8>().map_or(true,|h|h>23)
+                        || parts[1].parse::<u8>().map_or(true,|m|m>59) {
+                        return Err("invalid timeOfDay".into());
+                    }
+                    if let Some(weekdays)=map.get("weekdays") {
+                        let days=weekdays.as_array().ok_or("weekdays must be an array")?;
+                        if days.iter().any(|d|d.as_i64().is_none_or(|n|!(0..=6).contains(&n))) {
+                            return Err("weekday must be 0..6".into());
+                        }
+                    }
+                }
+                _=>return Err("unknown schedule type".into()),
+            }
+        }
+        "OrchestrationV2NotificationSource" | "OrchestrationV2PendingBackgroundTask" => {
+            let map=value.as_object_mut().ok_or("source must be an object")?;
+            let kind=match map.get("kind") {
+                None=>"",
+                Some(Value::String(s))=>s.as_str(),
+                _=>return Err("kind must be a string or omitted".into()),
+            };
+            let normalized=if name=="OrchestrationV2NotificationSource" {
+                match kind {
+                    "background_command"=>"command",
+                    "background_task" if map.get("work").and_then(Value::as_str)==Some("subagent")=>"subagent",
+                    "delegated_task"|"subagent"|"command"|"monitor"|"background_task"=>kind,
+                    _=>"background_task",
+                }
+            } else {
+                match kind { "subagent"|"command"|"monitor"|"background_task"=>kind,_=>"background_task" }
+            }.to_owned();
+            map.insert("kind".into(),json!(normalized));
+        }
+        _=>{}
+    }
+    Ok(value)
+}
+
+fn trim_field(map:&mut serde_json::Map<String,serde_json::Value>,field:&str)->Result<(),String> {
+    if let Some(value)=map.get_mut(field) {
+        let trimmed=value.as_str().ok_or_else(||format!("{field} must be a string"))?.trim().to_owned();
+        if trimmed.is_empty() { return Err(format!("{field} must be nonempty")); }
+        *value=serde_json::json!(trimmed);
+    }
+    Ok(())
+}
+
+fn normalize_option_selections(value:serde_json::Value,strict:bool)->Result<serde_json::Value,String> {
+    use serde_json::{Value,json};
+    let mut selections=Vec::new();
+    match value {
+        Value::Array(values)=>{
+            for mut entry in values {
+                let map=entry.as_object_mut().ok_or("option must be an object")?;
+                trim_field(map,"id")?;
+                if map.get("value").is_some_and(Value::is_string) { trim_field(map,"value")?; }
+                selections.push(entry);
+            }
+        }
+        Value::Object(map)=>{
+            for (key,value) in map {
+                let id=key.trim();
+                if id.is_empty() { if strict { return Err("empty option id".into()); } continue; }
+                match value {
+                    Value::String(s) if !s.trim().is_empty()=>selections.push(json!({"id":id,"value":s.trim()})),
+                    Value::Bool(b)=>selections.push(json!({"id":id,"value":b})),
+                    _ if strict=>return Err("option value must be a nonempty string or boolean".into()),
+                    _=>{}
+                }
+            }
+        }
+        _=>return Err("options must be an array or object".into()),
+    }
+    Ok(Value::Array(selections))
+}
+
+fn encode_notification_source(mut value:serde_json::Value)->serde_json::Value {
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("subagent")=>{
+            value["kind"]=serde_json::json!("background_task");
+            value["work"]=serde_json::json!("subagent");
+        }
+        Some("command")=>value["kind"]=serde_json::json!("background_command"),
+        _=>{}
+    }
+    value
+}

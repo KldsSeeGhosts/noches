@@ -1,0 +1,107 @@
+//! Opt-in V2 transactional kernel. SQLite owns execution; replicas never do.
+//! This module deliberately has no dependency on `sessions` and starts no runner.
+
+pub mod command;
+pub mod effects;
+pub mod event;
+pub mod projection;
+pub mod recovery;
+pub mod store;
+pub mod sync_publish;
+#[cfg(test)]
+mod tests;
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use zeron_proto::orchestration::{OrchestrationV2DomainEvent, ThreadId};
+use zeron_sync::DocsStore;
+
+pub use command::{Command, Operation, ProviderGuard};
+pub use store::{CommandReceipt, ReceiptStatus, Store, WriteBoundary};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("sqlite: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("orchestration codec: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("orchestration invariant: {0}")]
+    Invariant(String),
+    #[error("this profile is owned by a different orchestration host")]
+    NotOwner,
+    #[error("injected failure at {0:?}")]
+    Injected(WriteBoundary),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Weak entries prevent an unbounded lock registry. A caller retains all strong
+/// references before waiting; sorting/deduplication prevents AB/BA deadlocks.
+#[derive(Default)]
+pub struct ThreadLocks {
+    entries: Mutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+impl ThreadLocks {
+    pub async fn acquire(
+        &self,
+        threads: impl IntoIterator<Item = ThreadId>,
+    ) -> Vec<OwnedMutexGuard<()>> {
+        let mut ids: Vec<_> = threads.into_iter().map(|id| id.0).collect();
+        ids.sort();
+        ids.dedup();
+        let locks: Vec<_> = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            entries.retain(|_, value| value.strong_count() > 0);
+            ids.into_iter()
+                .map(|id| {
+                    let lock = entries.get(&id).and_then(Weak::upgrade).unwrap_or_default();
+                    entries.insert(id, Arc::downgrade(&lock));
+                    lock
+                })
+                .collect()
+        };
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
+    }
+}
+
+#[derive(Clone)]
+pub struct Kernel {
+    pub store: Store,
+    locks: Arc<ThreadLocks>,
+}
+
+impl Kernel {
+    /// The caller must be the profile's owning engine, under its InstanceLock.
+    /// Opening does not run recovery, publish documents, or execute effects.
+    pub fn open(docs: Arc<DocsStore>, host_id: &str) -> Result<Self> {
+        Ok(Self {
+            store: Store::open(docs, host_id)?,
+            locks: Arc::default(),
+        })
+    }
+
+    pub async fn dispatch(&self, command: &Command, now_ms: i64) -> Result<CommandReceipt> {
+        let _guards = self.locks.acquire(command.lock_threads()).await;
+        self.store.dispatch(command, now_ms)
+    }
+
+    /// Guard and projection writes are checked together inside the transaction.
+    pub async fn append_provider_events(
+        &self,
+        thread_id: &ThreadId,
+        guard: &ProviderGuard,
+        events: &[OrchestrationV2DomainEvent],
+        now_ms: i64,
+    ) -> Result<bool> {
+        let _guards = self.locks.acquire([thread_id.clone()]).await;
+        self.store
+            .append_provider_events(thread_id, guard, events, now_ms)
+    }
+}

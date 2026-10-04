@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Orchestration conformance scenario v1 (test protocol, not MCP)",
+  "type": "object",
+  "required": ["version", "id", "initial", "steps"],
+  "properties": {
+    "version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "initial": {
+      "description": "Isolated workspace/catalog/clock/provider/bootstrap state. Never live userdata or credentials.",
+      "type": "object"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["kind", "name", "arguments"],
+            "properties": {
+              "kind": { "const": "tool_call" },
+              "name": { "type": "string", "description": "Must be a name from the pinned 72-tool oracle." },
+              "arguments": { "type": "object" },
+              "expected": {},
+              "barrier": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["kind", "contract", "input"],
+            "properties": {
+              "kind": { "const": "codec" },
+              "contract": { "type": "string" },
+              "input": {},
+              "accepted": { "type": "boolean" },
+              "encoded": {}
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["kind", "payload"],
+            "properties": {
+              "kind": { "const": "provider_event" },
+              "payload": {}
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["kind", "name"],
+            "properties": {
+              "kind": { "enum": ["barrier", "crash"] },
+              "name": { "type": "string" },
+              "expected": {}
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": ["kind", "milliseconds"],
+            "properties": {
+              "kind": { "const": "clock_advance" },
+              "milliseconds": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

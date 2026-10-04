@@ -1,0 +1,62 @@
+/// Annotations as actually exposed by tools/list, not inferred from tool names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub title: Optional<String>,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub read_only_hint: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub destructive_hint: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub idempotent_hint: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub open_world_hint: Optional<bool>,
+}
+
+/// Frozen metadata. Capability gating belongs to the engine, not this catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub group: String,
+    pub phase: ToolPhase,
+    pub annotations: ToolAnnotations,
+    pub input_schema: serde_json::Value,
+    pub decoded_input_schema: serde_json::Value,
+    pub result_schema: serde_json::Value,
+    pub error_schema: serde_json::Value,
+    pub failure_result_schema: serde_json::Value,
+    pub error_tags: Vec<String>,
+    pub declared_error_tags: Vec<String>,
+    pub refusal_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub failure_mode: Optional<String>,
+    pub framing: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub transport: Optional<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPhase { Core, Later }
+
+pub fn pinned_tool_inventory() -> Vec<ToolDescriptor> {
+    serde_json::from_str(include_str!("../tests/t3_oracle/fixtures/tools.json"))
+        .expect("checked-in pinned T3 tool inventory")
+}
+
+/// Hand-registered PNG tools report a transport error envelope, not the
+/// underlying toolkit failure object. The tag can be a typed failure tag or
+/// the source's PreviewSnapshotError/device_screenshotError fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageToolError {
+    #[serde(rename = "_tag")]
+    pub tag: String,
+    pub operation: String,
+    pub failure_count: usize,
+    #[serde(default, skip_serializing_if = "Optional::is_absent")]
+    pub message: Optional<String>,
+}

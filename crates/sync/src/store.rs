@@ -89,6 +89,14 @@ pub struct DocsStore {
 }
 
 impl DocsStore {
+    /// Extend the profile's transactional authority (for example the V2 engine
+    /// kernel) without opening a competing SQLite connection. The callback is
+    /// synchronous: do not perform process, Git, network, or async work here.
+    /// Extensions must namespace their tables and migration ledger.
+    pub fn with_connection<T>(&self, operation: impl FnOnce(&mut Connection) -> T) -> T {
+        store_blocking(|| operation(&mut self.conn()))
+    }
+
     /// Open (creating directory, database, and schema as needed).
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();

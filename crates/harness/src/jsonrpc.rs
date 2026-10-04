@@ -198,7 +198,7 @@ fn response_error(error: &Value) -> String {
             rendered.push_str(&detail);
         }
     }
-    rendered
+    crate::redact::redact_registered(&rendered)
 }
 
 /// Parse stdout lines: responses resolve the pending map, everything else is

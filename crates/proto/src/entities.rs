@@ -94,6 +94,10 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    #[serde(default)]
+    pub runtime_mode: crate::RuntimeMode,
+    #[serde(default)]
+    pub interaction_mode: crate::InteractionMode,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.

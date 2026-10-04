@@ -254,6 +254,8 @@ async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool
                 model_options: Default::default(),
                 cwd: cwd.display().to_string(),
                 sandbox: SandboxLevel::ReadOnly,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
                 auto_approve: true,
                 attachments: vec![],
                 worktree: None,

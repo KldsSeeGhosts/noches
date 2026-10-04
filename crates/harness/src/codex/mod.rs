@@ -15,12 +15,9 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals, reviewer, and sandbox compile from explicit T3 runtime modes.
+//!   Command/file/permissions approvals use [`RunControls::request_permission`];
+//!   content questions separately use [`RunControls::request_input`].
 //! - Subagents are full child app-server threads. Parent spawn items establish
 //!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
@@ -37,6 +34,7 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 pub(crate) mod catalog;
+mod mcp;
 mod normalize;
 mod subagents;
 
@@ -603,32 +601,32 @@ impl CodexHarness {
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut controls = controls;
+        if title_only {
+            controls.mcp = Default::default();
+            controls.browser = None;
+        }
+        let mcp_guard = controls.mcp.run_guard();
+        controls.bind_browser()?;
         let exe = self.resolve_executable()?;
-        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
-        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
-        // Parity with the Claude adapter, which auto-approves every
-        // can_use_tool and so effectively grants full access. This also
-        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
-        // worktree on a slash-named branch derives a malformed mount that
-        // kills every command.
+        let policy = crate::policy::compile(
+            HarnessId::Codex,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
+        if request.interaction_mode == zeron_proto::InteractionMode::Plan && request.model.is_none()
+        {
+            return Err(HarnessError::Protocol(
+                "Codex plan mode requires an explicit model selection".into(),
+            ));
+        }
         request.sandbox = if title_only {
             zeron_proto::SandboxLevel::ReadOnly
         } else {
-            zeron_proto::SandboxLevel::DangerFullAccess
+            policy.codex_sandbox
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
-        if !title_only && let Some(browser) = &controls.browser {
-            // CLI -c values use TOML. JSON strings/arrays are compatible here.
-            cmd.arg("-c").arg(format!(
-                "mcp_servers.noches_browser.command={}",
-                serde_json::to_string(&browser.executable).unwrap()
-            ));
-            cmd.arg("-c").arg(format!(
-                "mcp_servers.noches_browser.args={}",
-                serde_json::to_string(&browser.args()).unwrap()
-            ));
-        }
         crate::compose_child_environment(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -654,20 +652,21 @@ impl CodexHarness {
             .take()
             .ok_or_else(|| HarnessError::Protocol("codex child has no stdout".into()))?;
         let stderr_tail = crate::StderrTail::default();
+        stderr_tail.retain_mcp(&controls.mcp);
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::codex", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
             });
         }
 
         let (client, incoming) = RpcClient::new(stdin, stdout);
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             title_only,
             child,
             client,
@@ -678,7 +677,11 @@ impl CodexHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -795,23 +798,33 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        mcp,
+        request_permission,
         browser: _,
         request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
+    let _permission_lifetime = interrupt.clone().drop_guard();
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (zeron sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // Only isolated read-only title runs use never without full access.
+    // Ordinary runs compile explicit native authority.
+    let policy = crate::policy::compile(
+        HarnessId::Codex,
+        request.runtime_mode,
+        request.interaction_mode,
+    )
+    .expect("policy was validated before launch");
+    let approval_policy = if title_only {
+        "never"
+    } else {
+        policy.codex_approval
+    };
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -849,6 +862,11 @@ async fn run_session(session: Session) {
                     "features.memories": false
                 }),
             );
+        } else {
+            p.insert("config".into(), mcp.codex_thread_overrides());
+            if !mcp.instructions().is_empty() {
+                p.insert("developerInstructions".into(), mcp.instructions().into());
+            }
         }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
@@ -957,6 +975,7 @@ async fn run_session(session: Session) {
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
         p.insert("approvalPolicy".into(), approval_policy.into());
+        p.insert("approvalsReviewer".into(), policy.codex_reviewer.into());
         p.insert(
             "sandboxPolicy".into(),
             sandbox_policy_value(request.sandbox),
@@ -974,6 +993,17 @@ async fn run_session(session: Session) {
         }
         if let Some(tier) = &service_tier {
             p.insert("serviceTier".into(), Value::String(tier.clone()));
+        }
+        if request.interaction_mode == zeron_proto::InteractionMode::Plan {
+            p.insert(
+                "collaborationMode".into(),
+                json!({
+                    "mode":"plan", "settings": {
+                        "model":request.model,
+                        "reasoning_effort":effort.unwrap_or("medium")
+                    }
+                }),
+            );
         }
         Value::Object(p)
     };
@@ -1292,12 +1322,22 @@ async fn run_session(session: Session) {
                 }
 
                 Some(Incoming::Request { id, method, params }) => {
+                    if method == "mcpServer/elicitation/request"
+                        && (interrupted
+                            || router.active.is_none()
+                            || params["turnId"].as_str() != router.active.as_deref()
+                            || router.active.as_deref().is_some_and(|turn| router.is_completed(turn)))
+                    {
+                        client.respond(&id, json!({"action":"decline"}));
+                        continue 'main;
+                    }
                     handle_server_request(
                         &client,
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        &request_permission,
+                        &interrupt,
                         &request_input,
                     );
                 }
@@ -1498,7 +1538,7 @@ async fn steer_as_new_turn(
 }
 
 // ---------------------------------------------------------------------------
-// Approvals (approval-as-input parity with zeron's UX)
+// Native approvals and separate content questions
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<
@@ -1507,19 +1547,23 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one server→client request. Approval requests round-trip through
-/// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// Serve one server→client request. Native approvals use the permission
+/// bridge, never the content-question bridge. Subtasks keep the message
+/// loop flowing; unknown requests are explicitly rejected so the server
+/// never wedges awaiting a reply.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
+    request_permission: &Arc<crate::RequestPermission>,
+    interrupt: &crate::CancellationToken,
     request_input: &Arc<RequestInputFn>,
 ) {
+    if method == "mcpServer/elicitation/request" {
+        handle_mcp_elicitation(client, id, params, request_input);
+        return;
+    }
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
     // question, never auto-approvable — route it to the input bridge and
     // answer keyed by question id, `{ answers: { <id>: { answers: [..] } } }`.
@@ -1531,9 +1575,13 @@ fn handle_server_request(
         }
         let client = client.clone();
         let request_input = Arc::clone(request_input);
+        let interrupt = interrupt.clone();
         tokio::spawn(async move {
             let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
-            let answers = (request_input)(asked).await.unwrap_or_default();
+            let answers = tokio::select! {
+                answers = (request_input)(asked) => answers.unwrap_or_default(),
+                _ = interrupt.cancelled() => Vec::new(),
+            };
             let mut by_id = serde_json::Map::new();
             for (wire_id, q) in &questions {
                 let labels: Vec<Value> = answers
@@ -1547,45 +1595,166 @@ fn handle_server_request(
         });
         return;
     }
-    let is_approval = matches!(
-        method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-    );
+    let is_permissions = method == "item/permissions/requestApproval";
+    let is_approval = is_permissions
+        || matches!(
+            method,
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        );
     if !is_approval {
         tracing::debug!(
             target: "zeron_harness::codex",
-            "unhandled server request: {method}"
+            method = %crate::redact::redact_registered(method),
+            "unhandled server request"
         );
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
         return;
     }
-    if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
-        return;
-    }
-
-    let question = approval_question(method, params);
+    let request = zeron_proto::PermissionRequest::standard(
+        method,
+        approval_question(method, params).question,
+        true,
+    );
     let client = client.clone();
-    let request_input = Arc::clone(request_input);
+    let request_permission = request_permission.clone();
+    let interrupt = interrupt.clone();
+    let permissions = params
+        .get("permissions")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
+        // A live permission callback is separate from content questions.
         //
         // A dropped sender (caller went away) degrades to a decline so the
         // agent is unblocked — never silently allowed.
+        let answer = tokio::select! {
+            biased;
+            _ = interrupt.cancelled() => zeron_proto::PermissionOption::default(),
+            answer = (request_permission)(request).recv() => answer,
+        };
+        let decision = match answer.decision {
+            zeron_proto::PermissionDecision::Accept => "accept",
+            zeron_proto::PermissionDecision::AcceptForSession => "acceptForSession",
+            _ => "decline",
+        };
+        if is_permissions {
+            client.respond(&id, json!({
+                "permissions": if matches!(answer.decision, zeron_proto::PermissionDecision::Accept | zeron_proto::PermissionDecision::AcceptForSession) {permissions} else {json!({})},
+                "scope": if answer.decision == zeron_proto::PermissionDecision::AcceptForSession {"session"} else {"turn"}
+            }));
+        } else {
+            client.respond(&id, json!({ "decision": decision }));
+        }
+    });
+}
+
+/// Elicitation is content input, never auto-approved. Mirror T3's conservative
+/// refusal for URL/unsupported forms. The existing input bridge cannot safely
+/// collect arbitrary typed form fields; accept only defaults/one-time choices.
+fn handle_mcp_elicitation(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &Arc<RequestInputFn>,
+) {
+    let Some(content) = mcp_elicitation_content(params) else {
+        client.respond(&id, json!({"action":"decline"}));
+        return;
+    };
+    let question = UserInputQuestion {
+        id: new_message_id(),
+        header: params["serverName"]
+            .as_str()
+            .unwrap_or("MCP request")
+            .into(),
+        question: params["message"]
+            .as_str()
+            .unwrap_or("Allow this MCP request?")
+            .into(),
+        options: vec!["Approve".into(), "Decline".into(), "Cancel".into()],
+        multi_select: false,
+    };
+    let client = client.clone();
+    let request_input = Arc::clone(request_input);
+    tokio::spawn(async move {
         let answers = (request_input)(vec![question.clone()])
             .await
             .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
-        client.respond(
-            &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
-        );
+        let label = answers
+            .iter()
+            .find(|a| a.question_id == question.id)
+            .and_then(|a| a.labels.first())
+            .map(String::as_str);
+        let response = match label {
+            Some("Approve") => json!({"action":"accept","content":content}),
+            Some("Decline") => json!({"action":"decline"}),
+            _ => json!({"action":"cancel"}),
+        };
+        client.respond(&id, response);
     });
+}
+
+fn mcp_elicitation_content(params: &Value) -> Option<Value> {
+    if params["mode"] == "url" || params.get("turnId").is_none_or(Value::is_null) {
+        return None;
+    }
+    let schema = &params["requestedSchema"];
+    let mut content = serde_json::Map::new();
+    for (key, field) in schema["properties"].as_object().into_iter().flatten() {
+        let options = field["oneOf"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["const"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                field["enum"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect()
+            });
+        let once = options.iter().find(|s| {
+            let s = s.to_ascii_lowercase();
+            !["session", "always", "persistent", "forever"]
+                .iter()
+                .any(|p| s.contains(p))
+                && ["once", "accept", "approve", "allow"]
+                    .iter()
+                    .any(|p| s.contains(p))
+        });
+        if let Some(value) = once {
+            content.insert(key.clone(), (**value).into());
+        } else if field["type"] == "boolean"
+            && ["persist", "always", "session"]
+                .iter()
+                .any(|p| key.to_ascii_lowercase().contains(p))
+        {
+            content.insert(key.clone(), false.into());
+        } else if let Some(default) = field.get("default").filter(|v| !v.is_null()) {
+            if default.as_str().is_some_and(|value| {
+                let value = value.to_ascii_lowercase();
+                ["session", "always", "persistent", "forever"]
+                    .iter()
+                    .any(|word| value.contains(word))
+            }) {
+                return None;
+            }
+            content.insert(key.clone(), default.clone());
+        }
+    }
+    if schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|key| key.as_str().is_none_or(|key| !content.contains_key(key)))
+    {
+        return None;
+    }
+    Some(Value::Object(content))
 }
 
 /// Parse `item/tool/requestUserInput` questions into (wire id, question)
@@ -1646,9 +1815,17 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
         .collect()
 }
 
-/// Synthesize the yes/no question an approval request surfaces to the user.
+/// Describe the native authority requested, never disguise it as content input.
 fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
-    let (header, question) = if method.contains("commandExecution") {
+    let (header, question) = if method == "item/permissions/requestApproval" {
+        (
+            "Approve permissions".to_owned(),
+            format!(
+                "Codex requests these permissions: {}",
+                params.get("permissions").unwrap_or(&Value::Null)
+            ),
+        )
+    } else if method.contains("commandExecution") {
         let command = match params.get("command") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(parts)) => parts
@@ -1699,6 +1876,38 @@ use crate::{Signal, send_signal, shutdown_child};
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mcp_elicitation_never_grants_unsupported_forms_or_persistent_defaults() {
+        assert!(
+            mcp_elicitation_content(
+                &json!({"mode":"url","turnId":"t","url":"https://example.test/auth"})
+            )
+            .is_none()
+        );
+        assert!(mcp_elicitation_content(&json!({"mode":"form","requestedSchema":{}})).is_none());
+        assert!(
+            mcp_elicitation_content(&json!({"mode":"form","turnId":"t","requestedSchema":{
+                "properties":{"name":{"type":"string"}},"required":["name"]
+            }}))
+            .is_none()
+        );
+        let content =
+            mcp_elicitation_content(&json!({"mode":"form","turnId":"t","requestedSchema":{
+                "properties":{"persist":{"type":"boolean","default":true},
+                    "scope":{"enum":["always","allow_once"]}},
+                "required":["persist","scope"]
+            }}))
+            .unwrap();
+        assert_eq!(content, json!({"persist":false,"scope":"allow_once"}));
+        assert!(
+            mcp_elicitation_content(&json!({"mode":"form","turnId":"t","requestedSchema":{
+                "properties":{"scope":{"enum":["always"],"default":"always"}},
+                "required":["scope"]
+            }}))
+            .is_none()
+        );
+    }
 
     #[test]
     fn approval_questions_are_yes_no() {
@@ -1786,4 +1995,14 @@ mod tests {
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
     }
+}
+#[test]
+fn permission_grant_description_names_network_and_filesystem_authority() {
+    let q = approval_question(
+        "item/permissions/requestApproval",
+        &json!({"permissions":{"network":{"enabled":true},"fileSystem":{"write":["/tmp"]}}}),
+    );
+    assert_eq!(q.header, "Approve permissions");
+    assert!(q.question.contains("network"));
+    assert!(q.question.contains("/tmp"));
 }

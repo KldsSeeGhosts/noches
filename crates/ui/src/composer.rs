@@ -41,6 +41,7 @@ use crate::settings::{ComposerSendBehavior, FollowUpBehavior, platform_combo};
 use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
 mod dictation;
+mod permission;
 use dictation::{DictationHold, DictationInputEvent, DictationKey, HoldSource};
 
 // ---------------------------------------------------------------------------
@@ -6516,6 +6517,16 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        if (resolved.runtime_mode != zeron_proto::RuntimeMode::FullAccess
+            || resolved.interaction_mode != zeron_proto::InteractionMode::Default)
+            && !self.state.read(cx).runtime_policy_supported(&device_id)
+        {
+            self.failure =
+                Some("Update the local and execution engines to enforce this runtime mode.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        }
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -7033,6 +7044,8 @@ impl Composer {
                         model_options: resolved.model_options.clone(),
                         cwd,
                         sandbox: SandboxLevel::WorkspaceWrite,
+                        runtime_mode: resolved.runtime_mode,
+                        interaction_mode: resolved.interaction_mode,
                         auto_approve: false,
                         resume: None,
                         attachments: attachment_paths,
@@ -7949,6 +7962,11 @@ impl Render for Composer {
                 ))
             });
 
+        if let Some(request) =
+            permission::pending_permission_request(self.target.transcript(self.state.read(cx)))
+        {
+            return container.child(self.render_permission(request, cx));
+        }
         if wizard_active {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));

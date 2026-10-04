@@ -183,6 +183,8 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub permission_suggestions: Vec<Value>,
 }
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.

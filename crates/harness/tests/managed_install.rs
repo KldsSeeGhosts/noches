@@ -29,7 +29,9 @@ async fn managed_install_reaches_session_started() {
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
@@ -43,6 +45,8 @@ async fn managed_install_reaches_session_started() {
         model_options: serde_json::Map::new(),
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

@@ -14,6 +14,7 @@ zeron-browser.workspace = true
 zeron-mcp.workspace = true
 base64 = "0.22"
 zeron-engine.workspace = true
+zeron-harness.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true
 zeron-update.workspace = true

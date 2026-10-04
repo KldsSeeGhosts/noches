@@ -2497,6 +2497,8 @@ mod pane_meta_tests {
             reasoning: None,
             model_options: Default::default(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
         });
         state.chats = vec![claude];
 

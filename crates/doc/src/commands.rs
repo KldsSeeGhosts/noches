@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    RespondPermission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,13 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    #[serde(rename_all = "camelCase")]
+    RespondPermission {
+        #[serde(default)]
+        request_id: String,
+        #[serde(default)]
+        option_id: String,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +71,9 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::RespondPermission { .. } => {
+                SessionCommandKind::RespondPermission
+            }
         }
     }
 }
@@ -356,6 +367,8 @@ mod tests {
             model_options: Default::default(),
             cwd: "/tmp".into(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: false,
             attachments: Vec::new(),
             worktree: None,

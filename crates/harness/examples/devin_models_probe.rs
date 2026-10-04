@@ -27,7 +27,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let (_steering, steering) = tokio::sync::mpsc::channel(8);
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
+        request_permission: zeron_harness::refuse_permissions(),
         request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -45,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
         model_options: Default::default(),
         cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
         sandbox: SandboxLevel::ReadOnly,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

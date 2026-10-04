@@ -10,10 +10,9 @@
 //!   transport the Claude Agent SDK's `query()` drives, and was re-validated
 //!   live against 2.1.228: `can_use_tool` control requests arrive and
 //!   allow/deny responses are honored). The alternative channel — an MCP
-//!   permission tool — needs a server process and was rejected. Tool calls
-//!   auto-allow (zeron sessions run unattended, parity with the ACP
-//!   harness's preferred-allow behavior); `AskUserQuestion` round-trips
-//!   through [`RunControls::request_input`].
+//!   permission tool — needs a server process and was rejected. Native mode
+//!   flags enforce policy; prompts use [`RunControls::request_permission`].
+//!   `AskUserQuestion` separately uses [`RunControls::request_input`].
 //! - DONE is the CLI's own `result` frame, eagerly: background work (a
 //!   spawned subagent) never holds the turn. The CLI natively runs a second
 //!   wake turn when a background task finishes — a fresh `init` (same
@@ -187,14 +186,15 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            cmd.args([
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-            ]);
-        } else {
-            cmd.args(["--permission-mode", "default"]);
+        let policy = crate::policy::compile(
+            HarnessId::ClaudeCode,
+            request.runtime_mode,
+            request.interaction_mode,
+        )
+        .expect("Claude supports all runtime/interaction modes");
+        cmd.args(["--permission-mode", policy.claude_permission_mode]);
+        if policy.claude_permission_mode == "bypassPermissions" {
+            cmd.arg("--dangerously-skip-permissions");
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
@@ -408,6 +408,8 @@ impl Harness for ClaudeHarness {
         request.attachments.clear();
         request.model_options.clear();
         request.auto_approve = false;
+        request.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+        request.interaction_mode = zeron_proto::InteractionMode::Default;
         self.run_with_mode(request, controls, true).await
     }
 }
@@ -419,12 +421,33 @@ impl ClaudeHarness {
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut controls = controls;
+        if title_only {
+            controls.mcp = Default::default();
+            controls.browser = None;
+        }
+        let mcp_guard = controls.mcp.run_guard();
+        controls.bind_browser()?;
+        crate::policy::compile(
+            HarnessId::ClaudeCode,
+            request.runtime_mode,
+            request.interaction_mode,
+        )?;
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
-        if !title_only && let Some(browser) = &controls.browser {
-            cmd.arg("--mcp-config").arg(
-                serde_json::json!({"mcpServers":{"noches_browser":browser.config()}}).to_string(),
-            );
+        let mcp_config = controls.mcp.claude_config()?;
+        if let Some(config) = &mcp_config {
+            cmd.arg("--mcp-config").arg(config.path());
+        }
+        if !title_only {
+            if !controls.mcp.allowed_tools().is_empty() {
+                cmd.arg("--allowedTools")
+                    .arg(controls.mcp.allowed_tools().join(","));
+            }
+            if !controls.mcp.instructions().is_empty() {
+                cmd.arg("--append-system-prompt")
+                    .arg(controls.mcp.instructions());
+            }
         }
         if title_only {
             cmd.args([
@@ -477,12 +500,13 @@ impl ClaudeHarness {
             .take()
             .ok_or_else(|| HarnessError::Protocol("claude child has no stdout".into()))?;
         let stderr_tail = crate::StderrTail::default();
+        stderr_tail.retain_mcp(&controls.mcp);
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
+                    tracing::debug!(target: "zeron_harness::claude", stderr = %crate::redact::redact_output(&line));
                     tail.push(&line);
                 }
             });
@@ -504,8 +528,8 @@ impl ClaudeHarness {
         );
         let _ = stdin_tx.send(StdinMsg::Line(first));
 
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
+        let session = Session {
             normalizer,
             title_only,
             child,
@@ -517,7 +541,12 @@ impl ClaudeHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+            _mcp_config: mcp_config,
+        };
+        tokio::spawn(async move {
+            let _mcp_start_guard = mcp_guard;
+            run_session(session).await;
+        });
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
@@ -643,6 +672,7 @@ struct Session {
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
+    _mcp_config: Option<tempfile::NamedTempFile>,
 }
 
 /// The per-run event loop: one task multiplexing stdout frames, the steering
@@ -660,15 +690,22 @@ async fn run_session(session: Session) {
         interrupt_grace,
         kill_grace,
         stderr_tail,
+        _mcp_config,
     } = session;
     let RunControls {
+        mcp,
+        request_permission,
         browser: _,
         request_input,
         mut steering,
         interrupt,
         computer_use_socket: _,
     } = controls;
+    let _mcp_guard = mcp.run_guard();
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
+    let permission_gate = crate::PermissionGate::default();
+    let _permission_lifetime = interrupt.clone().drop_guard();
 
     let mut steering_open = true;
     let mut interrupted = false;
@@ -699,7 +736,7 @@ async fn run_session(session: Session) {
                             }));
                             let _ = stdin_tx.send(StdinMsg::Line(line));
                         } else {
-                            handle_control_request(req, &request_input, &stdin_tx);
+                            handle_control_request(req, &request_input, &request_permission, &permission_gate, &interrupt, &stdin_tx);
                         }
                         continue;
                     }
@@ -806,32 +843,115 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
-/// surface the questions through the engine's input bridge (which owns the
-/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
-/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
-/// by question text, as the tool expects.
+/// Serve one control request through the permission bridge, except for
+/// `AskUserQuestion`, which uses the separate content-input bridge. Native
+/// permission modes filter requests before this callback; anything reaching
+/// it requires explicit consent. Subtasks keep the frame loop flowing, and
+/// unsupported requests are denied rather than left unanswered.
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
+    request_permission: &Arc<crate::RequestPermission>,
+    permission_gate: &crate::PermissionGate,
+    interrupt: &crate::CancellationToken,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
             target: "zeron_harness::claude",
-            "unhandled control_request subtype: {}", req.request.subtype
+            subtype = %crate::redact::redact_registered(&req.request.subtype),
+            "unhandled control_request subtype"
         );
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+            &req.request_id,
+            serde_json::json!({
+                "behavior": "deny", "message": "Unsupported control request"
+            }),
+        )));
+        return;
+    }
+    if req.request.tool_name == "ExitPlanMode" {
+        // T3 captures the plan but never lets a permission answer switch the
+        // interaction mode. Implementing it requires a later explicit turn.
+        let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+            &req.request_id,
+            serde_json::json!({
+                "behavior": "deny",
+                "message": "Stay in plan mode and wait for an explicit implementation turn."
+            }),
+        )));
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
-        let line = control_response_line(&req.request_id, allow_response(req.request.input));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        // Native acceptEdits/Auto filters run before this callback. A prompt
+        // that reaches us must ask, even in Full access (unexpected escalation).
+        let request_permission = request_permission.clone();
+        let permission_gate = permission_gate.clone();
+        let stdin_tx = stdin_tx.clone();
+        let interrupt = interrupt.clone();
+        tokio::spawn(async move {
+            let request = zeron_proto::PermissionRequest::standard(
+                &req.request.tool_name,
+                crate::permission_summary(&req.request.tool_name, &req.request.input),
+                true,
+            );
+            let fingerprint = crate::permission_fingerprint(&req.request.input);
+            let answer = permission_gate
+                .ask(request, fingerprint, &request_permission, &interrupt)
+                .await;
+            let response = if matches!(
+                answer.decision,
+                zeron_proto::PermissionDecision::Accept
+                    | zeron_proto::PermissionDecision::AcceptForSession
+            ) {
+                let mut response = allow_response(req.request.input.clone());
+                if answer.decision == zeron_proto::PermissionDecision::AcceptForSession {
+                    // Never apply a suggested global setMode or fabricate a
+                    // wildcard tool rule. Without scoped native rules, the
+                    // runtime-local exact-input grant above handles repeats.
+                    let mut updates: Vec<Value> = req
+                        .request
+                        .permission_suggestions
+                        .into_iter()
+                        .filter(|update| {
+                            update["type"] == "addRules"
+                                && update["behavior"] == "allow"
+                                && update["rules"].as_array().is_some_and(|rules| {
+                                    !rules.is_empty()
+                                        && rules.iter().all(|rule| {
+                                            rule["toolName"].as_str()
+                                                == Some(req.request.tool_name.as_str())
+                                                && exact_session_rule(
+                                                    &req.request.input,
+                                                    &rule["ruleContent"],
+                                                )
+                                        })
+                                })
+                        })
+                        .collect();
+                    for update in &mut updates {
+                        if let Some(update) = update.as_object_mut() {
+                            update.insert("destination".into(), "session".into());
+                        }
+                    }
+                    if !updates.is_empty() {
+                        response["updatedPermissions"] = serde_json::json!(updates);
+                    }
+                }
+                response
+            } else {
+                serde_json::json!({"behavior":"deny","message":"Permission declined"})
+            };
+            let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+                &req.request_id,
+                response,
+            )));
+        });
         return;
     }
     let request_input = Arc::clone(request_input);
     let stdin_tx = stdin_tx.clone();
+    let interrupt = interrupt.clone();
     tokio::spawn(async move {
         let request_id = req.request_id;
         let input = req.request.input;
@@ -845,11 +965,33 @@ fn handle_control_request(
         //
         // A dropped sender (caller went away) degrades to empty answers so the
         // agent is unblocked rather than wedged.
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+        let answers = tokio::select! {
+            answer = (request_input)(questions.clone()) => answer.unwrap_or_default(),
+            _ = interrupt.cancelled() => Vec::new(),
+        };
+        if answers.is_empty() {
+            let _ = stdin_tx.send(StdinMsg::Line(control_response_line(
+                &request_id,
+                serde_json::json!({"behavior":"deny","message":"Question cancelled"}),
+            )));
+            return;
+        }
         let updated = updated_input_with_answers(&input, &questions, &answers);
         let line = control_response_line(&request_id, allow_response(updated));
         let _ = stdin_tx.send(StdinMsg::Line(line));
     });
+}
+
+/// Native suggestions are patterns, not necessarily this request's scope.
+/// Forward only a literal exact command/path; cache everything else locally.
+fn exact_session_rule(input: &Value, rule: &Value) -> bool {
+    rule.as_str().is_some_and(|rule| {
+        !rule.is_empty()
+            && !rule.contains(['*', '?', '[', ']'])
+            && ["command", "file_path", "path"]
+                .into_iter()
+                .any(|key| input.get(key).and_then(Value::as_str) == Some(rule))
+    })
 }
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
@@ -925,6 +1067,23 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_rules_never_expand_exact_consent_to_a_pattern() {
+        let input = json!({"command":"echo safe"});
+        assert!(exact_session_rule(&input, &json!("echo safe")));
+        for rule in ["*", "echo *", "echo safe:*", "other command", ""] {
+            assert!(!exact_session_rule(&input, &json!(rule)));
+        }
+        assert!(!exact_session_rule(
+            &json!({"command":"echo *"}),
+            &json!("echo *")
+        ));
+        assert!(exact_session_rule(
+            &json!({"file_path":"/tmp/a.rs"}),
+            &json!("/tmp/a.rs")
+        ));
+    }
 
     #[test]
     fn parses_questions_tolerantly() {

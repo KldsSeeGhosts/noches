@@ -136,6 +136,8 @@ mod tests {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
             }),
             last_message_preview: None,
             last_message_at: None,

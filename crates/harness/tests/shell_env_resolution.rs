@@ -124,6 +124,8 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
             model_options: serde_json::Map::new(),
             cwd: String::new(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: true,
             attachments: Vec::new(),
             worktree: None,
@@ -131,7 +133,9 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
         };
         let (steering, receiver) = tokio::sync::mpsc::channel(1);
         let controls = zeron_harness::RunControls {
+            mcp: Default::default(),
             browser: None,
+            request_permission: zeron_harness::refuse_permissions(),
             request_input: Box::new(|_| panic!("fixture requires no input")),
             steering: receiver,
             interrupt: zeron_harness::CancellationToken::new(),

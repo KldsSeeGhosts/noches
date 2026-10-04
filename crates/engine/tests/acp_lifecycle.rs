@@ -60,6 +60,8 @@ async fn quiet_acp_prompt_stays_working_until_response() {
                 model_options: Default::default(),
                 cwd: dir.path().display().to_string(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
                 auto_approve: true,
                 attachments: Vec::new(),
                 worktree: None,

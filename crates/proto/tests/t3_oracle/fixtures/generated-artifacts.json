@@ -1,0 +1,6 @@
+{
+  "crates/proto/src/orchestration.rs": "3e0e18ca81e6450e90db0955e58c842aa5e0e7dda5d7d8a3d7908fbd22a37582",
+  "crates/proto/src/orchestration_mcp.rs": "fce81476b02510ca2329f84b04607859b0360f07ad35cd9ca9cb5e155ac48394",
+  "crates/proto/src/provider_instance.rs": "53976c4cf19c7be7e6e09ae6fcf283f8ddd801fced69024a85f26d037f2d2286",
+  "crates/proto/tests/t3_oracle/round_trips.rs": "5346d7d29c441708e8542311aa051bcf65932dcc0fd889b96de6157fdd69e09f"
+}

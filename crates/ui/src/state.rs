@@ -125,7 +125,11 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
-    fn connection_status(&self) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> { None }
+    fn connection_status(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> {
+        None
+    }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
@@ -278,12 +282,22 @@ struct NativeRemoteEngine {
 
 #[async_trait]
 impl EngineBackend for NativeRemoteEngine {
-    fn client(&self) -> &RpcClient { &self.remote.client }
-    fn mode(&self) -> EngineMode { EngineMode::Remote { url: self.endpoint.clone() } }
-    fn connection_status(&self) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> {
+    fn client(&self) -> &RpcClient {
+        &self.remote.client
+    }
+    fn mode(&self) -> EngineMode {
+        EngineMode::Remote {
+            url: self.endpoint.clone(),
+        }
+    }
+    fn connection_status(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> {
         Some(self.remote.status.clone())
     }
-    async fn shutdown(&self) { self.remote.shutdown().await; }
+    async fn shutdown(&self) {
+        self.remote.shutdown().await;
+    }
 }
 
 /// A saved remote computer refused the connection key outright (gateway 401)
@@ -340,12 +354,18 @@ impl EngineHandle {
                     return Err(anyhow::anyhow!(
                         "{} is unavailable. Check that remote access and Tailscale are running, then retry.",
                         profile.name
-                    ))
+                    ));
                 }
             };
-            anyhow::ensure!(info.device_id == profile.device_id, "The remote computer's identity changed. Pair it again.");
+            anyhow::ensure!(
+                info.device_id == profile.device_id,
+                "The remote computer's identity changed. Pair it again."
+            );
             return Ok(Self {
-                inner: Arc::new(NativeRemoteEngine { remote, endpoint: profile.endpoint }),
+                inner: Arc::new(NativeRemoteEngine {
+                    remote,
+                    endpoint: profile.endpoint,
+                }),
                 engine_info: info,
                 deferred_state: None,
             });
@@ -1414,6 +1434,13 @@ impl AppState {
             .is_some_and(|device| device.supports(capability))
     }
 
+    pub fn runtime_policy_supported(&self, device_id: &str) -> bool {
+        let capability = zeron_proto::capabilities::RUNTIME_POLICY_V1;
+        self.engine()
+            .is_some_and(|engine| engine.engine_info().supports(capability))
+            && self.device_supports(device_id, capability)
+    }
+
     pub fn chat_host_supports(&self, chat_id: &str, capability: &str) -> bool {
         self.chats
             .iter()
@@ -2290,7 +2317,10 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.remote_host = config.remote.as_ref().map(|p| p.name.clone());
-            s.remote_connection = config.remote.as_ref().map(|_| zeron_rpc::remote::ConnectionState::Connecting);
+            s.remote_connection = config
+                .remote
+                .as_ref()
+                .map(|_| zeron_rpc::remote::ConnectionState::Connecting);
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
@@ -2351,11 +2381,20 @@ impl AppState {
                 loop {
                     let value = status.borrow_and_update().clone();
                     let revoked = value == zeron_rpc::remote::ConnectionState::Unauthorized;
-                    if this.update(cx, |s, cx| s.apply_remote_status(value, cx)).is_err() { break; }
+                    if this
+                        .update(cx, |s, cx| s.apply_remote_status(value, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
                     // A revocation retires this task on the next tick; stop
                     // pumping frames rather than racing the sweep.
-                    if revoked { break; }
-                    if status.changed().await.is_err() { break; }
+                    if revoked {
+                        break;
+                    }
+                    if status.changed().await.is_err() {
+                        break;
+                    }
                 }
             }));
         }
@@ -2829,7 +2868,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -3593,18 +3635,29 @@ mod tests {
         let local_port = free_port().await;
         let result = EngineHandle::bootstrap(EngineBootConfig {
             remote: Some(zeron_rpc::remote::ConnectionProfile {
-                id: "test".into(), name: "Unavailable computer".into(),
+                id: "test".into(),
+                name: "Unavailable computer".into(),
                 endpoint: format!("ws://127.0.0.1:{remote_port}"),
-                token: "a".repeat(64), device_id: "remote".into(),
+                token: "a".repeat(64),
+                device_id: "remote".into(),
             }),
-            data_dir: dir.path().to_path_buf(), ipc_port: local_port,
-            edge_url: "http://127.0.0.1:1".into(), edge_token: None,
-            org_id: None, workos_client_id: None, default_harness: HarnessId::Mock,
-        }).await;
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: local_port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await;
         assert!(result.is_err());
         assert!(!dir.path().join("device-id").exists());
         assert!(!dir.path().join("profiles").exists());
-        assert!(tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await.is_ok());
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -3671,7 +3724,11 @@ mod tests {
         );
         // The failure came from the gateway, not a locally embedded engine.
         assert!(!dir.path().join("device-id").exists());
-        assert!(tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await.is_ok());
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -5131,6 +5188,8 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -5155,6 +5214,8 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
             },
         );
     }

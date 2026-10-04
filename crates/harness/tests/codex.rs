@@ -15,7 +15,7 @@ use zeron_harness::{
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
+    TodoStatus, ToolCall, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -44,6 +44,8 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
@@ -58,7 +60,24 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
+        request_permission: Box::new(move |request| {
+            let (tx, rx) = oneshot::channel();
+            let decision = if answer_label == "Yes" {
+                zeron_proto::PermissionDecision::Accept
+            } else {
+                zeron_proto::PermissionDecision::Decline
+            };
+            let _ = tx.send(
+                request
+                    .options
+                    .into_iter()
+                    .find(|o| o.decision == decision)
+                    .unwrap(),
+            );
+            zeron_harness::PermissionReceiver::new(rx, || {})
+        }),
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -400,32 +419,33 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
 }
 
 #[tokio::test]
-async fn approvals_round_trip_as_input_requests() {
+async fn approvals_round_trip_only_through_the_permission_bridge() {
     // Approvals must reach the ENGINE's input bridge (`request_input`) — and
     // the harness must NOT emit its own `InputRequested`/`InputResolved`
     // twins: the bridge owns that lifecycle (it mints the request id the
     // resolver is parked under; a harness-emitted copy folded an unanswerable
     // duplicate chip into the doc).
-    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let asked: Arc<Mutex<Vec<zeron_proto::PermissionRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        mcp: Default::default(),
         browser: None,
-        request_input: Box::new(move |questions| {
-            seen.lock().unwrap().extend(questions.iter().cloned());
+        request_permission: Box::new(move |request| {
+            seen.lock().unwrap().push(request.clone());
             let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
+            let _ = tx.send(
+                request
+                    .options
+                    .into_iter()
+                    .find(|o| o.id == "allow-once")
+                    .unwrap(),
+            );
+            zeron_harness::PermissionReceiver::new(rx, || {})
         }),
+        request_input: Box::new(|_| panic!("permission must not enter question bridge")),
         steering: steer_rx,
         interrupt: token.clone(),
         computer_use_socket: None,
@@ -436,11 +456,11 @@ async fn approvals_round_trip_as_input_requests() {
 
     let asked = asked.lock().unwrap();
     assert_eq!(asked.len(), 2, "{events:?}");
-    assert_eq!(asked[0].header, "Approve command");
-    assert!(asked[0].question.contains("rm -rf /tmp/x"));
-    assert_eq!(asked[0].options, vec!["Yes".to_string(), "No".to_string()]);
-    assert_eq!(asked[1].header, "Approve file change");
-    assert!(asked[1].question.contains("/tmp/a.rs"));
+    assert_eq!(asked[0].tool, "item/commandExecution/requestApproval");
+    assert!(asked[0].description.contains("rm -rf /tmp/x"));
+    assert!(asked[0].options.iter().any(|o| o.id == "allow-session"));
+    assert_eq!(asked[1].tool, "item/fileChange/requestApproval");
+    assert!(asked[1].description.contains("/tmp/a.rs"));
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -1312,7 +1332,7 @@ async fn real_image_generation_smoke() {
 }
 
 #[tokio::test]
-async fn registers_conversation_browser_mcp_at_process_start() {
+async fn registers_conversation_browser_mcp_at_thread_start() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let capture = temp.path().join("arguments");
@@ -1320,7 +1340,7 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\"\n",
+            "#!/bin/sh\nexport NOCHES_TEST_CODEX_CONFIG_WIRE={}\nexec {} \"$@\"\n",
             zeron_browser::shell_quote(capture.to_str().unwrap()),
             zeron_browser::shell_quote(fixture_path().to_str().unwrap())
         ),
@@ -1328,11 +1348,14 @@ async fn registers_conversation_browser_mcp_at_process_start() {
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut controls, _steer, _token) = controls("Yes");
-    controls.browser = Some(zeron_browser::Connection {
-        executable: "/Applications/Noches App/zeron".into(),
-        socket: "/tmp/browser-test/control.sock".into(),
-        session: "session-browser".into(),
-    });
+    controls.mcp = controls
+        .mcp
+        .with_browser(&zeron_browser::Connection {
+            executable: "/Applications/Noches App/zeron".into(),
+            socket: "/tmp/browser-test/control.sock".into(),
+            session: "session-browser".into(),
+        })
+        .unwrap();
     let provider = CodexHarness::new().with_executable(wrapper);
     let mut req = request("scenario:happy");
     req.cwd = "/tmp".into();

@@ -36,6 +36,34 @@ fn parked_command() -> Command {
 }
 
 #[test]
+fn bulk_environment_updates_preserve_command_semantics() {
+    use std::ffi::OsStr;
+
+    let mut command = parked_command();
+    command
+        .env_clear()
+        .env("ZERON_TEST_REPLACED", "before")
+        .envs([
+            ("ZERON_TEST_REPLACED", "after"),
+            ("ZERON_TEST_REMOVED", "unused"),
+        ])
+        .env_remove("ZERON_TEST_REMOVED")
+        .envs([(OsStr::new("ZERON_TEST_UNICODE"), OsStr::new("雪"))]);
+    let prepared = command.prepare().unwrap();
+    let entries: Vec<_> = prepared
+        .environment
+        .split(|unit| *unit == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf16(entry).unwrap())
+        .collect();
+    assert_eq!(
+        entries,
+        ["ZERON_TEST_REPLACED=after", "ZERON_TEST_UNICODE=雪"]
+    );
+    assert!(prepared.environment.ends_with(&[0, 0]));
+}
+
+#[test]
 fn parked_child_helper() {
     if let Ok(handle) = std::env::var("ZERON_TEST_INHERITED_EVENT") {
         // Signal only if the parent's sentinel handle accidentally survived the

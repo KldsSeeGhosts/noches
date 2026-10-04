@@ -789,6 +789,13 @@ impl ChatDocHandle {
                 continue;
             }
             for part in &entry.parts {
+                if let MessagePart::Permission { request, .. } = part
+                    && request.state == zeron_proto::RequestState::Pending
+                {
+                    let mut expired = request.clone();
+                    expired.state = zeron_proto::RequestState::Expired;
+                    chips_changed |= self.doc.update_permission_request(&expired)?;
+                }
                 if let MessagePart::Tool {
                     id,
                     subagent_status: Some(SubagentStatus::Running),
@@ -3340,6 +3347,19 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
+        let policy = match &payload {
+            SessionCommandPayload::Run { request, .. } => {
+                Some((request.runtime_mode, request.interaction_mode))
+            }
+            SessionCommandPayload::Steer { .. } | SessionCommandPayload::RespondInput { .. } => {
+                self.request_from_chat_row(chat_id, "")
+                    .map(|r| (r.runtime_mode, r.interaction_mode))
+            }
+            _ => None,
+        };
+        if let Some((runtime, interaction)) = policy {
+            self.require_runtime_policy_host(chat_id, runtime, interaction)?;
+        }
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
@@ -3375,6 +3395,48 @@ impl DocHost {
         self.nudge_remote_host(chat_id);
         self.spawn_command_delivery(chat_id, entry, transfers);
         Ok(id)
+    }
+
+    /// Old engines ignore unknown run fields. Refuse before any durable write,
+    /// including CRDT delivery, rather than silently running unrestricted.
+    fn require_runtime_policy_host(
+        &self,
+        chat_id: &str,
+        runtime: zeron_proto::RuntimeMode,
+        interaction: zeron_proto::InteractionMode,
+    ) -> Result<(), EngineError> {
+        let Some(target) = self.remote_host_for(chat_id) else {
+            return Ok(());
+        };
+        self.require_runtime_policy_device(&target, runtime, interaction)
+    }
+
+    pub(crate) fn require_runtime_policy_device(
+        &self,
+        target: &str,
+        runtime: zeron_proto::RuntimeMode,
+        interaction: zeron_proto::InteractionMode,
+    ) -> Result<(), EngineError> {
+        if target == self.device_id()
+            || (runtime == zeron_proto::RuntimeMode::FullAccess
+                && interaction == zeron_proto::InteractionMode::Default)
+        {
+            return Ok(());
+        }
+        let supported = self
+            .workspace()
+            .and_then(|ws| ws.read_devices().ok())
+            .into_iter()
+            .flatten()
+            .any(|device| {
+                device.id == target && device.supports(zeron_proto::capabilities::RUNTIME_POLICY_V1)
+            });
+        if !supported {
+            return Err(EngineError::Other(
+                "Update the execution host: it has not advertised runtime-policy-v1".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// A send revives an archived chat on every device (best-effort).
@@ -3415,6 +3477,13 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
+        if let Some(request) = self.request_from_chat_row(chat_id, "") {
+            self.require_runtime_policy_host(
+                chat_id,
+                request.runtime_mode,
+                request.interaction_mode,
+            )?;
+        }
         let handle = self.open(chat_id)?;
         let id = new_id();
         handle.doc.push_queued(&QueuedMessage {
@@ -4099,6 +4168,7 @@ impl DocHost {
                 "no live run and no prior run config".into(),
             ));
         };
+        self.apply_saved_runtime_authority(&sessions, chat_id, &mut request)?;
         request.prompt = prompt;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
@@ -5171,6 +5241,8 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        runtime_mode: request.runtime_mode,
+                        interaction_mode: request.interaction_mode,
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -5216,6 +5288,19 @@ impl DocHost {
             SessionCommandPayload::Interrupt {} => {
                 self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::RespondPermission {
+                request_id,
+                option_id,
+            } => {
+                if sessions.respond_permission(chat_id, request_id, option_id)? {
+                    Ok((SessionCommandStatus::Applied, None))
+                } else {
+                    Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("Permission request expired or option is invalid".into()),
+                    ))
+                }
             }
             SessionCommandPayload::RespondInput {
                 request_id,
@@ -5269,6 +5354,7 @@ impl DocHost {
                         Some("no pending input request and no prior run config".into()),
                     ));
                 };
+                self.apply_saved_runtime_authority(sessions, chat_id, &mut request)?;
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
@@ -5335,6 +5421,7 @@ impl DocHost {
                         Some("no live run and no prior run config".into()),
                     ));
                 };
+                self.apply_saved_runtime_authority(sessions, chat_id, &mut request)?;
                 request.prompt = prompt;
                 request.resume = None; // dispatch re-derives the harness session
                 // A reused config must not re-inline the PREVIOUS turn's
@@ -5557,6 +5644,25 @@ impl DocHost {
     /// row — cwd from the row, model/reasoning/options/sandbox from its config
     /// (composer defaults otherwise). `None` without a workspace host or row.
     // (Also the RespondInput dead-run fallback's config source.)
+    fn apply_saved_runtime_authority(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        request: &mut zeron_proto::RunRequest,
+    ) -> Result<(), EngineError> {
+        if let Some((runtime, interaction)) = sessions.recorded_runtime_authority(chat_id)? {
+            request.runtime_mode = runtime;
+            request.interaction_mode = interaction;
+        }
+        if let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) {
+            request.runtime_mode = request.runtime_mode.min(config.runtime_mode);
+            if config.interaction_mode == zeron_proto::InteractionMode::Plan {
+                request.interaction_mode = config.interaction_mode;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn request_from_chat_row(
         &self,
         chat_id: &str,
@@ -5586,6 +5692,11 @@ impl DocHost {
                 .map(|c| c.sandbox)
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
+            runtime_mode: config.as_ref().map(|c| c.runtime_mode).unwrap_or_default(),
+            interaction_mode: config
+                .as_ref()
+                .map(|c| c.interaction_mode)
+                .unwrap_or_default(),
             attachments: Vec::new(),
             resume: None,
             worktree: None,

@@ -30,6 +30,8 @@ async fn main() {
         model_options: serde_json::Map::new(),
         cwd: cwd.into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
@@ -43,7 +45,9 @@ async fn main() {
         .run(
             request,
             RunControls {
+                mcp: Default::default(),
                 browser: None,
+                request_permission: zeron_harness::refuse_permissions(),
                 request_input: Box::new(|_| panic!("probe must not ask for input")),
                 steering,
                 interrupt: CancellationToken::new(),

@@ -12690,6 +12690,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeron-browser",
  "zeron-engine",
+ "zeron-harness",
  "zeron-mcp",
  "zeron-rpc",
  "zeron-ui",
@@ -12840,6 +12841,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 

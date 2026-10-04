@@ -1553,6 +1553,32 @@ pub fn rows_for_entry(
                             copy_text: None,
                         });
                     }
+                    MessagePart::Permission {
+                        id: part_id,
+                        request,
+                    } => {
+                        let resolved = request.state != zeron_proto::RequestState::Pending;
+                        let outcome = match request.state {
+                            zeron_proto::RequestState::Pending => "Permission",
+                            zeron_proto::RequestState::Expired => "Permission expired",
+                            zeron_proto::RequestState::Resolved => request
+                                .options
+                                .iter()
+                                .find(|o| Some(&o.id) == request.selected_option_id.as_ref())
+                                .map(|o| o.label.as_str())
+                                .unwrap_or("Permission answered"),
+                        };
+                        let header: SharedString = format!("{outcome} · {}", request.tool).into();
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(header.as_bytes()) << 1 | resolved as u64,
+                            turn_start: false,
+                            kind: RowKind::InputChip { header, resolved },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                        });
+                    }
                     MessagePart::Error {
                         id: part_id,
                         message,
@@ -9112,6 +9138,16 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
+        }
+        if let MessagePart::Permission { request, .. } = part {
+            acc.push(
+                0x20 | match request.state {
+                    zeron_proto::RequestState::Pending => 0,
+                    zeron_proto::RequestState::Resolved => 1,
+                    zeron_proto::RequestState::Expired => 2,
+                },
+            );
+            acc.extend_from_slice(request.tool.as_bytes());
         }
     }
     fnv1a(&acc)

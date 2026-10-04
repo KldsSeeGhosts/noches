@@ -56,6 +56,102 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+type PendingPermissions = Arc<
+    Mutex<
+        HashMap<
+            String,
+            (
+                zeron_proto::PermissionRequest,
+                oneshot::Sender<zeron_proto::PermissionOption>,
+            ),
+        >,
+    >,
+>;
+
+fn permission_bridge(
+    pending: PendingPermissions,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+) -> zeron_harness::RequestPermission {
+    Box::new(move |mut request| {
+        let (tx, rx) = oneshot::channel();
+        let mut option_ids = std::collections::HashSet::new();
+        let valid = !request.options.is_empty()
+            && request.options.len() <= 32
+            && request.options.iter().all(|o| {
+                !o.id.trim().is_empty()
+                    && option_ids.insert(&o.id)
+                    && match o.decision {
+                        zeron_proto::PermissionDecision::AcceptForSession => {
+                            o.scope == zeron_proto::DecisionScope::Session
+                        }
+                        zeron_proto::PermissionDecision::AcceptAlways => {
+                            o.scope == zeron_proto::DecisionScope::Persistent
+                        }
+                        _ => o.scope == zeron_proto::DecisionScope::Once,
+                    }
+            });
+        if !valid {
+            let _ = tx.send(zeron_proto::PermissionOption::default());
+            return zeron_harness::PermissionReceiver::new(rx, || {});
+        }
+        request.description = request.description.chars().take(2000).collect();
+        request.id = new_id();
+        request.state = zeron_proto::RequestState::Pending;
+        request.selected_option_id = None;
+        let id = request.id.clone();
+        lock(&pending).insert(id.clone(), (request.clone(), tx));
+        let _ = engine_tx.send(AgentEvent::PermissionRequested { request });
+        let pending = pending.clone();
+        let engine_tx = engine_tx.clone();
+        zeron_harness::PermissionReceiver::new(rx, move || {
+            let removed = lock(&pending).remove(&id);
+            if let Some((mut request, _)) = removed {
+                request.state = zeron_proto::RequestState::Expired;
+                let _ = engine_tx.send(AgentEvent::PermissionUpdated { request });
+            }
+        })
+    })
+}
+
+fn resolve_permission(
+    pending: &PendingPermissions,
+    engine_tx: &mpsc::UnboundedSender<AgentEvent>,
+    request_id: &str,
+    option_id: &str,
+) -> bool {
+    let mut entries = lock(pending);
+    let Some((request, tx)) = entries.get(request_id) else {
+        return false;
+    };
+    let Some(option) = request.options.iter().find(|o| o.id == option_id).cloned() else {
+        return false;
+    };
+    if tx.is_closed() {
+        return false;
+    }
+    let Some((mut request, tx)) = entries.remove(request_id) else {
+        return false;
+    };
+    drop(entries);
+    // Receiver drop racing the response is expiration, never a grant.
+    let sent = tx.send(option).is_ok();
+    request.state = if sent {
+        zeron_proto::RequestState::Resolved
+    } else {
+        zeron_proto::RequestState::Expired
+    };
+    request.selected_option_id = sent.then(|| option_id.to_owned());
+    let _ = engine_tx.send(AgentEvent::PermissionUpdated { request });
+    sent
+}
+
+fn expire_permissions(pending: &PendingPermissions, engine_tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let entries: Vec<_> = lock(pending).drain().collect();
+    for (_, (mut request, _)) in entries {
+        request.state = zeron_proto::RequestState::Expired;
+        let _ = engine_tx.send(AgentEvent::PermissionUpdated { request });
+    }
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -80,6 +176,8 @@ struct RuntimeConfig {
     cwd: String,
     sandbox: zeron_proto::SandboxLevel,
     auto_approve: bool,
+    runtime_mode: zeron_proto::RuntimeMode,
+    interaction_mode: zeron_proto::InteractionMode,
     worktree: Option<zeron_proto::WorktreeSpec>,
 }
 
@@ -93,6 +191,8 @@ impl RuntimeConfig {
             cwd: request.cwd.clone(),
             sandbox: request.sandbox,
             auto_approve: request.auto_approve,
+            runtime_mode: request.runtime_mode,
+            interaction_mode: request.interaction_mode,
             worktree: request.worktree.clone(),
         }
     }
@@ -121,6 +221,7 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    pending_permissions: PendingPermissions,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
@@ -163,6 +264,8 @@ struct Inner {
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     browser_root: OnceLock<std::path::PathBuf>,
+    /// Host-only bindings. Never serialized with a session or RunRequest.
+    session_mcp: Mutex<HashMap<String, zeron_harness::mcp::SessionMcpContext>>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
@@ -218,6 +321,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
+                session_mcp: Mutex::new(HashMap::new()),
                 turn_listener: OnceLock::new(),
                 computer_use,
             }),
@@ -292,6 +396,40 @@ impl SessionsEngine {
     /// Discover the desktop browser endpoint in this device's profile.
     pub fn set_browser_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.browser_root.set(root);
+    }
+
+    /// Injection seam for the later orchestration MCP service. Register on
+    /// the execution host before dispatch. The returned context can attach a
+    /// credential revoker; replacement/end/shutdown invokes it exactly once.
+    /// Runtime mutation is refused: a warm provider retains its original
+    /// config until it is stopped and restarted.
+    pub fn register_session_mcp(
+        &self,
+        session: &str,
+        entries: Vec<zeron_harness::mcp::McpServerEntry>,
+        instructions: String,
+    ) -> Result<zeron_harness::mcp::SessionMcpContext, zeron_harness::HarnessError> {
+        let runs = lock(&self.inner.runs);
+        if runs.contains_key(session) {
+            return Err(zeron_harness::HarnessError::Protocol(
+                "stop the active session before replacing its MCP registration".into(),
+            ));
+        }
+        let context =
+            zeron_harness::mcp::SessionMcpContext::new(entries, instructions, Vec::new())?;
+        let previous = lock(&self.inner.session_mcp).insert(session.into(), context.clone());
+        drop(runs);
+        if let Some(previous) = previous {
+            previous.revoke();
+        }
+        Ok(context)
+    }
+
+    pub fn revoke_session_mcp(&self, session: &str) {
+        let context = lock(&self.inner.session_mcp).remove(session);
+        if let Some(context) = context {
+            context.revoke();
+        }
     }
 
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
@@ -437,6 +575,7 @@ impl SessionsEngine {
         startup_retry: bool,
     ) -> Result<String, EngineError> {
         let _admission = self.admit_work()?;
+        zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = crate::repos::expand_home(&request.cwd)
@@ -526,6 +665,7 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
+        zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -543,12 +683,24 @@ impl SessionsEngine {
             resume_injected = request.resume.is_some();
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        self.inner
+            .journal
+            .append(
+                chat_id,
+                &AgentEvent::RuntimePolicyConfigured {
+                    runtime_mode: request.runtime_mode,
+                    interaction_mode: request.interaction_mode,
+                },
+            )
+            .map_err(|e| EngineError::Other(format!("Cannot persist runtime authority: {e}")))?;
 
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
+        let request_permission = permission_bridge(pending_permissions.clone(), engine_tx.clone());
 
         let request_input_for_cua: crate::computer_use::RequestInput = Arc::new({
             let pending = pending_inputs.clone();
@@ -591,6 +743,8 @@ impl SessionsEngine {
             (None, None)
         };
         let controls = RunControls {
+            mcp: Default::default(),
+            request_permission,
             browser: None,
             request_input,
             steering: steer_rx,
@@ -610,6 +764,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                pending_permissions,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
@@ -656,9 +811,19 @@ impl SessionsEngine {
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
         let _admission = self.admit_work()?;
+        let configured = self
+            .inner
+            .doc_host()
+            .and_then(|host| host.workspace().and_then(|ws| ws.chat_config(chat_id)));
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
+            .filter(|h| {
+                configured.as_ref().is_none_or(|config| {
+                    config.runtime_mode == h.runtime_config.runtime_mode
+                        && config.interaction_mode == h.runtime_config.interaction_mode
+                })
+            })
             .map(|h| {
                 (
                     h.run_id.clone(),
@@ -737,15 +902,18 @@ impl SessionsEngine {
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
+                h.pending_permissions.clone(),
+                h.engine_tx.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, token, cancel, pending, permissions, engine_tx)) = target else {
             return Ok(false);
         };
         // Publish cancellation BEFORE waking the harness. Otherwise a fast
         // EOF after token.cancel() can beat this watch notification and be
         // classified as an error instead of an interrupted turn.
         let _ = cancel.send(true);
+        expire_permissions(&permissions, &engine_tx);
         // Unpark questions before harness teardown, which can await them.
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
@@ -780,11 +948,51 @@ impl SessionsEngine {
         let Some(resolver) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
+        if resolver.send(answers).is_err() {
+            return Ok(false);
+        }
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
         });
         Ok(true)
+    }
+
+    /// Live callback only: stale, invalid, or cross-question answers never
+    /// resume a run and never become a new prompt.
+    pub fn respond_permission(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        option_id: &str,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| (h.pending_permissions.clone(), h.engine_tx.clone()));
+        let Some((pending, engine_tx)) = target else {
+            return Ok(false);
+        };
+        Ok(resolve_permission(
+            &pending, &engine_tx, request_id, option_id,
+        ))
+    }
+
+    /// Implicit continuations inherit the last actual authority, not a stale
+    /// workspace default. Raising authority requires an explicit Run request.
+    pub(crate) fn recorded_runtime_authority(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<(zeron_proto::RuntimeMode, zeron_proto::InteractionMode)>, EngineError> {
+        if let Some(request) = lock(&self.inner.last_requests).get(chat_id) {
+            return Ok(Some((request.runtime_mode, request.interaction_mode)));
+        }
+        let events = self.inner.journal.replay(chat_id, 0)?;
+        Ok(events.into_iter().rev().find_map(|(_, event)| match event {
+            AgentEvent::RuntimePolicyConfigured {
+                runtime_mode,
+                interaction_mode,
+            } => Some((runtime_mode, interaction_mode)),
+            _ => None,
+        }))
     }
 
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
@@ -870,6 +1078,22 @@ impl SessionsEngine {
                 let Some(host) = sessions.inner.doc_host() else {
                     return;
                 };
+                // The journal owns the crashed run's authority, even when a
+                // stale workspace row exists. Read failures must not widen it.
+                let events = match sessions.inner.journal.replay(&chat_id, 0) {
+                    Ok(events) => events,
+                    Err(err) => {
+                        tracing::warn!(chat = %chat_id, error = %err, "auto-resume skipped: runtime authority unreadable");
+                        return;
+                    }
+                };
+                let authority = events.into_iter().rev().find_map(|(_, event)| match event {
+                    AgentEvent::RuntimePolicyConfigured {
+                        runtime_mode,
+                        interaction_mode,
+                    } => Some((runtime_mode, interaction_mode)),
+                    _ => None,
+                });
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
@@ -877,6 +1101,7 @@ impl SessionsEngine {
                     // — a crash can predate the debounced workspace-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
+                        let (runtime_mode, interaction_mode) = authority.unwrap_or_default();
                         Some(RunRequest {
                             prompt: String::new(),
                             harness: None,
@@ -885,6 +1110,8 @@ impl SessionsEngine {
                             model_options: Default::default(),
                             cwd,
                             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                            runtime_mode,
+                            interaction_mode,
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
@@ -895,6 +1122,10 @@ impl SessionsEngine {
                     tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                     return;
                 };
+                if let Some((runtime_mode, interaction_mode)) = authority {
+                    request.runtime_mode = runtime_mode;
+                    request.interaction_mode = interaction_mode;
+                }
                 request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
@@ -923,6 +1154,10 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        let contexts = std::mem::take(&mut *lock(&self.inner.session_mcp));
+        for context in contexts.into_values() {
+            context.revoke();
+        }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1027,6 +1262,8 @@ impl Inner {
     }
 
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        let event = zeron_harness::redact::redact_event(event.clone());
+        let event = &event;
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {
@@ -1255,7 +1492,9 @@ impl Inner {
     fn remove_run(&self, chat_id: &str, run_id: &str) {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+            if let Some(handle) = runs.remove(chat_id) {
+                expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+            }
         }
     }
 }
@@ -1573,7 +1812,9 @@ fn cursor_unstarted_history(
                         MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => {
                             !text.is_empty()
                         }
-                        MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+                        MessagePart::Tool { .. }
+                        | MessagePart::Input { .. }
+                        | MessagePart::Permission { .. } => true,
                         _ => false,
                     })
             })
@@ -1621,6 +1862,16 @@ async fn drive_run(
     resume_state: RunResumeState,
     mut cua_bridge: Option<crate::computer_use::RunBridge>,
 ) {
+    let registered_mcp = lock(&inner.session_mcp)
+        .get(&chat_id)
+        .cloned()
+        .unwrap_or_default();
+    controls.mcp = registered_mcp.clone();
+    let _mcp_cleanup = SessionMcpCleanup {
+        inner: Arc::downgrade(&inner),
+        session: chat_id.clone(),
+        context: registered_mcp.clone(),
+    };
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
@@ -1660,8 +1911,12 @@ async fn drive_run(
                     socket,
                     session: chat_id.clone(),
                 };
-                request.prompt = format!("{}\n\n{}", connection.instructions(), request.prompt);
-                controls.browser = Some(connection);
+                match controls.mcp.with_browser(&connection) {
+                    Ok(context) => controls.mcp = context,
+                    Err(error) => {
+                        tracing::warn!(chat = %chat_id, %error, "browser MCP binding unavailable")
+                    }
+                }
             }
         }
     }
@@ -1672,7 +1927,7 @@ async fn drive_run(
     let mut stream = match started {
         Ok(stream) => stream,
         Err(err) => {
-            let message = err.to_string();
+            let message = zeron_harness::redact::redact_registered(&err.to_string());
             tracing::warn!(chat = %chat_id, harness = ?harness_id, error = %message, "run failed to start");
             // The live journal does not survive a transcript reload.
             let parts = [MessagePart::Error {
@@ -1903,6 +2158,16 @@ async fn drive_run(
                 }
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
+                    Some(Ok(event)) if matches!(
+                        event,
+                        AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionUpdated { .. }
+                    ) => {
+                        // Permission lifecycle events come only from the
+                        // engine channel. A provider stream cannot mint an
+                        // answerable-looking request or forge its resolution.
+                        tracing::warn!(chat = %chat_id, "dropping harness-emitted permission lifecycle event");
+                        continue;
+                    }
                     Some(Ok(event)) => event,
                     // A stream error while PARKED is a post-turn child death —
                     // the turn was already finalized, so the run ends clean
@@ -1978,6 +2243,7 @@ async fn drive_run(
                             id != zeron_proto::LIVE_PLAN_TOOL_ID
                         }
                         MessagePart::Input { resolved: false, .. } => true,
+                        MessagePart::Permission { request, .. } => request.state == zeron_proto::RequestState::Pending,
                         _ => false,
                     }) =>
                 {
@@ -2026,7 +2292,11 @@ async fn drive_run(
 
             prepared_events.extend(
                 inner
-                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .prepare_generated_image(
+                        &chat_id,
+                        zeron_harness::redact::redact_event(raw_event),
+                        &mut seen_images,
+                    )
                     .await,
             );
             let Some(event) = prepared_events.pop_front() else {
@@ -2330,6 +2600,16 @@ async fn drive_run(
                     // A stale answer settling after its turn already closed:
                     // nothing is running — stay parked.
                     AgentEvent::InputResolved { .. } => continue,
+                    AgentEvent::PermissionRequested { request } => {
+                        if let Some(handle) = lock(&inner.runs).get(&chat_id) {
+                            let removed = lock(&handle.pending_permissions).remove(&request.id);
+                            if let Some((mut request, _)) = removed {
+                                request.state = zeron_proto::RequestState::Expired;
+                                inner.publish(&chat_id, &AgentEvent::PermissionUpdated { request });
+                            }
+                        }
+                        continue;
+                    }
                     _ => continue,
                 }
             }
@@ -2487,13 +2767,24 @@ async fn drive_run(
             } => {
                 inner.remember_harness_session(&chat_id, session_id, &run_cwd);
             }
-            AgentEvent::InputRequested { .. } => {
+            AgentEvent::InputRequested { .. } | AgentEvent::PermissionRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
                 // before the parked gate.
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
-            AgentEvent::InputResolved { .. } => {
-                inner.set_status(&chat_id, SessionStatus::Working, false);
+            AgentEvent::InputResolved { .. } | AgentEvent::PermissionUpdated { .. } => {
+                let waiting = lock(&inner.runs).get(&chat_id).is_some_and(|h| {
+                    !lock(&h.pending_inputs).is_empty() || !lock(&h.pending_permissions).is_empty()
+                });
+                inner.set_status(
+                    &chat_id,
+                    if waiting {
+                        SessionStatus::AwaitingInput
+                    } else {
+                        SessionStatus::Working
+                    },
+                    false,
+                );
             }
             _ => {}
         }
@@ -2532,6 +2823,9 @@ async fn drive_run(
                     let _ = tx.send(Vec::new());
                 }
             }
+            if let Some(handle) = lock(&inner.runs).get(&chat_id) {
+                expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+            }
             let message_status = match status {
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
@@ -2543,6 +2837,11 @@ async fn drive_run(
             for part in folded.iter_mut() {
                 if let MessagePart::Input { resolved, .. } = part {
                     *resolved = true;
+                }
+                if let MessagePart::Permission { request, .. } = part
+                    && request.state == zeron_proto::RequestState::Pending
+                {
+                    request.state = zeron_proto::RequestState::Expired;
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the
@@ -2696,9 +2995,116 @@ async fn drive_run(
     }
 }
 
+/// Compare ownership before cleanup: an old task must not revoke/remove a
+/// replacement registration admitted for the same conversation.
+struct SessionMcpCleanup {
+    inner: std::sync::Weak<Inner>,
+    session: String,
+    context: zeron_harness::mcp::SessionMcpContext,
+}
+
+impl Drop for SessionMcpCleanup {
+    fn drop(&mut self) {
+        self.context.revoke();
+        if let Some(inner) = self.inner.upgrade() {
+            let mut bindings = lock(&inner.session_mcp);
+            if bindings
+                .get(&self.session)
+                .is_some_and(|c| c.same_registration(&self.context))
+            {
+                bindings.remove(&self.session);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn permission_bridge_round_trip_is_id_scoped_and_not_a_question() {
+        let pending = PendingPermissions::default();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let bridge = permission_bridge(pending.clone(), events.clone());
+        let receiver = bridge(zeron_proto::PermissionRequest::standard(
+            "Bash",
+            "cargo test",
+            true,
+        ));
+        let AgentEvent::PermissionRequested { request } = received.recv().await.unwrap() else {
+            panic!("not a permission");
+        };
+        assert!(!request.id.is_empty());
+        assert!(!resolve_permission(
+            &pending,
+            &events,
+            &request.id,
+            "Allow once"
+        )); // label is not identity
+        assert!(!resolve_permission(
+            &pending,
+            &events,
+            "foreign-request",
+            "allow-once"
+        ));
+        assert!(resolve_permission(
+            &pending,
+            &events,
+            &request.id,
+            "allow-session"
+        ));
+        assert!(!resolve_permission(
+            &pending,
+            &events,
+            &request.id,
+            "allow-once"
+        )); // no duplicate grant
+        assert_eq!(
+            receiver.recv().await.decision,
+            zeron_proto::PermissionDecision::AcceptForSession
+        );
+        let AgentEvent::PermissionUpdated { request } = received.recv().await.unwrap() else {
+            panic!();
+        };
+        assert_eq!(request.state, zeron_proto::RequestState::Resolved);
+        assert_eq!(request.selected_option_id.as_deref(), Some("allow-session"));
+    }
+
+    #[tokio::test]
+    async fn permission_callback_drop_and_turn_end_expire_instead_of_allowing() {
+        let pending = PendingPermissions::default();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let bridge = permission_bridge(pending.clone(), events.clone());
+        let receiver = bridge(zeron_proto::PermissionRequest::standard(
+            "Edit", "a.rs", true,
+        ));
+        let AgentEvent::PermissionRequested { request } = received.recv().await.unwrap() else {
+            panic!();
+        };
+        drop(receiver);
+        let AgentEvent::PermissionUpdated { request: expired } = received.recv().await.unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(expired.state, zeron_proto::RequestState::Expired);
+        assert!(!resolve_permission(
+            &pending,
+            &events,
+            &request.id,
+            "allow-once"
+        ));
+        let receiver = bridge(zeron_proto::PermissionRequest::standard(
+            "Exec", "ls", false,
+        ));
+        let _ = received.recv().await;
+        expire_permissions(&pending, &events);
+        assert_eq!(
+            receiver.recv().await.decision,
+            zeron_proto::PermissionDecision::Cancel
+        );
+        assert!(lock(&pending).is_empty());
+    }
 
     #[test]
     fn cursor_without_a_session_id_retains_only_preceding_user_messages() {
@@ -2753,6 +3159,82 @@ mod tests {
     }
 
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    #[tokio::test]
+    async fn session_mcp_registry_is_host_local_redacted_and_ownership_checked() {
+        use super::*;
+        use zeron_harness::mcp::McpServerEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let entry = || {
+            McpServerEntry::http(
+                "scope",
+                "http://127.0.0.1:1234/mcp",
+                [(
+                    "Authorization".into(),
+                    "Bearer engine-mcp-private-credential".into(),
+                )]
+                .into(),
+            )
+        };
+        let old = sessions
+            .register_session_mcp("chat", vec![entry()], "instructions".into())
+            .unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        old.on_revoke(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        sessions.inner.publish(
+            "chat",
+            &AgentEvent::Error {
+                message: "echo engine-mcp-private-credential".into(),
+            },
+        );
+        let serialized = serde_json::to_string(&journal.replay("chat", 0).unwrap()).unwrap();
+        assert!(!serialized.contains("engine-mcp-private-credential"));
+        assert!(serialized.contains("[redacted]"));
+        let new = sessions
+            .register_session_mcp("chat", vec![entry()], "new instructions".into())
+            .unwrap();
+        assert!(old.is_revoked());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(SessionMcpCleanup {
+            inner: Arc::downgrade(&sessions.inner),
+            session: "chat".into(),
+            context: old,
+        });
+        assert!(
+            lock(&sessions.inner.session_mcp)
+                .get("chat")
+                .unwrap()
+                .same_registration(&new)
+        );
+        assert!(
+            !new.is_revoked(),
+            "old cleanup must not revoke a new registration"
+        );
+        sessions.shutdown().await;
+        assert!(new.is_revoked());
+        assert!(lock(&sessions.inner.session_mcp).is_empty());
+        assert!(
+            SessionsEngine::new(
+                "restarted".into(),
+                journal,
+                Arc::new(HarnessRegistry::new())
+            )
+            .inner
+            .session_mcp
+            .lock()
+            .unwrap()
+            .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn generated_image_failure_is_sanitized_even_inside_subagents() {
@@ -2825,6 +3307,8 @@ mod tests {
             model_options: serde_json::Map::new(),
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
             auto_approve: true,
             resume: None,
             attachments: Vec::new(),
