@@ -228,7 +228,7 @@ impl EngineCore {
         registry.load_prefs(data_dir);
         registry
             .provider_instances
-            .load(data_dir)
+            .load(&registry, data_dir)
             .map_err(EngineError::Other)?;
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let orchestration = orchestration::Kernel::open(store.clone(), &device_id)
