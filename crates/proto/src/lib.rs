@@ -8,6 +8,7 @@ pub mod entities;
 pub mod motion;
 pub mod orchestration;
 pub mod orchestration_mcp;
+pub mod orchestration_threads;
 pub mod preview;
 pub mod provider_instance;
 pub mod runtime_policy;
