@@ -55,6 +55,8 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<Value> {
     });
     Ok(
         json!({"threadId":id,"version":parent.through_sequence,"lineage":parent.thread.lineage,
+        "forkedFrom":parent.thread.forked_from,"transfers":super::transfer::transfers(conn,id)?,
+        "checkpoints":super::checkpoint::timeline(conn,id)?,
         "workState":task::progress(&parent).0,"tasks":tasks,"latestResult":latest_result}),
     )
 }

@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    transfer: RwLock<Option<Arc<dyn crate::orchestration::transfer_service::TransferService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +29,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            transfer: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -45,8 +47,27 @@ impl Toolkit {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
     }
 
+    pub fn set_transfer_service(
+        &self,
+        service: Arc<dyn crate::orchestration::transfer_service::TransferService>,
+    ) {
+        *self
+            .transfer
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
     pub fn tools(&self) -> &[Value] {
         &self.descriptors
+    }
+
+    fn transfer_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::transfer_service::TransferService>> {
+        self.transfer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub async fn request(&self, scope: InvocationScope, message: Value) -> Option<Value> {
@@ -192,6 +213,16 @@ impl Toolkit {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
         match input {
+            input @ (OrchestrationToolInput::T3ThreadFork(_)
+            | OrchestrationToolInput::T3ThreadMergeBack(_)
+            | OrchestrationToolInput::T3ThreadTransfers(_)) => codec::result(
+                crate::orchestration::transfer::mcp::dispatch(
+                    self.transfer_service(),
+                    scope.caller.clone(),
+                    input,
+                )
+                .await,
+            ),
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances

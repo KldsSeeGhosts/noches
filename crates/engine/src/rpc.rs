@@ -1618,6 +1618,17 @@ impl RpcService for EngineRpc {
         };
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::GET_THREAD_TRANSFER_STATE
+            | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
+            | methods::RESTORE_FILE_CHECKPOINT => {
+                crate::orchestration::ui_transfer::rpc(
+                    self.orchestration.as_ref(),
+                    method,
+                    params,
+                    &self.sessions,
+                )
+                .await
+            }
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())
             }

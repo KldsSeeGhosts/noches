@@ -3,6 +3,7 @@
 //! starts no workers; `runner` bridges its effects to ordinary sessions.
 
 pub mod assembly;
+pub mod checkpoint;
 pub mod command;
 pub mod continuation;
 #[cfg(test)]
@@ -21,7 +22,10 @@ pub mod sync_publish;
 pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod transfer;
+pub mod transfer_service;
 pub mod ui;
+pub mod ui_transfer;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -93,10 +97,14 @@ impl Kernel {
     /// The caller must be the profile's owning engine, under its InstanceLock.
     /// Opening does not run recovery, publish documents, or execute effects.
     pub fn open(docs: Arc<DocsStore>, host_id: &str) -> Result<Self> {
-        Ok(Self {
-            store: Store::open(docs, host_id)?,
-            locks: Arc::default(),
-        })
+        Ok(Self::from_store(Store::open(docs, host_id)?))
+    }
+
+    pub(crate) fn from_store(store: Store) -> Self {
+        Self {
+            locks: store.thread_locks.clone(),
+            store,
+        }
     }
 
     pub async fn dispatch(&self, command: &Command, now_ms: i64) -> Result<CommandReceipt> {

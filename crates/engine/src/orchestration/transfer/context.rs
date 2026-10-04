@@ -23,28 +23,59 @@ pub struct ContextUsage {
 /// Only accepted root attempts on the same durable native identity may supply
 /// occupancy. Reusing a provider row must never revive another native session.
 pub fn latest_native_context_usage(
-    projection: &crate::orchestration::projection::ThreadProjection, provider: &Value,
+    projection: &crate::orchestration::projection::ThreadProjection,
+    provider: &Value,
 ) -> Option<(ContextUsage, zeron_proto::provider_instance::ModelSelection)> {
     let native = provider["nativeThreadRef"]["nativeId"].as_str()?;
-    let mut latest: Option<(ContextUsage,zeron_proto::provider_instance::ModelSelection,String)> = None;
-    for turn in crate::orchestration::task::records(projection,"provider-turn") {
-        if turn["providerThreadId"] != provider["id"] || !turn["tokenUsage"].is_object() { continue }
-        let Some(attempt) = projection.attempts.iter().find(|a| turn["runAttemptId"] == a.id.0) else { continue };
-        let value = json!(attempt);
-        if value["nativeThreadId"] != native || value["providerThreadId"] != provider["id"]
-            || value["rootNodeId"] != turn["nodeId"] { continue }
-        let Some(run) = projection.runs.iter().find(|r| r.id == attempt.run_id) else { continue };
-        let Some(reported) = turn["tokenUsage"]["updatedAt"].as_str() else { continue };
-        if latest.as_ref().is_some_and(|(_,_,at)| at.as_str() >= reported) { continue }
-        let Some(tokens) = turn["tokenUsage"]["usedTokens"].as_u64() else { continue };
-        let usage = ContextUsage {
-            used_tokens:tokens as usize,
-            max_tokens:turn["tokenUsage"]["maxTokens"].as_u64().filter(|v| *v>0).map(|v| v as usize),
-            auto_compact_threshold:None,
+    let mut latest: Option<(
+        ContextUsage,
+        zeron_proto::provider_instance::ModelSelection,
+        String,
+    )> = None;
+    for turn in crate::orchestration::task::records(projection, "provider-turn") {
+        if turn["providerThreadId"] != provider["id"] || !turn["tokenUsage"].is_object() {
+            continue;
+        }
+        let Some(attempt) = projection
+            .attempts
+            .iter()
+            .find(|a| turn["runAttemptId"] == a.id.0)
+        else {
+            continue;
         };
-        latest = Some((usage,run.model_selection.clone(),reported.into()));
+        let value = json!(attempt);
+        if value["nativeThreadId"] != native
+            || value["providerThreadId"] != provider["id"]
+            || value["rootNodeId"] != turn["nodeId"]
+        {
+            continue;
+        }
+        let Some(run) = projection.runs.iter().find(|r| r.id == attempt.run_id) else {
+            continue;
+        };
+        let Some(reported) = turn["tokenUsage"]["updatedAt"].as_str() else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_some_and(|(_, _, at)| at.as_str() >= reported)
+        {
+            continue;
+        }
+        let Some(tokens) = turn["tokenUsage"]["usedTokens"].as_u64() else {
+            continue;
+        };
+        let usage = ContextUsage {
+            used_tokens: tokens as usize,
+            max_tokens: turn["tokenUsage"]["maxTokens"]
+                .as_u64()
+                .filter(|v| *v > 0)
+                .map(|v| v as usize),
+            auto_compact_threshold: None,
+        };
+        latest = Some((usage, run.model_selection.clone(), reported.into()));
     }
-    latest.map(|(usage,selection,_)| (usage,selection))
+    latest.map(|(usage, selection, _)| (usage, selection))
 }
 
 pub fn context_usage_for_handoff(

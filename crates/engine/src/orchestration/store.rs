@@ -11,7 +11,10 @@ use super::event::{APPLICATION_EVENT_VERSION, Envelope, encode_component, iso};
 use super::projection::{self, ThreadProjection, decode};
 use super::{Error, Result};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("schema_transfer.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBoundary {
@@ -68,6 +71,7 @@ pub struct CommandReceipt {
 
 #[derive(Clone)]
 pub struct Store {
+    pub(crate) thread_locks: Arc<super::ThreadLocks>,
     pub(crate) docs: Arc<DocsStore>,
     pub(crate) host_id: Arc<str>,
     pub(crate) cancellations: Arc<Cancellations>,
@@ -123,6 +127,7 @@ impl Store {
             Ok(())
         })?;
         Ok(Self {
+            thread_locks: Arc::default(),
             docs,
             host_id: host_id.into(),
             cancellations: Arc::default(),

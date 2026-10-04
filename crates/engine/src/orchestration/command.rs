@@ -42,6 +42,7 @@ pub enum Operation {
     /// Trusted ordinary-session admission updates the next turn's binding.
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
+    Transfer(Box<super::transfer::TransferOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,9 @@ impl Command {
         if let Operation::Task(operation) = &self.operation {
             threads.extend(operation.lock_threads(&self.id));
         }
+        if let Operation::Transfer(operation) = &self.operation {
+            threads.extend(operation.lock_threads());
+        }
         threads
     }
 
@@ -96,6 +100,7 @@ impl Command {
             Operation::Recover => "kernel.runtime.recover".into(),
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
+            Operation::Transfer(operation) => operation.command_type().into(),
         })
     }
 }
@@ -411,6 +416,9 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
     }
+    if let Operation::Transfer(operation) = &command.operation {
+        return super::transfer::plan(conn, command, operation, now);
+    }
     let projection = projection::read_thread(conn, &command.thread_id)?;
     let mut plan = Plan::default();
     if let Operation::Wire(wire) = &command.operation
@@ -698,6 +706,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
         }
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
+        Operation::Transfer(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }
