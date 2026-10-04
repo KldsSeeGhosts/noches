@@ -596,12 +596,7 @@ impl Shell {
             let main = action_segment(&theme, "project-action-main", can_run)
                 .role(gpui::Role::Button)
                 .aria_label(action_label.clone())
-                .tooltip(move |_, cx| {
-                    cx.new(|_| SurfaceTabTooltip {
-                        text: action_label.clone(),
-                    })
-                    .into()
-                })
+                .tooltip(crate::tooltip::text(action_label.clone()))
                 .when(!can_run, |el| el.opacity(0.45))
                 .when(can_run, |el| {
                     el.cursor_pointer()
@@ -640,12 +635,7 @@ impl Shell {
             let retry = action_segment(&theme, "project-actions-unavailable", true)
                 .role(gpui::Role::Button)
                 .aria_label("Actions unavailable")
-                .tooltip(|_, cx| {
-                    cx.new(|_| SurfaceTabTooltip {
-                        text: "Actions unavailable".into(),
-                    })
-                    .into()
-                })
+                .tooltip(crate::tooltip::text("Actions unavailable"))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -669,12 +659,7 @@ impl Shell {
                 .justify_center()
                 .role(gpui::Role::Button)
                 .aria_label("Add action")
-                .tooltip(|_, cx| {
-                    cx.new(|_| SurfaceTabTooltip {
-                        text: "Add action".into(),
-                    })
-                    .into()
-                })
+                .tooltip(crate::tooltip::text("Add action"))
                 .cursor_pointer()
                 .on_click(
                     cx.listener(|this, _, _, cx| this.open_project_action_editor(None, None, cx)),

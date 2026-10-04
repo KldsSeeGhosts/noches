@@ -426,25 +426,6 @@ pub(super) struct SidebarViewMenu {
     focus: FocusHandle,
 }
 
-struct SidebarViewOptionsTooltip;
-
-impl Render for SidebarViewOptionsTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(crate::typography::ui_rems(11.0))
-            .text_color(theme.text)
-            .child("Sidebar view options")
-    }
-}
-
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
     ByDevice,
@@ -799,7 +780,7 @@ impl Shell {
         rows
     }
 
-    pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
         }
@@ -1473,7 +1454,7 @@ impl Shell {
                     }
                 }
             }))
-            .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
+            .tooltip(crate::tooltip::text("Sidebar view options"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::SORT)
@@ -1512,7 +1493,7 @@ impl Shell {
             .hover(|el| el.bg(theme.glass_hover()))
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_command_palette(window, cx)))
-            .tooltip(|_, cx| cx.new(|_| super::SidebarTooltip("Search")).into())
+            .tooltip(crate::tooltip::text("Search"))
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::MAGNIFER)
@@ -2120,7 +2101,10 @@ impl Shell {
         // whose transcript is actually open (selected or pinned to a pane) -
         // the selector can only read loaded transcripts anyway.
         let sub_summaries = if is_selected || pane_open.contains(&chat.id) {
-            Some(crate::subagents::subagents_for(self.state.read(cx), &chat.id))
+            Some(crate::subagents::subagents_for(
+                self.state.read(cx),
+                &chat.id,
+            ))
         } else {
             None
         };
@@ -2187,6 +2171,7 @@ impl Shell {
             harness,
             status,
             is_selected,
+            pane_open.contains(&chat.id) && !is_selected,
             false,
             jump_label,
             None,
@@ -2273,7 +2258,8 @@ impl Shell {
             div().into_any_element()
         } else {
             let selected = self.state.read(cx).selected_chat.clone();
-            let selected_wash = crate::theme::glass_selected_bg();
+            // Same tiers as the live rows: focused < hover is never inverted.
+            let selected_wash = theme.sidebar_active();
             let mut list = div()
                 .flex()
                 .flex_col()
@@ -2338,9 +2324,12 @@ impl Shell {
                         )
                         .into_any_element()
                 } else {
+                    // Settled time is tertiary metadata: mono 11px, faint
+                    // (control-plane rule 3), like the live rows' time.
                     div()
+                        .font_family(theme.font_mono.clone())
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(theme.text_faint)
                         .child(time_ago)
                         .into_any_element()
                 };
@@ -2364,7 +2353,7 @@ impl Shell {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.sidebar_hover())))
                         .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
                             if *entered {
                                 if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
@@ -3872,12 +3861,7 @@ impl Shell {
                         .child(popover::dialog_field(input.into_any_element())),
                 )
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
                                 .id("rename-space-cancel")
@@ -3926,12 +3910,7 @@ impl Shell {
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
+                    popover::dialog_footer(&theme)
                         .child(
                             popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
                                 .id("delete-space-cancel")

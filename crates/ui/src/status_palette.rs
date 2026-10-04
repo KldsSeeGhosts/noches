@@ -70,14 +70,18 @@ impl SessionState {
     /// The state's color, or `None` when it should render neutral.
     pub fn color(self, theme: &Theme) -> Option<Hsla> {
         let dark = theme.appearance == crate::theme::Appearance::Dark;
-        let pick = |(on_dark, on_light): (u32, u32)| -> Hsla {
-            gpui::rgb(if dark { on_dark } else { on_light }).into()
+        // The dark tones are the 300 steps; at full strength they glare on a
+        // warm dark chrome, so they sit at 80-90% (T3's resolved dark status
+        // tones). Light tones are the 600/700 steps and stay solid.
+        let pick = |(on_dark, on_light): (u32, u32), dark_alpha: f32| -> Hsla {
+            let color: Hsla = gpui::rgb(if dark { on_dark } else { on_light }).into();
+            if dark { color.opacity(dark_alpha) } else { color }
         };
         match self {
             Self::Failed => Some(theme.danger),
-            Self::AwaitingInput => Some(pick(INDIGO)),
-            Self::Working => Some(pick(SKY)),
-            Self::Completed => Some(pick(EMERALD)),
+            Self::AwaitingInput => Some(pick(INDIGO, 0.9)),
+            Self::Working => Some(pick(SKY, 0.8)),
+            Self::Completed => Some(pick(EMERALD, 0.9)),
             Self::Queued | Self::Idle => None,
         }
     }
@@ -109,5 +113,19 @@ mod tests {
         assert!(SessionState::Failed.needs_you());
         assert!(SessionState::Queued.running());
         assert_eq!(SessionState::Idle.label(), None);
+    }
+
+    #[test]
+    fn dark_status_tones_are_muted_and_light_tones_are_solid() {
+        let dark = Theme::dark();
+        let light = Theme::light();
+        for state in [
+            SessionState::Working,
+            SessionState::AwaitingInput,
+            SessionState::Completed,
+        ] {
+            assert!(state.color(&dark).unwrap().a < 1.0, "{state:?}");
+            assert_eq!(state.color(&light).unwrap().a, 1.0, "{state:?}");
+        }
     }
 }

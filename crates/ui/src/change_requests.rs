@@ -68,22 +68,13 @@ impl ChangeRequestTooltip {
 
 impl Render for ChangeRequestTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        let card = div()
-            .max_w(px(320.0))
-            .px(px(9.0))
-            .py(px(7.0))
+        let theme = &Theme::of(cx).for_popup();
+        let card = crate::tooltip::surface(theme)
             .flex()
             .flex_col()
-            .gap(px(3.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(crate::popover::surface_bg(theme))
-            .shadow_md()
+            .gap(px(2.0))
             .child(
                 div()
-                    .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(self.model.tone.color(theme))
                     .child(SharedString::from(format!(
@@ -96,11 +87,10 @@ impl Render for ChangeRequestTooltip {
                     .min_w_0()
                     .truncate()
                     .whitespace_nowrap()
-                    .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(self.model.title.clone()),
             );
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::tooltip::frost(card)
     }
 }
 

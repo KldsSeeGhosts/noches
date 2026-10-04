@@ -288,6 +288,101 @@ impl AppearancePage {
         );
     }
 
+    /// Panel animation duration: a short ladder over the 0-400ms range the
+    /// motion catalog accepts. Off is the default (T3's).
+    fn render_panel_animation(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        const STEPS: [(u16, &str); 5] = [
+            (0, "Off"),
+            (100, "100ms"),
+            (200, "200ms"),
+            (300, "300ms"),
+            (400, "400ms"),
+        ];
+        let current = crate::settings::current(cx).panel_animation_ms;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(24.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(widgets::field_label(theme, "Panel animations"))
+                    .child(
+                        div()
+                            .max_w(px(520.0))
+                            .text_size(typography::ui_rems(12.0))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "How long the sidebar, panes and terminal take to open and close. Menus and dialogs always animate.",
+                            ),
+                    ),
+            )
+            .when(current != 0, |row| {
+                row.child(widgets::reset_button(theme, "panel-animation-reset", cx.entity_id()).on_click(
+                    cx.listener(|_, _, _, cx| {
+                        crate::motion::set_panel_animation_ms(0);
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Immediate,
+                            cx,
+                            |settings| settings.panel_animation_ms = 0,
+                        );
+                        cx.notify();
+                    }),
+                ))
+            })
+            .child(
+                div()
+                    .id("panel-animation-steps")
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .rounded(px(9.0))
+                    .p(px(2.0))
+                    .bg(crate::theme::ink(0.04))
+                    .children(STEPS.into_iter().map(|(ms, label)| {
+                        let selected = current == ms;
+                        div()
+                            .id(("panel-animation-step", usize::from(ms)))
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(if selected { theme.text } else { theme.text_muted })
+                            .when(selected, |el| {
+                                el.bg(theme.bg)
+                                    .border_1()
+                                    .border_color(theme.border.opacity(0.8))
+                            })
+                            .when(!selected, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.text_color(theme.text))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        crate::motion::set_panel_animation_ms(ms);
+                                        crate::settings::update(
+                                            crate::settings::SavePolicy::Immediate,
+                                            cx,
+                                            |settings| settings.panel_animation_ms = ms,
+                                        );
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(SharedString::from(label))
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// "Transcript tool rows": the Calm | Tree picker. Each card previews its
     /// look with a few mock rows; selection persists immediately and the open
     /// transcripts remeasure on their next frame.
@@ -3465,6 +3560,7 @@ impl Render for AppearancePage {
             );
         }
         font_section = font_section.child(self.render_transcript_width(&theme, window, cx));
+        font_section = font_section.child(self.render_panel_animation(&theme, cx));
         font_section = font_section.child(self.render_tool_rows(&theme, cx));
         for kind in FontKind::ALL {
             let (requested, effective) = (kind.requested(cx), kind.effective(cx));

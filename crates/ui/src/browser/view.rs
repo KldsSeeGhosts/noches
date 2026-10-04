@@ -655,7 +655,28 @@ impl Render for BrowserSurface {
                             && u.host_str()
                                 .is_some_and(|host| host.ends_with(".localhost")))
                 });
-        div().id("browser-surface").size_full().flex().flex_col().track_focus(&self.focus)
+        // Page-load bar: 2px accent line on the toolbar's lower edge that
+        // creeps across while the page loads. Keyed by URL so each navigation
+        // restarts it; reduced motion shows it full instead.
+        let loading_bar = (self.page.loading && !external).then(|| {
+            use gpui::AnimationExt as _;
+            let key = gpui::SharedString::from(format!(
+                "browser-load-{}",
+                self.page.url.as_deref().unwrap_or("")
+            ));
+            div()
+                .absolute()
+                .top(px(surface_chrome::HEADER_HEIGHT))
+                .left_0()
+                .right_0()
+                .h(px(2.0))
+                .child(div().h_full().bg(theme.accent).with_animation(
+                    key,
+                    crate::motion::PAGE_LOAD.animation(),
+                    |bar, t| bar.w(gpui::relative(0.04 + 0.9 * t)),
+                ))
+        });
+        div().id("browser-surface").relative().size_full().flex().flex_col().track_focus(&self.focus)
             .key_context("Browser").on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(|this,event: &gpui::KeyUpEvent,w,cx| {
                 #[cfg(any(all(target_os = "linux", feature = "webkit-browser"), all(any(target_os = "linux", target_os = "macos"), not(feature = "webkit-browser"))))]
@@ -675,6 +696,7 @@ impl Render for BrowserSurface {
                 .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
                 .child("Localhost opens on this device. Open a detected preview from a new tab to reach your other device.")))
             .child(body)
+            .children(loading_bar)
             .when(external, |el| el.child(div().h(px(26.0)).px(px(10.0)).flex().items_center().gap(px(5.0)).border_t_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(10.0)).text_color(theme.text_faint)
                 .child(icons::icon(icons::ARROW_UP_RIGHT).size(px(11.0))).child("Opens in your default browser")))

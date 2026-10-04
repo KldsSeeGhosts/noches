@@ -514,6 +514,27 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
+/// What sending a message while the agent is mid-turn does. `Queue` holds it
+/// for the next turn; `Steer` hands it to the live turn at the next step
+/// boundary when the harness can take it. The alternate gesture (Cmd/Ctrl+Enter
+/// or Cmd/Ctrl-click) always runs the other one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowUpBehavior {
+    #[default]
+    Queue,
+    Steer,
+}
+
+impl FollowUpBehavior {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Queue => Self::Steer,
+            Self::Steer => Self::Queue,
+        }
+    }
+}
+
 /// Persist the latest revision. Safe to call at shutdown.
 pub fn flush(cx: &mut App) {
     if !cx.has_global::<SettingsStore>() {
@@ -648,6 +669,12 @@ pub struct UiSettings {
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
+    /// Queue or steer a message sent while the agent is working.
+    pub follow_up_behavior: FollowUpBehavior,
+    /// How long sidebar, right-pane, terminal and disclosure open/close
+    /// animations run, 0-400ms. 0 (the default, T3's) makes them instant;
+    /// popovers, dialogs and hover fades keep their own smooth timing.
+    pub panel_animation_ms: u16,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -823,6 +850,8 @@ impl Default for UiSettings {
             escape_stops_active_agent: false,
             settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
+            follow_up_behavior: FollowUpBehavior::default(),
+            panel_animation_ms: 0,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -2107,6 +2136,8 @@ mod tests {
             escape_stops_active_agent: true,
             settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            follow_up_behavior: FollowUpBehavior::Steer,
+            panel_animation_ms: 250,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and

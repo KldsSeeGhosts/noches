@@ -1718,25 +1718,6 @@ pub enum ChangesEvent {
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
 
-struct DiffHeaderTooltip(&'static str);
-
-impl Render for DiffHeaderTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0)
-    }
-}
-
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
@@ -3624,9 +3605,7 @@ impl Changes {
                             cx.stop_propagation();
                             cx.emit(ChangesEvent::OpenFile(path.clone()));
                         }))
-                        .tooltip(|_, cx| {
-                            cx.new(|_| DiffHeaderTooltip("Open in file browser")).into()
-                        })
+                        .tooltip(crate::tooltip::text("Open in file browser"))
                         .tooltip_show_delay(Duration::from_millis(350))
                         .child(
                             crate::icons::icon(crate::icons::DOCUMENT)
@@ -3780,7 +3759,7 @@ impl Changes {
             cx.stop_propagation();
             this.toggle_wrap(cx);
         }))
-        .tooltip(|_, cx| cx.new(|_| DiffHeaderTooltip("Wrap long lines")).into())
+        .tooltip(crate::tooltip::text("Wrap long lines"))
         .tooltip_show_delay(Duration::from_millis(350))
         .into_any_element()
     }
@@ -3971,14 +3950,9 @@ impl Changes {
             .when(!discard_enabled, |button| button.opacity(0.35))
             .when(discard_truncated, |button| {
                 button
-                    .tooltip(|_, cx| {
-                        cx.new(|_| {
-                            DiffHeaderTooltip(
-                                "Too many or too large untracked files to discard safely",
-                            )
-                        })
-                        .into()
-                    })
+                    .tooltip(crate::tooltip::text(
+                        "Too many or too large untracked files to discard safely",
+                    ))
                     .tooltip_show_delay(Duration::from_millis(350))
             })
             .when_some(discard, |button, request| {

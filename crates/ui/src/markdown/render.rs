@@ -360,19 +360,8 @@ struct CodeBlockTooltip(SharedString);
 
 impl Render for CodeBlockTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .max_w(px(360.0))
-            .text_size(px(11.0))
-            .text_color(theme.text)
-            .child(self.0.clone())
+        let theme = &Theme::of(cx).for_popup();
+        crate::tooltip::frost(crate::tooltip::surface(theme).child(self.0.clone()))
     }
 }
 
