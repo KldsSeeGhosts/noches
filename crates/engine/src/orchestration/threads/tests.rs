@@ -14,7 +14,7 @@ use crate::orchestration::command::{Command, Operation};
 use crate::orchestration::service::OrchestratorService;
 use crate::orchestration::service::{CallerScope, ToolError};
 use crate::orchestration::task::{
-    DelegationService, DelegationTargets, ResolvedTarget, execution_seed,
+    DelegationService, DelegationTargets, ResolvedTarget, execution_seed, records,
 };
 use crate::orchestration::thread_service::ThreadService;
 use crate::orchestration::{Kernel, ReceiptStatus};
@@ -467,6 +467,60 @@ async fn fully_active_auto_steers_but_queue_remains_separate() {
         OrchestratorMcpThreadSendResultDelivery::Queued
     );
     assert_ne!(queue.run_id, auto.run_id);
+}
+
+#[tokio::test]
+async fn host_auto_send_preserves_attachments_and_schedule_provenance_in_active_turn() {
+    let f = Fixture::new();
+    f.running(false);
+    let attachments = vec![json!({"type":"file","id":"owned","name":"notes.txt",
+        "mimeType":"text/plain","sizeBytes":4})];
+    let result = f
+        .service
+        .send_to_thread(crate::orchestration::thread_service::ThreadSendRequest {
+            project_id: "project".into(),
+            thread_id: "parent".into(),
+            command_id: "scheduled-task:active".into(),
+            message_id: "scheduled-task-message:active".into(),
+            scheduled_task_id: Some("active-schedule".into()),
+            sender_thread_id: None,
+            text: "Review".into(),
+            attachments: attachments.clone(),
+            model_selection: None,
+            mode: T3ThreadSendInputMode::Auto,
+            created_by: OrchestrationV2Actor::System,
+            creation_source: OrchestrationV2CreationSource::Server,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.delivery,
+        OrchestratorMcpThreadSendResultDelivery::Steered
+    );
+    assert_eq!(result.run_id, f.caller.run_id);
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.runs.len(), 1);
+    let message = records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == result.message_id.0)
+        .unwrap();
+    assert_eq!(message["attachments"], json!(attachments));
+    assert_eq!(message["scheduledTaskId"], "active-schedule");
+    assert_eq!(message["createdBy"], "system");
+    assert_eq!(message["creationSource"], "server");
+    assert!(message.get("senderThreadId").is_none());
+    let item = records(&p, "turn-item")
+        .iter()
+        .find(|i| i["messageId"] == result.message_id.0)
+        .unwrap();
+    assert_eq!(item["scheduledTaskId"], "active-schedule");
+    assert_eq!(item["attachments"], message["attachments"]);
 }
 
 #[tokio::test]

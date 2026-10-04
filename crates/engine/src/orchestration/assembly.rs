@@ -240,6 +240,7 @@ pub struct OrchestrationHost {
     pub bridge: Arc<RunnerBridge>,
     /// The same service the MCP tools call; the UI's user-authority Stop uses it.
     pub service: Arc<DelegationService>,
+    pub threads: Arc<dyn super::thread_service::ThreadService>,
     pub scheduler: Arc<super::scheduler::Scheduler>,
     pub launch: Option<Arc<super::launch::HostLaunchService>>,
     stop: CancellationToken,
@@ -313,7 +314,8 @@ impl OrchestrationHost {
             kernel.store.clone(),
             Arc::new(super::scheduler::dispatch::ThreadDispatch {
                 store: kernel.store.clone(),
-                threads,
+                threads: threads.clone(),
+                launch: None,
             }),
         ));
         scheduler.recover()?;
@@ -322,7 +324,8 @@ impl OrchestrationHost {
             .toolkit
             .set_scheduler(scheduler.clone());
         let mut workers = bridge.spawn_workers(stop.clone());
-        workers.push(scheduler.spawn(stop.clone()));
+        // Start scheduling only after launch intake is installed below. A
+        // first-tick unbound task must not race host assembly.
         // END scheduler slice.
         let publisher = PublicationWorker {
             store: kernel.store.clone(),
@@ -352,6 +355,7 @@ impl OrchestrationHost {
         Ok(Self {
             bridge,
             service,
+            threads,
             scheduler,
             launch: None,
             stop,
@@ -391,6 +395,7 @@ impl OrchestrationHost {
             data_dir,
             Arc::new(HostLaunchIntake {
                 bridge: self.bridge.clone(),
+                threads: self.threads.clone(),
             }),
         )?);
         self.bridge
@@ -404,6 +409,16 @@ impl OrchestrationHost {
         service
             .recover_preparations()
             .map_err(|e| Error::Invariant(e.message))?;
+        self.scheduler
+            .set_dispatcher(Arc::new(super::scheduler::dispatch::ThreadDispatch {
+                store: self.bridge.kernel.store.clone(),
+                threads: self.threads.clone(),
+                launch: Some(service.clone()),
+            }));
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.scheduler.spawn(self.stop.clone()));
         self.launch = Some(service);
         Ok(())
     }

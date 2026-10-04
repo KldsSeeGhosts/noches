@@ -25,10 +25,13 @@ claimed files; it does not remove the worktree.
 
 ## Remaining parity / merge work
 
-- `LaunchThreadIntake` and `host_intake.rs` are **TODO(merge-threads)**. Current
-  auto-send queues busy input. Reconcile canonical native-child refusal,
-  steering, permissions, sender provenance and provider-native continuation
-  with the threads slice. No real-provider continuation conformance was run.
+- `LaunchThreadIntake` and `host_intake.rs` now call canonical thread intake:
+  auto steering, native-child refusal, attachments and sender provenance.
+  Scheduled launches share MCP launch's workspace preparation with stable
+  claim command/message identities and schedule actor/source.
+  **TODO(merge-threads)** remains for driver-authorized cross-cwd native resume
+  or bounded conversation transfer after handoff. Automatic native resume
+  remains fenced by instance and cwd; no real-provider continuation is claimed.
 - Provider/repository clone input currently derives public GitHub/GitLab/
   Bitbucket URLs and returns `repository:null`; it does **not** perform T3's
   configured provider lookup (including enterprise hosts, Forgejo and Azure).

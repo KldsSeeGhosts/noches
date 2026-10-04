@@ -401,6 +401,11 @@ impl RunnerBridge {
                 ));
             }
         }
+        // TODO(merge-threads): worktree handoff's native continuation needs a
+        // driver-authorized cross-cwd resume or bounded history transfer.
+        // SessionsEngine deliberately fences automatic resume by instance
+        // AND cwd. Do not bypass that guard by copying a native session ID
+        // onto a new checkout; the atomic queued continuation stays durable.
         let request: RunRequest = serde_json::from_value(json!({
             "prompt":prompt,"harness":harness.id(),"instanceId":run.provider_instance_id,
             "model":run.model_selection.model,"reasoning":reasoning,

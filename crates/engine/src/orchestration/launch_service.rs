@@ -4,6 +4,29 @@ use serde_json::Value;
 
 use super::service::ToolError;
 use crate::mcp::auth::InvocationScope;
+use zeron_proto::orchestration::*;
+use zeron_proto::provider_instance::ModelSelection;
+
+/// Trusted host launch input; never decoded from MCP arguments.
+pub struct HostThreadLaunchRequest {
+    pub command_id: CommandId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub model_selection: ModelSelection,
+    pub runtime_mode: zeron_proto::RuntimeMode,
+    pub interaction_mode: zeron_proto::InteractionMode,
+    pub workspace_strategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+    pub message_id: MessageId,
+    pub scheduled_task_id: ScheduledTaskId,
+    pub text: String,
+    pub created_by: OrchestrationV2Actor,
+    pub creation_source: OrchestrationV2CreationSource,
+}
+
+#[async_trait]
+pub trait ScheduledThreadLaunch: Send + Sync + 'static {
+    async fn launch_scheduled(&self, input: HostThreadLaunchRequest) -> Result<(), ToolError>;
+}
 
 #[async_trait]
 pub trait LaunchService: Send + Sync + 'static {
@@ -19,7 +42,6 @@ pub trait LaunchService: Send + Sync + 'static {
     ) -> Result<(), ToolError>;
 }
 
-/// TODO(merge-threads): replace with the threads slice's canonical intake.
 /// An error with uncertain=true MUST retain claimed files.
 #[derive(Debug)]
 pub struct SendFailure {
@@ -31,11 +53,7 @@ pub struct SendFailure {
 pub trait LaunchThreadIntake: Send + Sync + 'static {
     async fn send(
         &self,
-        thread: &str,
-        message_id: &str,
-        text: &str,
-        attachments: Vec<Value>,
-        queue: bool,
+        input: super::thread_service::ThreadSendRequest,
     ) -> Result<Value, SendFailure>;
     async fn detach(&self, thread: &str) -> Result<(), ToolError>;
 }

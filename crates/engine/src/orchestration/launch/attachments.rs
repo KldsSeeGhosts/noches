@@ -402,6 +402,26 @@ impl HostLaunchService {
                 "Unarchive the target thread before sending attachments.",
             ));
         }
+        if p.thread.deleted_at.is_some() {
+            return Err(ToolError::new(
+                super::Code::ThreadNotFound,
+                "The thread was not found.",
+            ));
+        }
+        // Refuse provider-owned children before claiming/copying any uploads.
+        if self
+            .kernel
+            .store
+            .read(|conn| crate::orchestration::threads::planner::native_child(conn, &p))
+            .map_err(|_| unavailable())?
+        {
+            return Err(ToolError::new(
+                super::Code::OrchestrationError,
+                format!(
+                    "Unable to send to thread {target}: This subagent is run by its provider and cannot take messages. Message the parent thread instead."
+                ),
+            ));
+        }
         let mut references = vec![];
         for a in input["attachments"].as_array().unwrap() {
             if pending(a) {
@@ -415,13 +435,20 @@ impl HostLaunchService {
         let (attachments, paths) = self.claim(target, references)?;
         match self
             .intake
-            .send(
-                target,
-                &id(),
-                input["message"].as_str().unwrap_or(""),
+            .send(crate::orchestration::thread_service::ThreadSendRequest {
+                project_id: caller.project_id,
+                thread_id: target.into(),
+                command_id: id().into(),
+                message_id: id().into(),
+                scheduled_task_id: None,
+                sender_thread_id: Some(caller.id),
+                text: input["message"].as_str().unwrap_or("").into(),
                 attachments,
-                false,
-            )
+                model_selection: None,
+                mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Auto,
+                created_by: zeron_proto::orchestration::OrchestrationV2Actor::Agent,
+                creation_source: zeron_proto::orchestration::OrchestrationV2CreationSource::Mcp,
+            })
             .await
         {
             Ok(result) => Ok(result),

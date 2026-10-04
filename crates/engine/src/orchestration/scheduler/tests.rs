@@ -219,6 +219,7 @@ fn thread_dispatch(kernel: Kernel) -> Arc<dispatch::ThreadDispatch> {
     Arc::new(dispatch::ThreadDispatch {
         store: kernel.store,
         threads,
+        launch: None,
     })
 }
 
@@ -312,7 +313,7 @@ async fn thread_dispatch_revalidates_paused_or_deleted_claim_before_intake() {
 }
 
 #[tokio::test]
-async fn unbound_thread_dispatch_is_unavailable_until_launch_merge() {
+async fn unbound_thread_dispatch_is_unavailable_without_installed_launch() {
     let f = Fixture::new();
     let mut input = f.input("unbound", json!({"type":"interval","everyMs":60_000}));
     input.thread_id = Optional::Present(None);

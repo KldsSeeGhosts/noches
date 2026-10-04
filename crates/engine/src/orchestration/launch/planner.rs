@@ -68,7 +68,7 @@ pub(crate) fn plan(
                 command,
                 thread,
                 1,
-                &command.id.0,
+                message["messageId"].as_str().unwrap_or(&command.id.0),
                 message["text"].as_str().unwrap_or(""),
                 message["attachments"]
                     .as_array()
@@ -78,12 +78,18 @@ pub(crate) fn plan(
                 driver,
                 now,
             )?;
-            if let Some(sender) = message.get("senderThreadId") {
-                if let Some(OrchestrationV2DomainEvent::MessageUpdated(event)) = plan
-                    .events
-                    .iter_mut()
-                    .find(|e| matches!(e, OrchestrationV2DomainEvent::MessageUpdated(_)))
-                {
+            if let Some(OrchestrationV2DomainEvent::MessageUpdated(event)) = plan
+                .events
+                .iter_mut()
+                .find(|e| matches!(e, OrchestrationV2DomainEvent::MessageUpdated(_)))
+            {
+                event.payload.created_by = thread.created_by.clone();
+                event.payload.creation_source = thread.creation_source.clone();
+                if let Some(task) = message.get("scheduledTaskId") {
+                    event.payload.scheduled_task_id =
+                        Optional::Present(serde_json::from_value(task.clone())?);
+                }
+                if let Some(sender) = message.get("senderThreadId") {
                     event.payload.sender_thread_id =
                         Optional::Present(serde_json::from_value(sender.clone())?);
                 }

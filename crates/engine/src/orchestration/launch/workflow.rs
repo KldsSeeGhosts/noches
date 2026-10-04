@@ -44,12 +44,58 @@ impl HostLaunchService {
     pub(crate) async fn launch(
         &self,
         scope: &InvocationScope,
-        input: Value,
+        mut input: Value,
     ) -> Result<Value, ToolError> {
         let caller = self.require_full(
             scope,
             "Project launches require a full-access/default calling thread.",
         )?;
+        if input.get("projectId").is_none() && input["scratch"] != true {
+            input["projectId"] = json!(caller.project_id);
+        }
+        if input.get("modelSelection").is_none() {
+            input["modelSelection"] = json!(caller.model_selection);
+        }
+        if input.get("runtimeMode").is_none() {
+            input["runtimeMode"] = json!(caller.runtime_mode);
+        }
+        if input.get("interactionMode").is_none() {
+            input["interactionMode"] = json!(caller.interaction_mode);
+        }
+        // Provenance comes from authenticated authority, never tool extras.
+        input["createdBy"] = json!("agent");
+        input["creationSource"] = json!("mcp");
+        input["senderThreadId"] = json!(scope.caller.thread_id);
+        let command_id = format!(
+            "command:mcp:{}:{}",
+            crate::orchestration::event::encode_component(&scope.caller.session_id),
+            id()
+        );
+        self.launch_host(input, command_id).await
+    }
+
+    async fn launch_host(&self, input: Value, command_id: String) -> Result<Value, ToolError> {
+        let tid = command_id.clone();
+        // A scheduler claim can replay after acceptance was committed but its
+        // response was lost. The ordinary receipt identity owns the launch.
+        if let Some(p) = self
+            .kernel
+            .store
+            .thread(&ThreadId(tid.clone()))
+            .map_err(|_| unavailable())?
+        {
+            let w = self.workflow(&tid)?;
+            if w["commandId"] != command_id
+                || p.thread.project_id.0 != input["projectId"].as_str().unwrap_or("")
+            {
+                return Err(unavailable());
+            }
+            self.spawn_preparation(tid.clone());
+            return Ok(
+                json!({"threadId":tid,"projectId":p.thread.project_id,"modelSelection":p.thread.model_selection,
+                "runId":p.runs.first().map(|r|&r.id),"status":p.runs.first().map(|r|&r.status)}),
+            );
+        }
         let attachments = input["attachments"].as_array().cloned().unwrap_or_default();
         if attachments.iter().any(|a| !super::attachments::pending(a)) {
             return Err(invalid(
@@ -73,11 +119,12 @@ impl HostLaunchService {
             let scratch = self.data_dir.join("scratch");
             std::fs::create_dir_all(&scratch).map_err(|_| unavailable())?;
             let root = scratch.to_string_lossy();
-            if let Some(project) = self
-                .projects()?
-                .into_iter()
-                .find(|p| p["workspaceRoot"] == root.as_ref() && p["deletedAt"].is_null())
-            {
+            if let Some(project) = self.projects()?.into_iter().find(|p| {
+                p["workspaceRoot"]
+                    .as_str()
+                    .is_some_and(|p| same_checkout(Path::new(p), &scratch))
+                    && p["deletedAt"].is_null()
+            }) {
                 project
             } else {
                 let mut project = self
@@ -89,15 +136,10 @@ impl HostLaunchService {
                 project
             }
         } else {
-            self.project(input["projectId"].as_str().unwrap_or(&caller.project_id.0))?
+            self.project(input["projectId"].as_str().ok_or_else(unavailable)?)?
         };
-        let selection: ModelSelection = serde_json::from_value(
-            input
-                .get("modelSelection")
-                .cloned()
-                .unwrap_or(serde_json::to_value(&caller.model_selection).unwrap()),
-        )
-        .map_err(|_| unavailable())?;
+        let selection: ModelSelection =
+            serde_json::from_value(input["modelSelection"].clone()).map_err(|_| unavailable())?;
         let target = json!({"providerInstanceId":selection.instance_id,"model":selection.model,"options":selection.options});
         self.registry
             .provider_instances
@@ -105,7 +147,7 @@ impl HostLaunchService {
             .await;
         let resolved = self.registry.provider_instances.resolve_target(
             &self.registry,
-            &caller.model_selection,
+            &selection,
             Some(&target),
         )?;
         let driver = self
@@ -117,18 +159,12 @@ impl HostLaunchService {
             .ok_or_else(unavailable)?
             .driver_kind
             .0;
-        let command_id = format!(
-            "command:mcp:{}:{}",
-            crate::orchestration::event::encode_component(&scope.caller.session_id),
-            id()
-        );
-        let tid = command_id.clone();
         let strategy = input
             .get("workspaceStrategy")
             .cloned()
             .unwrap_or(json!({"type":"root"}));
         let root = project["workspaceRoot"].as_str().unwrap();
-        let scratch_path = if root == self.data_dir.join("scratch").to_string_lossy() {
+        let scratch_path = if same_checkout(Path::new(root), &self.data_dir.join("scratch")) {
             let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let words = super::projects::folder_words(input["message"].as_str().unwrap_or(""));
             let normalized_id: String = tid
@@ -167,10 +203,10 @@ impl HostLaunchService {
             None
         };
         let thread:OrchestrationV2AppThread=serde_json::from_value(json!({
-            "id":tid,"projectId":project["id"],"title":input["title"],"createdBy":"agent","creationSource":"mcp",
+            "id":tid,"projectId":project["id"],"title":input["title"],"createdBy":input["createdBy"],"creationSource":input["creationSource"],
             "providerInstanceId":resolved.instance_id,"modelSelection":resolved,
-            "runtimeMode":input.get("runtimeMode").cloned().unwrap_or(json!(caller.runtime_mode)),
-            "interactionMode":input.get("interactionMode").cloned().unwrap_or(json!(caller.interaction_mode)),
+            "runtimeMode":input["runtimeMode"],
+            "interactionMode":input["interactionMode"],
             "branch":null,"worktreePath":scratch_path,"activeProviderThreadId":null,
             "lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":tid},"forkedFrom":null,
             "createdAt":crate::orchestration::event::iso(crate::now_ms()).map_err(|_|unavailable())?,
@@ -181,7 +217,14 @@ impl HostLaunchService {
         let mut w = json!({"threadId":tid,"projectId":project["id"],"commandId":command_id,"status":"preparing","stage":"fetch",
             "projectWorkspaceRoot":root,"strategy":strategy,"driver":driver,"branch":null,"worktreePath":scratch_path,"setup":null,"createdWorktree":false});
         if input.get("message").is_some() || !claimed.is_empty() {
-            w["initialMessage"] = json!({"text":input["message"].as_str().unwrap_or(""),"attachments":claimed,"senderThreadId":scope.caller.thread_id});
+            let mut message = json!({"text":input["message"].as_str().unwrap_or(""),"attachments":claimed,
+                "createdBy":input["createdBy"],"creationSource":input["creationSource"]});
+            for key in ["messageId", "scheduledTaskId", "senderThreadId"] {
+                if let Some(value) = input.get(key) {
+                    message[key] = value.clone();
+                }
+            }
+            w["initialMessage"] = message;
         }
         let result = self
             .operation(
@@ -421,12 +464,11 @@ impl HostLaunchService {
                             .worktree_claim_matches(&destination, &command_id)
                             .await)
                         || actual != requested
-                        || self
+                        || !self
                             .repos
                             .workspace_checkout(&root, &destination)
                             .await
-                            .as_deref()
-                            != Some(destination.as_path())
+                            .is_some_and(|actual| same_checkout(&actual, &destination))
                     {
                         return Err(invalid(
                             "The prepared worktree no longer matches its launch.",
@@ -455,7 +497,7 @@ impl HostLaunchService {
                     .workspace_checkout(&root, requested)
                     .await
                     .ok_or_else(unavailable)?;
-                if existing != requested {
+                if !same_checkout(&existing, requested) {
                     return Err(invalid(
                         "The existing worktree is not a checkout of the project repository.",
                     ));
@@ -993,6 +1035,25 @@ impl HostLaunchService {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::orchestration::launch_service::ScheduledThreadLaunch for HostLaunchService {
+    async fn launch_scheduled(
+        &self,
+        input: crate::orchestration::launch_service::HostThreadLaunchRequest,
+    ) -> Result<(), ToolError> {
+        self.launch_host(
+            json!({
+                "projectId":input.project_id,"title":input.title,"modelSelection":input.model_selection,
+                "runtimeMode":input.runtime_mode,"interactionMode":input.interaction_mode,
+                "workspaceStrategy":input.workspace_strategy,"messageId":input.message_id,
+                "scheduledTaskId":input.scheduled_task_id,"message":input.text,"attachments":[],
+                "createdBy":input.created_by,"creationSource":input.creation_source
+            }),
+            input.command_id.0,
+        ).await.map(|_| ())
+    }
+}
+
 struct FlightGuard {
     set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     key: String,
@@ -1003,6 +1064,13 @@ impl Drop for FlightGuard {
     }
 }
 struct ShaName;
+fn same_checkout(left: &Path, right: &Path) -> bool {
+    std::fs::canonicalize(left)
+        .ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
+}
+
 impl ShaName {
     fn of(s: &str) -> String {
         use sha2::{Digest, Sha256};

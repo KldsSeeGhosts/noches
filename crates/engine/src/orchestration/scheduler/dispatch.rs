@@ -7,11 +7,13 @@ use zeron_proto::orchestration_mcp::T3ThreadSendInputMode;
 
 use super::{ScheduledDispatch, ScheduledTaskDispatch, find};
 use crate::orchestration::Store;
+use crate::orchestration::launch_service::{HostThreadLaunchRequest, ScheduledThreadLaunch};
 use crate::orchestration::thread_service::{ThreadSendRequest, ThreadService};
 
 pub struct ThreadDispatch {
     pub store: Store,
     pub threads: Arc<dyn ThreadService>,
+    pub launch: Option<Arc<dyn ScheduledThreadLaunch>>,
 }
 
 #[async_trait]
@@ -37,11 +39,27 @@ impl ScheduledTaskDispatch for ThreadDispatch {
             .map_err(|_| "The operation could not be completed.".to_owned())?
             .ok_or_else(|| "Schedule task not found.".to_owned())?;
         let Some(thread_id) = task.thread_id else {
-            // TODO(merge-launch): call launch with the stable command/message
-            // IDs, task title/selection/modes/provenance, scheduledTaskId and
-            // stored workspaceStrategy. ThreadService::create is MCP-scoped
-            // and inherits the caller checkout; it is not a top-level launch.
-            return Err("The operation could not be completed.".into());
+            let launch = self
+                .launch
+                .as_ref()
+                .ok_or_else(|| "The operation could not be completed.".to_owned())?;
+            return launch
+                .launch_scheduled(HostThreadLaunchRequest {
+                    command_id: run.command_id,
+                    project_id: task.project_id,
+                    title: task.title,
+                    model_selection: task.model_selection,
+                    runtime_mode: task.runtime_mode,
+                    interaction_mode: task.interaction_mode,
+                    workspace_strategy: task.workspace_strategy,
+                    message_id: run.message_id,
+                    scheduled_task_id: task.id,
+                    text: task.prompt,
+                    created_by: task.created_by,
+                    creation_source: task.creation_source,
+                })
+                .await
+                .map_err(|e| e.message);
         };
         self.threads
             .send_to_thread(ThreadSendRequest {

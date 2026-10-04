@@ -50,8 +50,11 @@ UI should show the setup terminal and offer retry/continue-on-failure. Cancel
 and timeout close only that setup terminal. Restart does not silently re-run
 an uncertain setup process; it requires retry or continue.
 
-Merge seams: `LaunchThreadIntake` and its production adapter are explicitly
-`TODO(merge-threads)`. Replace auto-send's current busy-queue fallback with the
-canonical threads intake (including native-child refusal, steering and exact
-permission guards). `LaunchOperation` is a single kernel-planner routing arm.
+`LaunchThreadIntake` now takes the host-authorized `ThreadSendRequest`; its
+production adapter calls `ThreadService::send_to_thread`, including native-child
+refusal, auto steering, attachments and sender provenance. Attachment permission
+guards run before upload claims, and uncertain accepted sends retain their files.
+`HostThreadLaunchRequest` shares launch preparation with MCP launch for scheduled
+runs, carrying stable command/message IDs, schedule ID and actor/source.
+`LaunchOperation` is a single kernel-planner routing arm.
 Launch tables and workflows are independent of other slices' migrations.

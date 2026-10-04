@@ -27,23 +27,23 @@ struct Intake {
 impl LaunchThreadIntake for Intake {
     async fn send(
         &self,
-        thread: &str,
-        message: &str,
-        text: &str,
-        attachments: Vec<Value>,
-        queue: bool,
+        input: crate::orchestration::thread_service::ThreadSendRequest,
     ) -> Result<Value, SendFailure> {
         self.trace
             .lock()
             .unwrap()
-            .push(json!({"thread":thread,"text":text,"attachments":attachments,"queue":queue}));
+            .push(json!({"thread":input.thread_id,"text":input.text,"attachments":input.attachments,
+                "queue":input.mode == zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Queue,
+                "senderThreadId":input.sender_thread_id,"createdBy":input.created_by,"creationSource":input.creation_source}));
         if self.uncertain {
             return Err(SendFailure {
                 error: super::unavailable(),
                 uncertain: true,
             });
         }
-        Ok(json!({"threadId":thread,"messageId":message,"runId":"run:test","status":"starting"}))
+        Ok(
+            json!({"threadId":input.thread_id,"messageId":input.message_id,"runId":"run:test","status":"starting"}),
+        )
     }
     async fn detach(&self, thread: &str) -> Result<(), ToolError> {
         self.trace.lock().unwrap().push(json!({"detach":thread}));
@@ -67,6 +67,7 @@ impl Rig {
         let kernel = Kernel::open(store.clone(), "host").unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let repos =
             crate::Repos::with_worktrees_root(dir.path(), "host", dir.path().join("worktrees"));
         for args in [
@@ -228,6 +229,119 @@ impl Drop for Rig {
     fn drop(&mut self) {
         self.service.terminals.shutdown();
         self.service.workspace.shutdown();
+    }
+}
+
+struct ReplayScheduledDispatch {
+    adapter: crate::orchestration::scheduler::dispatch::ThreadDispatch,
+    kernel: Kernel,
+    runs: Mutex<Vec<crate::orchestration::scheduler::ScheduledDispatch>>,
+}
+#[async_trait]
+impl crate::orchestration::scheduler::ScheduledTaskDispatch for ReplayScheduledDispatch {
+    async fn dispatch(
+        &self,
+        run: crate::orchestration::scheduler::ScheduledDispatch,
+    ) -> Result<(), String> {
+        self.runs.lock().unwrap().push(run.clone());
+        self.kernel
+            .store
+            .inject_failure(WriteBoundary::AfterCommit, 1);
+        assert!(self.adapter.dispatch(run.clone()).await.is_err());
+        // Replay after the committed acceptance response was lost.
+        // No new command ID or message ID is allocated on replay.
+        self.adapter.dispatch(run).await
+    }
+}
+
+#[tokio::test]
+async fn unbound_schedules_launch_fresh_top_level_threads_with_strategy_and_replay_identity() {
+    use crate::orchestration::{scheduler::Scheduler, task::records};
+    use zeron_proto::orchestration::{Optional, ScheduledTaskRunStatus};
+    for strategy in [
+        json!({"type":"root"}),
+        json!({"type":"existing_worktree","worktreePath":"ROOT"}),
+        json!({"type":"worktree","baseRef":"main","startFromOrigin":false}),
+    ] {
+        let rig = Rig::new().await;
+        let strategy = if strategy["type"] == "existing_worktree" {
+            json!({"type":"existing_worktree","worktreePath":rig.scope.caller.workspace_root})
+        } else {
+            strategy
+        };
+        let threads = Arc::new(crate::orchestration::threads::KernelThreadService {
+            kernel: rig.service.kernel.clone(),
+            delegation: Arc::new(crate::orchestration::task::DelegationService {
+                kernel: rig.service.kernel.clone(),
+                targets: Arc::new(crate::orchestration::assembly::HostCatalog(
+                    rig.service.registry.clone(),
+                )),
+            }),
+        });
+        let dispatcher = Arc::new(ReplayScheduledDispatch {
+            adapter: crate::orchestration::scheduler::dispatch::ThreadDispatch {
+                store: rig.service.kernel.store.clone(),
+                threads,
+                launch: Some(Arc::new(rig.service.clone())),
+            },
+            kernel: rig.service.kernel.clone(),
+            runs: Mutex::new(vec![]),
+        });
+        let scheduler = Scheduler::new(rig.service.kernel.store.clone(), dispatcher.clone());
+        let mut input: zeron_proto::orchestration::ScheduledTaskUpsertInput = serde_json::from_value(json!({
+            "id":"fresh","title":"Scheduled review","prompt":"Review changes","enabled":true,
+            "schedule":{"type":"interval","everyMs":60000},"projectId":"project","threadId":null,
+            "workspaceStrategy":strategy,"modelSelection":{"instanceId":"mock","model":"mock-1"},
+            "runtimeMode":"full-access","interactionMode":"default"
+        })).unwrap();
+        input.created_by =
+            Optional::Present(zeron_proto::orchestration::OrchestrationV2Actor::System);
+        input.creation_source =
+            Optional::Present(zeron_proto::orchestration::OrchestrationV2CreationSource::Server);
+        scheduler.upsert(input).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                scheduler
+                    .run_now(&"fresh".into())
+                    .await
+                    .unwrap()
+                    .last_run_status,
+                ScheduledTaskRunStatus::Succeeded
+            );
+        }
+        let runs = dispatcher.runs.lock().unwrap().clone();
+        assert_ne!(runs[0].command_id, runs[1].command_id);
+        for run in runs {
+            let tid = &run.command_id.0;
+            let w = rig.settled(tid).await;
+            assert_eq!(w["status"], "ready", "{w}");
+            assert_eq!(w["strategy"], strategy);
+            let p = rig
+                .service
+                .kernel
+                .store
+                .thread(&tid.clone().into())
+                .unwrap()
+                .unwrap();
+            assert!(p.thread.lineage.parent_thread_id.is_none());
+            assert_eq!(
+                p.thread.created_by,
+                zeron_proto::orchestration::OrchestrationV2Actor::System
+            );
+            assert_eq!(p.runs.len(), 1);
+            let messages = records(&p, "message");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["id"], run.message_id.0);
+            assert_eq!(messages[0]["scheduledTaskId"], "fresh");
+            assert_eq!(messages[0]["createdBy"], "system");
+            assert_eq!(messages[0]["creationSource"], "server");
+            assert!(messages[0].get("senderThreadId").is_none());
+            if strategy["type"] == "root" {
+                assert!(p.thread.worktree_path.is_none());
+            } else {
+                assert!(p.thread.worktree_path.is_some());
+            }
+        }
     }
 }
 
@@ -475,7 +589,10 @@ async fn launch_local_base_has_dirty_isolation_and_existing_checkout_binding() {
     let existing=rig.call("t3_thread_launch",json!({"title":"Existing","workspaceStrategy":{"type":"existing_worktree","worktreePath":checkout,"branch":"feature/local"}})).await;
     let w = rig.settled(existing["threadId"].as_str().unwrap()).await;
     assert_eq!(w["status"], "ready", "{w}");
-    assert_eq!(w["worktreePath"], checkout.to_string_lossy().as_ref());
+    assert_eq!(
+        std::fs::canonicalize(w["worktreePath"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(checkout).unwrap()
+    );
 }
 
 #[tokio::test]
