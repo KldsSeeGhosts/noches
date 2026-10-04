@@ -56,7 +56,9 @@ pub(crate) fn enqueue(
         summaries.push(serde_json::json!({
             "id":thread.id,"projectId":thread.project_id,"title":thread.title,
             "lineage":thread.lineage,"archivedAt":thread.archived_at,"deletedAt":thread.deleted_at,
-            "version":projection.through_sequence
+            "lastVisitedAt":thread.last_visited_at,
+            "version":projection.through_sequence,
+            "lifecycle":super::ui_queue::state(conn,&ThreadId(id.clone()))?.lifecycle
         }));
         documents.push(PublicationDocument {
             doc_id: format!("orchestration/thread/{id}"),

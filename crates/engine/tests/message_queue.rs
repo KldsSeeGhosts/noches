@@ -653,6 +653,16 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
     .await;
     assert_eq!(queue_texts(&core), vec!["second queued"]);
     assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
+    // The transcript user row precedes asynchronous orchestration admission;
+    // do not finish a harness turn before its broadcast receiver exists.
+    wait_for(
+        || {
+            prompts.lock().unwrap().iter().any(|p| p == "first queued")
+                && harness.finish.receiver_count() > 0
+        },
+        "the first queued harness to be ready",
+    )
+    .await;
     harness.finish.send(()).unwrap();
     wait_for(
         || user_messages(&core).iter().any(|m| m == "second queued"),

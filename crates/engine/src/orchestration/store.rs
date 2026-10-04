@@ -11,7 +11,7 @@ use super::event::{APPLICATION_EVENT_VERSION, Envelope, encode_component, iso};
 use super::projection::{self, ThreadProjection, decode};
 use super::{Error, Result};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("schema_queue.sql")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBoundary {
@@ -240,7 +240,7 @@ impl Store {
                 }
                 Err(error) => return Err(error),
             };
-            if plan.events.is_empty() {
+            if plan.events.is_empty() && !matches!(command.operation, super::Operation::Queue(_)) {
                 return Err(Error::Invariant(
                     "accepted command produced no events".into(),
                 ));
@@ -250,7 +250,7 @@ impl Store {
                 thread_id: command.thread_id.clone(),
                 command_type,
                 accepted_at,
-                result_sequence: 0,
+                result_sequence: latest_sequence(tx)?,
                 status: ReceiptStatus::Accepted,
                 error: None,
             };
@@ -316,14 +316,33 @@ impl Store {
                 )?;
                 self.boundary(WriteBoundary::AdoptionRecorded)?;
             }
-            super::sync_publish::enqueue(
+            super::ui_queue::persist(
                 tx,
-                &self.host_id,
-                &receipt.command_id,
-                receipt.result_sequence,
-                changed_threads,
+                &command.thread_id,
+                plan.queue_lifecycle.as_ref(),
+                plan.queue_intents.as_deref(),
             )?;
-            self.boundary(WriteBoundary::PublicationEnqueued)?;
+            if let Some(patch) = &plan.queue_patch {
+                tx.execute(
+                    "INSERT OR IGNORE INTO orchestration_queue_patches VALUES(?1,?2,?3,?4)",
+                    params![
+                        command.id.0,
+                        command.thread_id.0,
+                        receipt.result_sequence,
+                        serde_json::to_string(patch)?
+                    ],
+                )?;
+            }
+            if !changed_threads.is_empty() {
+                super::sync_publish::enqueue(
+                    tx,
+                    &self.host_id,
+                    &receipt.command_id,
+                    receipt.result_sequence,
+                    changed_threads,
+                )?;
+                self.boundary(WriteBoundary::PublicationEnqueued)?;
+            }
             put_receipt(tx, &receipt)?;
             self.boundary(WriteBoundary::ReceiptFinalized)?;
             Ok((receipt, cancellations))

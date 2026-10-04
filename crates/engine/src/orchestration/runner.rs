@@ -518,11 +518,14 @@ impl RunnerBridge {
             if super::task::progress(&current).0 == "result_available" {
                 break;
             }
-            if current
-                .runs
-                .last()
-                .is_some_and(|latest| latest.id != run.id)
-            {
+            // Queued runs may have newer ordinals without owning the provider.
+            // Stop observing only once admission transfers this live binding.
+            if records(&current, "provider-thread").iter().any(|provider| {
+                run.provider_thread_id
+                    .as_ref()
+                    .is_some_and(|id| provider["id"] == id.0)
+                    && provider["lastRunOrdinal"].as_i64() != Some(run.ordinal)
+            }) {
                 break;
             }
         }
@@ -592,6 +595,12 @@ impl RunnerBridge {
         cancellation: CancellationToken,
     ) -> Result<EffectOutcome> {
         match &effect.request {
+            EffectRequest::ProviderTurnSteer { .. }
+            | EffectRequest::ProviderSessionDetach { .. }
+            | EffectRequest::RuntimeRequestRespond { .. }
+            | EffectRequest::ThreadTitleGenerate { .. } => {
+                super::queue::effects::execute(self, effect).await
+            }
             EffectRequest::ProviderTurnStart { run_id } => {
                 self.start(effect, run_id, cancellation).await
             }
@@ -823,6 +832,7 @@ pub(crate) fn plan_event(
     if provider["lastRunOrdinal"] != run["ordinal"] {
         return Ok(());
     }
+    super::queue::runtime::observe(projection, command, plan, run_id, &provider, event, now)?;
     let turn_id = format!("provider-turn:{}", encode_component(&attempt_id.0));
     let mut turn = json!({"id":turn_id,"providerThreadId":provider["id"],"nodeId":node["id"],
         "runAttemptId":attempt_id,"nativeTurnRef":null,"ordinal":run["ordinal"],"status":"running","startedAt":iso(now)?,"completedAt":null});

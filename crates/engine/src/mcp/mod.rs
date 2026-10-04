@@ -51,6 +51,13 @@ impl McpServer {
         self.toolkit.set_service(service);
     }
 
+    pub fn set_queue_service(
+        &self,
+        service: Arc<dyn crate::orchestration::queue_service::QueueService>,
+    ) {
+        self.toolkit.set_queue_service(service);
+    }
+
     pub async fn endpoint(self: &Arc<Self>) -> std::io::Result<&str> {
         self.endpoint
             .get_or_try_init(|| async {

@@ -42,6 +42,7 @@ pub enum Operation {
     /// Trusted ordinary-session admission updates the next turn's binding.
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
+    Queue(Box<super::queue::QueueCommand>),
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,7 @@ impl Command {
             Operation::Recover => "kernel.runtime.recover".into(),
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
+            Operation::Queue(operation) => operation.command_type().into(),
         })
     }
 }
@@ -108,6 +110,9 @@ pub(crate) struct Plan {
     pub adoption: Option<String>,
     pub routed_effects: Vec<(ThreadId, EffectRequest)>,
     pub cancel_threads: Vec<ThreadId>,
+    pub queue_lifecycle: Option<serde_json::Value>,
+    pub queue_intents: Option<Vec<zeron_doc::QueuedMessage>>,
+    pub queue_patch: Option<serde_json::Value>,
 }
 
 impl Plan {
@@ -408,6 +413,9 @@ fn provider_batch(
 }
 
 pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Plan> {
+    if let Operation::Queue(operation) = &command.operation {
+        return super::queue::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
     }
@@ -698,6 +706,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
         }
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
+        Operation::Queue(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

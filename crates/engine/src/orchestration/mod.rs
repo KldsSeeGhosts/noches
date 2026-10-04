@@ -13,6 +13,8 @@ pub mod effects;
 pub mod event;
 pub mod mailbox;
 pub mod projection;
+pub mod queue;
+pub mod queue_service;
 pub mod recovery;
 pub mod runner;
 pub mod service;
@@ -22,6 +24,7 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod ui;
+pub mod ui_queue;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

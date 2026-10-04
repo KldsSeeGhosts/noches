@@ -145,7 +145,7 @@ impl TitleGenerator {
     }
 
     /// One-shot titling run: collect TextDeltas until Done; retries on failure.
-    async fn run_title_model(
+    pub(crate) async fn run_title_model(
         &self,
         harness_id: HarnessId,
         prompt: &str,

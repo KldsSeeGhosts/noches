@@ -203,7 +203,7 @@ impl OrchestrationHost {
         registry: Arc<HarnessRegistry>,
         device_id: String,
     ) -> Result<Self> {
-        let catalog = Arc::new(HostCatalog(registry));
+        let catalog = Arc::new(HostCatalog(registry.clone()));
         let bridge = Arc::new(RunnerBridge {
             kernel: kernel.clone(),
             sessions: sessions.clone(),
@@ -227,6 +227,34 @@ impl OrchestrationHost {
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
         let mut workers = bridge.spawn_workers(stop.clone());
+        // ── P4b queue/questions/lifecycle assembly ───────────────────────────
+        let queue_domain = Arc::new(super::queue::QueueDomain::new(kernel.clone()));
+        let queue_host = Arc::new(super::queue::host::HostQueue {
+            domain: queue_domain.clone(),
+            docs: doc_host.clone(),
+            registry,
+        });
+        sessions.mcp_server().set_queue_service(queue_host.clone());
+        doc_host.set_orchestration_queue(Arc::downgrade(&queue_host));
+        let queue_stop = stop.clone();
+        workers.push(tokio::spawn(async move {
+            loop {
+                if queue_stop.is_cancelled() {
+                    break;
+                }
+                if let Err(error) = queue_host.repair_all().await {
+                    tracing::warn!(code=?error.code,"queue intent repair deferred");
+                }
+                if let Err(error) = queue_domain.wake_due(crate::now_ms()).await {
+                    tracing::warn!(%error,"thread snooze wake failed");
+                }
+                tokio::select! {
+                    _=queue_stop.cancelled()=>break,
+                    _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{}
+                }
+            }
+        }));
+        // ── end P4b assembly ────────────────────────────────────────────────
         let publisher = PublicationWorker {
             store: kernel.store.clone(),
             publisher: Arc::new(ChatPublisher {
@@ -296,9 +324,10 @@ impl RunnerBridge {
         // Done. Bound the admission race without inventing another active run.
         for _ in 0..100 {
             let active = self.kernel.store.thread(thread)?.is_some_and(|p| {
-                p.runs
-                    .last()
-                    .is_some_and(|run| !super::command::run_terminal(&run.status))
+                p.runs.iter().any(|run| {
+                    !super::command::run_terminal(&run.status)
+                        && run.status != OrchestrationV2RunStatus::Queued
+                })
             });
             if !active {
                 break;
@@ -334,19 +363,47 @@ impl RunnerBridge {
         if receipt.status == super::ReceiptStatus::Rejected {
             return Err(Error::Invariant(receipt.error.unwrap_or_default()));
         }
-        self.kernel
-            .task_command(
-                thread,
-                CommandId(format!("session-run:{message_id}")),
-                TaskOperation::ExternalMessage {
-                    prompt: request.prompt.clone(),
-                    driver: crate::provider_instances::legacy_driver(harness.id()),
-                    message_id: MessageId(message_id.into()),
-                },
-            )
-            .await?;
+        let queued = self.kernel.store.thread(thread)?.is_some_and(|p| {
+            p.runs.iter().any(|r| {
+                r.user_message_id.0 == message_id && r.status == OrchestrationV2RunStatus::Queued
+            })
+        });
+        if queued {
+            // TODO(merge-threads): reuse this admission primitive in thread.send.
+            let domain = super::queue::QueueDomain::new(self.kernel.clone());
+            let receipt = domain
+                .mutate(
+                    None,
+                    thread.clone(),
+                    "host.adopt_loro_delivery",
+                    json!({"messageId":message_id}),
+                    CommandId(format!("session-run:{message_id}")),
+                    crate::now_ms(),
+                )
+                .await?;
+            if receipt.status == super::ReceiptStatus::Rejected {
+                return Err(Error::Invariant(receipt.error.unwrap_or_default()));
+            }
+        } else {
+            self.kernel
+                .task_command(
+                    thread,
+                    CommandId(format!("session-run:{message_id}")),
+                    TaskOperation::ExternalMessage {
+                        prompt: request.prompt.clone(),
+                        driver: crate::provider_instances::legacy_driver(harness.id()),
+                        message_id: MessageId(message_id.into()),
+                    },
+                )
+                .await?;
+        }
         let projection = self.kernel.store.thread(thread)?.unwrap();
-        let run = projection.runs.last().unwrap().clone();
+        let run = projection
+            .runs
+            .iter()
+            .find(|r| r.user_message_id.0 == message_id)
+            .unwrap()
+            .clone();
         scope.run_id = run.id.clone();
         self.observe_external(thread.clone(), run, capabilities(harness))
             .await?;

@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    queue_service: RwLock<Option<Arc<dyn crate::orchestration::queue_service::QueueService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +29,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            queue_service: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -47,6 +49,16 @@ impl Toolkit {
 
     pub fn tools(&self) -> &[Value] {
         &self.descriptors
+    }
+
+    pub fn set_queue_service(
+        &self,
+        service: Arc<dyn crate::orchestration::queue_service::QueueService>,
+    ) {
+        *self
+            .queue_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub async fn request(&self, scope: InvocationScope, message: Value) -> Option<Value> {
@@ -191,7 +203,30 @@ impl Toolkit {
         {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
+        let queue_service = self
+            .queue_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         match input {
+            _ if matches!(
+                name,
+                "t3_queue_list"
+                    | "t3_queue_read"
+                    | "t3_queue_edit"
+                    | "t3_queue_cancel"
+                    | "t3_queue_reorder"
+                    | "t3_queue_promote_to_steer"
+                    | "t3_pending_request_list"
+                    | "t3_pending_request_read"
+                    | "t3_pending_request_respond"
+                    | "t3_thread_update"
+                    | "t3_thread_organize"
+                    | "t3_thread_search"
+            ) =>
+            {
+                crate::orchestration::queue::mcp::dispatch(queue_service, scope, name, args).await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances

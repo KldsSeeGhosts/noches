@@ -907,7 +907,15 @@ pub(crate) fn plan(
             super::mailbox::plan_delivery(&projection, command, &mut plan, delivery, now)?
         }
         TaskOperation::DrainQueue => {
-            super::continuation::drain(&projection, command, &mut plan, now)?
+            // Loro-backed intents have exactly one drainer: DocHost's owner
+            // lane. Canonical runs are adopted at its delivery boundary.
+            let intents = super::ui_queue::loro_intents(conn, &command.thread_id)?;
+            let mut authority = projection.clone();
+            authority.runs.retain(|r| {
+                r.status != OrchestrationV2RunStatus::Queued
+                    || !intents.iter().any(|i| i.id == r.user_message_id.0)
+            });
+            super::continuation::drain(&authority, command, &mut plan, now)?
         }
         TaskOperation::StopCohort { run_id } => {
             super::mailbox::stop(&projection, command, &mut plan, run_id, now)?
