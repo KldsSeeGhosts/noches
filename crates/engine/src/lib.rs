@@ -262,7 +262,7 @@ impl EngineCore {
         sessions.set_doc_host(doc_host.clone());
         // ON by default for T3 parity. Disable explicitly for legacy-only rigs;
         // no provider runs start until a user turn or a scoped delegated task.
-        let orchestration_host = if std::env::var("ZERON_ORCHESTRATION")
+        let mut orchestration_host = if std::env::var("ZERON_ORCHESTRATION")
             .is_ok_and(|value| matches!(value.as_str(), "0" | "off" | "false"))
         {
             None
@@ -304,6 +304,16 @@ impl EngineCore {
         )
         .map_err(|e| EngineError::Other(e.to_string()))?;
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        if let Some(host) = &mut orchestration_host {
+            host.install_launch(
+                repos.clone(),
+                project_actions.clone(),
+                terminals.clone(),
+                registry.clone(),
+                profile.store_root().to_path_buf(),
+            )
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
@@ -512,6 +522,9 @@ impl EngineCore {
         .with_previews(self.previews.clone());
         if let Some(host) = &self.orchestration_host {
             rpc = rpc.with_delegation(host.service.clone());
+            if let Some(launch) = &host.launch {
+                rpc = rpc.with_launch(launch.clone());
+            }
         }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);

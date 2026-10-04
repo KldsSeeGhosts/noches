@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod launch;
 pub mod remote;
 mod server;
 
@@ -34,6 +35,9 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";
+    pub const GET_LAUNCH_STATE: &str = "GetLaunchState";
+    pub const CONTROL_WORKTREE_SETUP: &str = "ControlWorktreeSetup";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
