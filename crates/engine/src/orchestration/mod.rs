@@ -11,6 +11,8 @@ mod delegation_live_tests;
 mod delegation_tests;
 pub mod effects;
 pub mod event;
+pub mod launch;
+pub mod launch_service;
 pub mod mailbox;
 pub mod projection;
 pub mod recovery;
@@ -22,6 +24,7 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod ui;
+pub mod ui_launch;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

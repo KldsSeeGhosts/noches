@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    launch_service: RwLock<Option<Arc<dyn crate::orchestration::launch_service::LaunchService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +29,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            launch_service: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -43,6 +45,25 @@ impl Toolkit {
 
     pub fn set_service(&self, service: Arc<dyn OrchestratorService>) {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
+    }
+
+    pub fn set_launch_service(
+        &self,
+        service: Arc<dyn crate::orchestration::launch_service::LaunchService>,
+    ) {
+        *self
+            .launch_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn launch_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::launch_service::LaunchService>> {
+        self.launch_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -192,6 +213,19 @@ impl Toolkit {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
         match input {
+            _ if matches!(
+                tool.group.as_str(),
+                "project" | "environment" | "attachment" | "worktree"
+            ) =>
+            {
+                crate::orchestration::launch::mcp::dispatch(
+                    self.launch_service(),
+                    scope,
+                    name,
+                    args,
+                )
+                .await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances
