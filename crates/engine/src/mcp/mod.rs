@@ -249,7 +249,9 @@ fn response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
         .status(status)
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(value.to_string())))
+        .body(Full::new(Bytes::from(
+            crate::orchestration::threads::wire::response_json(&value),
+        )))
         .expect("response")
 }
 

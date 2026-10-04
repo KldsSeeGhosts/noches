@@ -23,9 +23,12 @@ pub mod sync_publish;
 pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod thread_service;
+pub mod threads;
 pub mod ui;
 pub mod ui_scheduler;
 pub mod ui_git_actions;
+pub mod ui_threads;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

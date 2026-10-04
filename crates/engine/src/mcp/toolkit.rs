@@ -15,6 +15,7 @@ pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
     scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
+    threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -30,6 +31,7 @@ impl Toolkit {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
             scheduler: RwLock::new(None),
+            threads: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -55,6 +57,13 @@ impl Toolkit {
             .scheduler
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_thread_service(
+        &self,
+        service: Arc<dyn crate::orchestration::thread_service::ThreadService>,
+    ) {
+        *self.threads.write().unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -341,6 +350,16 @@ impl Toolkit {
                         Err(error) => serde_json::to_value(error.into_failure()).expect("failure"),
                     },
                 )
+            }
+            input @ (OrchestrationToolInput::T3ThreadList(_)
+            | OrchestrationToolInput::T3ThreadRead(_)
+            | OrchestrationToolInput::T3ThreadSend(_)
+            | OrchestrationToolInput::T3ThreadWait(_)
+            | OrchestrationToolInput::T3ThreadInterrupt(_)
+            | OrchestrationToolInput::T3ThreadConfiguration(_)
+            | OrchestrationToolInput::T3ThreadConfigure(_)
+            | OrchestrationToolInput::CreateThreads(_)) => {
+                crate::orchestration::threads::mcp::dispatch(&self.threads, scope, input).await
             }
             _ if matches!(name, "t3_worktree_handoff" | "t3_worktree_status") => {
                 codec::result(json!({
