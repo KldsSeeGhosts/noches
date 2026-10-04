@@ -136,7 +136,11 @@ restart. Recovery never executes a harness or drains queued work.
 `is_v2_managed` is the durable recovery-ownership gate for adopted legacy
 chats. The later `sessions.rs` runner **must** use it to exclude V2-owned chats
 from native journal auto-resume before enabling adoption in production.
-Kernel assembly/adoption is deliberately not enabled in `EngineCore` yet.
+Production assembly now installs on-demand registry admission. Its stable
+adoption receipt commits the projection, text-only historical conversation
+records, adoption mapping and publication atomically, without effects or runs.
+Legacy startup recovery uses projection-only reads, not admitting lookup.
+See [thread-service.md](thread-service.md) for historical read-model gaps.
 Subagent/background rosters, terminal task results/mailbox reconciliation,
 checkpoint-aware continuation eligibility, and restart continuation creation
 are the later runner/task slices, not claimed as implemented recovery parity.
