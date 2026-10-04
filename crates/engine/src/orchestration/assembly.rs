@@ -21,6 +21,73 @@ use super::{Error, Kernel, Result};
 use crate::mcp::auth::InvocationScope;
 use crate::{DocHost, HarnessRegistry, SessionsEngine, WorkspaceHost};
 
+// ── F1 git-actions host assembly (owned by git-actions slice) ──────────────
+pub struct GitActionsHost {
+    pub service: super::git_actions::GitActionsService,
+    stop: CancellationToken,
+    worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl GitActionsHost {
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble(
+        store: super::Store,
+        sessions: SessionsEngine,
+        terminals: crate::Terminals,
+        doc_host: DocHost,
+        workspace: WorkspaceHost,
+        registry: Arc<HarnessRegistry>,
+        repos: crate::Repos,
+        history_roots: Vec<(zeron_proto::git_actions::HistorySource, std::path::PathBuf)>,
+    ) -> anyhow::Result<Self> {
+        let service = super::git_actions::GitActionsService::new(
+            store,
+            repos,
+            sessions,
+            terminals,
+            doc_host,
+            workspace,
+            registry,
+            history_roots,
+        )?;
+        let stop = CancellationToken::new();
+        let token = stop.clone();
+        let worker_service = service.clone();
+        let worker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {},
+                }
+                worker_service.pull_tick().await;
+            }
+        });
+        Ok(Self {
+            service,
+            stop,
+            worker: std::sync::Mutex::new(Some(worker)),
+        })
+    }
+    pub async fn shutdown(&self) {
+        self.stop.cancel();
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+        }
+        self.service.shutdown().await;
+    }
+}
+impl Drop for GitActionsHost {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+// ── End F1 assembly ──────────────────────────────────────────────────────
+
 pub struct HostCatalog(pub Arc<HarnessRegistry>);
 
 #[async_trait]

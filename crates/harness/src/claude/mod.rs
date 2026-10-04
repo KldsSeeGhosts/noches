@@ -429,6 +429,24 @@ impl Harness for ClaudeHarness {
         request.interaction_mode = zeron_proto::InteractionMode::Default;
         self.run_with_mode(request, controls, true).await
     }
+
+    async fn run_source_control(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request
+            .model_options
+            .insert("_noches_source_control".into(), true.into());
+        request.auto_approve = false;
+        request.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+        request.interaction_mode = zeron_proto::InteractionMode::Default;
+        self.run_with_mode(request, controls, true).await
+    }
 }
 
 impl ClaudeHarness {
@@ -469,7 +487,7 @@ impl ClaudeHarness {
         if title_only {
             cmd.args([
                 "--system-prompt",
-                crate::TITLE_INSTRUCTIONS,
+                crate::restricted_text_instructions(&request),
                 "--tools",
                 "",
                 "--strict-mcp-config",

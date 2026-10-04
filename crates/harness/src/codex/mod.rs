@@ -592,6 +592,24 @@ impl Harness for CodexHarness {
         request.auto_approve = false;
         self.run_with_mode(request, controls, true).await
     }
+
+    async fn run_source_control(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request
+            .model_options
+            .insert("_noches_source_control".into(), true.into());
+        request.auto_approve = false;
+        request.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+        request.interaction_mode = zeron_proto::InteractionMode::Default;
+        self.run_with_mode(request, controls, true).await
+    }
 }
 
 impl CodexHarness {
@@ -838,10 +856,13 @@ async fn run_session(session: Session) {
     let start_params = {
         let mut p = serde_json::Map::new();
         if title_only {
-            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
+            p.insert(
+                "baseInstructions".into(),
+                crate::restricted_text_instructions(&request).into(),
+            );
             p.insert(
                 "developerInstructions".into(),
-                crate::TITLE_INSTRUCTIONS.into(),
+                crate::restricted_text_instructions(&request).into(),
             );
             p.insert("ephemeral".into(), true.into());
             p.insert(
