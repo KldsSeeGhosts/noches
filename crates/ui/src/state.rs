@@ -788,6 +788,8 @@ pub struct AppState {
     pub automations: crate::automations::AutomationsStore,
     /// F1 root-checkout pull policy/status, owner-routed.
     pub git_actions: crate::git_store::GitStore,
+    /// Owner/chat keyed Details reads; refreshed on open and after mutations.
+    pub details: crate::details_data::DetailsStore,
     pub history_import: crate::history_import::HistoryImportStore,
     sessions: Vec<Session>,
     /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
@@ -989,6 +991,7 @@ impl AppState {
             thread_lifecycles: HashMap::new(),
             automations: Default::default(),
             git_actions: Default::default(),
+            details: Default::default(),
             history_import: Default::default(),
             sessions: Vec::new(),
             session_index: HashMap::new(),

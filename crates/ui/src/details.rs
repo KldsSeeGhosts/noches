@@ -193,6 +193,12 @@ impl DetailsModel {
                 });
             }
         }
+        // Engine-owned wave-3 data overlays legacy checkout fallbacks.
+        if let Some(chat) = chat
+            && let Some(row) = state.details.get(&chat.device_id, chat_id)
+        {
+            crate::details_data::apply_snapshot(&mut model, row);
+        }
         model
     }
 }
@@ -211,7 +217,7 @@ type ShellAction<T> = Rc<dyn Fn(&mut Shell, T, &mut Context<Shell>)>;
 #[derive(Clone)]
 pub struct DetailsActions {
     pub open_url: ShellAction<String>,
-    pub toggle_watch: ShellAction<(u64, bool)>,
+    pub toggle_watch: ShellAction<(String, bool)>,
     pub link_pull_request: ShellAction<()>,
     pub commit: ShellAction<()>,
     pub run_automation: ShellAction<String>,
@@ -561,8 +567,8 @@ fn version_control_section(
     let mut rows: Vec<AnyElement> = Vec::new();
     // Stack order: bottom of the stack first.
     for pr in &model.pull_requests {
-        let number = pr.summary.number;
         let url = pr.summary.url.clone();
+        let watch_url = url.clone();
         let open = actions.open_url.clone();
         let watch = actions.toggle_watch.clone();
         let watching = pr.watching;
@@ -608,12 +614,12 @@ fn version_control_section(
         };
         rows.push(
             hover_row(
-                row(format!("details-{chat_id}-pr-{number}").into(), None, theme),
+                row(format!("details-{chat_id}-pr-{url}").into(), None, theme),
                 theme,
             )
             .pr(px(4.0))
             .child(crate::change_requests::pull_request_badge_with_query(
-                format!("details-{chat_id}-pr-{number}-badge").into(),
+                format!("details-{chat_id}-pr-{url}-badge").into(),
                 pr.summary.clone(),
                 crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                 None,
@@ -623,7 +629,7 @@ fn version_control_section(
             .children(checks)
             .child(
                 icon_action(
-                    format!("details-{chat_id}-pr-{number}-watch").into(),
+                    format!("details-{chat_id}-pr-{url}-watch").into(),
                     icons::EYE,
                     if watching {
                         "Stop watching"
@@ -634,7 +640,10 @@ fn version_control_section(
                 )
                 // Watching reads as a present eye; not watching recedes.
                 .when(!watching, |el| el.opacity(0.45))
-                .on_click(cx.listener(move |this, _, _, cx| watch(this, (number, !watching), cx))),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    watch(this, (watch_url.clone(), !watching), cx)
+                })),
             )
             .on_click(cx.listener(move |this, _, _, cx| open(this, url.clone(), cx)))
             .into_any_element(),
