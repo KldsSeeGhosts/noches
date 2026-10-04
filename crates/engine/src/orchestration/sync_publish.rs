@@ -56,7 +56,9 @@ pub(crate) fn enqueue(
         summaries.push(serde_json::json!({
             "id":thread.id,"projectId":thread.project_id,"title":thread.title,
             "lineage":thread.lineage,"archivedAt":thread.archived_at,"deletedAt":thread.deleted_at,
-            "version":projection.through_sequence
+            "lastVisitedAt":thread.last_visited_at,
+            "version":projection.through_sequence,
+            "lifecycle":super::ui_queue::state(conn,&ThreadId(id.clone()))?.lifecycle
         }));
         documents.push(PublicationDocument {
             doc_id: format!("orchestration/thread/{id}"),
@@ -69,6 +71,18 @@ pub(crate) fn enqueue(
                     // replicate the kernel's broader internal read model.
                     records.remove("provider-session");
                     records.remove("runtime-request");
+                    if let Some(handoffs) = records
+                        .get_mut("context-handoff")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for handoff in handoffs {
+                            if let Some(record) = handoff.as_object_mut() {
+                                record.insert("summaryText".into(), serde_json::json!(""));
+                                record.remove("history");
+                                record.remove("delivery");
+                            }
+                        }
+                    }
                 }
                 payload["uiState"] = super::ui::state(conn, &ThreadId(id.clone()))?;
                 payload

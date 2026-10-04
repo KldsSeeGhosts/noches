@@ -161,6 +161,7 @@ fn expire_permissions(pending: &PendingPermissions, engine_tx: &mpsc::UnboundedS
 struct HarnessSessionRef {
     session_id: String,
     cwd: String,
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
 }
 
 /// Configuration baked into a live harness runtime. The steering mailbox only
@@ -170,6 +171,7 @@ struct HarnessSessionRef {
 #[derive(Debug, Clone, PartialEq)]
 struct RuntimeConfig {
     harness_id: HarnessId,
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
     model: Option<String>,
     reasoning: Option<zeron_proto::ReasoningLevel>,
     model_options: serde_json::Map<String, serde_json::Value>,
@@ -185,6 +187,7 @@ impl RuntimeConfig {
     fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
         Self {
             harness_id,
+            instance_id: request.instance_id.clone(),
             model: request.model.clone(),
             reasoning: request.reasoning,
             model_options: request.model_options.clone(),
@@ -450,6 +453,13 @@ impl SessionsEngine {
         self.inner.mcp_server.clone()
     }
 
+    pub(crate) fn registered_mcp(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_harness::mcp::SessionMcpContext> {
+        lock(&self.inner.session_mcp).get(chat_id).cloned()
+    }
+
     pub(crate) fn set_orchestration_runner(
         &self,
         runner: std::sync::Weak<crate::orchestration::runner::RunnerBridge>,
@@ -486,6 +496,20 @@ impl SessionsEngine {
     /// completed exchange the run task fires it for still-untitled chats.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
+    }
+
+    pub(crate) async fn generate_orchestration_title(
+        &self,
+        harness: HarnessId,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
+        prompt: &str,
+        cwd: &str,
+    ) -> Option<String> {
+        self.inner
+            .titles
+            .get()?
+            .run_title_model(harness, Some(instance), prompt, cwd)
+            .await
     }
 
     /// Wire the turn-start listener (called once at engine assembly).
@@ -726,6 +750,78 @@ impl SessionsEngine {
         startup_retry: bool,
     ) -> Result<String, EngineError> {
         let _admission = self.admit_work()?;
+        // A kernel-owned start may already carry imported provider context.
+        // Keep the original app message separate from that native-only input.
+        let display_prompt = if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+            && let Some(id) = message_id.as_ref()
+        {
+            store
+                .thread(&chat_id.into())
+                .map_err(|e| EngineError::Other(e.to_string()))?
+                .and_then(|p| {
+                    crate::orchestration::task::records(&p, "message")
+                        .iter()
+                        .find(|m| m["id"] == *id)
+                        .and_then(|m| m["text"].as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| request.prompt.clone())
+        } else {
+            request.prompt.clone()
+        };
+        // Resolve before any interruption, message write, worktree use, or
+        // process startup. Never select the first matching driver row.
+        let requested_instance = request
+            .instance_id
+            .clone()
+            .or_else(|| {
+                self.inner
+                    .workspace()
+                    .and_then(|ws| ws.chat_config(chat_id))
+                    .and_then(|config| config.instance_id)
+            })
+            .unwrap_or_else(|| crate::provider_instances::legacy_instance_id(harness_id));
+        let _instance_lifecycle = self
+            .inner
+            .registry
+            .provider_instances
+            .lifecycle(&requested_instance)
+            .await;
+        let instance = self
+            .inner
+            .registry
+            .provider_instances
+            .snapshot(&self.inner.registry)
+            .into_iter()
+            .find(|row| row.provider_instance_id == requested_instance)
+            .ok_or_else(|| {
+                EngineError::Other("Provider is absent from the live catalog.".into())
+            })?;
+        let driver = instance
+            .harness_id
+            .ok_or_else(|| EngineError::Other("Missing adapter.".into()))?;
+        if request.harness.is_some() && driver != harness_id {
+            return Err(EngineError::Other(
+                "Provider instance/driver mismatch.".into(),
+            ));
+        }
+        let harness_id = driver;
+        let bound = lock(&self.inner.provider_bindings).get(chat_id).cloned();
+        if bound
+            .as_ref()
+            .is_some_and(|(id, _)| id != requested_instance.as_ref())
+        {
+            return Err(EngineError::Other(
+                "Provider instance/driver mismatch.".into(),
+            ));
+        }
+        let harness = self.inner.registry.provider_instances.resolve_runtime(
+            &self.inner.registry,
+            &requested_instance,
+            true,
+        )?;
+        let harness = bound.map(|(_, harness)| harness).unwrap_or(harness);
+        request.instance_id = Some(requested_instance.clone());
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
@@ -757,10 +853,11 @@ impl SessionsEngine {
                     && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
                         .is_some_and(|thread| thread.runs.last().is_none_or(|run|
                             run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
-                    let harness = self.inner.registry.resolve(harness_id)?;
-                    scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &request, &user_id, harness.as_ref())
+                    scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &mut request, &user_id, harness.as_ref())
                         .await.map_err(|error| EngineError::Other(error.to_string()))?;
                     self.inner.mcp_server.credentials.advance_session(scope);
+                    runner.prepare_external_turn(&chat_id.into(),&mut request,harness.as_ref())
+                        .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
             }
             let accepted = if steerable && same_runtime {
@@ -782,7 +879,7 @@ impl SessionsEngine {
                         bridge.turn_started();
                     }
                     pending.push_back(RoutedSteer {
-                        prompt: request.prompt.clone(),
+                        prompt: display_prompt.clone(),
                         message_id: user_id.clone(),
                     });
                     true
@@ -794,7 +891,7 @@ impl SessionsEngine {
             };
             if accepted {
                 let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                handle.write_user_message(&user_id, &display_prompt, now_ms())?;
                 if self.is_live(chat_id, &run_id) {
                     // Working BEFORE the lastMessageAt bump: both ride the
                     // workspace doc from this one peer, so causal order makes it
@@ -802,7 +899,7 @@ impl SessionsEngine {
                     // — that gap read as unseen-with-no-live-run = a phantom
                     // "completed" flash on every remote send (2026-07-31).
                     self.set_status(chat_id, SessionStatus::Working, false);
-                    self.inner.note_message(chat_id, &request.prompt);
+                    self.inner.note_message(chat_id, &display_prompt);
                     return Ok(run_id);
                 }
                 // The run died around the send. If its exit drain already
@@ -815,7 +912,7 @@ impl SessionsEngine {
                     ledger.len() != before
                 };
                 if !reclaimed {
-                    self.inner.note_message(chat_id, &request.prompt);
+                    self.inner.note_message(chat_id, &display_prompt);
                     return Ok(run_id);
                 }
                 // Keep the already-written doc entry's id for the fresh run
@@ -832,24 +929,13 @@ impl SessionsEngine {
             // the routed run died with the message reclaimed, or configuration
             // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
+            request.prompt = display_prompt.clone();
         }
 
-        let bound = lock(&self.inner.provider_bindings)
-            .get(chat_id)
-            .map(|(_, harness)| harness.clone());
-        let harness = match bound {
-            Some(harness) if harness.id() == harness_id => harness,
-            Some(_) => {
-                return Err(EngineError::Other(
-                    "Provider instance/driver mismatch.".into(),
-                ));
-            }
-            None => self.inner.registry.resolve(harness_id)?,
-        };
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        handle.write_user_message(&user_id, &display_prompt, now_ms())?;
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -860,10 +946,21 @@ impl SessionsEngine {
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
         if request.resume.is_none() {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            request.resume = self.inner.resume_for_instance(
+                chat_id,
+                &request.cwd,
+                &requested_instance,
+                harness_id,
+            );
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        lock(&self.inner.last_requests).insert(
+            chat_id.to_string(),
+            RunRequest {
+                prompt: display_prompt.clone(),
+                ..request.clone()
+            },
+        );
         self.inner
             .journal
             .append(
@@ -900,7 +997,6 @@ impl SessionsEngine {
         if ordinary || !lock(&self.inner.session_mcp).contains_key(chat_id) {
             use crate::mcp::auth::InvocationScope;
             use crate::orchestration::service::CallerScope;
-            use crate::provider_instances::legacy_instance_id;
             let project = self
                 .inner
                 .doc_host()
@@ -910,15 +1006,7 @@ impl SessionsEngine {
                         .and_then(|chat| chat.space_id)
                 })
                 .unwrap_or_else(|| request.cwd.clone());
-            let instance_id = self
-                .inner
-                .registry
-                .provider_instances
-                .snapshot(&self.inner.registry)
-                .iter()
-                .find(|instance| instance.harness_id == Some(harness_id))
-                .map(|instance| instance.provider_instance_id.clone())
-                .unwrap_or_else(|| legacy_instance_id(harness_id));
+            let instance_id = requested_instance.clone();
             let model = request.model.clone().unwrap_or_else(|| {
                 self.inner
                     .registry
@@ -986,12 +1074,12 @@ impl SessionsEngine {
                 issued_at: 0,
                 task_id: None,
             };
-            if ordinary && let Some(runner) = runner {
+            if ordinary && let Some(runner) = runner.as_ref() {
                 scope.caller = runner
                     .admit_parent(
                         scope.caller,
                         scope.selection.clone(),
-                        &request,
+                        &mut request,
                         &user_id,
                         harness.as_ref(),
                     )
@@ -1007,6 +1095,12 @@ impl SessionsEngine {
                 }
             } else {
                 self.inner.mcp_server.register(self, chat_id, scope).await?;
+            }
+            if ordinary && let Some(runner) = runner.as_ref() {
+                runner
+                    .prepare_external_turn(&chat_id.into(), &mut request, harness.as_ref())
+                    .await
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
             }
         }
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -1086,7 +1180,7 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        self.inner.note_message(chat_id, &display_prompt);
 
         // Name the chat NOW, off the first prompt — not after the first
         // exchange completes ("called New session for a long time for no
@@ -1094,7 +1188,7 @@ impl SessionsEngine {
         // the Done-time call below stays as the retry for a failed
         // generation).
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, harness_id, &display_prompt, &request.cwd);
         }
 
         tokio::spawn(drive_run(
@@ -1108,6 +1202,7 @@ impl SessionsEngine {
             engine_rx,
             cancel_rx,
             RunResumeState {
+                display_prompt,
                 user_message_id: user_id,
                 resume_injected,
                 startup_retry,
@@ -1248,6 +1343,41 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Removing/replacing a configured instance retires only its live scope.
+    pub async fn interrupt_provider_instance(
+        &self,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
+    ) -> Result<(), EngineError> {
+        let chats: Vec<_> = lock(&self.inner.runs)
+            .iter()
+            .filter(|(_, run)| run.runtime_config.instance_id.as_ref() == Some(instance))
+            .map(|(chat, _)| chat.clone())
+            .collect();
+        for chat in chats {
+            self.interrupt(&chat).await?;
+            lock(&self.inner.provider_bindings).remove(&chat);
+            self.inner.mcp_server.credentials.revoke_thread(&chat);
+        }
+        lock(&self.inner.provider_bindings).retain(|_, (id, _)| id != instance.as_ref());
+        Ok(())
+    }
+
+    /// Owner orchestration detach acceptance. Signal teardown under the kernel
+    /// ownership lane, without waiting for the observer that needs that lane.
+    pub(crate) fn request_orchestration_detach(&self, chat_id: &str, revoke_mcp: bool) {
+        if revoke_mcp {
+            self.revoke_session_mcp(chat_id);
+        }
+        if let Some(handle) = lock(&self.inner.runs).get(chat_id) {
+            let _ = handle.cancel.send(true);
+            expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+            for (_, answer) in lock(&handle.pending_inputs).drain() {
+                let _ = answer.send(Vec::new());
+            }
+            handle.interrupt_token.cancel();
+        }
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -1346,8 +1476,12 @@ impl SessionsEngine {
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (zeron recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
-                self.inner
-                    .remember_harness_session(&chat_id, &session_id, &cwd);
+                self.inner.remember_harness_session(
+                    &chat_id,
+                    &session_id,
+                    &cwd,
+                    self.inner.journal_harness_instance(&chat_id),
+                );
             }
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
@@ -1431,6 +1565,7 @@ impl SessionsEngine {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         let (runtime_mode, interaction_mode) = authority.unwrap_or_default();
                         Some(RunRequest {
+                            instance_id: None,
                             prompt: String::new(),
                             harness: None,
                             model: None,
@@ -1734,7 +1869,13 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (zeron sessions.ts:1039).
-    fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+    fn remember_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
+    ) {
         if session_id.is_empty() {
             return;
         }
@@ -1743,10 +1884,11 @@ impl Inner {
             HarnessSessionRef {
                 session_id: session_id.to_string(),
                 cwd: cwd.to_string(),
+                instance_id: instance_id.clone(),
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
+            ws.set_chat_harness_session_binding(chat_id, session_id, cwd, instance_id.as_ref());
         }
     }
 
@@ -1779,8 +1921,56 @@ impl Inner {
         }
         let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
-        self.remember_harness_session(chat_id, &session_id, &session_cwd);
+        self.remember_harness_session(
+            chat_id,
+            &session_id,
+            &session_cwd,
+            self.journal_harness_instance(chat_id),
+        );
         cwd_ok(&session_cwd).then_some(session_id)
+    }
+
+    fn journal_harness_instance(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_proto::provider_instance::ProviderInstanceId> {
+        self.journal
+            .replay(chat_id, 0)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|(_, event)| match event {
+                AgentEvent::SessionStarted { instance_id, .. } => Some(instance_id),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    fn resume_for_instance(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
+        harness: HarnessId,
+    ) -> Option<String> {
+        let owner = lock(&self.harness_sessions)
+            .get(chat_id)
+            .and_then(|r| r.instance_id.clone())
+            .or_else(|| {
+                self.workspace()
+                    .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                    .and_then(|chat| chat.harness_session_instance_id)
+            })
+            .or_else(|| self.journal_harness_instance(chat_id));
+        let matches = owner
+            .as_ref()
+            .map(|id| id == instance)
+            .unwrap_or_else(|| *instance == crate::provider_instances::legacy_instance_id(harness));
+        if matches {
+            self.resume_for(chat_id, cwd)
+        } else {
+            None
+        }
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
@@ -2113,6 +2303,7 @@ fn finish_segment<'a>(
 /// engine-injected resumes retry — a caller-specified resume fails loudly),
 /// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
+    display_prompt: String,
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
@@ -2204,8 +2395,9 @@ async fn drive_run(
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
-    let user_prompt = request.prompt.clone();
+    let user_prompt = resume_state.display_prompt.clone();
     let run_cwd = request.cwd.clone();
+    let run_instance = request.instance_id.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
@@ -2214,6 +2406,7 @@ async fn drive_run(
     // the event loop) can take ownership.
     let mut retry_request = Some(RunRequest {
         resume: None,
+        prompt: user_prompt.clone(),
         ..request.clone()
     });
     // Startup can stop before the SDK saves user text, with no new session
@@ -2432,7 +2625,7 @@ async fn drive_run(
 
     let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
@@ -2633,6 +2826,9 @@ async fn drive_run(
             };
             event
         };
+        if let AgentEvent::SessionStarted { instance_id, .. } = &mut event {
+            *instance_id = run_instance.clone();
+        }
 
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
@@ -3088,13 +3284,18 @@ async fn drive_run(
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
-                inner.remember_harness_session(&chat_id, session_id, cwd);
+                inner.remember_harness_session(&chat_id, session_id, cwd, run_instance.clone());
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
                 ..
             } => {
-                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                inner.remember_harness_session(
+                    &chat_id,
+                    session_id,
+                    &run_cwd,
+                    run_instance.clone(),
+                );
             }
             AgentEvent::InputRequested { .. } | AgentEvent::PermissionRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
@@ -3349,6 +3550,57 @@ impl Drop for SessionMcpCleanup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_resume_requires_the_same_instance_and_legacy_defaults_remain_routable() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        sessions.inner.remember_harness_session(
+            "chat",
+            "native",
+            "/repo",
+            Some("codex_work".into()),
+        );
+        assert_eq!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/repo", &"codex_work".into(), HarnessId::Codex)
+                .as_deref(),
+            Some("native")
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/repo", &"codex".into(), HarnessId::Codex)
+                .is_none()
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/other", &"codex_work".into(), HarnessId::Codex)
+                .is_none()
+        );
+        sessions
+            .inner
+            .remember_harness_session("old", "legacy", "/repo", None);
+        assert_eq!(
+            sessions
+                .inner
+                .resume_for_instance("old", "/repo", &"codex".into(), HarnessId::Codex)
+                .as_deref(),
+            Some("legacy")
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("old", "/repo", &"codex_work".into(), HarnessId::Codex)
+                .is_none()
+        );
+    }
     use super::*;
 
     #[tokio::test]
@@ -3629,6 +3881,7 @@ mod tests {
 
     fn request() -> RunRequest {
         RunRequest {
+            instance_id: None,
             prompt: "first".into(),
             harness: None,
             model: Some("grok-4.6".into()),
@@ -3772,6 +4025,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn imported_provider_context_never_rewrites_app_user_message_or_retry_prompt() {
+        use super::*;
+        let (_feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            feed: Mutex::new(Some(rx)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let command = crate::orchestration::Command::wire(serde_json::from_value(serde_json::json!({
+            "type":"thread.create","commandId":"create-context-target","threadId":"context-target",
+            "projectId":"project","title":"Target","createdBy":"user","creationSource":"web",
+            "modelSelection":{"instanceId":"mock","model":"mock-1"},"runtimeMode":"full-access",
+            "interactionMode":"default","branch":null,"worktreePath":dir.path()
+        })).unwrap()).unwrap();
+        core.orchestration
+            .dispatch(&command, now_ms())
+            .await
+            .unwrap();
+        core.orchestration
+            .task_command(
+                &"context-target".into(),
+                "context-input".into(),
+                crate::orchestration::task::TaskOperation::ExternalMessage {
+                    prompt: "Original request.".into(),
+                    driver: "mock".into(),
+                    message_id: "user-input".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut input = request();
+        input.cwd = dir.path().to_string_lossy().into_owned();
+        input.prompt = "Imported historical context.\n\nOriginal request.".into();
+        core.sessions
+            .dispatch_orchestrated(
+                "context-target",
+                HarnessId::Mock,
+                input,
+                Some("user-input".into()),
+            )
+            .await
+            .unwrap();
+        let entries = core
+            .doc_host
+            .open("context-target")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        let user = entries.iter().find(|e| e.id == "user-input").unwrap();
+        let text = user
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Original request.");
+        assert_eq!(
+            lock(&core.sessions.inner.last_requests)["context-target"].prompt,
+            "Original request."
+        );
+        core.sessions.shutdown().await;
+    }
+
     // A tagged subagent event that folds to NO parts used to leave its sink
     // dirty forever: the commit branch's guard stayed true on a deadline in
     // the past and the run loop burned a core until real content arrived.
@@ -3794,6 +4117,7 @@ mod tests {
             .await
             .unwrap();
         feed.send(AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],

@@ -508,6 +508,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::NativeReference { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::ContextUsageSnapshot { .. }
         | AgentEvent::AvailableCommands { .. }
@@ -835,6 +836,7 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: zeron_proto::HarnessId::Mock,
                 model: "m".into(),
                 tools: vec![],

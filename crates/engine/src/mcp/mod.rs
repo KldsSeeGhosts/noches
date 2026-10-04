@@ -51,6 +51,20 @@ impl McpServer {
         self.toolkit.set_service(service);
     }
 
+    pub fn set_queue_service(
+        &self,
+        service: Arc<dyn crate::orchestration::queue_service::QueueService>,
+    ) {
+        self.toolkit.set_queue_service(service);
+    }
+
+    pub fn set_pull_requests(
+        &self,
+        service: Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>,
+    ) {
+        self.toolkit.set_pull_requests(service);
+    }
+
     pub async fn endpoint(self: &Arc<Self>) -> std::io::Result<&str> {
         self.endpoint
             .get_or_try_init(|| async {
@@ -156,6 +170,41 @@ async fn serve(listener: TcpListener, server: Weak<McpServer>, shutdown: Cancell
 
 impl McpServer {
     async fn handle_http(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+        if let Some(token) = request
+            .uri()
+            .path()
+            .strip_prefix("/api/attachments/upload/")
+        {
+            if request.method() != hyper::Method::POST {
+                return empty(StatusCode::METHOD_NOT_ALLOWED);
+            }
+            // Signed bearer URL independent of the session credential.
+            if request.headers().contains_key("origin") {
+                return empty(StatusCode::FORBIDDEN);
+            }
+            let token = token.to_owned();
+            let Some(service) = self.toolkit.launch_service() else {
+                return empty(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            let body = tokio::time::timeout(
+                Duration::from_secs(30),
+                Limited::new(
+                    request.into_body(),
+                    crate::orchestration::launch::attachments::MAX_UPLOAD_BYTES,
+                )
+                .collect(),
+            )
+            .await;
+            let bytes = match body {
+                Ok(Ok(body)) => body.to_bytes(),
+                _ => return empty(StatusCode::PAYLOAD_TOO_LARGE),
+            };
+            let (status, value) = service.upload(&token, &bytes).await;
+            return response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                value,
+            );
+        }
         let authorization = request
             .headers()
             .get("authorization")
@@ -249,7 +298,9 @@ fn response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
         .status(status)
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(value.to_string())))
+        .body(Full::new(Bytes::from(
+            crate::orchestration::threads::wire::response_json(&value),
+        )))
         .expect("response")
 }
 

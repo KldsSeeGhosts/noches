@@ -9,11 +9,15 @@ pub mod git_actions;
 pub mod motion;
 pub mod orchestration;
 pub mod orchestration_mcp;
+pub mod orchestration_threads;
 pub mod preview;
 pub mod provider_instance;
+pub mod provider_settings;
+pub mod pull_requests;
 pub mod runtime_policy;
 pub mod scheduler;
 pub mod thread_lifecycle;
+pub mod transfer;
 pub mod view;
 pub mod workspace;
 
@@ -22,7 +26,7 @@ pub use entities::*;
 pub use orchestration::ProviderInteractionMode;
 pub use preview::*;
 pub use runtime_policy::*;
-pub use thread_lifecycle::{ChatLifecycle, SettleSource};
+pub use thread_lifecycle::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)
@@ -42,3 +46,4 @@ pub fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
         .ok()?;
     Some((major, minor, patch))
 }
+pub mod launch;

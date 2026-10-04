@@ -16,6 +16,9 @@ use zeron_proto::{HarnessId, Model, ModelOption, ModelOptionChoice};
 use crate::HarnessRegistry;
 use crate::orchestration::service::ToolError;
 
+#[path = "orchestration/provider_instances.rs"]
+mod settings;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authentication {
@@ -66,6 +69,8 @@ pub struct ProviderInstance {
     pub message: Option<String>,
     #[serde(default)]
     pub models: Vec<CatalogModel>,
+    #[serde(default)]
+    pub model_count: usize,
 }
 
 fn yes() -> bool {
@@ -125,9 +130,14 @@ impl ProviderInstance {
 #[derive(Default)]
 struct State {
     configured: Option<Vec<ProviderInstance>>,
-    discovered: HashMap<HarnessId, Vec<CatalogModel>>,
+    discovered: HashMap<ProviderInstanceId, Vec<CatalogModel>>,
     snapshot: Vec<ProviderInstance>,
     authentication: HashMap<HarnessId, Authentication>,
+    instance_authentication: HashMap<ProviderInstanceId, Authentication>,
+    configs: Option<zeron_proto::provider_instance::ProviderInstanceConfigMap>,
+    data_dir: Option<std::path::PathBuf>,
+    runtimes: HashMap<ProviderInstanceId, std::sync::Arc<dyn zeron_harness::Harness>>,
+    lifecycle_gates: HashMap<ProviderInstanceId, std::sync::Arc<tokio::sync::Mutex<()>>>,
 }
 
 /// The watch receiver subscribes before reading its snapshot (no event gap).
@@ -223,15 +233,6 @@ impl ProviderInstanceRegistry {
         Ok(())
     }
 
-    pub fn load(&self, data_dir: &std::path::Path) -> Result<(), String> {
-        let path = data_dir.join("provider-instances.json");
-        match std::fs::read(path) {
-            Ok(bytes) => self.configure(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
     pub fn snapshot(&self, harnesses: &HarnessRegistry) -> Vec<ProviderInstance> {
         let descriptors = harnesses.descriptors();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -252,6 +253,7 @@ impl ProviderInstanceRegistry {
                     status: None,
                     message: None,
                     models: Vec::new(),
+                    model_count: 0,
                 })
                 .collect()
         } else {
@@ -260,20 +262,42 @@ impl ProviderInstanceRegistry {
         for instance in &mut instances {
             if let Some(id) = instance.harness_id {
                 if instance.authentication == Authentication::Unknown {
-                    instance.authentication =
-                        state.authentication.get(&id).cloned().unwrap_or_default();
+                    instance.authentication = state
+                        .instance_authentication
+                        .get(&instance.provider_instance_id)
+                        .cloned()
+                        .or_else(|| {
+                            (state.configs.is_none()
+                                || (instance.provider_instance_id == legacy_instance_id(id)
+                                    && state
+                                        .configs
+                                        .as_ref()
+                                        .and_then(|c| c.get(&instance.provider_instance_id))
+                                        .is_none_or(|c| {
+                                            c.environment.as_ref().is_none_or(Vec::is_empty)
+                                                && c.config.as_ref().is_none_or(|v| {
+                                                    v["homePath"].as_str().is_none_or(str::is_empty)
+                                                        && v["shadowHomePath"]
+                                                            .as_str()
+                                                            .is_none_or(str::is_empty)
+                                                })
+                                        })))
+                            .then(|| state.authentication.get(&id).cloned())
+                            .flatten()
+                        })
+                        .unwrap_or_default();
                 }
                 if let Some(d) = descriptors.iter().find(|d| d.id == id) {
                     if id != HarnessId::Mock && instance.driver_kind != legacy_driver(id) {
                         instance.adapter_registered = false;
                     }
-                    instance.installed = d.installed;
-                    instance.enabled &= d.enabled.unwrap_or(d.installed) || id == HarnessId::Mock;
+                    // Explicit instances are independent of the legacy toggle.
+                    instance.installed = self.configured_installed(&state, instance, d.installed);
                 } else {
                     instance.adapter_registered = false;
                     instance.installed = false;
                 }
-                if let Some(models) = state.discovered.get(&id) {
+                if let Some(models) = state.discovered.get(&instance.provider_instance_id) {
                     let configured: HashSet<_> =
                         instance.models.iter().map(|m| m.id.clone()).collect();
                     instance.models.extend(
@@ -286,6 +310,7 @@ impl ProviderInstanceRegistry {
             } else {
                 instance.adapter_registered = false;
             }
+            instance.model_count = instance.models.len();
         }
         // Only publish semantic catalog changes, never credential/turn traffic.
         if serde_json::to_value(&state.snapshot).ok() != serde_json::to_value(&instances).ok() {
@@ -300,19 +325,34 @@ impl ProviderInstanceRegistry {
         harnesses: &HarnessRegistry,
         id: HarnessId,
     ) -> Result<Vec<Model>, zeron_harness::HarnessError> {
-        let harness = harnesses.resolve(id)?;
-        if let Ok(Some(authenticated)) = harness.authenticated().await {
-            self.set_authentication(
-                id,
-                if authenticated {
-                    Authentication::Authenticated
-                } else {
-                    Authentication::Unauthenticated
-                },
-            );
-        }
+        let instance = self
+            .snapshot(harnesses)
+            .into_iter()
+            .find(|instance| instance.provider_instance_id == legacy_instance_id(id))
+            .ok_or_else(|| {
+                zeron_harness::HarnessError::Protocol(
+                    "Provider is absent from the live catalog.".into(),
+                )
+            })?;
+        self.refresh_instance(harnesses, &instance.provider_instance_id)
+            .await
+    }
+
+    pub async fn refresh_instance(
+        &self,
+        harnesses: &HarnessRegistry,
+        instance_id: &ProviderInstanceId,
+    ) -> Result<Vec<Model>, zeron_harness::HarnessError> {
+        let harness = self.resolve_runtime(harnesses, instance_id, false)?;
+        let id = harness.id();
+        let config = self.config(instance_id);
         let models = harness.models().await?;
-        let enrolled = self
+        let auth = harness.authenticated().await.ok().flatten();
+        let enrolled = config.as_ref().is_some_and(|c| {
+            c.config
+                .as_ref()
+                .is_some_and(|v| v["legacyCatalogImport"] == true)
+        }) || self
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -334,15 +374,45 @@ impl ProviderInstanceRegistry {
                 models.push(model);
             }
         }
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .discovered
-            .insert(id, models);
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // An in-flight discovery cannot resurrect a removed/reconfigured row.
+            if state
+                .configs
+                .as_ref()
+                .and_then(|c| c.get(instance_id))
+                .cloned()
+                != config
+            {
+                return Err(zeron_harness::HarnessError::Protocol(
+                    "Provider settings changed during discovery; retry.".into(),
+                ));
+            }
+            if state
+                .runtimes
+                .get(instance_id)
+                .is_none_or(|runtime| !std::sync::Arc::ptr_eq(runtime, &harness))
+            {
+                return Err(zeron_harness::HarnessError::Protocol(
+                    "Provider settings changed during discovery; retry.".into(),
+                ));
+            }
+            state.discovered.insert(instance_id.clone(), models);
+            if let Some(authenticated) = auth {
+                state.instance_authentication.insert(
+                    instance_id.clone(),
+                    if authenticated {
+                        Authentication::Authenticated
+                    } else {
+                        Authentication::Unauthenticated
+                    },
+                );
+            }
+        }
         let snapshot = self.snapshot(harnesses);
         Ok(snapshot
             .into_iter()
-            .find(|p| p.harness_id == Some(id))
+            .find(|p| &p.provider_instance_id == instance_id)
             .map(|p| p.models.into_iter().map(to_legacy_model).collect())
             .unwrap_or_default())
     }
@@ -352,15 +422,13 @@ impl ProviderInstanceRegistry {
             .snapshot(harnesses)
             .iter()
             .filter(|p| p.enabled && p.installed)
-            .filter_map(|p| p.harness_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
+            .map(|p| p.provider_instance_id.clone())
             .collect();
         // Driver discovery may contact a process. No registry mutex crosses it.
         futures::future::join_all(ids.into_iter().map(|id| async move {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                self.refresh(harnesses, id),
+                self.refresh_instance(harnesses, &id),
             )
             .await;
         }))
@@ -1108,9 +1176,17 @@ mod tests {
             .unwrap();
         let composer = registry
             .provider_instances
-            .refresh(&registry, HarnessId::Mock)
+            .refresh_instance(&registry, &"cpa".into())
             .await
             .unwrap();
+        assert!(
+            registry
+                .provider_instances
+                .refresh(&registry, HarnessId::Mock)
+                .await
+                .is_err(),
+            "a missing canonical slot must not select an arbitrary sibling"
+        );
         let snapshot = registry.provider_instances.snapshot(&registry);
         let capability = snapshot[0].capability();
         assert_eq!(

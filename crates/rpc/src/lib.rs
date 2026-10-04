@@ -21,9 +21,13 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 pub mod git_actions;
+pub mod launch;
+pub mod provider_instances;
+pub mod pull_requests;
 pub mod remote;
 pub mod scheduled_tasks;
 mod server;
+mod threads;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -36,19 +40,36 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const ORGANIZE_THREAD: &str = "OrganizeThread";
+    pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
+    pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
+    pub const GET_QUEUE_STATE: &str = "GetQueueState";
+    pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
+    pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
+    pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";
+    pub const GET_LAUNCH_STATE: &str = "GetLaunchState";
+    pub const CONTROL_WORKTREE_SETUP: &str = "ControlWorktreeSetup";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
+    /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
+    pub const GET_THREAD_TRANSFER_STATE: &str = "GetThreadTransferState";
+    /// `{chatId,checkpointId}` -> RestorePreview. Does not change files.
+    pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
+    /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.
+    pub const RESTORE_FILE_CHECKPOINT: &str = "RestoreFileCheckpoint";
+    pub const GET_THREAD_PULL_REQUESTS: &str = "GetThreadPullRequests";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
     /// `task_cancel` under host authority. Resolves on acceptance, not on the
     /// terminal state, which `GetOrchestrationState` reports.
     pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
-    /// Pin/snooze/settle/archive/mark-unread one chat under host authority,
-    /// `{chatId, action, snoozedUntil?}` (T3 `t3_thread_organize` semantics).
-    pub const ORGANIZE_THREAD: &str = "OrganizeThread";
-    /// Clear a woken snooze's attention marker, `{chatId}`.
-    pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
+    pub const GET_PROVIDER_INSTANCE_SETTINGS: &str = "GetProviderInstanceSettings";
+    pub const CREATE_PROVIDER_INSTANCE: &str = "CreateProviderInstance";
+    pub const DUPLICATE_PROVIDER_INSTANCE: &str = "DuplicateProviderInstance";
+    pub const UPDATE_PROVIDER_INSTANCE: &str = "UpdateProviderInstance";
+    pub const DELETE_PROVIDER_INSTANCE: &str = "DeleteProviderInstance";
+    pub const SET_PROVIDER_INSTANCE_ENABLED: &str = "SetProviderInstanceEnabled";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);

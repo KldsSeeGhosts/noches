@@ -1022,7 +1022,25 @@ async fn chain_creates_explicit_fork_pr_then_links_thread_and_replays_progress()
     let forge = Arc::new(FakeForge::default());
     f.service.set_commit_publisher(forge.clone());
     f.service.set_pr_creator(forge.clone());
-    f.service.set_pr_linker(forge.clone());
+    let kernel = crate::orchestration::Kernel::from_store(f.service.0.store.clone());
+    let create = crate::orchestration::command::Command::wire(
+        serde_json::from_value(json!({
+            "type":"thread.create","commandId":"create-thread","threadId":"thread",
+            "projectId":"project","title":"Fixture","createdBy":"user","creationSource":"web",
+            "modelSelection":{"instanceId":"mock","model":"mock-1"},
+            "runtimeMode":"full-access","interactionMode":"default",
+            "branch":"main","worktreePath":f.repo
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    kernel.dispatch(&create, crate::now_ms()).await.unwrap();
+    let links = Arc::new(crate::orchestration::pull_requests::PullRequestService {
+        kernel,
+        host: Arc::new(crate::orchestration::pull_requests::host::GitHubHost::default()),
+    });
+    f.service
+        .set_pr_linker(Arc::new(UserPullRequestLinker(links.clone())));
     let preview = f.preview().await;
     let mut request = f.request(&preview);
     request.authorize_push = true;
@@ -1049,12 +1067,15 @@ async fn chain_creates_explicit_fork_pr_then_links_thread_and_replays_progress()
         forge.pushed.lock().unwrap()[0].remote_url,
         "https://github.com/fork/fixture.git"
     );
+    use crate::orchestration::pull_requests::PullRequestLinks;
+    let linked = links
+        .links(&zeron_proto::orchestration::ThreadId("thread".into()))
+        .unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].url, "https://github.com/fork/fixture/pull/42");
     assert_eq!(
-        forge.linked.lock().unwrap().as_slice(),
-        &[(
-            "thread".into(),
-            "https://github.com/fork/fixture/pull/42".into()
-        )]
+        linked[0].source,
+        zeron_proto::orchestration::ThreadPullRequestLinkSource::Created
     );
     let progress: Vec<GitProgress> =
         serde_json::from_value(final_state["progress"].clone()).unwrap();
@@ -1115,6 +1136,61 @@ async fn no_pr_link_service_reports_pending_not_falsely_linked() {
             .unwrap()
             .iter()
             .any(|p| p["kind"] == "link_pending")
+    );
+}
+
+#[tokio::test]
+async fn failed_pr_authority_preserves_created_url_and_uncertain_link() {
+    let f = Fixture::new().await;
+    git(
+        &f.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/fork/fixture.git",
+        ],
+    )
+    .await
+    .unwrap();
+    f.stage().await;
+    let forge = Arc::new(FakeForge::default());
+    f.service.set_commit_publisher(forge.clone());
+    f.service.set_pr_creator(forge);
+    // No canonical thread exists: production authority must refuse the link.
+    f.service
+        .set_pr_linker(Arc::new(UserPullRequestLinker(Arc::new(
+            crate::orchestration::pull_requests::PullRequestService {
+                kernel: crate::orchestration::Kernel::from_store(f.service.0.store.clone()),
+                host: Arc::new(crate::orchestration::pull_requests::host::GitHubHost::default()),
+            },
+        ))));
+    let preview = f.preview().await;
+    let mut request = f.request(&preview);
+    request.authorize_push = true;
+    request.authorize_create_pr = true;
+    request.push_remote = Some(preview.checkout.remotes[0].clone());
+    request.pr_repository = Some("https://github.com/fork/fixture".into());
+    let state = f.service.start(request).await.unwrap();
+    let final_state = f.wait("action", &state.action_id).await;
+    assert_eq!(final_state["status"], "uncertain");
+    assert_eq!(final_state["prLinked"], false);
+    assert_eq!(
+        final_state["prUrl"],
+        "https://github.com/fork/fixture/pull/42"
+    );
+    assert!(
+        final_state["error"]
+            .as_str()
+            .unwrap()
+            .contains("Thread thread was not found.")
+    );
+    assert!(
+        final_state["progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["kind"] == "failed")
     );
 }
 

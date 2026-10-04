@@ -46,6 +46,7 @@ impl Harness for SmokeHarness {
         let session_id = uuid::Uuid::new_v4().to_string();
         Ok(futures::stream::iter([
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Codex,
                 model: "smoke-1".into(),
                 tools: vec![],

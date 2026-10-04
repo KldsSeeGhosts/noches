@@ -1274,6 +1274,10 @@ impl AppState {
 
     // ---- reducers (pure) ----
 
+    pub fn chat_lifecycle(&self, chat_id: &str) -> Option<&zeron_proto::ChatLifecycle> {
+        self.thread_lifecycles.get(chat_id)
+    }
+
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
@@ -2224,9 +2228,6 @@ impl AppState {
         }
     }
 
-    pub fn chat_lifecycle(&self, chat_id: &str) -> Option<&zeron_proto::ChatLifecycle> {
-        self.thread_lifecycles.get(chat_id)
-    }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         // O(1): the index is rebuilt wherever `sessions` is replaced, and the
@@ -2401,6 +2402,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.thread_lifecycles.clear();
         self.replace_sessions(Vec::new());
         self.session_presentation = None;
         self.selected_space = None;
@@ -2532,6 +2534,18 @@ impl AppState {
                 AppState::apply_sessions,
             ),
             spawn_chats_watch(cx, handle.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_THREAD_LIFECYCLES,
+                |state, value: HashMap<String, zeron_proto::ChatLifecycle>| {
+                    if state.thread_lifecycles == value {
+                        return false;
+                    }
+                    state.thread_lifecycles = value;
+                    true
+                },
+            ),
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -4293,6 +4307,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -5307,6 +5322,7 @@ mod tests {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
         let config = zeron_proto::ChatConfig {
+            instance_id: None,
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
@@ -5333,6 +5349,7 @@ mod tests {
         state.apply_chat_config(
             "missing",
             zeron_proto::ChatConfig {
+                instance_id: None,
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,

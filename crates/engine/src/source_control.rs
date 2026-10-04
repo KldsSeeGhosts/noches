@@ -79,6 +79,8 @@ pub enum ChangeRequestError {
     Decode,
     #[error("GitHub request failed")]
     CommandFailed,
+    #[error("GitHub resource was not found")]
+    NotFound,
 }
 
 /// Provider boundary shared by the checkout badge and future source-control views.
@@ -193,6 +195,37 @@ impl GitHubCli {
 
     fn with_runner(runner: Arc<dyn ProcessRunner>) -> Self {
         Self { runner }
+    }
+
+    /// Bounded, noninteractive host read shared by orchestration PR tracking.
+    /// Explicit argv/host routing; no shell, writes, or repository transport.
+    pub async fn read_json(
+        &self,
+        cwd: &Path,
+        args: Vec<String>,
+    ) -> Result<serde_json::Value, ChangeRequestError> {
+        let output = self
+            .runner
+            .run(ProcessRequest {
+                program: "gh".into(),
+                args,
+                cwd: cwd.into(),
+                env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
+                timeout: GITHUB_TIMEOUT,
+                output_limit: GITHUB_OUTPUT_LIMIT,
+            })
+            .await
+            .map_err(classify_run_error)?;
+        if !output.success {
+            if String::from_utf8_lossy(&output.stderr).contains("(HTTP 404)") {
+                return Err(ChangeRequestError::NotFound);
+            }
+            return Err(classify_github_failure(&output.stderr));
+        }
+        if output.stdout_truncated {
+            return Err(ChangeRequestError::Decode);
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)
     }
 
     async fn list_for_selector(
@@ -1416,6 +1449,253 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         let source = source("feature/status", "acme", Some("main"));
         let (result, _) = resolve_with(&source, Err(ProcessRunError::Timeout)).await;
         assert_eq!(result.unwrap_err(), ChangeRequestError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn orchestration_pr_json_read_uses_explicit_host_and_bounded_noninteractive_runner() {
+        let runner = FakeProcessRunner::with_responses([command_success(
+            br#"{"data":{"viewer":{"login":"agent"}}}"#.to_vec(),
+        )]);
+        let github = GitHubCli::with_runner(runner.clone());
+        let args = vec![
+            "api".into(),
+            "graphql".into(),
+            "--hostname".into(),
+            "github.example".into(),
+            "-f".into(),
+            "query=query { viewer { login } }".into(),
+        ];
+        let result = github
+            .read_json(Path::new("/host-checkout"), args.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["data"]["viewer"]["login"], "agent");
+        let requests = runner.requests();
+        assert_eq!(requests[0].program, "gh");
+        assert_eq!(requests[0].args, args);
+        assert_eq!(requests[0].cwd, Path::new("/host-checkout"));
+        assert_eq!(requests[0].env, [("GH_PROMPT_DISABLED".into(), "1".into())]);
+        assert_eq!(requests[0].timeout, GITHUB_TIMEOUT);
+        assert_eq!(requests[0].output_limit, GITHUB_OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn orchestration_pr_json_read_distinguishes_stack_404_from_transient_failure() {
+        let runner = FakeProcessRunner::with_responses([
+            command_failure("gh: Not Found (HTTP 404)"),
+            command_failure("private internals, service unavailable (HTTP 503)"),
+            Ok(ProcessOutput {
+                success: true,
+                stdout: b"{}".to_vec(),
+                stderr: vec![],
+                stdout_truncated: true,
+            }),
+        ]);
+        let github = GitHubCli::with_runner(runner);
+        assert_eq!(
+            github
+                .read_json(Path::new("/repo"), vec![])
+                .await
+                .unwrap_err(),
+            ChangeRequestError::NotFound
+        );
+        let failure = github
+            .read_json(Path::new("/repo"), vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(failure, ChangeRequestError::CommandFailed);
+        assert!(!failure.to_string().contains("private"));
+        assert_eq!(
+            github
+                .read_json(Path::new("/repo"), vec![])
+                .await
+                .unwrap_err(),
+            ChangeRequestError::Decode
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_activity_degrades_thread_failure_without_losing_check_read() {
+        let runner = FakeProcessRunner::with_responses([
+            command_success(br#"{"comments":[{"id":"IC_1","body":"new","createdAt":"2026-10-02T12:01:00Z"}],"reviews":[]}"#.to_vec()),
+            command_failure("GraphQL temporarily unavailable"),
+        ]);
+        let cli = GitHubCli::with_runner(runner.clone());
+        let target = crate::orchestration::pull_requests::Identity {
+            host: "github.enterprise".into(),
+            repository: "acme/web".into(),
+            number: 7,
+            url: "https://github.enterprise/acme/web/pull/7".into(),
+        };
+        let remarks = crate::orchestration::pull_requests::activity::read(
+            &cli,
+            Path::new("/checkout"),
+            &target,
+        )
+        .await
+        .unwrap();
+        assert!(
+            remarks.is_none(),
+            "failed review-thread read defers every remark"
+        );
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            [
+                "pr",
+                "view",
+                "7",
+                "--repo",
+                "github.enterprise/acme/web",
+                "--json",
+                "author,comments,reviews,commits"
+            ]
+        );
+        assert_eq!(
+            &requests[1].args[..4],
+            ["api", "graphql", "--hostname", "github.enterprise"]
+        );
+        assert!(
+            requests[1]
+                .args
+                .iter()
+                .any(|s| s.contains("comments(first:10)"))
+        );
+        assert!(
+            requests[1]
+                .args
+                .iter()
+                .any(|s| s.contains("reviewThreads(first:100"))
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_activity_thread_walk_follows_host_cursor_and_sorts_remarks() {
+        let core = br#"{"comments":[{"id":"IC_1","body":"new","createdAt":"2026-10-02T12:02:00Z"}],"reviews":[]}"#.to_vec();
+        let thread_page = |cursor: Option<&str>, id: &str, at: &str| {
+            command_success(serde_json::to_vec(&serde_json::json!({
+                "data":{"repository":{"pullRequest":{
+                    "reviewThreads":{
+                        "pageInfo":{"hasNextPage":cursor.is_some(),"endCursor":cursor},
+                        "nodes":[{"path":"src/lib.rs","comments":{
+                            "pageInfo":{"hasNextPage":false},
+                            "nodes":[{"id":id,"body":"line","createdAt":at,"author":{"login":"reviewer"}}]
+                        }}]
+                    },
+                    "reviewDismissals":{"nodes":[],"pageInfo":{"hasNextPage":false}}
+                }}}
+            })).unwrap())
+        };
+        let runner = FakeProcessRunner::with_responses([
+            command_success(core),
+            thread_page(Some("next-threads"), "RC_1", "2026-10-02T12:03:00Z"),
+            thread_page(None, "RC_2", "2026-10-02T12:01:00Z"),
+        ]);
+        let cli = GitHubCli::with_runner(runner.clone());
+        let target = crate::orchestration::pull_requests::Identity {
+            host: "github.com".into(),
+            repository: "acme/web".into(),
+            number: 7,
+            url: "https://github.com/acme/web/pull/7".into(),
+        };
+        let remarks = crate::orchestration::pull_requests::activity::read(
+            &cli,
+            Path::new("/checkout"),
+            &target,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            remarks.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["RC_2", "IC_1", "RC_1"]
+        );
+        assert_eq!(remarks[0].path.as_deref(), Some("src/lib.rs"));
+        assert!(
+            runner.requests()[2]
+                .args
+                .iter()
+                .any(|s| s == "cursor=next-threads")
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_pr_host_uses_summary_stack_listing_and_retains_avatar() {
+        use crate::orchestration::pull_requests::{
+            Identity,
+            host::{GitHubHost, PullRequestHost},
+        };
+        let response = serde_json::json!({"data":{
+            "viewer":{"login":"agent"},
+            "repository":{"pullRequest":{
+                "state":"OPEN","title":"PR","headRefName":"topic","baseRefName":"main",
+                "isDraft":false,"updatedAt":"2026-10-02T12:00:00Z",
+                "headRefOid":"aaa","mergeable":"MERGEABLE",
+                "additions":1,"deletions":0,"changedFiles":1,
+                "author":{"login":"author","avatarUrl":"https://github.com/avatar.png"}
+            }}
+        }});
+        let stack = serde_json::json!([{
+            "id":42,"number":3,"html_url":"https://github.com/acme/web/stacks/3",
+            "base":{"ref":"main"},"pull_requests":[
+                {"number":7,"head":{"ref":"topic"},"state":"open"},
+                {"number":8,"head":{"ref":"upper"},"state":"open"}
+            ]
+        }]);
+        let mut deleted_author = response.clone();
+        deleted_author["data"]["repository"]["pullRequest"]["author"] = serde_json::Value::Null;
+        let runner = FakeProcessRunner::with_responses([
+            command_success(serde_json::to_vec(&response).unwrap()),
+            command_success(serde_json::to_vec(&stack).unwrap()),
+            command_success(serde_json::to_vec(&deleted_author).unwrap()),
+            command_success(b"[]".to_vec()),
+        ]);
+        let host = GitHubHost::with_cli(GitHubCli::with_runner(runner.clone()));
+        let read = host
+            .read(
+                Path::new("/checkout"),
+                &Identity {
+                    host: "github.com".into(),
+                    repository: "acme/web".into(),
+                    number: 7,
+                    url: "https://github.com/acme/web/pull/7".into(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!read.stack_read_failed);
+        assert_eq!(read.stack.unwrap().layers.len(), 2);
+        assert_eq!(
+            serde_json::to_value(read.snapshot).unwrap()["author"]["avatarUrl"],
+            "https://github.com/avatar.png"
+        );
+        assert_eq!(
+            runner.requests().len(),
+            2,
+            "sync must not request stack details"
+        );
+        assert_eq!(
+            runner.requests()[1].args.last().unwrap(),
+            "repos/acme/web/stacks?pull_request=7"
+        );
+        let deleted = host
+            .read(
+                Path::new("/checkout"),
+                &Identity {
+                    host: "github.com".into(),
+                    repository: "acme/web".into(),
+                    number: 7,
+                    url: "https://github.com/acme/web/pull/7".into(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(deleted.snapshot).unwrap()["author"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]

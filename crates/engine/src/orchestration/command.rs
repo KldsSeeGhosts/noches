@@ -42,6 +42,11 @@ pub enum Operation {
     /// Trusted ordinary-session admission updates the next turn's binding.
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
+    Transfer(Box<super::transfer::TransferOperation>),
+    Queue(Box<super::queue::QueueCommand>),
+    Thread(Box<super::threads::planner::ThreadOperation>),
+    Launch(Box<super::launch::LaunchOperation>),
+    PullRequest(Box<super::pull_requests::PrOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +85,9 @@ impl Command {
         if let Operation::Task(operation) = &self.operation {
             threads.extend(operation.lock_threads(&self.id));
         }
+        if let Operation::Transfer(operation) = &self.operation {
+            threads.extend(operation.lock_threads());
+        }
         threads
     }
 
@@ -96,6 +104,11 @@ impl Command {
             Operation::Recover => "kernel.runtime.recover".into(),
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
+            Operation::Transfer(operation) => operation.command_type().into(),
+            Operation::Queue(operation) => operation.command_type().into(),
+            Operation::Thread(operation) => operation.command_type().into(),
+            Operation::Launch(_) => "launch.workflow".into(),
+            Operation::PullRequest(operation) => operation.command_type().into(),
         })
     }
 }
@@ -108,6 +121,9 @@ pub(crate) struct Plan {
     pub adoption: Option<String>,
     pub routed_effects: Vec<(ThreadId, EffectRequest)>,
     pub cancel_threads: Vec<ThreadId>,
+    pub queue_lifecycle: Option<serde_json::Value>,
+    pub queue_intents: Option<Vec<zeron_doc::QueuedMessage>>,
+    pub queue_patch: Option<serde_json::Value>,
 }
 
 impl Plan {
@@ -408,8 +424,23 @@ fn provider_batch(
 }
 
 pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Plan> {
+    if let Operation::Queue(operation) = &command.operation {
+        return super::queue::plan(conn, command, operation, now);
+    }
+    if let Operation::Thread(operation) = &command.operation {
+        return super::threads::planner::plan(conn, command, operation, now);
+    }
+    if let Operation::Launch(operation) = &command.operation {
+        return super::launch::planner::plan(conn, command, operation, now);
+    }
+    if let Operation::PullRequest(operation) = &command.operation {
+        return super::pull_requests::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
+    }
+    if let Operation::Transfer(operation) = &command.operation {
+        return super::transfer::plan(conn, command, operation, now);
     }
     let projection = projection::read_thread(conn, &command.thread_id)?;
     let mut plan = Plan::default();
@@ -518,6 +549,11 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
                     } else {
                         "thread.model-selection-updated"
                     }
+                }
+                OrchestrationV2Command::ProviderSwitch(set) => {
+                    thread.provider_instance_id = set.model_selection.instance_id.clone();
+                    thread.model_selection = set.model_selection.clone();
+                    "thread.provider-switched"
                 }
                 OrchestrationV2Command::ThreadUnarchive(_) => {
                     thread.archived_at = None;
@@ -696,8 +732,13 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
             }
             plan.emit(command, "thread.metadata-updated", thread, now)?;
         }
+        Operation::Launch(_) => unreachable!("launch planner routed above"),
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
+        Operation::Transfer(_) => unreachable!("routed before the kernel subset"),
+        Operation::Queue(_) => unreachable!("routed before the kernel subset"),
+        Operation::Thread(_) => unreachable!("routed before the kernel subset"),
+        Operation::PullRequest(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

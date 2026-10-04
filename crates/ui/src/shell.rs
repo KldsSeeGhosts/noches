@@ -12562,6 +12562,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

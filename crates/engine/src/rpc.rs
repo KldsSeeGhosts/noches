@@ -91,7 +91,10 @@ struct ChatParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
-    harness: HarnessId,
+    #[serde(default)]
+    harness: Option<HarnessId>,
+    #[serde(default)]
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,6 +593,7 @@ enum MutateParams {
 
 pub struct EngineRpc {
     git_actions: Option<crate::orchestration::git_actions::GitActionsService>,
+    launch: Option<std::sync::Arc<crate::orchestration::launch::HostLaunchService>>,
     orchestration: Option<crate::orchestration::Store>,
     delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
     scheduler: Option<std::sync::Arc<crate::orchestration::scheduler::Scheduler>>,
@@ -643,6 +647,7 @@ impl EngineRpc {
         Self {
             git_actions: None,
             orchestration: None,
+            launch: None,
             delegation: None,
             scheduler: None,
             sessions,
@@ -705,6 +710,14 @@ impl EngineRpc {
         scheduler: std::sync::Arc<crate::orchestration::scheduler::Scheduler>,
     ) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_launch(
+        mut self,
+        service: std::sync::Arc<crate::orchestration::launch::HostLaunchService>,
+    ) -> Self {
+        self.launch = Some(service);
         self
     }
 
@@ -1247,6 +1260,17 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
+            | methods::LIST_PROVIDER_INSTANCES
+            | methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED
+            | methods::ORGANIZE_THREAD
+            | methods::ACKNOWLEDGE_THREAD_WOKE
+            | methods::GET_QUEUE_STATE
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1585,6 +1609,19 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        let mut params = params;
+        // Lifecycle commands keep the concise {chatId,...} desktop contract;
+        // the registry selects the owner, just as the queue UI does explicitly.
+        if matches!(
+            method,
+            methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE
+        ) && params.get("targetDeviceId").is_none()
+            && let Some(chat) = params["chatId"]
+                .as_str()
+                .and_then(|id| self.workspace.chat(id).ok().flatten())
+        {
+            params["targetDeviceId"] = serde_json::json!(chat.device_id);
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -1670,6 +1707,71 @@ impl RpcService for EngineRpc {
             None
         };
         match method {
+            methods::WATCH_THREAD_LIFECYCLES => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_thread_lifecycles(),
+            ))),
+            methods::GET_QUEUE_STATE => {
+                let p: ChatParams = parse_params(params)?;
+                let state = if self.doc_host.is_host(&p.chat_id)
+                    && let Some(store) = &self.orchestration
+                    && store
+                        .thread(&p.chat_id.clone().into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_some()
+                {
+                    serde_json::to_value(
+                        store
+                            .queue_ui_state(&p.chat_id.into())
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    self.doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .doc()
+                        .orchestration()["projection"]["uiState"]["queueState"]
+                        .clone()
+                };
+                RpcReply::value(&state)
+            }
+            methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    #[serde(default)]
+                    action: Option<String>,
+                    #[serde(default)]
+                    snoozed_until: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                if !self.doc_host.is_host(&p.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Thread lifecycle mutations require the owning host.".into(),
+                    ));
+                }
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Thread organization is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                let mut input = serde_json::json!({"threadId":p.chat_id,"action":p.action});
+                if let Some(time) = p.snoozed_until {
+                    input["snoozedUntil"] = serde_json::json!(time);
+                }
+                let result = domain
+                    .organize_for_user(
+                        &self.workspace,
+                        &self.doc_host,
+                        &self.registry,
+                        &p.chat_id,
+                        input,
+                        method == methods::ACKNOWLEDGE_THREAD_WOKE,
+                    )
+                    .await
+                    .map_err(|error| RpcError::Failed(error.message))?;
+                RpcReply::value(&result)
+            }
             method if crate::orchestration::ui_scheduler::is_method(method) => {
                 let service = self.scheduler.as_ref().ok_or_else(|| {
                     RpcError::Failed("Scheduled tasks are unavailable on this host.".into())
@@ -1677,8 +1779,45 @@ impl RpcService for EngineRpc {
                 crate::orchestration::ui_scheduler::dispatch(service, method, params).await
             }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::GET_THREAD_TRANSFER_STATE
+            | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
+            | methods::RESTORE_FILE_CHECKPOINT => {
+                crate::orchestration::ui_transfer::rpc(
+                    self.orchestration.as_ref(),
+                    method,
+                    params,
+                    &self.sessions,
+                )
+                .await
+            }
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())
+            }
+            methods::GET_THREAD_SUMMARIES => {
+                let input: zeron_proto::orchestration_threads::ThreadSummariesRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_summaries(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_THREAD_TIMELINE => {
+                let input: zeron_proto::orchestration_threads::ThreadTimelineRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_timeline(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
             }
             methods::CANCEL_DELEGATED_TASK => {
                 #[derive(Deserialize)]
@@ -1719,12 +1858,92 @@ impl RpcService for EngineRpc {
                 };
                 RpcReply::value(&state)
             }
+            methods::LIST_LAUNCH_PROJECTS => {
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                RpcReply::value(
+                    &store
+                        .launch_projects()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_LAUNCH_STATE => {
+                let p: zeron_proto::launch::LaunchReadParams = parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                RpcReply::value(
+                    &store
+                        .launch_state(&p.chat_id.into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::CONTROL_WORKTREE_SETUP => {
+                let p: zeron_proto::launch::SetupControlParams = parse_params(params)?;
+                let service = self
+                    .launch
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                service
+                    .setup_control(p)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.message))?;
+                RpcReply::value(&serde_json::json!({"accepted":true}))
+            }
+            methods::GET_THREAD_PULL_REQUESTS => {
+                let p: ChatParams = parse_params(params)?;
+                let state = if let Some(store) = &self.orchestration
+                    && store
+                        .thread(&p.chat_id.clone().into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_some()
+                {
+                    store
+                        .ui_pull_requests(&p.chat_id.into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    let value = self
+                        .doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .doc()
+                        .orchestration()["projection"]["uiState"]["pullRequests"]
+                        .clone();
+                    if value.is_null() {
+                        zeron_proto::pull_requests::ThreadPullRequestsUi {
+                            thread_id: p.chat_id,
+                            ..Default::default()
+                        }
+                    } else {
+                        serde_json::from_value(value)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?
+                    }
+                };
+                RpcReply::value(&state)
+            }
             methods::LIST_PROVIDER_INSTANCES => {
                 self.registry
                     .provider_instances
                     .refresh_all(&self.registry)
                     .await;
                 RpcReply::value(&self.registry.provider_instances.snapshot(&self.registry))
+            }
+            methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED => {
+                crate::orchestration::ui_provider_instances::dispatch(
+                    &self.registry,
+                    &self.sessions,
+                    method,
+                    params,
+                )
+                .await
             }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
@@ -1745,18 +1964,70 @@ impl RpcService for EngineRpc {
                     zeron_harness::AcpHarness::antigravity().sign_out(),
                 )
                 .await?;
+                // Compatibility UI toggles control the canonical identity,
+                // never all accounts/routes of the same driver.
+                let instance_id = crate::provider_instances::legacy_instance_id(p.harness);
+                if self
+                    .registry
+                    .provider_instances
+                    .config(&instance_id)
+                    .is_some()
+                {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::SET_PROVIDER_INSTANCE_ENABLED,
+                        serde_json::json!({"instanceId":instance_id,"enabled":p.enabled}),
+                    )
+                    .await?;
+                } else if p.enabled {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::CREATE_PROVIDER_INSTANCE,
+                        serde_json::json!({"instanceId":instance_id,"instance":{
+                            "driver":crate::provider_instances::legacy_driver(p.harness),
+                            "enabled":true,"config":{"legacyCatalogImport":true}
+                        }}),
+                    )
+                    .await?;
+                }
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let models = self
-                    .registry
-                    .provider_instances
-                    .refresh(&self.registry, p.harness)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let models = if let Some(instance) = p.instance_id {
+                    if let Some(harness) = p.harness
+                        && self
+                            .registry
+                            .provider_instances
+                            .snapshot(&self.registry)
+                            .iter()
+                            .find(|p| p.provider_instance_id == instance)
+                            .is_some_and(|p| p.harness_id != Some(harness))
+                    {
+                        return Err(RpcError::Failed(
+                            "Provider instance/driver mismatch.".into(),
+                        ));
+                    }
+                    self.registry
+                        .provider_instances
+                        .refresh_instance(&self.registry, &instance)
+                        .await
+                } else {
+                    self.registry
+                        .provider_instances
+                        .refresh(
+                            &self.registry,
+                            p.harness.ok_or_else(|| {
+                                RpcError::Failed("harness or instanceId is required.".into())
+                            })?,
+                        )
+                        .await
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
@@ -1767,9 +2038,27 @@ impl RpcService for EngineRpc {
                 // no listing (cursor, mock) fall through to the trait's
                 // empty default.
                 let p: ListModelsParams = parse_params(params)?;
+                if let (Some(instance), Some(harness)) = (&p.instance_id, p.harness)
+                    && self
+                        .registry
+                        .provider_instances
+                        .snapshot(&self.registry)
+                        .iter()
+                        .find(|p| &p.provider_instance_id == instance)
+                        .is_some_and(|p| p.harness_id != Some(harness))
+                {
+                    return Err(RpcError::Failed(
+                        "Provider instance/driver mismatch.".into(),
+                    ));
+                }
+                let instance = p
+                    .instance_id
+                    .or_else(|| p.harness.map(crate::provider_instances::legacy_instance_id))
+                    .ok_or_else(|| RpcError::Failed("harness or instanceId is required.".into()))?;
                 let harness = self
                     .registry
-                    .resolve(p.harness)
+                    .provider_instances
+                    .resolve_runtime(&self.registry, &instance, false)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
                     .commands()

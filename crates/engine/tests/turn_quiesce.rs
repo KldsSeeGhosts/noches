@@ -49,6 +49,7 @@ fn init_quiesce_env() {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -76,6 +77,7 @@ fn done(status: DoneStatus) -> AgentEvent {
 
 fn session_started() -> AgentEvent {
     AgentEvent::SessionStarted {
+        instance_id: None,
         harness: HarnessId::Mock,
         model: "mock-1".into(),
         tools: vec![],

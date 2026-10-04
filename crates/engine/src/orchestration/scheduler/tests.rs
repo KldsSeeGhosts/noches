@@ -186,6 +186,148 @@ fn tool(name: &str, args: Value) -> OrchestrationToolInput {
     serde_json::from_value(json!({"name":name,"arguments":args})).unwrap()
 }
 
+struct ThreadTargets;
+#[async_trait]
+impl crate::orchestration::task::DelegationTargets for ThreadTargets {
+    async fn resolve(
+        &self,
+        parent: &OrchestrationV2AppThread,
+        target: Option<&zeron_proto::orchestration_mcp::DelegateTaskInputTarget>,
+    ) -> std::result::Result<
+        crate::orchestration::task::ResolvedTarget,
+        crate::orchestration::service::ToolError,
+    > {
+        let mut selection = parent.model_selection.clone();
+        if let Some(model) = target.and_then(|t| t.model.as_ref()) {
+            selection.model = model.clone();
+        }
+        Ok(crate::orchestration::task::ResolvedTarget {
+            selection,
+            driver: "mock".into(),
+        })
+    }
+}
+
+fn thread_dispatch(kernel: Kernel) -> Arc<dispatch::ThreadDispatch> {
+    let threads = Arc::new(crate::orchestration::threads::KernelThreadService {
+        delegation: Arc::new(crate::orchestration::task::DelegationService {
+            kernel: kernel.clone(),
+            targets: Arc::new(ThreadTargets),
+        }),
+        kernel: kernel.clone(),
+    });
+    Arc::new(dispatch::ThreadDispatch {
+        store: kernel.store,
+        threads,
+        launch: None,
+    })
+}
+
+#[tokio::test]
+async fn bound_thread_dispatch_replays_lost_acceptance_once_with_current_binding_and_provenance() {
+    let f = Fixture::new();
+    f.parent();
+    f.set_parent(|t| t.worktree_path = Some("/repo/current-checkout".into()));
+    let mut input = f.input("host-dispatch", json!({"type":"interval","everyMs":60_000}));
+    input.created_by = Optional::Present(OrchestrationV2Actor::System);
+    input.creation_source = Optional::Present(OrchestrationV2CreationSource::Server);
+    input.model_selection.model = "scheduled-model".into();
+    f.scheduler.upsert(input).unwrap();
+    let kernel = f.kernel.clone();
+    let path = f._dir.path().to_owned();
+    *f.recorder.hook.lock().unwrap() = Some(Arc::new(move |run| {
+        let kernel = kernel.clone();
+        let path = path.clone();
+        Box::pin(async move {
+            kernel.store.inject_failure(WriteBoundary::AfterCommit, 1);
+            assert!(thread_dispatch(kernel).dispatch(run.clone()).await.is_err());
+            // Fresh service/store after an uncertain committed acceptance.
+            // Replay the durable claim identities, not a new manual run.
+            let restarted = Kernel::open(Arc::new(DocsStore::open(path).unwrap()), "host").unwrap();
+            thread_dispatch(restarted.clone())
+                .dispatch(run.clone())
+                .await?;
+            let p = restarted.store.thread(&"parent".into()).unwrap().unwrap();
+            let messages = crate::orchestration::task::records(&p, "message");
+            let messages: Vec<_> = messages
+                .iter()
+                .filter(|m| m["id"] == run.message_id.0)
+                .collect();
+            assert_eq!(messages.len(), 1);
+            let m = messages[0];
+            assert_eq!(m["scheduledTaskId"], "host-dispatch");
+            assert_eq!(m["createdBy"], "system");
+            assert_eq!(m["creationSource"], "server");
+            assert!(m["senderThreadId"].is_null());
+            let accepted = p.runs.iter().find(|r| m["runId"] == r.id.0).unwrap();
+            assert_eq!(accepted.model_selection.model, "scheduled-model");
+            assert_eq!(
+                p.thread.worktree_path.as_deref(),
+                Some("/repo/current-checkout")
+            );
+            assert_eq!(accepted.status, OrchestrationV2RunStatus::Queued);
+            Ok(())
+        })
+    }));
+    assert_eq!(
+        f.scheduler
+            .run_now(&"host-dispatch".into())
+            .await
+            .unwrap()
+            .last_run_status,
+        ScheduledTaskRunStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn thread_dispatch_revalidates_paused_or_deleted_claim_before_intake() {
+    for deleted in [false, true] {
+        let f = Fixture::new();
+        f.parent();
+        f.due("revalidate", 0);
+        let scheduler = f.scheduler.clone();
+        let adapter = thread_dispatch(f.kernel.clone());
+        *f.recorder.hook.lock().unwrap() = Some(Arc::new(move |run| {
+            if deleted {
+                scheduler.delete(&run.task.id).unwrap();
+            } else {
+                scheduler
+                    .mutate(&run.task.id, "test", |old, _| {
+                        let mut task = old.unwrap();
+                        task.enabled = false;
+                        Ok(task)
+                    })
+                    .unwrap();
+            }
+            let adapter = adapter.clone();
+            Box::pin(async move {
+                assert!(adapter.dispatch(run).await.is_err());
+                Err("Refused before intake.".into())
+            })
+        }));
+        f.scheduler.tick().await.unwrap();
+        let p = f.kernel.store.thread(&"parent".into()).unwrap().unwrap();
+        assert!(crate::orchestration::task::records(&p, "message").is_empty());
+        assert_eq!(f.claims()[0].2, "failed");
+    }
+}
+
+#[tokio::test]
+async fn unbound_thread_dispatch_is_unavailable_without_installed_launch() {
+    let f = Fixture::new();
+    let mut input = f.input("unbound", json!({"type":"interval","everyMs":60_000}));
+    input.thread_id = Optional::Present(None);
+    f.scheduler.upsert(input).unwrap();
+    f.scheduler
+        .set_dispatcher(thread_dispatch(f.kernel.clone()));
+    let task = f.scheduler.run_now(&"unbound".into()).await.unwrap();
+    assert_eq!(task.last_run_status, ScheduledTaskRunStatus::Failed);
+    assert_eq!(
+        task.last_run_error.as_deref(),
+        Some("The operation could not be completed.")
+    );
+}
+
 #[test]
 fn parse_times() {
     assert_eq!(schedule::parse_time("09:30"), Some((9, 30)));

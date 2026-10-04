@@ -95,6 +95,7 @@ impl Harness for Mock {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             tx.send(Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 session_id: uuid::Uuid::new_v4().to_string(),
                 harness: HarnessId::Mock,
                 model: request.model.clone().unwrap(),
@@ -264,7 +265,7 @@ async fn e2e(steer: bool) {
             Some(dir.path().display().to_string()),
         )
         .unwrap();
-    let request = serde_json::from_value(json!({"prompt":"delegate parent","model":"cpa/exact/custom-model",
+    let request = serde_json::from_value(json!({"instanceId":"parent","prompt":"delegate parent","model":"cpa/exact/custom-model",
         "reasoning":null,"cwd":dir.path(),"sandbox":"workspace-write","runtimeMode":"auto","resume":null})).unwrap();
     core.sessions
         .dispatch("parent", HarnessId::Mock, request, None)
@@ -330,7 +331,7 @@ async fn e2e(steer: bool) {
             .contains(&if steer { "steer wake" } else { "queued wake" }.to_string())
     );
     if steer {
-        let next: RunRequest = serde_json::from_value(json!({"prompt":"second parent","model":"cpa/exact/custom-model",
+        let next: RunRequest = serde_json::from_value(json!({"instanceId":"parent","prompt":"second parent","model":"cpa/exact/custom-model",
             "reasoning":null,"cwd":dir.path(),"sandbox":"workspace-write","runtimeMode":"auto","resume":null})).unwrap();
         core.sessions
             .dispatch("parent", HarnessId::Mock, next, None)

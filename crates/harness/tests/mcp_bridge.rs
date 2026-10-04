@@ -86,6 +86,24 @@ impl HttpStub {
                             .to_string(),
                             "",
                         )
+                    } else if matches!(
+                        message["params"]["name"].as_str(),
+                        Some("surrogate" | "surrogate_sse")
+                    ) {
+                        let result = format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"content":[{{"type":"text","text":"{{\"items\":[{{\"text\":\"\\ud83d\"}}]}}"}}],"structuredContent":{{"items":[{{"text":"\ud83d","nextTextOffset":1}}]}},"isError":false}}}}"#,
+                            message["id"]
+                        );
+                        if message["params"]["name"] == "surrogate_sse" {
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                format!("data: {result}\n\n"),
+                                "",
+                            )
+                        } else {
+                            ("200 OK", "application/json", result, "")
+                        }
                     } else {
                         assert!(initialized.load(std::sync::atomic::Ordering::SeqCst));
                         (
@@ -212,6 +230,68 @@ async fn cli_fallback_uses_authenticated_handshake_and_preserves_tool_content() 
     assert_eq!(result["content"][0]["text"], "HTTP_MCP_OK");
     assert_eq!(result["structuredContent"]["ok"], true);
     assert_eq!(result["isError"], false);
+}
+
+#[tokio::test]
+async fn cli_and_stdio_bridge_preserve_utf16_surrogate_slices_for_json_and_sse() {
+    for tool in ["surrogate", "surrogate_sse"] {
+        let stub = HttpStub::start().await;
+        let result = command(&stub)
+            .args(["acp-mcp-call", tool, "{}"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let raw = String::from_utf8(result.stdout).unwrap();
+        assert!(raw.contains(r#""text":"\ud83d""#), "{raw}");
+        assert!(raw.contains(r#"\"text\":\"\\ud83d\""#), "{raw}");
+        assert!(raw.contains(r#""nextTextOffset":1"#), "{raw}");
+        let mut child = command(&stub)
+            .arg("acp-mcp-bridge")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let request = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{{}}}}}}\n"
+        );
+        stdin.write_all(request.as_bytes()).await.unwrap();
+        let raw = tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(raw.contains(r#""text":"\ud83d""#), "{raw}");
+        assert!(raw.contains(r#"\"text\":\"\\ud83d\""#), "{raw}");
+        assert!(raw.contains(r#""id":2"#), "{raw}");
+        drop(stdin);
+        drop(stdout);
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[tokio::test]

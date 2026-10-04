@@ -1,38 +1,19 @@
-//! Durable thread parking: pin, snooze and settle (T3 `t3_thread_organize`).
-//!
-//! Kept beside, not on, [`crate::Chat`]: the registry row stays the same and
-//! a chat with no lifecycle entry is simply unpinned, awake and unsettled.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SettleSource {
-    User,
-    Auto,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ChatLifecycle {
-    /// Pinned when set; pinned rows sort by this instant, oldest first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<SettleSource>,
-    /// Set when a snooze elapses; cleared once the user acknowledges it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub woke_at: Option<DateTime<Utc>>,
 }
 
 impl ChatLifecycle {
     pub fn is_default(&self) -> bool {
-        *self == Self::default()
+        self == &Self::default()
     }
 
     pub fn pinned(&self) -> bool {
@@ -48,7 +29,59 @@ impl ChatLifecycle {
         self.settled_at.is_some()
     }
 
+    /// A snooze elapsed and the user has not acknowledged it yet.
     pub fn woke(&self) -> bool {
         self.woke_at.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettleSource {
+    User,
+    Auto,
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueUiState {
+    pub thread_id: String,
+    pub version: i64,
+    pub queue: Vec<QueueUiEntry>,
+    pub pending_questions: Vec<PendingQuestionUi>,
+    pub lifecycle: ChatLifecycle,
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueUiEntry {
+    pub queued_run_id: String,
+    pub message_id: String,
+    pub text: String,
+    pub attachments: Vec<serde_json::Value>,
+    pub attachment_paths: Vec<String>,
+    pub held: bool,
+    pub delivery_gate: Option<serde_json::Value>,
+    pub automatic: bool,
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PendingQuestionUi {
+    pub request_id: String,
+    pub questions: Vec<serde_json::Value>,
+    pub response_type: String,
+    pub answerable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn old_lifecycle_loads_with_defaults() {
+        let value: super::ChatLifecycle = serde_json::from_str("{}").unwrap();
+        assert!(value.is_default());
+        assert_eq!(
+            serde_json::to_value(super::SettleSource::User).unwrap(),
+            "User"
+        );
     }
 }

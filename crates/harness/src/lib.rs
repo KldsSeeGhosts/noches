@@ -15,6 +15,7 @@
 //! wires don't have (decision record: docs/research/acp.md).
 
 use async_trait::async_trait;
+pub mod instance;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
@@ -286,6 +287,9 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    fn session_lifecycle(&self) -> Option<&dyn session_lifecycle::SessionLifecycle> {
+        None
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. A filesystem probe, never a spawn.
@@ -366,6 +370,7 @@ pub mod policy;
 pub mod process;
 pub mod redact;
 mod scratch;
+pub mod session_lifecycle;
 pub mod shell_env;
 #[cfg(windows)]
 pub mod windows_process;

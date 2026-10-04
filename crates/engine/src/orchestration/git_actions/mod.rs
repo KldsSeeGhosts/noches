@@ -26,13 +26,30 @@ use crate::{DocHost, HarnessRegistry, Repos, SessionsEngine, Terminals, Workspac
 use persistence::{get, list, put};
 use process::{git, required, run};
 
-/// TODO(merge-pr-watch): adapt to the PR-watch slice's user-authority link API.
+/// Adapter boundary to the PR-watch slice's user-authority link API.
 /// A missing implementation is reported as link_pending, never a false success.
 #[async_trait]
 pub trait PullRequestLinker: Send + Sync {
     async fn link(&self, thread_id: &str, url: &str) -> anyhow::Result<()>;
 }
 
+pub struct UserPullRequestLinker(pub Arc<dyn super::pull_requests::PullRequestLinks>);
+
+#[async_trait]
+impl PullRequestLinker for UserPullRequestLinker {
+    async fn link(&self, thread_id: &str, url: &str) -> anyhow::Result<()> {
+        let target = super::pull_requests::identity::parse_url(url)
+            .ok_or_else(|| super::pull_requests::PrError::new("PullRequestUrlInvalidError"))?;
+        self.0
+            .link(
+                &zeron_proto::orchestration::ThreadId(thread_id.into()),
+                target,
+                zeron_proto::orchestration::ThreadPullRequestLinkSource::Created,
+            )
+            .await?;
+        Ok(())
+    }
+}
 #[derive(Debug, Clone)]
 pub struct CreatePullRequest {
     pub cwd: PathBuf,

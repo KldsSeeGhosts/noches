@@ -269,6 +269,7 @@ impl Tools {
             "MCP session creation cannot disable the sandbox"
         );
         let config = ChatConfig {
+            instance_id: None,
             harness,
             model: args.model,
             reasoning: args.reasoning,
@@ -514,6 +515,7 @@ impl Tools {
 
 fn run_request(config: &ChatConfig, cwd: &str, prompt: String) -> RunRequest {
     RunRequest {
+        instance_id: config.instance_id.clone(),
         prompt,
         harness: Some(config.harness),
         model: config.model.clone(),
