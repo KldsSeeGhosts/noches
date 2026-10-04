@@ -112,6 +112,7 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
     use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
     for title in [false, true] {
         let request = RunRequest {
+            instance_id: None,
             prompt: if title {
                 "scenario:title"
             } else {

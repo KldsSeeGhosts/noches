@@ -55,6 +55,7 @@ use zeron_proto::{
 
 use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, shutdown_child};
+mod lifecycle;
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -206,9 +207,11 @@ fn free_localhost_port() -> Option<u16> {
 // ---------------------------------------------------------------------------
 
 pub struct OpencodeHarness {
+    launch: crate::instance::InstanceLaunch,
     executable: Option<PathBuf>,
     /// Test seam: an already-running server (no spawn, no auth unless given).
     base_url: Option<String>,
+    server_password: Option<String>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     startup_timeout: Duration,
@@ -222,8 +225,10 @@ pub struct OpencodeHarness {
 impl Default for OpencodeHarness {
     fn default() -> Self {
         Self {
+            launch: Default::default(),
             executable: None,
             base_url: None,
+            server_password: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             startup_timeout: startup_timeout(),
@@ -239,6 +244,11 @@ impl OpencodeHarness {
         Self::default()
     }
 
+    pub fn with_instance_launch(mut self, launch: crate::instance::InstanceLaunch) -> Self {
+        self.launch = launch;
+        self
+    }
+
     /// Use a fixed binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
@@ -248,6 +258,11 @@ impl OpencodeHarness {
     /// Drive an already-running server (tests): no spawn, no basic auth.
     pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
         self.base_url = Some(base.into());
+        self
+    }
+
+    pub fn with_server_password(mut self, password: impl Into<String>) -> Self {
+        self.server_password = Some(password.into());
         self
     }
 
@@ -268,10 +283,19 @@ impl OpencodeHarness {
     /// they boot in the user's home, where global provider config lives.
     async fn server(&self, cwd: Option<&str>) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
-            return Ok(Server::attached(base.clone()));
+            let mut server = Server::attached(base.clone());
+            if let Some(password) = &self.server_password {
+                use base64::Engine;
+                server.auth = Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(format!("opencode:{password}"))
+                ));
+            }
+            return Ok(server);
         }
         let exe = self.resolve_executable()?;
-        Server::spawn(&exe, cwd, self.startup_timeout).await
+        Server::spawn(&exe, cwd, self.startup_timeout, &self.launch).await
     }
 
     /// One short-lived server answers both discovery calls. Also primes the
@@ -315,6 +339,9 @@ impl OpencodeHarness {
 
 #[async_trait]
 impl Harness for OpencodeHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::Opencode
     }
@@ -534,9 +561,14 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
         )
         .unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut server = Self::spawn(&exe, dir.path().to_str(), Duration::from_secs(5))
-            .await
-            .expect("both OpenCode password variables must match our Basic auth");
+        let mut server = Self::spawn(
+            &exe,
+            dir.path().to_str(),
+            Duration::from_secs(5),
+            &Default::default(),
+        )
+        .await
+        .expect("both OpenCode password variables must match our Basic auth");
         server.shutdown(Duration::from_millis(100)).await;
     }
 
@@ -570,6 +602,7 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
         exe: &std::path::Path,
         cwd: Option<&str>,
         startup: Duration,
+        launch: &crate::instance::InstanceLaunch,
     ) -> Result<Self, HarnessError> {
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
@@ -587,6 +620,10 @@ http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),H
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
         crate::compose_child_environment(&mut cmd, exe);
+        launch.apply_launch(&mut cmd);
+        // Server ownership credentials cannot be overridden by settings.
+        cmd.env("OPENCODE_PASSWORD", &password)
+            .env("OPENCODE_SERVER_PASSWORD", &password);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -1585,6 +1622,7 @@ async fn run_session(session: Session) {
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Opencode,
             model: request.model.clone().unwrap_or_default(),
             tools: Vec::new(),
@@ -2683,6 +2721,18 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 return BusOutcome::Continue;
             };
             if session == session_id {
+                if role == "user"
+                    && !send(
+                        event_tx,
+                        AgentEvent::NativeReference {
+                            thread_id: session.to_owned(),
+                            turn_id: Some(message.to_owned()),
+                        },
+                    )
+                    .await
+                {
+                    return BusOutcome::ConsumerGone;
+                }
                 main_feed
                     .assistant_messages
                     .entry(message.to_owned())

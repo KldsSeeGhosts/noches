@@ -34,6 +34,58 @@ fn orchestration_discovery_is_idempotent_monotonic_and_preserves_chat_fields() {
     assert_eq!(replica.orchestration_threads(), doc.orchestration_threads());
 }
 
+#[test]
+fn thread_lifecycle_map_syncs_separately_and_live_attention_cannot_be_hidden() {
+    let mut doc = RegistryDoc::new("host");
+    doc.upsert_chat(&chat("thread", "host")).unwrap();
+    let lifecycle = zeron_proto::ChatLifecycle {
+        pinned_at: Some(ts(10)),
+        snoozed_until: Some(ts(5000)),
+        settled_at: Some(ts(20)),
+        settled_by: Some(zeron_proto::SettleSource::User),
+        woke_at: Some(ts(30)),
+    };
+    let summary = json!({"id":"thread","title":"Renamed","archivedAt":null,"lastVisitedAt":"1970-01-01T00:00:00.009Z",
+        "hostId":"host","hostEpoch":1,"version":1,"lifecycle":lifecycle});
+    doc.set_chat_orchestration("thread", summary.clone())
+        .unwrap();
+    let replica = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "viewer").unwrap();
+    assert_eq!(replica.thread_lifecycles()["thread"], lifecycle);
+    assert_eq!(
+        replica.chat("thread").unwrap().unwrap().title.as_deref(),
+        Some("Renamed")
+    );
+    assert_eq!(
+        replica.chat("thread").unwrap().unwrap().last_seen_at,
+        Some(ts(9))
+    );
+    for status in [
+        SessionStatus::Working,
+        SessionStatus::AwaitingInput,
+        SessionStatus::Errored,
+    ] {
+        doc.upsert_session(&session("thread", "host", status))
+            .unwrap();
+        let live = doc.thread_lifecycles().remove("thread").unwrap();
+        assert!(live.snoozed_until.is_none());
+        assert!(live.settled_at.is_none());
+        assert!(live.settled_by.is_none());
+        assert_eq!(live.pinned_at, lifecycle.pinned_at);
+        assert_eq!(live.woke_at, lifecycle.woke_at);
+    }
+    doc.upsert_session(&session("thread", "host", SessionStatus::Idle))
+        .unwrap();
+    assert_eq!(doc.thread_lifecycles()["thread"], lifecycle);
+    doc.rename_chat("thread", "User rename").unwrap();
+    let mut unrelated = summary;
+    unrelated["version"] = json!(2);
+    doc.set_chat_orchestration("thread", unrelated).unwrap();
+    assert_eq!(
+        doc.chat("thread").unwrap().unwrap().title.as_deref(),
+        Some("User rename")
+    );
+}
+
 fn hlc(ms: i64) -> String {
     encode_hlc(ms, 0, "dev-a")
 }
@@ -285,6 +337,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         checkout_id: None,
         source_context: None,
         config: Some(ChatConfig {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: Some("mock-1".into()),
             reasoning: None,
@@ -298,6 +351,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         created_at: ts(2_000),
         harness_session_id: None,
         harness_session_cwd: None,
+        harness_session_instance_id: None,
         space_id: None,
         last_seen_at: None,
         room_gen: None,

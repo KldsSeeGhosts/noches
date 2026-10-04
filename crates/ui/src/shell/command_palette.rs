@@ -345,6 +345,7 @@ impl Shell {
                     ix == active,
                     false,
                     chat.archived,
+                    Default::default(),
                     None,
                     Some(&query),
                     None,

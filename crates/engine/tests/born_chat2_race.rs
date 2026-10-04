@@ -55,6 +55,7 @@ impl Harness for OneLinerHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -152,6 +153,7 @@ async fn transcript_survives_open_racing_create_chat() {
                 CHAT,
                 SessionCommandPayload::Run {
                     request: RunRequest {
+                        instance_id: None,
                         prompt: "what's the codeword?".into(),
                         harness: None,
                         model: None,

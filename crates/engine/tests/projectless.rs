@@ -60,6 +60,7 @@ impl Harness for RecordingHarness {
             .push(request.clone());
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -283,6 +284,7 @@ async fn exercise_projectless(command_first: bool) {
                 CHAT,
                 SessionCommandPayload::Run {
                     request: RunRequest {
+                        instance_id: None,
                         prompt: "hello from no project".into(),
                         harness: None,
                         model: None,

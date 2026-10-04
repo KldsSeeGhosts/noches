@@ -19,9 +19,16 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
+pub mod details;
 pub mod device_room;
+pub mod git_actions;
+pub mod launch;
+pub mod provider_instances;
+pub mod pull_requests;
 pub mod remote;
+pub mod scheduled_tasks;
 mod server;
+mod threads;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -34,14 +41,38 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const ORGANIZE_THREAD: &str = "OrganizeThread";
+    pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
+    pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
+    pub const GET_QUEUE_STATE: &str = "GetQueueState";
+    pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
+    pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
+    pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";
+    pub const GET_LAUNCH_STATE: &str = "GetLaunchState";
+    pub const CONTROL_WORKTREE_SETUP: &str = "ControlWorktreeSetup";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
+    /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
+    pub const GET_THREAD_TRANSFER_STATE: &str = "GetThreadTransferState";
+    /// `{chatId,checkpointId}` -> RestorePreview. Does not change files.
+    pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
+    /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.
+    pub const RESTORE_FILE_CHECKPOINT: &str = "RestoreFileCheckpoint";
+    pub const GET_THREAD_PULL_REQUESTS: &str = "GetThreadPullRequests";
+    pub const CHANGE_THREAD_PULL_REQUEST: &str = "ChangeThreadPullRequest";
+    pub const HANDOFF_THREAD_WORKTREE: &str = "HandoffThreadWorktree";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
     /// `task_cancel` under host authority. Resolves on acceptance, not on the
     /// terminal state, which `GetOrchestrationState` reports.
     pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
+    pub const GET_PROVIDER_INSTANCE_SETTINGS: &str = "GetProviderInstanceSettings";
+    pub const CREATE_PROVIDER_INSTANCE: &str = "CreateProviderInstance";
+    pub const DUPLICATE_PROVIDER_INSTANCE: &str = "DuplicateProviderInstance";
+    pub const UPDATE_PROVIDER_INSTANCE: &str = "UpdateProviderInstance";
+    pub const DELETE_PROVIDER_INSTANCE: &str = "DeleteProviderInstance";
+    pub const SET_PROVIDER_INSTANCE_ENABLED: &str = "SetProviderInstanceEnabled";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);
@@ -250,7 +281,11 @@ pub struct ClientFrame {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerFrame {
     pub id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_json_value"
+    )]
     pub ok: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
@@ -258,6 +293,13 @@ pub struct ServerFrame {
     pub item: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub done: bool,
+}
+
+/// A present JSON null is a valid unary value, not a missing reply field.
+fn present_json_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// What a service returns for one invocation.
@@ -396,6 +438,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn null_unary_reply_is_distinct_from_an_absent_reply() {
+        let frame: ServerFrame =
+            serde_json::from_value(serde_json::json!({"id":1,"ok":null})).unwrap();
+        assert_eq!(frame.ok, Some(serde_json::Value::Null));
+        let frame: ServerFrame =
+            serde_json::from_value(serde_json::json!({"id":1,"done":true})).unwrap();
+        assert!(frame.ok.is_none());
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 pub(crate) mod catalog;
+mod lifecycle;
 mod mcp;
 mod normalize;
 mod subagents;
@@ -102,6 +103,8 @@ pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessErr
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
+    launch: crate::instance::InstanceLaunch,
+    authentication: std::sync::Mutex<Option<bool>>,
     executable: Option<PathBuf>,
     /// Grace between `turn/interrupt` and SIGTERM.
     interrupt_grace: Duration,
@@ -115,6 +118,8 @@ pub struct CodexHarness {
 impl Default for CodexHarness {
     fn default() -> Self {
         Self {
+            launch: Default::default(),
+            authentication: Default::default(),
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -126,6 +131,11 @@ impl Default for CodexHarness {
 impl CodexHarness {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_instance_launch(mut self, launch: crate::instance::InstanceLaunch) -> Self {
+        self.launch = launch;
+        self
     }
 
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
@@ -172,6 +182,7 @@ impl CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -225,6 +236,7 @@ impl CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -292,6 +304,25 @@ impl CodexHarness {
             {
                 let default_model = models.remove(index);
                 models.insert(0, default_model);
+            }
+            // Public readiness only. Do not retain/log account identities.
+            if let Ok(Ok(account)) = tokio::time::timeout(
+                Duration::from_millis(500),
+                client.request("account/read", json!({"refreshToken":false})),
+            )
+            .await
+            {
+                let authenticated = if account.get("account").is_some_and(|v| !v.is_null()) {
+                    Some(true)
+                } else {
+                    account["requiresOpenaiAuth"]
+                        .as_bool()
+                        .map(|required| !required)
+                };
+                *self
+                    .authentication
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = authenticated;
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
@@ -516,6 +547,9 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
 
 #[async_trait]
 impl Harness for CodexHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::Codex
     }
@@ -563,6 +597,13 @@ impl Harness for CodexHarness {
         }
     }
 
+    async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
+        Ok(*self
+            .authentication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
     /// Skills from a short-lived `skills/list` probe (see
     /// [`Self::discover_commands`]); cached on success.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
@@ -590,6 +631,24 @@ impl Harness for CodexHarness {
         request.attachments.clear();
         request.model_options.clear();
         request.auto_approve = false;
+        self.run_with_mode(request, controls, true).await
+    }
+
+    async fn run_source_control(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request
+            .model_options
+            .insert("_noches_source_control".into(), true.into());
+        request.auto_approve = false;
+        request.runtime_mode = zeron_proto::RuntimeMode::ApprovalRequired;
+        request.interaction_mode = zeron_proto::InteractionMode::Default;
         self.run_with_mode(request, controls, true).await
     }
 }
@@ -628,6 +687,7 @@ impl CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_environment(&mut cmd, &exe);
+        self.launch.apply_launch(&mut cmd);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -838,10 +898,13 @@ async fn run_session(session: Session) {
     let start_params = {
         let mut p = serde_json::Map::new();
         if title_only {
-            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
+            p.insert(
+                "baseInstructions".into(),
+                crate::restricted_text_instructions(&request).into(),
+            );
             p.insert(
                 "developerInstructions".into(),
-                crate::TITLE_INSTRUCTIONS.into(),
+                crate::restricted_text_instructions(&request).into(),
             );
             p.insert("ephemeral".into(), true.into());
             p.insert(
@@ -1012,6 +1075,7 @@ async fn run_session(session: Session) {
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Codex,
             model: request.model.clone().unwrap_or_default(),
             tools: Vec::new(),
@@ -1028,7 +1092,19 @@ async fn run_session(session: Session) {
 
     let mut router = TurnRouter::default();
     match start_turn(&client, turn_params(&request.prompt)).await {
-        Ok(id) => router.adopt_started(id),
+        Ok(id) => {
+            if !id.is_empty() {
+                let _ = send(
+                    &event_tx,
+                    AgentEvent::NativeReference {
+                        thread_id: thread_id.clone(),
+                        turn_id: Some(id.clone()),
+                    },
+                )
+                .await;
+            }
+            router.adopt_started(id);
+        }
         Err(e) => {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
@@ -1090,7 +1166,15 @@ async fn run_session(session: Session) {
                     }
                 }
                 match method.as_str() {
-                    "turn/started" => router.note_started(turn_id(&params)),
+                    "turn/started" => {
+                        let native_turn = turn_id(&params);
+                        if !native_turn.is_empty() {
+                            let _ = send(&event_tx, AgentEvent::NativeReference {
+                                thread_id: thread_id.clone(), turn_id: Some(native_turn.clone()),
+                            }).await;
+                        }
+                        router.note_started(native_turn);
+                    },
 
                     "item/agentMessage/delta" => {
                         streamed_text.insert(item_id(&params));

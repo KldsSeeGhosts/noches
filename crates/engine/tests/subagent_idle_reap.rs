@@ -40,6 +40,7 @@ fn init_env() {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -201,6 +202,7 @@ async fn park_after_spawn() -> Parked {
         .expect("dispatch");
 
     feed.send(AgentEvent::SessionStarted {
+        instance_id: None,
         harness: HarnessId::Mock,
         model: "mock-1".into(),
         tools: vec![],

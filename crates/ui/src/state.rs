@@ -751,6 +751,9 @@ pub fn canvas_panel_key(space_id: Option<&str>) -> String {
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
+/// See [`AppState::apply_lifecycle_fixture`].
+pub const LIFECYCLE_FIXTURE_ENV: &str = "NOCHES_LIFECYCLE_FIXTURE";
+
 pub struct AppState {
     pub remote_host: Option<String>,
     pub remote_connection: Option<zeron_rpc::remote::ConnectionState>,
@@ -778,6 +781,16 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Pin/snooze/settle parking per chat id. A chat without an entry is
+    /// unpinned, awake and unsettled.
+    pub thread_lifecycles: HashMap<String, zeron_proto::ChatLifecycle>,
+    /// Live scheduled tasks per owner device (see `crate::automations`).
+    pub automations: crate::automations::AutomationsStore,
+    /// F1 root-checkout pull policy/status, owner-routed.
+    pub git_actions: crate::git_store::GitStore,
+    /// Owner/chat keyed Details reads; refreshed on open and after mutations.
+    pub details: crate::details_data::DetailsStore,
+    pub history_import: crate::history_import::HistoryImportStore,
     sessions: Vec<Session>,
     /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
     /// ([`Self::replace_sessions`]) so [`Self::session_for`] is O(1) on the
@@ -975,6 +988,11 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            thread_lifecycles: HashMap::new(),
+            automations: Default::default(),
+            git_actions: Default::default(),
+            details: Default::default(),
+            history_import: Default::default(),
             sessions: Vec::new(),
             session_index: HashMap::new(),
             session_presentation: None,
@@ -1259,10 +1277,15 @@ impl AppState {
 
     // ---- reducers (pure) ----
 
+    pub fn chat_lifecycle(&self, chat_id: &str) -> Option<&zeron_proto::ChatLifecycle> {
+        self.thread_lifecycles.get(chat_id)
+    }
+
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
+        self.apply_lifecycle_fixture();
         // A new child chat or a parent's publication arrives as a chat row.
         self.nudge_delegation();
         self.transcript_cache
@@ -2171,6 +2194,44 @@ impl AppState {
         &self.sessions
     }
 
+    /// Headed-QA seam: `NOCHES_LIFECYCLE_FIXTURE` names a JSON object keyed by
+    /// chat TITLE (seeded ids are random) whose values are lifecycle records
+    /// with hour offsets from now: `{"pinnedHours", "snoozedHours",
+    /// "settledHours", "wokeHours"}`. Never set outside QA.
+    fn apply_lifecycle_fixture(&mut self) {
+        let Some(path) = std::env::var_os(LIFECYCLE_FIXTURE_ENV).filter(|p| !p.is_empty()) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(fixture) = serde_json::from_str::<HashMap<String, HashMap<String, f64>>>(&text)
+        else {
+            return;
+        };
+        let now = Utc::now();
+        let at = |hours: Option<&f64>| {
+            hours.map(|h| now + chrono::Duration::seconds((h * 3600.0) as i64))
+        };
+        for chat in &self.chats {
+            let Some(entry) = chat.title.as_ref().and_then(|title| fixture.get(title)) else {
+                continue;
+            };
+            self.thread_lifecycles
+                .entry(chat.id.clone())
+                .or_insert_with(|| zeron_proto::ChatLifecycle {
+                    pinned_at: at(entry.get("pinnedHours")),
+                    snoozed_until: at(entry.get("snoozedHours")),
+                    settled_at: at(entry.get("settledHours")),
+                    settled_by: entry
+                        .contains_key("settledHours")
+                        .then_some(zeron_proto::SettleSource::User),
+                    woke_at: at(entry.get("wokeHours")),
+                });
+        }
+    }
+
+
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         // O(1): the index is rebuilt wherever `sessions` is replaced, and the
         // field is private so no caller can bypass that.
@@ -2344,6 +2405,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.thread_lifecycles.clear();
         self.replace_sessions(Vec::new());
         self.session_presentation = None;
         self.selected_space = None;
@@ -2475,6 +2537,18 @@ impl AppState {
                 AppState::apply_sessions,
             ),
             spawn_chats_watch(cx, handle.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_THREAD_LIFECYCLES,
+                |state, value: HashMap<String, zeron_proto::ChatLifecycle>| {
+                    if state.thread_lifecycles == value {
+                        return false;
+                    }
+                    state.thread_lifecycles = value;
+                    true
+                },
+            ),
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -4236,6 +4310,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -5250,6 +5325,7 @@ mod tests {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
         let config = zeron_proto::ChatConfig {
+            instance_id: None,
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
@@ -5276,6 +5352,7 @@ mod tests {
         state.apply_chat_config(
             "missing",
             zeron_proto::ChatConfig {
+                instance_id: None,
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,

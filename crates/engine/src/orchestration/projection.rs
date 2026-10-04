@@ -106,6 +106,8 @@ pub(crate) fn read_thread(
                 "provider-session",
                 "provider-turn",
                 "runtime-request",
+                "checkpoint",
+                "checkpoint-scope",
             ] {
                 records.insert(kind.to_string(), read_records(conn, &thread_id.0, kind)?);
             }
@@ -185,6 +187,8 @@ pub(crate) fn apply_checked(
                     (TABLES[4], Some("context-transfer"))
                 }
                 "context-handoff.updated" => (TABLES[4], Some("context-handoff")),
+                "checkpoint.captured" => (TABLES[4], Some("checkpoint")),
+                "checkpoint-scope.created" => (TABLES[4], Some("checkpoint-scope")),
                 _ => {
                     return Err(Error::Invariant(format!(
                         "event outside kernel slice: {event_type}"

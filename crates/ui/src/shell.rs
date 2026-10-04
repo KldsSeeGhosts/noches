@@ -71,7 +71,9 @@ mod chat_rename;
 #[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
+mod details_binding;
 mod file_mutations;
+mod lifecycle;
 mod panes;
 mod project_icon;
 #[cfg(test)]
@@ -178,6 +180,8 @@ pub(crate) fn restore_mounted_focus(
 enum ChatMenuPage {
     Root,
     Copy,
+    /// Snooze presets, opened from the Root row or the row's hover clock.
+    Snooze,
 }
 
 #[derive(Clone)]
@@ -576,12 +580,20 @@ pub enum SettingsSection {
     Dictation,
     Shortcuts,
     Appshots,
+    /// Scheduled tasks (T3 P7): run now, pause, delete.
+    Automations,
+    Import,
     Archived,
     Updates,
 }
 
+/// Reuse the shell's identity fallback in engine-backed Settings project chips.
+pub(crate) fn project_monogram(name: &str, seed: &str, theme: &Theme) -> AnyElement {
+    project_icon::monogram(name, seed, false, theme)
+}
+
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 12] = [
+    pub const ALL: [SettingsSection; 14] = [
         SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
@@ -592,6 +604,8 @@ impl SettingsSection {
         SettingsSection::Dictation,
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
+        SettingsSection::Automations,
+        SettingsSection::Import,
         SettingsSection::Archived,
         SettingsSection::Updates,
     ];
@@ -610,6 +624,8 @@ impl SettingsSection {
             SettingsSection::Dictation => "Dictation",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
+            SettingsSection::Automations => "Automations",
+            SettingsSection::Import => "Import history",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Updates => "Updates",
         }
@@ -660,7 +676,11 @@ impl SettingsSection {
                 "working",
             ],
             SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
+            SettingsSection::Automations => {
+                &["schedule", "scheduled", "task", "cron", "recurring", "timer", "run"]
+            }
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
+            SettingsSection::Import => &["import", "cli", "history", "claude", "codex", "sessions"],
             SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
         }
     }
@@ -704,6 +724,8 @@ impl SettingsSection {
             SettingsSection::Dictation => "dictation",
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Appshots => "appshots",
+            SettingsSection::Automations => "automations",
+            SettingsSection::Import => "import",
             SettingsSection::Archived => "archived",
             SettingsSection::Updates => "updates",
         }
@@ -725,6 +747,8 @@ impl SettingsSection {
             "dictation" | "voice" => SettingsSection::Dictation,
             "shortcuts" => SettingsSection::Shortcuts,
             "appshots" => SettingsSection::Appshots,
+            "automations" | "scheduled-tasks" => SettingsSection::Automations,
+            "import" | "import-history" => SettingsSection::Import,
             "archived" => SettingsSection::Archived,
             "updates" => SettingsSection::Updates,
             _ => return None,
@@ -799,6 +823,9 @@ pub enum RightSurface {
     /// The chat's subagent inventory (Codex-style Agents panel) - one per
     /// panel key; lists Active and Done rows that open Subagent tabs.
     Agents,
+    /// Thread details (DESIGN-W3 §1): workspace, pull requests, automations
+    /// and checkpoints for the panel key's chat.
+    Details,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1847,6 +1874,7 @@ pub struct Shell {
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     /// Per-chat Agents-panel state: Previous open/closed and lineage paging.
     pub(crate) agents_ui: std::collections::HashMap<String, crate::subagents::PanelUi>,
+    pub(crate) details_ui: std::collections::HashMap<String, crate::details::DetailsUi>,
     /// The engine read/cancel API for delegated tasks (`ui-api.md`).
     delegation_api: std::sync::Arc<dyn crate::delegation::DelegationApi>,
     _delegation_sync: Task<()>,
@@ -1877,6 +1905,13 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     connections_page: Option<Entity<ConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    automations_page: Option<Entity<crate::settings::automations::AutomationsPage>>,
+    git_dialog: Option<Entity<crate::git_dialog::GitDialog>>,
+    git_dialog_events: Option<Subscription>,
+    details_dialog: Option<Entity<crate::details_dialog::DetailsDialog>>,
+    details_dialog_events: Option<Subscription>,
+    import_page: Option<Entity<crate::settings::import::ImportPage>>,
+    import_page_events: Option<Subscription>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2403,6 +2438,13 @@ impl Shell {
             devices_page: None,
             connections_page: None,
             archived_page: None,
+            automations_page: None,
+            git_dialog: None,
+            git_dialog_events: None,
+            details_dialog: None,
+            details_dialog_events: None,
+            import_page: None,
+            import_page_events: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -2505,6 +2547,7 @@ impl Shell {
             activation_sub: None,
             _ticker: ticker,
             agents_ui: Default::default(),
+            details_ui: Default::default(),
             delegation_api,
             _delegation_sync: delegation_sync,
             _state_observation: observation,
@@ -3137,6 +3180,7 @@ impl Shell {
                     )
                 }),
                 RightSurface::Agents => Some((*surface, "Agents".into(), false, None)),
+                RightSurface::Details => Some((*surface, "Details".into(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -3158,6 +3202,7 @@ impl Shell {
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
             | RightSurface::Agents
+            | RightSurface::Details
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -3252,6 +3297,11 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        // Passive owner reads on activation; never start a polling loop.
+        if matches!(surface, RightSurface::Details | RightSurface::Agents) {
+            self.state
+                .update(cx, |state, cx| state.refresh_details(&key, true, cx));
+        }
         match surface {
             RightSurface::Files => {
                 if let Some(files) = self.files.get(&key).cloned() {
@@ -3279,7 +3329,10 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Agents => {}
+            RightSurface::Subagent(_)
+            | RightSurface::Browser(_)
+            | RightSurface::Agents
+            | RightSurface::Details => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -4170,6 +4223,23 @@ impl Shell {
         }
     }
 
+    /// Open (or focus) the right pane's Details tab for the panel key's chat.
+    pub(crate) fn open_details_panel(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let tabs = self.right_tabs.entry(key).or_default();
+        if !tabs.contains(&RightSurface::Details) {
+            tabs.push(RightSurface::Details);
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        self.set_right_active(RightSurface::Details, cx);
+    }
+
+    fn details_panel_actions(&self, chat_id: String) -> crate::details::DetailsActions {
+        self.live_details_actions(chat_id)
+    }
+
     /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
     pub(crate) fn toggle_agents_panel(&mut self, cx: &mut Context<Self>) {
         let key = self.panel_key(cx);
@@ -4300,7 +4370,7 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Agents | RightSurface::Picker => {}
+            RightSurface::Agents | RightSurface::Details | RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -5104,6 +5174,18 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Automations => {
+                if self.automations_page.is_none() {
+                    let state = self.state.clone();
+                    self.automations_page = Some(cx.new(|cx| {
+                        crate::settings::automations::AutomationsPage::new(state, cx)
+                    }));
+                }
+                match &self.automations_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Archived => {
                 if self.archived_page.is_none() {
                     let state = self.state.clone();
@@ -5113,6 +5195,17 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::Import => {
+                if self.import_page.is_none() {
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| crate::settings::import::ImportPage::new(state, cx));
+                    self.import_page_events = Some(cx.subscribe(&page, |this, _, event: &crate::settings::import::OpenChat, cx| {
+                        this.open_chat(event.0.clone(), cx);
+                    }));
+                    self.import_page = Some(page);
+                }
+                self.import_page.as_ref().unwrap().clone().into_any_element()
             }
         }
     }
@@ -6715,6 +6808,8 @@ impl Shell {
             SettingsSection::Dictation => icons::MICROPHONE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
+            SettingsSection::Automations => icons::CALENDAR,
+            SettingsSection::Import => icons::DOCUMENT_ADD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Updates => icons::RESTART,
         };
@@ -6842,6 +6937,7 @@ impl Shell {
         // On screen in a pane that is not the focused one: the middle fill tier.
         visible: bool,
         archived: bool,
+        parking: lifecycle::RowParking,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
         // nine chips appear together instead of leaving a hole on whichever
@@ -6868,7 +6964,8 @@ impl Shell {
         };
         let corner_hovered = self.chat_status_hover.as_deref() == Some(row_id.as_str());
         let show_jump_hint = jump_label.is_some();
-        let show_archive = corner_hovered && !show_jump_hint;
+        // Hover actions take the corner's clock (live glyphs stay).
+        let show_actions = corner_hovered && !show_jump_hint;
         // One source of truth for state (status_palette.rs): send truth
         // overrides the engine's indicator, and the title weight, gutter bar,
         // icon, label and elapsed clock all read the same resolved state.
@@ -6898,6 +6995,8 @@ impl Shell {
             (session, elapsed)
         };
         let needs_you = session.needs_you();
+        // Running or needing the user: never parked, never settled from hover.
+        let live_state = session.running() || needs_you;
         // The gutter bar speaks the state hue: indigo under an awaiting
         // session, danger under a failed one.
         let needs_you_color = session.color(theme).unwrap_or(theme.danger);
@@ -6927,7 +7026,18 @@ impl Shell {
                     .child(label)
                     .into_any_element()
             }
-        } else if let Some(label) = session.label() {
+        } else if let Some(label) = session
+            .label()
+            // A parked row tells its parking story (wake / settled time)
+            // instead of the unseen-completion check; live states still win.
+            .filter(|_| {
+                live_state
+                    || (!show_actions
+                        && parking.snoozed_until.is_none()
+                        && parking.settled_at.is_none()
+                        && !parking.woke)
+            })
+        {
             // Every live state keeps a 12px glyph in its state hue.
             // Queued stays neutral; Working earns the clock.
             let color = session.color(theme).unwrap_or(theme.text_muted);
@@ -6983,7 +7093,7 @@ impl Shell {
                         .justify_center()
                         .child(glyph),
                 ));
-            if let Some(elapsed) = elapsed.filter(|_| !show_archive) {
+            if let Some(elapsed) = elapsed.filter(|_| !show_actions) {
                 slot = slot.child(
                     div()
                         .font_family(theme.font_mono.clone())
@@ -6996,18 +7106,167 @@ impl Shell {
                 );
             }
             slot.into_any_element()
-        } else if show_archive {
+        } else if parking.woke {
+            // A woken snooze keeps its signal until acknowledged. No new hue
+            // (rule 1): MEDIUM text and the alarm glyph carry it.
+            let woke_id = id.clone();
+            div()
+                .id(SharedString::from(format!("{row_id}-woke")))
+                .role(gpui::Role::Button)
+                .aria_label("Dismiss Woke notification")
+                .tooltip(crate::settings::widgets::text_tooltip_above(
+                    "Dismiss Woke notification",
+                ))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(16.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.acknowledge_woke(woke_id.clone(), cx);
+                }))
+                .child(icon(icons::BELL).size(px(12.0)).flex_none())
+                .child(SharedString::from("Woke"))
+                .into_any_element()
+        } else if show_actions {
             div().into_any_element()
         } else {
-            // Settled rows: the time is tertiary information - faint,
-            // regular weight, mono (rule 3), never competing with the title.
+            // Idle rows: the time is tertiary information - faint, regular
+            // weight, mono (rule 3), never competing with the title. Snoozed
+            // rows show when they come back; settled rows how long ago they
+            // wrapped up.
+            let label: SharedString = match (parking.snoozed_until, parking.settled_at) {
+                (Some(until), _) => lifecycle::wake_label(until, now).into(),
+                (None, Some(settled)) => format_time_ago(settled, now).into(),
+                (None, None) => time_ago.clone(),
+            };
             div()
                 .text_size(crate::typography::ui_rems(11.5))
                 .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
                 .font_family(theme.font_mono.clone())
-                .text_color(theme.text_faint)
-                .child(time_ago.clone())
+                .text_color(if parking.snoozed_until.is_some() {
+                    theme.text_muted
+                } else {
+                    theme.text_faint
+                })
+                .child(label)
                 .into_any_element()
+        };
+        // One quiet 20px icon button per hover action, in the archive pill's
+        // exact metrics. Every action stops propagation: it never selects the
+        // row or starts a drag.
+        let row_action = |key: &str, glyph: &'static str, label: &'static str| {
+            div()
+                .id(SharedString::from(format!("{row_id}-{key}")))
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .size(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .cursor_pointer()
+                .tooltip(crate::settings::widgets::text_tooltip_above(label))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
+        };
+        let actions: Vec<AnyElement> = if !show_actions || search_query.is_some() {
+            Vec::new()
+        } else if archived {
+            let archive_id = id.clone();
+            vec![
+                row_action(
+                    "archive",
+                    icons::ARCHIVE_UP_MINIMALISTIC,
+                    "Unarchive session",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_chat_archived(archive_id.clone(), false, cx);
+                }))
+                .into_any_element(),
+            ]
+        } else if parking.snoozed_until.is_some() {
+            let wake_id = id.clone();
+            vec![
+                row_action("wake", icons::ALARM_OFF, "Wake thread now")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.organize_chat(
+                            wake_id.clone(),
+                            lifecycle::OrganizeAction::Unsnooze,
+                            None,
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+            ]
+        } else if parking.settled_at.is_some() {
+            let unsettle_id = id.clone();
+            let archive_id = id.clone();
+            vec![
+                row_action("unsettle", icons::UNDO, "Un-settle thread")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.organize_chat(
+                            unsettle_id.clone(),
+                            lifecycle::OrganizeAction::Unsettle,
+                            None,
+                            cx,
+                        );
+                    }))
+                    .into_any_element(),
+                row_action("archive", icons::ARCHIVE_MINIMALISTIC, "Archive session")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_chat_archived(archive_id.clone(), true, cx);
+                    }))
+                    .into_any_element(),
+            ]
+        } else {
+            let snooze_id = id.clone();
+            let mut actions = vec![
+                row_action("snooze", icons::CLOCK_CIRCLE, "Snooze thread")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.chat_menu.open(ChatMenuState {
+                                chat_id: snooze_id.clone(),
+                                position: event.position,
+                                page: ChatMenuPage::Snooze,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+            ];
+            // Settling live work is not offered: it would park nothing.
+            if !live_state {
+                let settle_id = id.clone();
+                actions.push(
+                    row_action("settle", icons::CHECK, "Settle thread")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.organize_chat(
+                                settle_id.clone(),
+                                lifecycle::OrganizeAction::Settle,
+                                None,
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                );
+            }
+            actions
         };
         // A stable slot prevents title jitter on hover. Live glyphs never
         // disappear behind an action; only their elapsed clock yields.
@@ -7024,46 +7283,7 @@ impl Shell {
             .justify_end()
             .gap(px(5.0))
             .child(corner_body)
-            .when(show_archive, |el| {
-                let archive_id = id.clone();
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("{row_id}-archive")))
-                        .role(gpui::Role::Button)
-                        .aria_label(if archived {
-                            "Unarchive session"
-                        } else {
-                            "Archive session"
-                        })
-                        .size(px(20.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.0))
-                        .hover(|s| s.bg(crate::theme::wash(0.10)))
-                        .cursor_pointer()
-                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
-                            "Unarchive session"
-                        } else {
-                            "Archive session"
-                        }))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_chat_archived(archive_id.clone(), !archived, cx);
-                        }))
-                        .child(
-                            icon(if archived {
-                                icons::ARCHIVE_UP_MINIMALISTIC
-                            } else {
-                                icons::ARCHIVE_MINIMALISTIC
-                            })
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                        ),
-                )
-            })
+            .children(actions)
             .into_any_element();
         let text = theme.text;
         let select_id = id.clone();
@@ -7096,8 +7316,11 @@ impl Shell {
         let recede = session == SessionState::Working && !selected && !visible && sidebar_row;
         // Rule 4: titles are NORMAL weight; a card that needs you lifts to
         // MEDIUM and full-strength text. Everything else rests at 0.9.
-        let rest_text = if selected || needs_you || search_query.is_some() {
+        let rest_text = if selected || needs_you || parking.woke || search_query.is_some() {
             text
+        } else if parking.settled_at.is_some() {
+            // Settled history recedes until the pointer reaches it.
+            theme.text_muted
         } else {
             text.opacity(0.9)
         };
@@ -7241,13 +7464,42 @@ impl Shell {
                             .truncate()
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(SIDEBAR_CARD_TITLE_HEIGHT))
-                            .when(needs_you, |el| el.font_weight(gpui::FontWeight::MEDIUM))
+                            .when(needs_you || parking.woke, |el| {
+                                el.font_weight(gpui::FontWeight::MEDIUM)
+                            })
                             .child(popover::search_highlight(
                                 title.clone(),
                                 search_query,
                                 theme,
                             ))
                             .into_any_element(),
+                    })
+                    .when(parking.pinned && search_query.is_none(), |el| {
+                        let unpin_id = id.clone();
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("{row_id}-pin")))
+                                .role(gpui::Role::Button)
+                                .aria_label("Unpin thread")
+                                .tooltip(crate::settings::widgets::text_tooltip_above(
+                                    "Unpin thread",
+                                ))
+                                .flex_none()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.organize_chat(
+                                        unpin_id.clone(),
+                                        lifecycle::OrganizeAction::Unpin,
+                                        None,
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    icon(icons::PIN).size(px(11.0)).text_color(theme.text_faint),
+                                ),
+                        )
                     })
                     .child(corner),
             )
@@ -7261,12 +7513,29 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(self.render_project_icon(
-                        badge,
-                        SIDEBAR_PROJECT_BADGE_SIZE,
-                        selected,
-                        cx,
-                    ))
+                    .child({
+                        let badge = self.render_project_icon(
+                            badge,
+                            SIDEBAR_PROJECT_BADGE_SIZE,
+                            selected,
+                            cx,
+                        );
+                        // Settled rows dim their project badge at rest and
+                        // restore it under the pointer (T3's settled tail).
+                        if parking.settled_at.is_some() && !selected {
+                            div()
+                                .flex_none()
+                                .opacity(motion::lerp(
+                                    0.4,
+                                    1.0,
+                                    motion::hover_t_owned(hover_owner, &fade_key),
+                                ))
+                                .child(badge)
+                                .into_any_element()
+                        } else {
+                            badge
+                        }
+                    })
                     .child(
                         div()
                             .max_w(px(if branch.is_some() { 88.0 } else { 140.0 }))
@@ -8308,6 +8577,8 @@ impl Shell {
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
         if self.sync_flow.has_visible_overlay()
+            || self.git_dialog.is_some()
+            || self.details_dialog.is_some()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_menu.get().is_some()
@@ -8465,6 +8736,30 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let details_id = chat_id.clone();
+            let lifecycle = self
+                .state
+                .read(cx)
+                .chat_lifecycle(&chat_id)
+                .cloned()
+                .unwrap_or_default();
+            let now = Utc::now();
+            let menu_chat = chat_id.clone();
+            let lifecycle_row = move |key: &str,
+                                      glyph: &'static str,
+                                      label: &'static str,
+                                      action: lifecycle::OrganizeAction,
+                                      theme: &Theme,
+                                      cx: &mut Context<Self>| {
+                let id = menu_chat.clone();
+                popover::menu_row(theme, false, format!("chat-menu-{key}-{menu_chat}"))
+                    .id(SharedString::from(format!("chat-menu-{key}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.organize_chat(id.clone(), action, None, cx)
+                    }))
+                    .child(icon(glyph).size(px(16.0)).text_color(theme.text_muted))
+                    .child(SharedString::from(label))
+            };
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -8482,6 +8777,89 @@ impl Shell {
                             }))
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename")),
+                    )
+                    .child(if lifecycle.pinned() {
+                        lifecycle_row(
+                            "unpin",
+                            icons::PIN,
+                            "Unpin",
+                            lifecycle::OrganizeAction::Unpin,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        lifecycle_row(
+                            "pin",
+                            icons::PIN,
+                            "Pin",
+                            lifecycle::OrganizeAction::Pin,
+                            &theme,
+                            cx,
+                        )
+                    })
+                    .child(if lifecycle.snoozed(now) {
+                        lifecycle_row(
+                            "wake",
+                            icons::ALARM_OFF,
+                            "Wake now",
+                            lifecycle::OrganizeAction::Unsnooze,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        popover::menu_row(&theme, false, format!("chat-menu-snooze-{chat_id}"))
+                            .id("chat-menu-snooze")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(menu) = this.chat_menu.open_mut() {
+                                    menu.page = ChatMenuPage::Snooze;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                icon(icons::CLOCK_CIRCLE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().child(SharedString::from("Snooze")))
+                            .child(
+                                icon(icons::ALT_ARROW_RIGHT)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                    })
+                    .child(if lifecycle.settled() {
+                        lifecycle_row(
+                            "unsettle",
+                            icons::UNDO,
+                            "Un-settle",
+                            lifecycle::OrganizeAction::Unsettle,
+                            &theme,
+                            cx,
+                        )
+                    } else {
+                        lifecycle_row(
+                            "settle",
+                            icons::CHECK,
+                            "Settle",
+                            lifecycle::OrganizeAction::Settle,
+                            &theme,
+                            cx,
+                        )
+                    })
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-details-{chat_id}"))
+                            .id("chat-menu-details")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.open_chat(details_id.clone(), cx);
+                                this.open_details_panel(cx);
+                            }))
+                            .child(
+                                icon(icons::INFO_CIRCLE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Thread details")),
                     )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
@@ -8529,6 +8907,60 @@ impl Shell {
                             )
                             .child(SharedString::from("Delete…")),
                     ),
+                ChatMenuPage::Snooze => {
+                    let mut menu = menu
+                        .child(
+                            popover::menu_row(&theme, false, format!("chat-snooze-back-{chat_id}"))
+                                .id("chat-snooze-back")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(menu) = this.chat_menu.open_mut() {
+                                        menu.page = ChatMenuPage::Root;
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(
+                                    icon(icons::ALT_ARROW_LEFT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Snooze")),
+                        )
+                        .child(popover::menu_separator());
+                    // Resolved at open time, so "In 1 hour" is relative to
+                    // the click, not to when the row mounted.
+                    for (index, preset) in lifecycle::snooze_presets(chrono::Local::now())
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let id = chat_id.clone();
+                        let until = preset.until;
+                        menu = menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-snooze-{index}-{chat_id}"),
+                            )
+                            .id(SharedString::from(format!("chat-snooze-{index}")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.organize_chat(
+                                    id.clone(),
+                                    lifecycle::OrganizeAction::Snooze,
+                                    Some(until),
+                                    cx,
+                                )
+                            }))
+                            .child(div().flex_1().child(SharedString::from(preset.label)))
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(preset.when)),
+                            ),
+                        );
+                    }
+                    menu
+                }
                 ChatMenuPage::Copy => {
                     let chat = self
                         .state
@@ -8656,6 +9088,21 @@ impl Shell {
         }
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
             overlays.push(overlay);
+        }
+
+        if let Some(dialog) = &self.git_dialog {
+            overlays.push(popover::modal(
+                "git-action-dialog",
+                viewport,
+                dialog.clone().into_any_element(),
+            ));
+        }
+        if let Some(dialog) = &self.details_dialog {
+            overlays.push(popover::modal(
+                "thread-details-dialog",
+                viewport,
+                dialog.clone().into_any_element(),
+            ));
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
@@ -9797,16 +10244,9 @@ impl Shell {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
                     let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
-                    let related = {
-                        let state = self.state.read(cx);
-                        crate::delegation::related_rows(&state.delegation, &chat_id, |id| {
-                            state
-                                .chats
-                                .iter()
-                                .find(|chat| chat.id == id)
-                                .and_then(|chat| chat.title.clone())
-                        })
-                    };
+                    self.state
+                        .update(cx, |state, cx| state.refresh_details(&chat_id, false, cx));
+                    let related = self.details_related_rows(&chat_id, cx);
                     let ui = self.agents_ui.get(&chat_id).cloned().unwrap_or_default();
                     let actions = self.agents_panel_actions(chat_id.clone());
                     crate::subagents::agents_panel_body(
@@ -9818,6 +10258,68 @@ impl Shell {
                         &theme,
                         cx.entity_id(),
                         &actions,
+                        cx,
+                    )
+                }
+                RightSurface::Details => {
+                    let theme = Theme::of(cx).clone();
+                    let chat_id = self.panel_key(cx);
+                    self.state
+                        .update(cx, |state, cx| state.refresh_details(&chat_id, false, cx));
+                    if let Some(notice) = self
+                        .state
+                        .update(cx, |state, _| state.details.notice.take())
+                    {
+                        self.sidebar_notice = Some(notice.into());
+                    }
+                    let pull_space = self
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
+                        .and_then(|chat| {
+                            let space = chat.space_id.as_ref().and_then(|id| {
+                                self.state.read(cx).spaces.iter().find(|s| &s.id == id)
+                            })?;
+                            crate::git_store::is_root_checkout(chat, space)
+                                .then(|| space.id.clone())
+                        });
+                    if let Some(space) = pull_space {
+                        self.state
+                            .update(cx, |state, cx| state.ensure_pull_watch(&space, cx));
+                    }
+                    // Owner-routed: the chat's host device owns its automations.
+                    let owner = self
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
+                        .map(|chat| chat.device_id.clone());
+                    if let Some(owner) = owner
+                        && !self.state.read(cx).automations.watching(&owner)
+                    {
+                        self.state
+                            .update(cx, |state, cx| state.ensure_automations_watch(&owner, cx));
+                    }
+                    let model =
+                        crate::details::DetailsModel::for_chat(self.state.read(cx), &chat_id);
+                    let ui = self.details_ui.get(&chat_id).cloned().unwrap_or_default();
+                    let actions = self.details_panel_actions(chat_id.clone());
+                    let toggle_chat = chat_id.clone();
+                    crate::details::details_panel_body(
+                        &chat_id,
+                        &model,
+                        &ui,
+                        Utc::now(),
+                        &theme,
+                        &actions,
+                        std::rc::Rc::new(move |this: &mut Shell, (), cx| {
+                            let ui = this.details_ui.entry(toggle_chat.clone()).or_default();
+                            ui.checkpoints_expanded = !ui.checkpoints_expanded;
+                            cx.notify();
+                        }),
                         cx,
                     )
                 }
@@ -10174,6 +10676,7 @@ impl Shell {
                     })
                     .unwrap_or(icons::LIST),
                 RightSurface::Subagent(_) | RightSurface::Agents => icons::BOT,
+                RightSurface::Details => icons::INFO_CIRCLE,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
@@ -12055,6 +12558,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -14891,6 +15395,7 @@ mod workspace_persistence {
                         true,
                         false,
                         false,
+                        Default::default(),
                         self.jump.then(|| {
                             if self.index == 5 {
                                 "Ctrl+Shift+A"
@@ -15246,6 +15751,8 @@ mod settings_reopen_regressions {
             ("settings/shortcuts", SettingsSection::Shortcuts),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
+            ("settings/scheduled-tasks", SettingsSection::Automations),
+            ("settings/import", SettingsSection::Import),
             ("settings/updates", SettingsSection::Updates),
         ] {
             assert_eq!(

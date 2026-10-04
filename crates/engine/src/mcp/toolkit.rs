@@ -14,6 +14,12 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    transfer: RwLock<Option<Arc<dyn crate::orchestration::transfer_service::TransferService>>>,
+    queue_service: RwLock<Option<Arc<dyn crate::orchestration::queue_service::QueueService>>>,
+    scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
+    threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
+    launch_service: RwLock<Option<Arc<dyn crate::orchestration::launch_service::LaunchService>>>,
+    pull_requests: RwLock<Option<Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +34,12 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            transfer: RwLock::new(None),
+            queue_service: RwLock::new(None),
+            scheduler: RwLock::new(None),
+            threads: RwLock::new(None),
+            launch_service: RwLock::new(None),
+            pull_requests: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -45,8 +57,83 @@ impl Toolkit {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
     }
 
+    pub fn set_transfer_service(
+        &self,
+        service: Arc<dyn crate::orchestration::transfer_service::TransferService>,
+    ) {
+        *self
+            .transfer
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_pull_requests(
+        &self,
+        service: Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>,
+    ) {
+        *self
+            .pull_requests
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_scheduler(
+        &self,
+        service: Arc<dyn crate::orchestration::scheduler::service::SchedulerService>,
+    ) {
+        *self
+            .scheduler
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_launch_service(
+        &self,
+        service: Arc<dyn crate::orchestration::launch_service::LaunchService>,
+    ) {
+        *self
+            .launch_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_thread_service(
+        &self,
+        service: Arc<dyn crate::orchestration::thread_service::ThreadService>,
+    ) {
+        *self.threads.write().unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn launch_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::launch_service::LaunchService>> {
+        self.launch_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn tools(&self) -> &[Value] {
         &self.descriptors
+    }
+
+    fn transfer_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::transfer_service::TransferService>> {
+        self.transfer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_queue_service(
+        &self,
+        service: Arc<dyn crate::orchestration::queue_service::QueueService>,
+    ) {
+        *self
+            .queue_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub async fn request(&self, scope: InvocationScope, message: Value) -> Option<Value> {
@@ -159,7 +246,13 @@ impl Toolkit {
     ) -> Value {
         let name = tool.name.as_str();
         if tool.group == "pullRequests" {
-            return self.pull_request_unavailable(scope, name);
+            let service = self
+                .pull_requests
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            return crate::orchestration::pull_requests::mcp::dispatch(service, scope, name, args)
+                .await;
         }
         if tool.group == "worktree" && !scope.capabilities.contains("worktree") {
             return codec::result(if name == "t3_worktree_list" {
@@ -184,6 +277,7 @@ impl Toolkit {
             ));
         }
         if let Some(task) = &scope.task_id
+            && name != "run_scheduled_task_now"
             && args
                 .get("taskId")
                 .and_then(Value::as_str)
@@ -191,7 +285,65 @@ impl Toolkit {
         {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
+        let queue_service = self
+            .queue_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         match input {
+            input @ (OrchestrationToolInput::T3ThreadFork(_)
+            | OrchestrationToolInput::T3ThreadMergeBack(_)
+            | OrchestrationToolInput::T3ThreadTransfers(_)) => codec::result(
+                crate::orchestration::transfer::mcp::dispatch(
+                    self.transfer_service(),
+                    scope.caller.clone(),
+                    input,
+                )
+                .await,
+            ),
+            _ if matches!(
+                name,
+                "t3_queue_list"
+                    | "t3_queue_read"
+                    | "t3_queue_edit"
+                    | "t3_queue_cancel"
+                    | "t3_queue_reorder"
+                    | "t3_queue_promote_to_steer"
+                    | "t3_pending_request_list"
+                    | "t3_pending_request_read"
+                    | "t3_pending_request_respond"
+                    | "t3_thread_update"
+                    | "t3_thread_organize"
+                    | "t3_thread_search"
+            ) =>
+            {
+                crate::orchestration::queue::mcp::dispatch(queue_service, scope, name, args).await
+            }
+            input @ (OrchestrationToolInput::ScheduleTask(_)
+            | OrchestrationToolInput::ListScheduledTasks(_)
+            | OrchestrationToolInput::UpdateScheduledTask(_)
+            | OrchestrationToolInput::DeleteScheduledTask(_)
+            | OrchestrationToolInput::RunScheduledTaskNow(_)) => {
+                crate::orchestration::scheduler::mcp::dispatch(
+                    &self.scheduler,
+                    scope.caller.clone(),
+                    input,
+                )
+                .await
+            }
+            _ if matches!(
+                tool.group.as_str(),
+                "project" | "environment" | "attachment" | "worktree"
+            ) =>
+            {
+                crate::orchestration::launch::mcp::dispatch(
+                    self.launch_service(),
+                    scope,
+                    name,
+                    args,
+                )
+                .await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances
@@ -317,29 +469,19 @@ impl Toolkit {
                     },
                 )
             }
-            _ if matches!(name, "t3_worktree_handoff" | "t3_worktree_status") => {
-                codec::result(json!({
-                    "_tag":"WorktreeMcpFailure","code":"operation_failed",
-                    "message":format!("Unable to read thread {}: The operation could not be completed.", scope.caller.thread_id)
-                }))
+            input @ (OrchestrationToolInput::T3ThreadList(_)
+            | OrchestrationToolInput::T3ThreadRead(_)
+            | OrchestrationToolInput::T3ThreadSend(_)
+            | OrchestrationToolInput::T3ThreadWait(_)
+            | OrchestrationToolInput::T3ThreadInterrupt(_)
+            | OrchestrationToolInput::T3ThreadConfiguration(_)
+            | OrchestrationToolInput::T3ThreadConfigure(_)
+            | OrchestrationToolInput::CreateThreads(_)) => {
+                crate::orchestration::threads::mcp::dispatch(&self.threads, scope, input).await
             }
             // Future domains deliberately refuse; there is no legacy RPC
             // emulation, mutation, receipt, provider call, or hidden success.
             _ => codec::result(codec::unavailable()),
         }
-    }
-
-    fn pull_request_unavailable(&self, scope: &InvocationScope, name: &str) -> Value {
-        if !scope.capabilities.contains("pull-requests") {
-            return codec::error_text(
-                "MCP credential does not grant the pull-requests capability.",
-            );
-        }
-        codec::error_text(match name {
-            "link_pull_request" => "Could not link the pull request.",
-            "unlink_pull_request" => "Could not unlink the pull request.",
-            "list_thread_pull_requests" => "Could not list the pull request.",
-            _ => "Could not change whether the pull request is watched.",
-        })
     }
 }

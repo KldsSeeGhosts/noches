@@ -2498,6 +2498,7 @@ mod pane_meta_tests {
         let mut state = seeded_state();
         let mut claude = chat("claude-chat", "local", None);
         claude.config = Some(zeron_proto::ChatConfig {
+            instance_id: None,
             harness: zeron_proto::HarnessId::ClaudeCode,
             model: None,
             reasoning: None,

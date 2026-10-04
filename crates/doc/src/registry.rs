@@ -901,6 +901,10 @@ impl RegistryDoc {
                 "harnessSessionCwd",
                 opt_str(chat.harness_session_cwd.as_deref()),
             ),
+            (
+                "harnessSessionInstanceId",
+                json!(chat.harness_session_instance_id),
+            ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
             (
@@ -998,12 +1002,25 @@ impl RegistryDoc {
                 return Ok(());
             }
         }
-        self.write(
-            KIND_CHATS,
-            id,
-            OpKind::Update,
-            fields([("orchestration", summary)]),
-        );
+        let previous = row.fields.get("orchestration");
+        let mut patch = fields([("orchestration", summary.clone())]);
+        // Mirror only source changes; an unrelated execution publication must
+        // not undo a legacy UI rename/seen write made since the last summary.
+        if previous.is_none_or(|old| old["title"] != summary["title"])
+            && let Some(title) = summary["title"].as_str()
+        {
+            patch.insert("title".into(), json!(title));
+        }
+        if previous.is_none_or(|old| old["archivedAt"] != summary["archivedAt"]) {
+            patch.insert("archived".into(), json!(!summary["archivedAt"].is_null()));
+        }
+        if previous.is_none_or(|old| old["lastVisitedAt"] != summary["lastVisitedAt"])
+            && let Some(visited) = summary["lastVisitedAt"].as_str()
+            && let Ok(visited) = DateTime::parse_from_rfc3339(visited)
+        {
+            patch.insert("lastSeenAt".into(), json!(visited.timestamp_millis()));
+        }
+        self.write(KIND_CHATS, id, OpKind::Update, patch);
         Ok(())
     }
 
@@ -1011,6 +1028,38 @@ impl RegistryDoc {
         self.overlay_rows(KIND_CHATS)
             .into_iter()
             .filter_map(|row| row.fields.get("orchestration").cloned())
+            .collect()
+    }
+
+    /// Separate synced lifecycle map; Chat's long-standing row type is unchanged.
+    pub fn thread_lifecycles(&self) -> HashMap<String, zeron_proto::ChatLifecycle> {
+        let blocked: std::collections::HashSet<_> = self
+            .read_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    zeron_proto::SessionStatus::Working
+                        | zeron_proto::SessionStatus::AwaitingInput
+                        | zeron_proto::SessionStatus::Errored
+                )
+            })
+            .map(|s| s.chat_id)
+            .collect();
+        self.overlay_rows(KIND_CHATS)
+            .into_iter()
+            .filter_map(|row| {
+                let value = row.fields.get("orchestration")?.get("lifecycle")?;
+                let mut lifecycle: zeron_proto::ChatLifecycle =
+                    serde_json::from_value(value.clone()).ok()?;
+                if blocked.contains(&row.id) {
+                    lifecycle.snoozed_until = None;
+                    lifecycle.settled_at = None;
+                    lifecycle.settled_by = None;
+                }
+                Some((row.id, lifecycle))
+            })
             .collect()
     }
 
@@ -1160,6 +1209,46 @@ impl RegistryDoc {
             fields([
                 ("harnessSessionId", json!(session_id)),
                 ("harnessSessionCwd", json!(cwd)),
+            ]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_harness_session_instance(
+        &mut self,
+        chat_id: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("harnessSessionInstanceId", json!(instance))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_harness_session_binding(
+        &mut self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("harnessSessionId", json!(session_id)),
+                ("harnessSessionCwd", json!(cwd)),
+                ("harnessSessionInstanceId", json!(instance)),
             ]),
         );
         Ok(true)
@@ -1329,6 +1418,10 @@ impl RegistryDoc {
                     (
                         "harnessSessionCwd",
                         opt_str(chat.harness_session_cwd.as_deref()),
+                    ),
+                    (
+                        "harnessSessionInstanceId",
+                        json!(chat.harness_session_instance_id),
                     ),
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),

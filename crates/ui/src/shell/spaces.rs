@@ -30,6 +30,63 @@ struct ActiveChatRow {
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
     section: SidebarSection,
+    /// Where pin/snooze/settle parks the row (DESIGN-W3 §2).
+    park: RowPark,
+    lifecycle: Option<zeron_proto::ChatLifecycle>,
+}
+
+/// Lifecycle placement. Pinned rows lead the list whatever their state;
+/// snoozed and settled rows only park while nothing needs the user or runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RowPark {
+    None,
+    Pinned,
+    Snoozed,
+    Settled,
+}
+
+pub(super) fn row_park(
+    lifecycle: Option<&zeron_proto::ChatLifecycle>,
+    section: SidebarSection,
+    now: chrono::DateTime<Utc>,
+) -> RowPark {
+    let Some(lifecycle) = lifecycle else {
+        return RowPark::None;
+    };
+    if lifecycle.pinned() {
+        RowPark::Pinned
+    } else if section != SidebarSection::Rest {
+        RowPark::None
+    } else if lifecycle.snoozed(now) {
+        RowPark::Snoozed
+    } else if lifecycle.settled() {
+        RowPark::Settled
+    } else {
+        RowPark::None
+    }
+}
+
+/// The collapsible lifecycle shelves drawn after the user's organization.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum SidebarShelf {
+    Snoozed,
+    Settled,
+}
+
+impl SidebarShelf {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Snoozed => "Snoozed",
+            Self::Settled => "Settled",
+        }
+    }
+
+    pub(super) fn key(self) -> &'static str {
+        match self {
+            Self::Snoozed => "shelf:snoozed",
+            Self::Settled => "shelf:settled",
+        }
+    }
 }
 
 /// The non-collapsible state sections that float above the user's chosen
@@ -113,6 +170,15 @@ enum SidebarEntry {
         space_id: String,
         rows: Vec<ActiveChatRow>,
     },
+    /// The hairline closing the pinned block.
+    PinnedDivider,
+    /// A lifecycle shelf. Collapsed rows stay in the projection for counts
+    /// but are not part of the drawn or keyboard order.
+    Shelf {
+        shelf: SidebarShelf,
+        expanded: bool,
+        rows: Vec<ActiveChatRow>,
+    },
 }
 
 /// The sidebar's ordered entries as plain data, built once per render. The
@@ -129,6 +195,8 @@ struct SidebarProjectionSettings {
     organization: SidebarOrganization,
     branch: bool,
     pull_request: bool,
+    snoozed_expanded: bool,
+    settled_expanded: bool,
 }
 
 impl From<&UiSettings> for SidebarProjectionSettings {
@@ -138,6 +206,8 @@ impl From<&UiSettings> for SidebarProjectionSettings {
             sort: settings.sidebar_sort,
             organization: settings.sidebar_organization,
             branch: settings.sidebar_show_branch,
+            snoozed_expanded: settings.sidebar_snoozed_expanded,
+            settled_expanded: settings.sidebar_settled_expanded,
             pull_request: settings.sidebar_show_pull_request,
         }
     }
@@ -191,6 +261,16 @@ fn sidebar_source_fingerprint(state: &AppState, now: chrono::DateTime<Utc>) -> u
             chat.config.as_ref().map(|config| config.harness),
         )
             .hash(&mut hash);
+        if let Some(lifecycle) = state.chat_lifecycle(&chat.id) {
+            (
+                lifecycle.pinned_at,
+                lifecycle.snoozed_until,
+                lifecycle.snoozed(now),
+                lifecycle.settled_at,
+                lifecycle.woke_at,
+            )
+                .hash(&mut hash);
+        }
         state
             .delegation
             .is_delegated_child(&chat.id)
@@ -224,10 +304,15 @@ impl SidebarProjection {
         let mut ids = Vec::new();
         for entry in &self.entries {
             match entry {
-                SidebarEntry::Heading(_) => {}
+                SidebarEntry::Heading(_) | SidebarEntry::PinnedDivider => {}
                 SidebarEntry::Row(row) => ids.push(row.chat.id.clone()),
                 SidebarEntry::Group { rows, .. } => {
                     ids.extend(rows.iter().map(|row| row.chat.id.clone()));
+                }
+                SidebarEntry::Shelf { expanded, rows, .. } => {
+                    if *expanded {
+                        ids.extend(rows.iter().map(|row| row.chat.id.clone()));
+                    }
                 }
             }
         }
@@ -286,7 +371,11 @@ fn sidebar_rows(
             // queued one is running.
             let undelivered = state.send_undelivered(&chat.id, now);
             let queued = state.send_queued(&chat.id, now);
+            let section = sidebar_section(status, queued, undelivered);
+            let lifecycle = state.chat_lifecycle(&chat.id).cloned();
             ActiveChatRow {
+                park: row_park(lifecycle.as_ref(), section, now),
+                lifecycle,
                 status,
                 chat,
                 badge,
@@ -295,7 +384,7 @@ fn sidebar_rows(
                 remote_device,
                 change_request,
                 group,
-                section: sidebar_section(status, queued, undelivered),
+                section,
             }
         })
         .collect();
@@ -316,6 +405,73 @@ fn sidebar_rows(
 /// chosen organization, without touching GPUI: the ordered projection both the
 /// renderer and the keyboard order consume.
 fn project_sidebar(
+    rows: Vec<ActiveChatRow>,
+    organization: SidebarOrganization,
+    local_device_id: Option<&str>,
+    expanded: impl Fn(SidebarShelf) -> bool,
+) -> SidebarProjection {
+    // Lifecycle parking comes off first: pinned rows lead (oldest pin first),
+    // snoozed and settled rows trail in their shelves, and everything else
+    // flows through the state sections and organization unchanged.
+    let mut pinned: Vec<ActiveChatRow> = Vec::new();
+    let mut snoozed: Vec<ActiveChatRow> = Vec::new();
+    let mut settled: Vec<ActiveChatRow> = Vec::new();
+    let rows: Vec<ActiveChatRow> = rows
+        .into_iter()
+        .filter_map(|row| match row.park {
+            RowPark::None => Some(row),
+            RowPark::Pinned => {
+                pinned.push(row);
+                None
+            }
+            RowPark::Snoozed => {
+                snoozed.push(row);
+                None
+            }
+            RowPark::Settled => {
+                settled.push(row);
+                None
+            }
+        })
+        .collect();
+    let lifecycle_at =
+        |row: &ActiveChatRow,
+         at: fn(&zeron_proto::ChatLifecycle) -> Option<chrono::DateTime<Utc>>| {
+            row.lifecycle.as_ref().and_then(at)
+        };
+    pinned.sort_by_key(|row| lifecycle_at(row, |l| l.pinned_at));
+    // Soonest wake first; most recently settled first.
+    snoozed.sort_by_key(|row| lifecycle_at(row, |l| l.snoozed_until));
+    settled.sort_by_key(|row| std::cmp::Reverse(lifecycle_at(row, |l| l.settled_at)));
+    let shelves = [
+        (SidebarShelf::Snoozed, snoozed),
+        (SidebarShelf::Settled, settled),
+    ];
+    let mut projection = project_sidebar_sections(rows, organization, local_device_id);
+    if !pinned.is_empty() {
+        let mut entries: Vec<SidebarEntry> = pinned
+            .into_iter()
+            .map(|row| SidebarEntry::Row(Box::new(row)))
+            .collect();
+        if !projection.entries.is_empty() || shelves.iter().any(|(_, rows)| !rows.is_empty()) {
+            entries.push(SidebarEntry::PinnedDivider);
+        }
+        entries.append(&mut projection.entries);
+        projection.entries = entries;
+    }
+    for (shelf, rows) in shelves {
+        if !rows.is_empty() {
+            projection.entries.push(SidebarEntry::Shelf {
+                shelf,
+                expanded: expanded(shelf),
+                rows,
+            });
+        }
+    }
+    projection
+}
+
+fn project_sidebar_sections(
     rows: Vec<ActiveChatRow>,
     organization: SidebarOrganization,
     local_device_id: Option<&str>,
@@ -474,6 +630,8 @@ const SIDEBAR_SECTION_HEADER_HEIGHT: f32 = 30.0;
 const SIDEBAR_SECTION_HEADER_LINE: f32 = 18.0;
 const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
+/// The hairline under the pinned block, centered in its own band.
+const SIDEBAR_PINNED_DIVIDER_HEIGHT: f32 = 9.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
@@ -716,7 +874,7 @@ impl Shell {
         let projection = self.sidebar_projection(cx);
         let active = projection.entries.iter().find_map(|entry| match entry {
             SidebarEntry::Row(row) if row.chat.id == chat_id => Some((**row).clone()),
-            SidebarEntry::Group { rows, .. } => {
+            SidebarEntry::Group { rows, .. } | SidebarEntry::Shelf { rows, .. } => {
                 rows.iter().find(|row| row.chat.id == chat_id).cloned()
             }
             _ => None,
@@ -1736,7 +1894,14 @@ impl Shell {
         }
         self.sidebar_source_dirty.set(false);
         let fingerprint = sidebar_source_fingerprint(state, now);
-        let valid_until = state.next_display_refresh(now);
+        // A snooze ending is a display deadline too: the row wakes on time.
+        let valid_until = state
+            .thread_lifecycles
+            .values()
+            .filter_map(|lifecycle| lifecycle.snoozed_until.filter(|until| *until > now))
+            .fold(state.next_display_refresh(now), |earliest, until| {
+                earliest.min(until)
+            });
         if let Some(cached) = cache.as_mut()
             && cached.fingerprint == fingerprint
             && cached.settings == settings
@@ -1749,6 +1914,10 @@ impl Shell {
             sidebar_rows(state, &self.settings, Utc::now()),
             self.settings.sidebar_organization,
             state.local_device_id.as_deref(),
+            |shelf| match shelf {
+                SidebarShelf::Snoozed => settings.snoozed_expanded,
+                SidebarShelf::Settled => settings.settled_expanded,
+            },
         ));
         *cache = Some(SidebarProjectionCache {
             fingerprint,
@@ -2054,6 +2223,124 @@ impl Shell {
                         };
                     rendered.push((format!("g:{collapse_key}"), height, element));
                 }
+                SidebarEntry::PinnedDivider => {
+                    rendered.push((
+                        "pinned-divider".to_string(),
+                        SIDEBAR_PINNED_DIVIDER_HEIGHT,
+                        div()
+                            .h(px(SIDEBAR_PINNED_DIVIDER_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .px(px(Theme::SPACE_SM))
+                            .child(div().h(px(1.0)).w_full().bg(theme.border))
+                            .into_any_element(),
+                    ));
+                }
+                SidebarEntry::Shelf {
+                    shelf,
+                    expanded,
+                    rows,
+                } => {
+                    let shelf = *shelf;
+                    let open = *expanded;
+                    let motion_key = shelf.key().to_string();
+                    let mounted = self.sidebar_body_mounted(&motion_key, open);
+                    let mut rendered_rows = Vec::new();
+                    let mut rows_height = 0.0;
+                    for row in rows {
+                        if mounted {
+                            let rendered = self.render_active_chat_row(
+                                row.clone(),
+                                now,
+                                slot,
+                                // Collapsing mid-hint must not leave stale chips.
+                                jump_hints && open,
+                                &keymap,
+                                selected.as_deref(),
+                                &pane_open,
+                                theme,
+                                cx,
+                            );
+                            rows_height += rendered.1;
+                            rendered_rows.push(rendered);
+                        } else {
+                            rows_height += super::chat_row_height();
+                        }
+                        // A collapsed shelf is outside the keyboard order
+                        // (`visible_chat_ids`), so it consumes no jump slot.
+                        if open {
+                            slot += 1;
+                        }
+                    }
+                    let count = rows.len();
+                    let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                        + rows_height
+                        + SIDEBAR_LIST_GAP * count.saturating_sub(1) as f32;
+                    if open
+                        && let Some(tween) = self.sidebar_disclosure_motion.get_mut(&motion_key)
+                        && tween.animating()
+                    {
+                        tween.to = body_height;
+                    }
+                    self.begin_queued_sidebar_reveal(&motion_key, open, body_height);
+                    // The Archived shelf's header recipe: the count shows only
+                    // while collapsed.
+                    let label: SharedString = if open {
+                        shelf.label().into()
+                    } else {
+                        format!("{} ({count})", shelf.label()).into()
+                    };
+                    let chevron = self.sidebar_disclosure_chevron(&motion_key, open, theme);
+                    let toggle_motion_key = motion_key.clone();
+                    let header = sidebar_disclosure_header(theme, label, chevron)
+                        .id(SharedString::from(format!(
+                            "sidebar-{}-toggle",
+                            shelf.key()
+                        )))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let flag = match shelf {
+                                SidebarShelf::Snoozed => {
+                                    &mut this.settings.sidebar_snoozed_expanded
+                                }
+                                SidebarShelf::Settled => {
+                                    &mut this.settings.sidebar_settled_expanded
+                                }
+                            };
+                            let was_open = *flag;
+                            *flag = !was_open;
+                            this.begin_sidebar_disclosure_motion(
+                                &toggle_motion_key,
+                                if was_open { body_height } else { 0.0 },
+                                if was_open { 0.0 } else { body_height },
+                            );
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }));
+                    let mut element = div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .pt(px(SIDEBAR_SECTION_GAP))
+                        .child(header);
+                    if mounted {
+                        let body = div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                            .gap(px(SIDEBAR_LIST_GAP))
+                            .children(rendered_rows.into_iter().map(|(_, _, row)| row));
+                        element = element.child(self.render_sidebar_disclosure_body(
+                            &motion_key,
+                            open,
+                            body_height,
+                            body.into_any_element(),
+                        ));
+                    }
+                    let height =
+                        SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if open { body_height } else { 0.0 };
+                    rendered.push((motion_key, height, element.into_any_element()));
+                }
             }
         }
         rendered
@@ -2084,7 +2371,10 @@ impl Shell {
             change_request,
             group: _,
             section: _,
+            park,
+            lifecycle,
         } = row;
+        let parking = super::lifecycle::RowParking::of(park, lifecycle.as_ref());
         let time_ago: SharedString =
             format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
         let is_selected = selected == Some(chat.id.as_str());
@@ -2181,6 +2471,7 @@ impl Shell {
             is_selected,
             pane_open.contains(&chat.id) && !is_selected,
             false,
+            parking,
             jump_label,
             None,
             children,
@@ -3948,8 +4239,8 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::{
-        ActiveChatRow, SidebarEntry, SidebarSection, compare_sidebar_chats, project_sidebar,
-        promote_local_device_group,
+        ActiveChatRow, RowPark, SidebarEntry, SidebarProjection, SidebarSection, SidebarShelf,
+        compare_sidebar_chats, project_sidebar, promote_local_device_group, row_park,
     };
     use crate::settings::{SidebarOrganization, SidebarSort};
     use zeron_proto::ChatIndicator;
@@ -4088,6 +4379,7 @@ mod tests {
             created_at: Utc.timestamp_opt(5, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -4145,7 +4437,183 @@ mod tests {
             change_request: None,
             group: Some((device.into(), space.into())),
             section,
+            park: RowPark::None,
+            lifecycle: None,
         }
+    }
+
+    fn parked_row(
+        id: &str,
+        section: SidebarSection,
+        lifecycle: zeron_proto::ChatLifecycle,
+    ) -> ActiveChatRow {
+        let now = Utc::now();
+        ActiveChatRow {
+            park: row_park(Some(&lifecycle), section, now),
+            lifecycle: Some(lifecycle),
+            ..active_row(id, "device", "alpha", section)
+        }
+    }
+
+    fn drawn(projection: &SidebarProjection) -> Vec<String> {
+        projection
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                SidebarEntry::Heading(section) => format!("[{section:?}]"),
+                SidebarEntry::Row(row) => row.chat.id.clone(),
+                SidebarEntry::Group { rows, .. } => format!(
+                    "group({})",
+                    rows.iter()
+                        .map(|row| row.chat.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                SidebarEntry::PinnedDivider => "---".into(),
+                &SidebarEntry::Shelf {
+                    shelf,
+                    expanded,
+                    ref rows,
+                } => format!(
+                    "{}{}({})",
+                    shelf.label(),
+                    if expanded { "+" } else { "-" },
+                    rows.iter()
+                        .map(|row| row.chat.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lifecycle_parks_rows_around_state_sections() {
+        let now = Utc::now();
+        let hour = chrono::Duration::hours(1);
+        let lifecycle = zeron_proto::ChatLifecycle::default;
+        let rows = vec![
+            active_row("idle", "device", "alpha", SidebarSection::Rest),
+            parked_row(
+                "pin-late",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    pinned_at: Some(now),
+                    ..lifecycle()
+                },
+            ),
+            parked_row(
+                "pin-running",
+                SidebarSection::Running,
+                zeron_proto::ChatLifecycle {
+                    pinned_at: Some(now - hour),
+                    ..lifecycle()
+                },
+            ),
+            parked_row(
+                "snooze-far",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    snoozed_until: Some(now + hour * 5),
+                    ..lifecycle()
+                },
+            ),
+            parked_row(
+                "snooze-near",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    snoozed_until: Some(now + hour),
+                    ..lifecycle()
+                },
+            ),
+            // A snoozed chat that needs the user is never hidden.
+            parked_row(
+                "snooze-needs",
+                SidebarSection::NeedsYou,
+                zeron_proto::ChatLifecycle {
+                    snoozed_until: Some(now + hour),
+                    ..lifecycle()
+                },
+            ),
+            // An elapsed snooze is back in the list.
+            parked_row(
+                "snooze-elapsed",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    snoozed_until: Some(now - hour),
+                    ..lifecycle()
+                },
+            ),
+            parked_row(
+                "settled-old",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    settled_at: Some(now - hour * 48),
+                    ..lifecycle()
+                },
+            ),
+            parked_row(
+                "settled-new",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    settled_at: Some(now - hour),
+                    ..lifecycle()
+                },
+            ),
+        ];
+        let projection = project_sidebar(
+            rows.clone(),
+            SidebarOrganization::InOneList,
+            Some("device"),
+            |shelf| shelf == SidebarShelf::Settled,
+        );
+        assert_eq!(
+            drawn(&projection),
+            [
+                "pin-running",
+                "pin-late",
+                "---",
+                "[NeedsYou]",
+                "snooze-needs",
+                "[Rest]",
+                "idle",
+                "snooze-elapsed",
+                "Snoozed-(snooze-near,snooze-far)",
+                "Settled+(settled-new,settled-old)",
+            ]
+        );
+        // A collapsed shelf is not part of the keyboard order.
+        assert_eq!(
+            projection.visible_chat_ids(),
+            [
+                "pin-running",
+                "pin-late",
+                "snooze-needs",
+                "idle",
+                "snooze-elapsed",
+                "settled-new",
+                "settled-old",
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_block_without_followers_has_no_divider() {
+        let now = Utc::now();
+        let projection = project_sidebar(
+            vec![parked_row(
+                "pin",
+                SidebarSection::Rest,
+                zeron_proto::ChatLifecycle {
+                    pinned_at: Some(now),
+                    ..Default::default()
+                },
+            )],
+            SidebarOrganization::ByDevice,
+            Some("device"),
+            |_| true,
+        );
+        assert_eq!(drawn(&projection), ["pin"]);
     }
 
     #[test]
@@ -4160,6 +4628,7 @@ mod tests {
             ],
             SidebarOrganization::ByDevice,
             Some("device"),
+            |_| false,
         );
 
         assert!(matches!(
@@ -4200,6 +4669,7 @@ mod tests {
             ],
             SidebarOrganization::ByDevice,
             Some("device"),
+            |_| false,
         );
 
         assert!(matches!(
@@ -4230,6 +4700,7 @@ mod tests {
             ],
             SidebarOrganization::ByDevice,
             Some("device"),
+            |_| false,
         );
         let header_only = match &projection.entries[2] {
             SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),

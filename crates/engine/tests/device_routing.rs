@@ -161,6 +161,7 @@ impl Harness for InstantHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Ok(futures::stream::iter([
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: self.0,
                 model: "instant-1".into(),
                 tools: vec![],
@@ -898,6 +899,7 @@ async fn target_device_id_routes_over_the_relay() {
     // Unary forward with side effects: QueueCommand lands (and executes) on B.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
+            instance_id: None,
             prompt: "run remotely".into(),
             harness: None,
             model: None,

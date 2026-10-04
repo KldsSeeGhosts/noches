@@ -203,6 +203,7 @@ fn fixture(dir: &Path) -> PathBuf {
 }
 fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,

@@ -53,6 +53,7 @@ async fn main() {
             .into()
     });
     let request = RunRequest {
+        instance_id: None,
         prompt,
         harness: None,
         model: None,

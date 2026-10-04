@@ -1693,6 +1693,8 @@ pub struct ComposerInput {
     text_size: f32,
     configured_line_height: f32,
     single_line: bool,
+    /// Metadata fields opt into the theme's code face; chat text stays UI.
+    monospace: bool,
     scroll_left: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
@@ -1791,6 +1793,7 @@ impl ComposerInput {
             text_size: INPUT_TEXT_SIZE,
             configured_line_height: INPUT_LINE_HEIGHT,
             single_line: false,
+            monospace: false,
             scroll_left: 0.0,
             last_lines: Vec::new(),
             line_starts: vec![0],
@@ -1838,6 +1841,20 @@ impl ComposerInput {
     pub fn with_single_line(mut self) -> Self {
         self.single_line = true;
         self
+    }
+
+    pub fn with_monospace(mut self) -> Self {
+        self.monospace = true;
+        self
+    }
+
+    pub fn with_max_visible_lines(mut self, lines: usize) -> Self {
+        self.viewport_height = Some(lines as f32 * self.configured_line_height);
+        self
+    }
+
+    pub fn measured_text_height(&self) -> f32 {
+        self.content_height
     }
 
     fn set_key_context(&mut self, key_context: &'static str, cx: &mut Context<Self>) {
@@ -3867,7 +3884,7 @@ impl Render for ComposerInput {
             .text_size(crate::typography::ui_rems(self.text_size))
             .line_height(crate::typography::ui_rems(self.configured_line_height))
             .text_color(text_color)
-            .font_family(theme.font_sans.clone())
+            .font_family(if self.monospace { theme.font_mono.clone() } else { theme.font_sans.clone() })
             .child({
                 let input = cx.entity();
                 let ascent = self.max_ascent;
@@ -7041,6 +7058,7 @@ impl Composer {
 
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        instance_id: resolved.instance_id.clone(),
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),
@@ -8778,6 +8796,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     harness_session_id: None,
                     harness_session_cwd: None,
+                    harness_session_instance_id: None,
                     space_id: None,
                     last_seen_at: None,
                     room_gen: None,

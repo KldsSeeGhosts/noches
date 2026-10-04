@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub mod accounts;
 pub mod appearance;
 pub mod archived;
+pub mod automations;
+pub mod import;
 pub mod composer;
 pub mod connections;
 pub mod devices;
@@ -689,6 +691,10 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// Open state of the Snoozed and Settled shelves. Both start collapsed,
+    /// and a collapsed shelf contributes nothing to the jump order.
+    pub sidebar_snoozed_expanded: bool,
+    pub sidebar_settled_expanded: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -830,6 +836,8 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            sidebar_snoozed_expanded: false,
+            sidebar_settled_expanded: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
@@ -2107,6 +2115,8 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            sidebar_snoozed_expanded: true,
+            sidebar_settled_expanded: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
                 "space-1".into(),

@@ -110,6 +110,7 @@ impl Harness for HeldHarness {
         }
         let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],
@@ -652,12 +653,25 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
         || {
             user_messages(&core).iter().any(|m| m == "first queued")
                 && prompts.lock().unwrap().iter().any(|p| p == "first queued")
+                && harness.finish.receiver_count() > 0
         },
-        "first queued turn",
+        // User entries publish before async admission/checkpoint work. They
+        // cannot be used as proof that the next mock turn can receive finish.
+        "first queued provider turn ready",
     )
     .await;
     assert_eq!(queue_texts(&core), vec!["second queued"]);
     assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
+    // The transcript user row precedes asynchronous orchestration admission;
+    // do not finish a harness turn before its broadcast receiver exists.
+    wait_for(
+        || {
+            prompts.lock().unwrap().iter().any(|p| p == "first queued")
+                && harness.finish.receiver_count() > 0
+        },
+        "the first queued harness to be ready",
+    )
+    .await;
     harness.finish.send(()).unwrap();
     wait_for(
         || user_messages(&core).iter().any(|m| m == "second queued"),
@@ -847,11 +861,10 @@ async fn a_message_with_attachments_holds_even_for_a_steerable_agent() {
         "the held message to flush at turn end",
     )
     .await;
-    assert!(
-        user_messages(&core)
-            .iter()
-            .any(|message| message.contains("Attached images (local files")),
-        "the transport trailer is materialized only when the queued row dispatches"
+    assert_eq!(
+        user_messages(&core),
+        ["opening", "with a file"],
+        "the attachment transport trailer belongs only in provider input, not app history"
     );
 
     let _ = harness.finish.send(());
@@ -1542,6 +1555,7 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
     for send_now in [false, true] {
         let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
         let mut config = zeron_proto::ChatConfig {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: Some("old-model".into()),
             reasoning: Some(ReasoningLevel::Medium),

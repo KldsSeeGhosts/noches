@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,14 @@ use super::event::{APPLICATION_EVENT_VERSION, Envelope, encode_component, iso};
 use super::projection::{self, ThreadProjection, decode};
 use super::{Error, Result};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("schema_scheduler.sql"),
+    include_str!("schema_git_actions.sql"),
+    include_str!("schema_launch.sql"),
+    include_str!("schema_transfer.sql"),
+    include_str!("schema_queue.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBoundary {
@@ -68,11 +75,13 @@ pub struct CommandReceipt {
 
 #[derive(Clone)]
 pub struct Store {
+    pub(crate) thread_locks: Arc<super::ThreadLocks>,
     pub(crate) docs: Arc<DocsStore>,
     pub(crate) host_id: Arc<str>,
     pub(crate) cancellations: Arc<Cancellations>,
     pub(crate) publication_lane: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<Mutex<Option<(WriteBoundary, usize)>>>,
+    admission: Arc<OnceLock<super::adoption::RegistryAdmission>>,
 }
 
 impl Store {
@@ -97,13 +106,17 @@ impl Store {
             }
             for (index, sql) in MIGRATIONS.iter().enumerate() {
                 let version = index as i64 + 1;
-                if version <= current {
+                if index == 0 && version <= current {
                     continue;
                 }
+                // Wave slices appended domain scripts independently, so a
+                // positional version can denote different domains before
+                // integration. Replay the IF-NOT-EXISTS domain DDL on open;
+                // the original, non-idempotent kernel schema runs only once.
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute_batch(sql)?;
                 tx.execute(
-                    "INSERT INTO orchestration_schema_migrations VALUES(?1,?2)",
+                    "INSERT OR IGNORE INTO orchestration_schema_migrations VALUES(?1,?2)",
                     params![version, crate::now_ms()],
                 )?;
                 tx.commit()?;
@@ -123,11 +136,13 @@ impl Store {
             Ok(())
         })?;
         Ok(Self {
+            thread_locks: Arc::default(),
             docs,
             host_id: host_id.into(),
             cancellations: Arc::default(),
             publication_lane: Arc::default(),
             failure: Arc::default(),
+            admission: Arc::default(),
         })
     }
 
@@ -187,7 +202,85 @@ impl Store {
     }
 
     pub fn thread(&self, id: &ThreadId) -> Result<Option<ThreadProjection>> {
+        self.thread_in_project(id, None)
+    }
+
+    pub(crate) fn stored_thread(&self, id: &ThreadId) -> Result<Option<ThreadProjection>> {
         self.read(|conn| projection::read_thread(conn, id))
+    }
+
+    pub(crate) fn install_admission(&self, admission: super::adoption::RegistryAdmission) {
+        let _ = self.admission.set(admission);
+    }
+
+    pub(crate) fn registry_unavailable(
+        &self,
+        id: &ThreadId,
+        project: Option<&zeron_proto::orchestration::ProjectId>,
+    ) -> bool {
+        self.admission
+            .get()
+            .is_some_and(|a| a.unavailable(id, project))
+    }
+
+    pub(crate) fn admit_project(
+        &self,
+        project: &zeron_proto::orchestration::ProjectId,
+    ) -> Result<()> {
+        if let Some(admission) = self.admission.get() {
+            for chat in admission
+                .workspace
+                .read_chats()
+                .map_err(|e| Error::Invariant(e.to_string()))?
+            {
+                if chat.device_id == self.host_id.as_ref()
+                    && super::adoption::project_id(&chat) == project.0
+                {
+                    self.thread_in_project(&ThreadId(chat.id), Some(project))?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Resolve outside the SQL connection. The stable adoption receipt and
+    /// immediate transaction fence independently racing handles/first calls.
+    pub(crate) fn thread_in_project(
+        &self,
+        id: &ThreadId,
+        project: Option<&zeron_proto::orchestration::ProjectId>,
+    ) -> Result<Option<ThreadProjection>> {
+        if self.registry_unavailable(id, project) {
+            return Ok(None);
+        }
+        let existing = self.read(|conn| projection::read_thread(conn, id))?;
+        if existing.is_some() {
+            return Ok(existing);
+        }
+        let Some(admission) = self.admission.get() else {
+            return Ok(None);
+        };
+        let Some((thread, messages)) = admission.prepare(id, project)? else {
+            return Ok(None);
+        };
+        let receipt = self.dispatch(
+            &Command {
+                id: CommandId(format!("registry-adopt:{}", encode_component(&id.0))),
+                thread_id: id.clone(),
+                operation: super::Operation::Adopt {
+                    legacy_chat_id: id.0.clone(),
+                    thread: Box::new(thread),
+                    messages,
+                },
+            },
+            crate::now_ms(),
+        )?;
+        // An ordinary turn could have created the projection after our read.
+        // Its existing identity wins; never overwrite or replay its input.
+        let current = self.read(|conn| projection::read_thread(conn, id))?;
+        if current.is_none() && receipt.status == ReceiptStatus::Rejected {
+            return Err(Error::Invariant(receipt.error.unwrap_or_default()));
+        }
+        Ok(current)
     }
 
     pub fn events(&self) -> Result<Vec<Envelope>> {
@@ -240,7 +333,7 @@ impl Store {
                 }
                 Err(error) => return Err(error),
             };
-            if plan.events.is_empty() {
+            if plan.events.is_empty() && !matches!(command.operation, super::Operation::Queue(_)) {
                 return Err(Error::Invariant(
                     "accepted command produced no events".into(),
                 ));
@@ -250,7 +343,7 @@ impl Store {
                 thread_id: command.thread_id.clone(),
                 command_type,
                 accepted_at,
-                result_sequence: 0,
+                result_sequence: latest_sequence(tx)?,
                 status: ReceiptStatus::Accepted,
                 error: None,
             };
@@ -316,14 +409,33 @@ impl Store {
                 )?;
                 self.boundary(WriteBoundary::AdoptionRecorded)?;
             }
-            super::sync_publish::enqueue(
+            super::ui_queue::persist(
                 tx,
-                &self.host_id,
-                &receipt.command_id,
-                receipt.result_sequence,
-                changed_threads,
+                &command.thread_id,
+                plan.queue_lifecycle.as_ref(),
+                plan.queue_intents.as_deref(),
             )?;
-            self.boundary(WriteBoundary::PublicationEnqueued)?;
+            if let Some(patch) = &plan.queue_patch {
+                tx.execute(
+                    "INSERT OR IGNORE INTO orchestration_queue_patches VALUES(?1,?2,?3,?4)",
+                    params![
+                        command.id.0,
+                        command.thread_id.0,
+                        receipt.result_sequence,
+                        serde_json::to_string(patch)?
+                    ],
+                )?;
+            }
+            if !changed_threads.is_empty() {
+                super::sync_publish::enqueue(
+                    tx,
+                    &self.host_id,
+                    &receipt.command_id,
+                    receipt.result_sequence,
+                    changed_threads,
+                )?;
+                self.boundary(WriteBoundary::PublicationEnqueued)?;
+            }
             put_receipt(tx, &receipt)?;
             self.boundary(WriteBoundary::ReceiptFinalized)?;
             Ok((receipt, cancellations))

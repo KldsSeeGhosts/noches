@@ -78,6 +78,7 @@ fn context(executable: &std::path::Path) -> SessionMcpContext {
 
 fn request(resume: bool) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: "MCP fixture".into(),
         harness: None,
         model: None,

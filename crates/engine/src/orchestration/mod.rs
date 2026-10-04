@@ -2,7 +2,9 @@
 //! `assembly` enables the production host by default. Opening only the kernel
 //! starts no workers; `runner` bridges its effects to ordinary sessions.
 
+pub(crate) mod adoption;
 pub mod assembly;
+pub mod checkpoint;
 pub mod command;
 pub mod continuation;
 #[cfg(test)]
@@ -11,17 +13,37 @@ mod delegation_live_tests;
 mod delegation_tests;
 pub mod effects;
 pub mod event;
+pub mod git_actions;
+pub mod launch;
+pub mod launch_service;
 pub mod mailbox;
 pub mod projection;
+pub mod pull_requests;
+pub mod queue;
+pub mod queue_service;
 pub mod recovery;
 pub mod runner;
+pub mod scheduler;
 pub mod service;
 pub mod store;
 pub mod sync_publish;
 pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod thread_service;
+pub mod threads;
+pub mod transfer;
+pub mod transfer_service;
 pub mod ui;
+pub(crate) mod ui_details;
+pub mod ui_git_actions;
+pub mod ui_launch;
+pub mod ui_provider_instances;
+pub mod ui_pull_requests;
+pub mod ui_queue;
+pub mod ui_scheduler;
+pub mod ui_threads;
+pub mod ui_transfer;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -93,10 +115,14 @@ impl Kernel {
     /// The caller must be the profile's owning engine, under its InstanceLock.
     /// Opening does not run recovery, publish documents, or execute effects.
     pub fn open(docs: Arc<DocsStore>, host_id: &str) -> Result<Self> {
-        Ok(Self {
-            store: Store::open(docs, host_id)?,
-            locks: Arc::default(),
-        })
+        Ok(Self::from_store(Store::open(docs, host_id)?))
+    }
+
+    pub(crate) fn from_store(store: Store) -> Self {
+        Self {
+            locks: store.thread_locks.clone(),
+            store,
+        }
     }
 
     pub async fn dispatch(&self, command: &Command, now_ms: i64) -> Result<CommandReceipt> {

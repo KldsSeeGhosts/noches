@@ -295,6 +295,7 @@ struct DocHostInner {
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
+    orchestration_queue: OnceLock<std::sync::Weak<crate::orchestration::queue::host::HostQueue>>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -723,6 +724,16 @@ impl ChatDocHandle {
         rx
     }
 
+    /// V2 mutations and the legacy drainer share this owner lane. Callers must
+    /// keep the guard through source commit and the Loro intent patch.
+    pub(crate) async fn orchestration_queue_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.drain_lock.lock().await
+    }
+
+    pub(crate) fn publish_orchestration_queue(&self) {
+        self.publish_queue();
+    }
+
     fn publish_queue(&self) {
         match self.doc.read_queue() {
             Ok(items) => {
@@ -914,6 +925,7 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
+                orchestration_queue: OnceLock::new(),
                 http: edge_url
                     .as_deref()
                     .map(crate::http_error::client_builder_for)
@@ -1048,6 +1060,54 @@ impl DocHost {
         for handle in handles {
             handle.queue_paused.store(true, Ordering::Release);
         }
+    }
+
+    /// Observational migration read: never open a handle, join sync, drain
+    /// commands/queue, or start a provider merely because history is imported.
+    pub(crate) fn orchestration_history(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<SessionMessageEntry>, EngineError> {
+        let cached = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = cached {
+            return Ok(handle.doc().read_entries()?);
+        }
+        let Some(bytes) = self.inner.store.load_snapshot(chat_id)? else {
+            return Ok(vec![]);
+        };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes)
+            .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+        Ok(SessionDoc::from_doc(raw).read_entries()?)
+    }
+
+    pub(crate) fn orchestration_queue_handles(&self) -> Vec<Arc<ChatDocHandle>> {
+        lock(&self.inner.handles).values().cloned().collect()
+    }
+
+    pub(crate) fn set_orchestration_queue(
+        &self,
+        service: std::sync::Weak<crate::orchestration::queue::host::HostQueue>,
+    ) {
+        let _ = self.inner.orchestration_queue.set(service);
+    }
+
+    async fn prepare_orchestration_queue(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+    ) -> Result<(), EngineError> {
+        if let Some(service) = self
+            .inner
+            .orchestration_queue
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            service
+                .prepare_locked(handle)
+                .await
+                .map_err(|e| EngineError::Other(e.message))?;
+        }
+        Ok(())
     }
 
     /// Test-only retirement sentinel: reports true once the doc-host graph
@@ -3519,6 +3579,32 @@ impl DocHost {
         Ok(changed)
     }
 
+    pub(crate) fn persist_orchestration_queue(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+    ) -> Result<(), EngineError> {
+        handle.publish_queue();
+        // Do not acknowledge the SQL repair outbox on a failed snapshot write.
+        if let Some(persistence) = &handle.persistence {
+            persistence.dirty(true);
+            persistence.flush_sync();
+            if !persistence.is_clean() {
+                return Err(EngineError::Other("Queue snapshot is not durable.".into()));
+            }
+        } else {
+            if handle.retired.load(Ordering::Relaxed) {
+                return Err(EngineError::Other("Queue document was retired.".into()));
+            }
+            let bytes = handle.doc.export_snapshot()?;
+            self.inner
+                .store
+                .save_snapshot(&handle.chat_id, &bytes)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Reorder a queued message (drag, or the up/down buttons).
     pub fn move_queued_message(
         &self,
@@ -3919,6 +4005,7 @@ impl DocHost {
         // Sending one now sends ONE: the lock keeps the flush out of the idle
         // window the interrupt opens, and out of the take itself.
         let _drain = handle.drain_lock.lock().await;
+        self.prepare_orchestration_queue(&handle).await?;
         let Some(candidate) = handle
             .doc
             .read_queue()?
@@ -3966,6 +4053,7 @@ impl DocHost {
         }
         let handle = self.open(chat_id)?;
         let _drain = handle.drain_lock.lock().await;
+        self.prepare_orchestration_queue(&handle).await?;
         let Some(sessions) = self.sessions() else {
             return Err(EngineError::Other("sessions engine not wired".into()));
         };
@@ -4029,6 +4117,9 @@ impl DocHost {
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
+        if self.prepare_orchestration_queue(handle).await.is_err() {
+            return;
+        }
         let Ok(_admission) = sessions.admit_work() else {
             return;
         };
@@ -4891,7 +4982,7 @@ impl DocHost {
     /// ours; a chat with no row is claimable (claim-on-first-command). Without a
     /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
-    fn is_host(&self, chat_id: &str) -> bool {
+    pub(crate) fn is_host(&self, chat_id: &str) -> bool {
         self.workspace().is_none_or(|ws| ws.is_host(chat_id))
     }
 
@@ -5236,6 +5327,7 @@ impl DocHost {
                     && ws.chat_config(chat_id).is_none()
                 {
                     let config = zeron_proto::ChatConfig {
+                        instance_id: request.instance_id.clone(),
                         harness,
                         model: request.model.clone(),
                         reasoning: request.reasoning,
@@ -5678,6 +5770,7 @@ impl DocHost {
         };
         let config = chat.config;
         Some(zeron_proto::RunRequest {
+            instance_id: config.as_ref().and_then(|c| c.instance_id.clone()),
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),

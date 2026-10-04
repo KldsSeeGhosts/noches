@@ -36,12 +36,19 @@ pub enum Operation {
     Adopt {
         legacy_chat_id: String,
         thread: Box<OrchestrationV2AppThread>,
+        /// Historical conversation records, never executable input.
+        messages: Vec<serde_json::Value>,
     },
     /// Trusted host startup only. Does not schedule restart continuations yet.
     Recover,
     /// Trusted ordinary-session admission updates the next turn's binding.
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
+    Transfer(Box<super::transfer::TransferOperation>),
+    Queue(Box<super::queue::QueueCommand>),
+    Thread(Box<super::threads::planner::ThreadOperation>),
+    Launch(Box<super::launch::LaunchOperation>),
+    PullRequest(Box<super::pull_requests::PrOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +87,9 @@ impl Command {
         if let Operation::Task(operation) = &self.operation {
             threads.extend(operation.lock_threads(&self.id));
         }
+        if let Operation::Transfer(operation) = &self.operation {
+            threads.extend(operation.lock_threads());
+        }
         threads
     }
 
@@ -96,6 +106,11 @@ impl Command {
             Operation::Recover => "kernel.runtime.recover".into(),
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
+            Operation::Transfer(operation) => operation.command_type().into(),
+            Operation::Queue(operation) => operation.command_type().into(),
+            Operation::Thread(operation) => operation.command_type().into(),
+            Operation::Launch(_) => "launch.workflow".into(),
+            Operation::PullRequest(operation) => operation.command_type().into(),
         })
     }
 }
@@ -108,6 +123,9 @@ pub(crate) struct Plan {
     pub adoption: Option<String>,
     pub routed_effects: Vec<(ThreadId, EffectRequest)>,
     pub cancel_threads: Vec<ThreadId>,
+    pub queue_lifecycle: Option<serde_json::Value>,
+    pub queue_intents: Option<Vec<zeron_doc::QueuedMessage>>,
+    pub queue_patch: Option<serde_json::Value>,
 }
 
 impl Plan {
@@ -408,8 +426,23 @@ fn provider_batch(
 }
 
 pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Plan> {
+    if let Operation::Queue(operation) = &command.operation {
+        return super::queue::plan(conn, command, operation, now);
+    }
+    if let Operation::Thread(operation) = &command.operation {
+        return super::threads::planner::plan(conn, command, operation, now);
+    }
+    if let Operation::Launch(operation) = &command.operation {
+        return super::launch::planner::plan(conn, command, operation, now);
+    }
+    if let Operation::PullRequest(operation) = &command.operation {
+        return super::pull_requests::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
+    }
+    if let Operation::Transfer(operation) = &command.operation {
+        return super::transfer::plan(conn, command, operation, now);
     }
     let projection = projection::read_thread(conn, &command.thread_id)?;
     let mut plan = Plan::default();
@@ -466,6 +499,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
     if let Operation::Adopt {
         legacy_chat_id,
         thread,
+        messages,
     } = &command.operation
     {
         if projection.is_some() || thread.id != command.thread_id || legacy_chat_id.is_empty() {
@@ -482,6 +516,24 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
             return Err(refuse("Legacy chat is already adopted."));
         }
         plan.emit(command, "thread.created", thread, now)?;
+        for (ordinal, message) in messages.iter().enumerate() {
+            if message["threadId"] != thread.id.0 || !message["runId"].is_null() {
+                return Err(refuse("Imported history cannot own a run."));
+            }
+            plan.emit(command, "message.updated", message, now)?;
+            let item = serde_json::json!({
+                "id":format!("turn-item:legacy:{}", encode_component(message["id"].as_str().unwrap_or_default())),
+                "threadId":thread.id,"runId":null,"nodeId":null,"providerThreadId":null,"providerTurnId":null,
+                "nativeItemRef":null,"parentItemId":null,"ordinal":ordinal + 1,
+                "type":if message["role"] == "user" {"user_message"} else {"assistant_message"},
+                "status":"completed","title":null,"text":message["text"],"messageId":message["id"],
+                "startedAt":message["createdAt"],"completedAt":message["updatedAt"],
+                "updatedAt":message["updatedAt"],"createdBy":message["createdBy"],
+                "creationSource":message["creationSource"],"attachments":message["attachments"],
+                "inputIntent":"turn_start","streaming":false
+            });
+            plan.emit(command, "turn-item.updated", &item, now)?;
+        }
         plan.adoption = Some(legacy_chat_id.clone());
         return Ok(plan);
     }
@@ -518,6 +570,11 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
                     } else {
                         "thread.model-selection-updated"
                     }
+                }
+                OrchestrationV2Command::ProviderSwitch(set) => {
+                    thread.provider_instance_id = set.model_selection.instance_id.clone();
+                    thread.model_selection = set.model_selection.clone();
+                    "thread.provider-switched"
                 }
                 OrchestrationV2Command::ThreadUnarchive(_) => {
                     thread.archived_at = None;
@@ -696,8 +753,13 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
             }
             plan.emit(command, "thread.metadata-updated", thread, now)?;
         }
+        Operation::Launch(_) => unreachable!("launch planner routed above"),
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
+        Operation::Transfer(_) => unreachable!("routed before the kernel subset"),
+        Operation::Queue(_) => unreachable!("routed before the kernel subset"),
+        Operation::Thread(_) => unreachable!("routed before the kernel subset"),
+        Operation::PullRequest(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

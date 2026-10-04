@@ -94,6 +94,10 @@ pub struct ModelOptionChoice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
+    /// Host-local provider routing identity. Absent on older replicated runs:
+    /// resolve the driver's canonical compatibility instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<crate::provider_instance::ProviderInstanceId>,
     pub prompt: String,
     /// The harness picked at send time. Rides the command plane so
     /// claim-on-first-command (chat row still in flight on the registry
@@ -420,8 +424,17 @@ pub enum DoneStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
+    /// Host-only durable native conversation boundary, not a visible message.
+    #[serde(rename_all = "camelCase")]
+    NativeReference {
+        thread_id: String,
+        #[serde(default)]
+        turn_id: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     SessionStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<crate::provider_instance::ProviderInstanceId>,
         harness: HarnessId,
         model: String,
         #[serde(default)]
@@ -637,18 +650,49 @@ mod tests {
         // Old-wire JSON without the field parses (additive compat)…
         let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
         let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.instance_id.is_none());
         assert!(req.attachments.is_empty());
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
         // Populated lists round-trip.
         let req = RunRequest {
+            instance_id: None,
             attachments: vec!["/tmp/a.png".into()],
             ..req
         };
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn instance_selection_and_legacy_session_start_are_sync_safe() {
+        let old = serde_json::json!({"prompt":"p","model":null,"reasoning":null,
+            "cwd":".","sandbox":"workspace-write","resume":null});
+        let mut request: RunRequest = serde_json::from_value(old).unwrap();
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("instanceId")
+                .is_none()
+        );
+        request.instance_id = Some("codex_proxy".into());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["instanceId"], "codex_proxy");
+        assert_eq!(serde_json::from_value::<RunRequest>(wire).unwrap(), request);
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type":"sessionStarted","harness":"codex","model":"opaque/model",
+            "tools":[],"cwd":"/repo","sessionId":"native","assistantMessageId":"message"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::SessionStarted {
+                instance_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -662,6 +706,7 @@ mod tests {
         assert!(json.get("worktree").is_none());
         // A populated spec round-trips camelCased.
         let req = RunRequest {
+            instance_id: None,
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),

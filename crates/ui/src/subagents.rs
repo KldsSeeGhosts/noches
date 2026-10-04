@@ -2415,6 +2415,7 @@ mod tests {
             checkout_id: None,
             source_context: None,
             config: Some(zeron_proto::ChatConfig {
+                instance_id: None,
                 harness: zeron_proto::HarnessId::ClaudeCode,
                 model: Some("anthropic/claude-opus".into()),
                 reasoning: Some(zeron_proto::ReasoningLevel::High),
@@ -2428,6 +2429,7 @@ mod tests {
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -2589,6 +2591,7 @@ mod tests {
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

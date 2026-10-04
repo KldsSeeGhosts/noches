@@ -111,8 +111,14 @@ fn cached(state: &State) -> Result<Vec<Model>, HarnessError> {
 
 /// Hash (never log) the SDK's auth inputs. Contents, not mtime, detect atomic
 /// account swaps. Expiry crossing also invalidates the prior account's cache.
-pub(super) fn credential_context() -> Result<[u8; 32], HarnessError> {
-    let path = crate::executable::home_or_current_dir().join(".cursor/sdk/auth.json");
+pub(super) fn credential_context(
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<[u8; 32], HarnessError> {
+    let path = overrides
+        .get("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::executable::home_or_current_dir)
+        .join(".cursor/sdk/auth.json");
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -131,14 +137,19 @@ pub(super) fn credential_context() -> Result<[u8; 32], HarnessError> {
     let mut hash = Sha256::new();
     hash.update(bytes);
     hash.update([u8::from(expired)]);
-    let mut env: Vec<_> = std::env::vars_os()
-        .filter(|(key, _)| key.to_string_lossy().starts_with("CURSOR_"))
+    let mut env: std::collections::BTreeMap<_, _> = std::env::vars()
+        .filter(|(key, _)| key.starts_with("CURSOR_"))
         .collect();
-    env.sort();
+    env.extend(
+        overrides
+            .iter()
+            .filter(|(key, _)| key.starts_with("CURSOR_"))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
     for (key, value) in env {
-        hash.update(key.as_encoded_bytes());
+        hash.update(key.as_bytes());
         hash.update([0]);
-        hash.update(value.as_encoded_bytes());
+        hash.update(value.as_bytes());
         hash.update([0]);
     }
     Ok(hash.finalize().into())

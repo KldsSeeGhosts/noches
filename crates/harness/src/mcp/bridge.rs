@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::{Value, json, value::RawValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 
@@ -20,6 +21,66 @@ use crate::{
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 const PROTOCOL: &str = "2025-06-18";
+
+/// MCP results may contain JavaScript strings with lone UTF-16 surrogates.
+/// Parse only the routing envelope; forwarding must not decode the payload
+/// into Rust strings or change its escaped representation.
+#[derive(Deserialize)]
+struct RpcEnvelope {
+    id: Option<Value>,
+    #[serde(default, deserialize_with = "present_raw")]
+    result: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    error: Option<Box<RawValue>>,
+}
+
+fn present_raw<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+struct HttpFrame {
+    raw: Box<RawValue>,
+    envelope: RpcEnvelope,
+}
+
+impl HttpFrame {
+    fn parse(raw: &str) -> Result<Self, serde_json::Error> {
+        let validated: Box<RawValue> = serde_json::from_str(raw)?;
+        let raw = RawValue::from_string(compact_json(validated.get()))?;
+        let envelope = serde_json::from_str(raw.get())?;
+        Ok(Self { raw, envelope })
+    }
+
+    fn value(value: Value) -> Self {
+        Self::parse(&value.to_string()).expect("JSON-RPC value")
+    }
+}
+
+/// Stdio frames must occupy a single line. Remove only insignificant JSON
+/// whitespace, keeping every string character and escape byte unchanged.
+fn compact_json(raw: &str) -> String {
+    let mut compact = String::with_capacity(raw.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if quoted {
+            compact.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if !matches!(ch, ' ' | '\n' | '\r' | '\t') {
+            compact.push(ch);
+            quoted = ch == '"';
+        }
+    }
+    compact
+}
 
 #[derive(Default)]
 struct HttpState {
@@ -57,7 +118,7 @@ impl HttpPeer {
     async fn request(
         &self,
         message: Value,
-        output: &mpsc::Sender<Value>,
+        output: &mpsc::Sender<HttpFrame>,
     ) -> Result<(), HarnessError> {
         let mut request = self
             .client
@@ -122,7 +183,7 @@ impl HttpPeer {
                         .join("\n");
                     if !data.is_empty() {
                         self.emit(
-                            serde_json::from_str(&data)
+                            HttpFrame::parse(&data)
                                 .map_err(|_| protocol_error("invalid MCP SSE JSON"))?,
                             output,
                         )
@@ -136,8 +197,11 @@ impl HttpPeer {
         }
         if !sse && !buffered.is_empty() {
             self.emit(
-                serde_json::from_slice(&buffered)
-                    .map_err(|_| protocol_error("invalid MCP response JSON"))?,
+                HttpFrame::parse(
+                    std::str::from_utf8(&buffered)
+                        .map_err(|_| protocol_error("MCP response is not UTF-8"))?,
+                )
+                .map_err(|_| protocol_error("invalid MCP response JSON"))?,
                 output,
             )
             .await?;
@@ -145,8 +209,15 @@ impl HttpPeer {
         Ok(())
     }
 
-    async fn emit(&self, message: Value, output: &mpsc::Sender<Value>) -> Result<(), HarnessError> {
-        if let Some(version) = message["result"]["protocolVersion"].as_str() {
+    async fn emit(
+        &self,
+        message: HttpFrame,
+        output: &mpsc::Sender<HttpFrame>,
+    ) -> Result<(), HarnessError> {
+        if let Some(result) = &message.envelope.result
+            && let Ok(result) = serde_json::from_str::<Value>(result.get())
+            && let Some(version) = result["protocolVersion"].as_str()
+        {
             self.state.lock().await.protocol = Some(version.into());
         }
         output
@@ -281,7 +352,7 @@ pub async fn cli(args: &[String]) -> Result<(), HarnessError> {
             let result = async {
                 peer.request("initialize", json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"noches-acp-cli","version":env!("CARGO_PKG_VERSION")}})).await?;
                 peer.notify("notifications/initialized").await?;
-                peer.request("tools/call", json!({"name":tool,"arguments":arguments})).await
+                peer.request_raw("tools/call", json!({"name":tool,"arguments":arguments})).await
             }.await;
             peer.close().await;
             println!("{}", result?);
@@ -373,11 +444,13 @@ async fn select_server(
 }
 
 async fn run_http_bridge(peer: HttpPeer) -> Result<(), HarnessError> {
-    let (tx, mut rx) = mpsc::channel::<Value>(128);
+    let (tx, mut rx) = mpsc::channel::<HttpFrame>(128);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(message) = rx.recv().await {
-            stdout.write_all(format!("{message}\n").as_bytes()).await?;
+            stdout
+                .write_all(format!("{}\n", message.raw).as_bytes())
+                .await?;
             stdout.flush().await?;
         }
         Ok::<_, std::io::Error>(())
@@ -403,7 +476,7 @@ async fn run_http_bridge(peer: HttpPeer) -> Result<(), HarnessError> {
         let message: Value = match serde_json::from_slice(&frame) {
             Ok(value) => value,
             Err(_) => {
-                let _ = tx.send(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})).await;
+                let _ = tx.send(HttpFrame::value(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}))).await;
                 continue;
             }
         };
@@ -415,7 +488,7 @@ async fn run_http_bridge(peer: HttpPeer) -> Result<(), HarnessError> {
             Some("initialize" | "notifications/initialized")
         ) {
             if let Err(error) = peer.request(message, &tx).await {
-                let _ = tx.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})).await;
+                let _ = tx.send(HttpFrame::value(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}}))).await;
             }
         } else {
             if tasks.len() >= 128 {
@@ -425,7 +498,7 @@ async fn run_http_bridge(peer: HttpPeer) -> Result<(), HarnessError> {
             let tx = tx.clone();
             tasks.spawn(async move {
                 if let Err(error) = peer.request(message, &tx).await && let Some(id) = id {
-                    let _ = tx.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})).await;
+                    let _ = tx.send(HttpFrame::value(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}}))).await;
                 }
             });
         }
@@ -482,6 +555,15 @@ impl ToolPeer {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, HarnessError> {
+        let raw = self.request_raw(method, params).await?;
+        serde_json::from_str(raw.get()).map_err(|_| protocol_error("invalid MCP result JSON"))
+    }
+
+    async fn request_raw(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Box<RawValue>, HarnessError> {
         match self {
             Self::Http(peer) => {
                 let (tx, mut rx) = mpsc::channel(128);
@@ -495,12 +577,12 @@ impl ToolPeer {
                         result = &mut request => {
                             result?;
                             while let Ok(message) = rx.try_recv() {
-                                if message.get("id") == Some(&json!(1)) { return rpc_result(message); }
+                                if message.envelope.id == Some(json!(1)) { return rpc_result(message); }
                             }
                             return Err(protocol_error("MCP response missing"));
                         },
                         Some(message) = rx.recv() => {
-                            if message.get("id") == Some(&json!(1)) { return rpc_result(message); }
+                            if message.envelope.id == Some(json!(1)) { return rpc_result(message); }
                         }
                     }
                 }
@@ -510,7 +592,8 @@ impl ToolPeer {
                 tokio::pin!(request);
                 loop {
                     tokio::select! {
-                        result = &mut request => return result,
+                        result = &mut request => return RawValue::from_string(result?.to_string())
+                            .map_err(|_| protocol_error("invalid MCP result JSON")),
                         Some(message) = incoming.recv() => if let Incoming::Request { id, .. } = message {
                             rpc.respond_error(&id, -32601, "terminal fallback cannot answer server requests");
                         },
@@ -542,14 +625,40 @@ impl ToolPeer {
     }
 }
 
-fn rpc_result(message: Value) -> Result<Value, HarnessError> {
-    if let Some(error) = message.get("error") {
+fn rpc_result(message: HttpFrame) -> Result<Box<RawValue>, HarnessError> {
+    if let Some(error) = message.envelope.error {
         return Err(protocol_error(&crate::redact::redact_registered(
-            &error.to_string(),
+            error.get(),
         )));
     }
     message
-        .get("result")
-        .cloned()
+        .envelope
+        .result
         .ok_or_else(|| protocol_error("MCP response missing result"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_frame_preserves_surrogates_escapes_and_single_line_framing() {
+        let raw = "{\n \"jsonrpc\":\"2.0\", \"id\":1,\n \"result\":{\"text\":\"\\ud83d\",\"space\":\" a b \",\"escapes\":\"\\\\\\\"\\n\"}\n}";
+        let frame = HttpFrame::parse(raw).unwrap();
+        assert_eq!(frame.envelope.id, Some(json!(1)));
+        assert!(!frame.raw.get().contains('\n'));
+        let result = rpc_result(frame).unwrap();
+        assert_eq!(
+            result.get(),
+            r#"{"text":"\ud83d","space":" a b ","escapes":"\\\"\n"}"#
+        );
+        assert!(HttpFrame::parse(r#"{"id":1 2}"#).is_err());
+        assert_eq!(
+            rpc_result(HttpFrame::parse(r#"{"id":1,"result":null}"#).unwrap())
+                .unwrap()
+                .get(),
+            "null"
+        );
+        assert!(rpc_result(HttpFrame::parse(r#"{"id":1}"#).unwrap()).is_err());
+    }
 }
