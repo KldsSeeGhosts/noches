@@ -97,6 +97,16 @@ pub struct ScheduledTaskLastRun {
     pub error: Option<String>,
 }
 
+impl Default for ScheduledTaskLastRun {
+    fn default() -> Self {
+        Self {
+            status: ScheduledTaskRunStatus::Never,
+            at: None,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledTaskView {
@@ -105,6 +115,7 @@ pub struct ScheduledTaskView {
     pub task: ScheduledTask,
     #[serde(default)]
     pub cadence: String,
+    #[serde(default)]
     pub last_run: ScheduledTaskLastRun,
 }
 

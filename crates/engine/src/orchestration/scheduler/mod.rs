@@ -3,6 +3,8 @@
 pub mod mcp;
 pub mod schedule;
 pub mod service;
+#[cfg(test)]
+mod tests;
 
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -153,7 +155,7 @@ impl Scheduler {
     /// changed payload under the same key edits the definition and preserves
     /// run history; a different provider session has a different resolved ID.
     pub fn upsert(&self, input: ScheduledTaskUpsertInput) -> SchedulerResult<ScheduledTask> {
-        let id = input.id.as_ref().cloned().unwrap_or_else(|| {
+        let mut id = input.id.as_ref().cloned().unwrap_or_else(|| {
             ScheduledTaskId(format!(
                 "scheduled-task:{}",
                 input
@@ -163,6 +165,8 @@ impl Scheduler {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
             ))
         });
+        id.0 = nonempty(&id.0)
+            .map_err(|_| SchedulerError::new("Could not save schedule task.", Some(&id)))?;
         // Validate writes even when called through a typed Rust/UI API.
         let input: ScheduledTaskUpsertInput = normalize_contract(
             "ScheduledTaskUpsertInput",
@@ -235,7 +239,7 @@ impl Scheduler {
         edit: impl FnOnce(Option<ScheduledTask>, i64) -> Result<ScheduledTask>,
     ) -> SchedulerResult<ScheduledTask> {
         let result = self.store.write(|tx| {
-            let task = edit(find(tx, id)?, self.clock.now_ms())?;
+            let task = normalize_task(edit(find(tx, id)?, self.clock.now_ms())?)?;
             save(tx, &task)?;
             Ok(task)
         });
@@ -638,7 +642,48 @@ fn decode_row(row: StoredTask) -> Result<ScheduledTask> {
     value["runCount"] = serde_json::json!(row.count);
     let value = normalize_contract("ScheduledTask", value)
         .map_err(|_| Error::Invariant("Could not decode schedule task row.".into()))?;
-    Ok(serde_json::from_value(value)?)
+    normalize_task(serde_json::from_value(value)?)
+}
+
+fn nonempty(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::Invariant(
+            "Could not decode schedule task row.".into(),
+        ));
+    }
+    Ok(value.into())
+}
+
+/// The generated contracts use transparent ID/string aliases, so supplement
+/// their shape decoder with T3 baseSchemas.ts trimming/nonempty and count
+/// checks at the persistence boundary. A corrupt ID must not dispatch.
+pub(super) fn normalize_task(mut task: ScheduledTask) -> Result<ScheduledTask> {
+    task.id.0 = nonempty(&task.id.0)?;
+    task.project_id.0 = nonempty(&task.project_id.0)?;
+    task.title = nonempty(&task.title)?;
+    task.prompt = nonempty(&task.prompt)?;
+    if let Some(thread) = &mut task.thread_id {
+        thread.0 = nonempty(&thread.0)?;
+    }
+    task.model_selection.instance_id.0 = nonempty(&task.model_selection.instance_id.0)?;
+    task.model_selection.model = nonempty(&task.model_selection.model)?;
+    if task.run_count < 0 {
+        return Err(Error::Invariant(
+            "Could not decode schedule task row.".into(),
+        ));
+    }
+    let mut strategy = serde_json::to_value(&task.workspace_strategy)?;
+    for field in ["baseRef", "branch", "worktreePath"] {
+        if let Some(value) = strategy.get_mut(field) {
+            let text = value
+                .as_str()
+                .ok_or_else(|| Error::Invariant("Could not decode schedule task row.".into()))?;
+            *value = serde_json::json!(nonempty(text)?);
+        }
+    }
+    task.workspace_strategy = serde_json::from_value(strategy)?;
+    Ok(task)
 }
 
 fn find(conn: &Connection, id: &ScheduledTaskId) -> Result<Option<ScheduledTask>> {
