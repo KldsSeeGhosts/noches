@@ -380,7 +380,7 @@ impl Harness for ClaudeHarness {
 
     async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
         let executable = self.resolve_executable()?;
-        let mut command = tokio::process::Command::new(&executable);
+        let mut command = Command::new(&executable);
         crate::compose_child_environment(&mut command, &executable);
         command
             .args(["auth", "status", "--json"])
