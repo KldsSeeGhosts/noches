@@ -19,8 +19,8 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
-pub mod provider_instances;
 pub mod device_room;
+pub mod provider_instances;
 pub mod remote;
 mod server;
 

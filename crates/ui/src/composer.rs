@@ -7041,6 +7041,7 @@ impl Composer {
 
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        instance_id: resolved.instance_id.clone(),
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),
@@ -8778,8 +8779,8 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     harness_session_id: None,
                     harness_session_cwd: None,
-                    space_id: None,
                     harness_session_instance_id: None,
+                    space_id: None,
                     last_seen_at: None,
                     room_gen: None,
                 }]);

@@ -126,6 +126,7 @@ pub fn bump_harness_catalog(cx: &mut App) {
 /// extras (ref + checkout kind) and the run config.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftConfig {
+    pub instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
@@ -169,6 +170,7 @@ pub enum CheckoutPlan {
 /// loaded), plus the explicit non-default option picks.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedRunConfig {
+    pub instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
     pub runtime_mode: zeron_proto::RuntimeMode,
     pub interaction_mode: zeron_proto::InteractionMode,
     pub harness: Option<HarnessId>,
@@ -182,6 +184,7 @@ impl ResolvedRunConfig {
     /// The `ChatConfig` recorded on `Mutate createChat` (needs a known harness).
     pub fn chat_config(&self) -> Option<ChatConfig> {
         Some(ChatConfig {
+            instance_id: self.instance_id.clone(),
             harness: self.harness?,
             model: self.model.clone(),
             reasoning: self.reasoning,
@@ -679,6 +682,11 @@ pub struct Pickers {
     setting_scroll: gpui::ScrollHandle,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    /// Driver rails remain a presentation key; each cached slot also belongs
+    /// to one exact instance, including the legacy canonical selection.
+    models_instance_ids:
+        HashMap<HarnessId, Option<zeron_proto::provider_instance::ProviderInstanceId>>,
+    model_request_ids: HashMap<HarnessId, u64>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -899,6 +907,8 @@ impl Pickers {
             setting_scroll: gpui::ScrollHandle::new(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            models_instance_ids: HashMap::new(),
+            model_request_ids: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -939,6 +949,7 @@ impl Pickers {
             self.draft_runtime_mode = Default::default();
             self.runtime_menu_open = false;
             self.config.harness = None;
+            self.config.instance_id = None;
             self.config.model = None;
             self.config.reasoning = None;
             self.switch_error = None;
@@ -963,6 +974,8 @@ impl Pickers {
             // a space switch may land on another device, so refetch.
             self.harnesses = Loadable::Idle;
             self.models.clear();
+            self.models_instance_ids.clear();
+            self.model_request_ids.clear();
             self.catalog_rev += 1;
         }
         self.presentation_changed(PickerPresentationChanged::Config, cx);
@@ -1287,6 +1300,12 @@ impl Pickers {
     /// loaded (no "engine picks a default" passthrough).
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
+            instance_id: self
+                .target
+                .chat(self.state.read(cx))
+                .and_then(|c| c.config.as_ref())
+                .and_then(|c| c.instance_id.clone())
+                .or_else(|| self.config.instance_id.clone()),
             runtime_mode: self.runtime_mode(cx),
             interaction_mode: self
                 .target
@@ -1644,6 +1663,27 @@ impl Pickers {
     }
 
     fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        let instance_id = self
+            .target
+            .chat(self.state.read(cx))
+            .and_then(|c| c.config.as_ref())
+            .filter(|config| config.harness == harness)
+            .and_then(|config| config.instance_id.clone())
+            .or_else(|| {
+                (self.config.harness == Some(harness))
+                    .then(|| self.config.instance_id.clone())
+                    .flatten()
+            });
+        let identity_changed = self
+            .models_instance_ids
+            .get(&harness)
+            .map_or(instance_id.is_some(), |previous| previous != &instance_id);
+        if identity_changed {
+            self.models.remove(&harness);
+            self.catalog_rev += 1;
+        }
+        self.models_instance_ids
+            .insert(harness, instance_id.clone());
         // Normal prefetches load absent/Idle slots once. Picker-open refreshes
         // also retry Ready/Error slots, while an in-flight load is always
         // reused. Ready rows stay visible until the replacement lands.
@@ -1660,6 +1700,9 @@ impl Pickers {
         };
         let target = self.space_target(cx);
         let generation = self.target_generation;
+        self.catalog_rev += 1;
+        let request_id = self.catalog_rev;
+        self.model_request_ids.insert(harness, request_id);
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
             self.models.insert(harness, Loadable::Loading);
             self.catalog_rev += 1;
@@ -1669,6 +1712,9 @@ impl Pickers {
             // field - unlike upstream, there is no persisted catalog to
             // force-refresh past. `force` still decides which slots reload.
             let mut params = serde_json::json!({ "harness": harness });
+            if let Some(instance) = &instance_id {
+                params["instanceId"] = serde_json::json!(instance);
+            }
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
                     "targetDeviceId".into(),
@@ -1711,7 +1757,10 @@ impl Pickers {
                 cx.background_executor().timer(delay).await;
             }
             this.update(cx, |pickers, cx| {
-                if pickers.target_generation != generation {
+                if pickers.target_generation != generation
+                    || pickers.models_instance_ids.get(&harness) != Some(&instance_id)
+                    || pickers.model_request_ids.get(&harness) != Some(&request_id)
+                {
                     return;
                 }
                 let loaded = match result {
@@ -1943,6 +1992,7 @@ impl Pickers {
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
             self.config.reasoning = None;
+            self.config.instance_id = None;
         }
         self.config.harness = Some(harness);
         self.defaults.harness = Some(harness);
@@ -1951,6 +2001,37 @@ impl Pickers {
         self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
+        self.presentation_changed(PickerPresentationChanged::Config, cx);
+    }
+
+    /// Designer seam for instance-grouped model rows. Existing threads keep
+    /// their driver but may select another account/route of that same driver.
+    pub fn select_provider_instance(
+        &mut self,
+        harness: HarnessId,
+        instance_id: zeron_proto::provider_instance::ProviderInstanceId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.harness_locked(cx) && self.effective_harness(cx) != Some(harness) {
+            return;
+        }
+        if self.target.chat_id(self.state.read(cx)).is_some() {
+            self.update_chat_config(cx, move |config| {
+                config.harness = harness;
+                config.instance_id = Some(instance_id);
+                config.model = None;
+                config.reasoning = None;
+                config.model_options.clear();
+            });
+        } else {
+            self.config.harness = Some(harness);
+            self.config.instance_id = Some(instance_id);
+            self.config.model = None;
+            self.config.reasoning = None;
+            self.defaults.harness = Some(harness);
+            self.save_defaults();
+        }
+        self.ensure_models(harness, false, cx);
         self.presentation_changed(PickerPresentationChanged::Config, cx);
     }
 
@@ -5409,6 +5490,30 @@ mod tests {
                 pickers.scalar_presentation(cx).label.as_deref(),
                 Some("Now listed")
             );
+        });
+    }
+
+    #[gpui::test]
+    fn instance_selection_invalidates_driver_models_and_chat_switch_resets_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.config.harness = Some(HarnessId::Codex);
+            pickers.config.instance_id = Some("direct".into());
+            pickers.ensure_models(HarnessId::Codex, false, cx);
+            pickers.apply_model_catalog(
+                HarnessId::Codex,
+                Loadable::Ready(vec![bare_model("direct/model", "Direct")]),
+                cx,
+            );
+            pickers.select_provider_instance(HarnessId::Codex, "proxy".into(), cx);
+            assert!(!pickers.models.contains_key(&HarnessId::Codex));
+            assert_eq!(pickers.resolved(cx).instance_id.unwrap().as_ref(), "proxy");
+            pickers.draft_owner = Some("previous-chat".into());
+            pickers.refresh_target(cx);
+            assert!(pickers.config.instance_id.is_none());
         });
     }
 
