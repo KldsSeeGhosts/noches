@@ -278,7 +278,11 @@ pub struct ClientFrame {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerFrame {
     pub id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_json_value"
+    )]
     pub ok: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
@@ -286,6 +290,13 @@ pub struct ServerFrame {
     pub item: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub done: bool,
+}
+
+/// A present JSON null is a valid unary value, not a missing reply field.
+fn present_json_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// What a service returns for one invocation.
@@ -424,6 +435,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn null_unary_reply_is_distinct_from_an_absent_reply() {
+        let frame: ServerFrame =
+            serde_json::from_value(serde_json::json!({"id":1,"ok":null})).unwrap();
+        assert_eq!(frame.ok, Some(serde_json::Value::Null));
+        let frame: ServerFrame =
+            serde_json::from_value(serde_json::json!({"id":1,"done":true})).unwrap();
+        assert!(frame.ok.is_none());
     }
 
     #[tokio::test]
