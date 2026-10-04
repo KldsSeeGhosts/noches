@@ -512,6 +512,7 @@ impl EngineCore {
         .with_previews(self.previews.clone());
         if let Some(host) = &self.orchestration_host {
             rpc = rpc.with_delegation(host.service.clone());
+            rpc = rpc.with_scheduler(host.scheduler.clone());
         }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
