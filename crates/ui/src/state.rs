@@ -786,6 +786,9 @@ pub struct AppState {
     pub thread_lifecycles: HashMap<String, zeron_proto::ChatLifecycle>,
     /// Live scheduled tasks per owner device (see `crate::automations`).
     pub automations: crate::automations::AutomationsStore,
+    /// F1 root-checkout pull policy/status, owner-routed.
+    pub git_actions: crate::git_store::GitStore,
+    pub history_import: crate::history_import::HistoryImportStore,
     sessions: Vec<Session>,
     /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
     /// ([`Self::replace_sessions`]) so [`Self::session_for`] is O(1) on the
@@ -985,6 +988,8 @@ impl AppState {
             chats: Vec::new(),
             thread_lifecycles: HashMap::new(),
             automations: Default::default(),
+            git_actions: Default::default(),
+            history_import: Default::default(),
             sessions: Vec::new(),
             session_index: HashMap::new(),
             session_presentation: None,

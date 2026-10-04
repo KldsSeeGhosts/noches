@@ -581,12 +581,18 @@ pub enum SettingsSection {
     Appshots,
     /// Scheduled tasks (T3 P7): run now, pause, delete.
     Automations,
+    Import,
     Archived,
     Updates,
 }
 
+/// Reuse the shell's identity fallback in engine-backed Settings project chips.
+pub(crate) fn project_monogram(name: &str, seed: &str, theme: &Theme) -> AnyElement {
+    project_icon::monogram(name, seed, false, theme)
+}
+
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 13] = [
+    pub const ALL: [SettingsSection; 14] = [
         SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
@@ -598,6 +604,7 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Automations,
+        SettingsSection::Import,
         SettingsSection::Archived,
         SettingsSection::Updates,
     ];
@@ -617,6 +624,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Automations => "Automations",
+            SettingsSection::Import => "Import history",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Updates => "Updates",
         }
@@ -671,6 +679,7 @@ impl SettingsSection {
                 &["schedule", "scheduled", "task", "cron", "recurring", "timer", "run"]
             }
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
+            SettingsSection::Import => &["import", "cli", "history", "claude", "codex", "sessions"],
             SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
         }
     }
@@ -715,6 +724,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Automations => "automations",
+            SettingsSection::Import => "import",
             SettingsSection::Archived => "archived",
             SettingsSection::Updates => "updates",
         }
@@ -737,6 +747,7 @@ impl SettingsSection {
             "shortcuts" => SettingsSection::Shortcuts,
             "appshots" => SettingsSection::Appshots,
             "automations" | "scheduled-tasks" => SettingsSection::Automations,
+            "import" | "import-history" => SettingsSection::Import,
             "archived" => SettingsSection::Archived,
             "updates" => SettingsSection::Updates,
             _ => return None,
@@ -1894,6 +1905,10 @@ pub struct Shell {
     connections_page: Option<Entity<ConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     automations_page: Option<Entity<crate::settings::automations::AutomationsPage>>,
+    git_dialog: Option<Entity<crate::git_dialog::GitDialog>>,
+    git_dialog_events: Option<Subscription>,
+    import_page: Option<Entity<crate::settings::import::ImportPage>>,
+    import_page_events: Option<Subscription>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2421,6 +2436,10 @@ impl Shell {
             connections_page: None,
             archived_page: None,
             automations_page: None,
+            git_dialog: None,
+            git_dialog_events: None,
+            import_page: None,
+            import_page_events: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -4194,7 +4213,7 @@ impl Shell {
         self.set_right_active(RightSurface::Details, cx);
     }
 
-    fn details_panel_actions(&self) -> crate::details::DetailsActions {
+    fn details_panel_actions(&self, chat_id: String) -> crate::details::DetailsActions {
         // Engine-backed actions arrive with their slices (pr-watch,
         // scheduler, transfer, launch, git-actions); until then they say so.
         fn pending<T: 'static>(
@@ -4210,7 +4229,18 @@ impl Shell {
             open_url: std::rc::Rc::new(|_, url, cx| cx.open_url(&url)),
             toggle_watch: pending("Pull request watch"),
             link_pull_request: pending("Linking pull requests"),
-            commit: pending("Commit"),
+            commit: std::rc::Rc::new(move |this, (), cx| {
+                let state = this.state.clone();
+                let chat_id = chat_id.clone();
+                let dialog = cx.new(|cx| crate::git_dialog::GitDialog::new(state, chat_id, cx));
+                this.git_dialog_events = Some(cx.subscribe(&dialog, |this, _, _: &crate::git_dialog::Closed, cx| {
+                    this.git_dialog = None;
+                    this.git_dialog_events = None;
+                    cx.notify();
+                }));
+                this.git_dialog = Some(dialog);
+                cx.notify();
+            }),
             run_automation: std::rc::Rc::new(|this, id, cx| {
                 this.state
                     .update(cx, |state, cx| state.run_automation_now(&id, cx));
@@ -4226,6 +4256,12 @@ impl Shell {
             retry_setup: pending("Worktree setup"),
             continue_setup: pending("Worktree setup"),
             move_to_worktree: pending("Worktree handoff"),
+            toggle_pull: std::rc::Rc::new(|this, (space_id, enabled), cx| {
+                this.state.update(cx, |state, cx| state.change_pull(&space_id, Some(enabled), cx));
+            }),
+            retry_pull: std::rc::Rc::new(|this, space_id, cx| {
+                this.state.update(cx, |state, cx| state.change_pull(&space_id, None, cx));
+            }),
         }
     }
 
@@ -5184,6 +5220,17 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::Import => {
+                if self.import_page.is_none() {
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| crate::settings::import::ImportPage::new(state, cx));
+                    self.import_page_events = Some(cx.subscribe(&page, |this, _, event: &crate::settings::import::OpenChat, cx| {
+                        this.open_chat(event.0.clone(), cx);
+                    }));
+                    self.import_page = Some(page);
+                }
+                self.import_page.as_ref().unwrap().clone().into_any_element()
             }
         }
     }
@@ -6787,6 +6834,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Automations => icons::CALENDAR,
+            SettingsSection::Import => icons::DOCUMENT_ADD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Updates => icons::RESTART,
         };
@@ -8554,6 +8602,7 @@ impl Shell {
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
         if self.sync_flow.has_visible_overlay()
+            || self.git_dialog.is_some()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_menu.get().is_some()
@@ -9063,6 +9112,10 @@ impl Shell {
         }
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
             overlays.push(overlay);
+        }
+
+        if let Some(dialog) = &self.git_dialog {
+            overlays.push(popover::modal("git-action-dialog", viewport, dialog.clone().into_any_element()));
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
@@ -10231,6 +10284,14 @@ impl Shell {
                 RightSurface::Details => {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
+                    let pull_space = self.state.read(cx).chats.iter().find(|chat| chat.id == chat_id)
+                        .and_then(|chat| {
+                            let space = chat.space_id.as_ref().and_then(|id| self.state.read(cx).spaces.iter().find(|s| &s.id == id))?;
+                            crate::git_store::is_root_checkout(chat, space).then(|| space.id.clone())
+                        });
+                    if let Some(space) = pull_space {
+                        self.state.update(cx, |state, cx| state.ensure_pull_watch(&space, cx));
+                    }
                     // Owner-routed: the chat's host device owns its automations.
                     let owner = self
                         .state
@@ -10249,7 +10310,7 @@ impl Shell {
                     let model =
                         crate::details::DetailsModel::for_chat(self.state.read(cx), &chat_id);
                     let ui = self.details_ui.get(&chat_id).cloned().unwrap_or_default();
-                    let actions = self.details_panel_actions();
+                    let actions = self.details_panel_actions(chat_id.clone());
                     let toggle_chat = chat_id.clone();
                     crate::details::details_panel_body(
                         &chat_id,
@@ -15645,6 +15706,7 @@ mod settings_reopen_regressions {
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
             ("settings/scheduled-tasks", SettingsSection::Automations),
+            ("settings/import", SettingsSection::Import),
             ("settings/updates", SettingsSection::Updates),
         ] {
             assert_eq!(

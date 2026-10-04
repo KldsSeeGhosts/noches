@@ -18,6 +18,7 @@ pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod automations;
+pub mod import;
 pub mod composer;
 pub mod connections;
 pub mod devices;
