@@ -31,6 +31,10 @@ with normal send (which would duplicate messages or permit late restart).
 
 ## Closed seams
 
+- Ordinary registry chats are admitted on first orchestration lookup through
+  the kernel's atomic adoption receipt. History imports as non-executable
+  text items; scheduler/thread intake, queue/lifecycle and PR lookups share
+  the same owner-scoped boundary. See `thread-service.md` for historical gaps.
 - Bound schedules revalidate task/claim authority, use mode `auto` and the
   thread's current checkout, and enqueue through ordinary stable command and
   message receipts with schedule ID and actor/source.
@@ -53,8 +57,10 @@ with normal send (which would duplicate messages or permit late restart).
 
 Native cross-checkout handoff still needs driver-authorized resume or bounded
 history transfer; instance/cwd fences are preserved. Canonical direct thread
-deletion, sidebar-chat admission, strict existing-message delivery/selection
-transition, and observational pinned-run history remain documented seams.
+deletion, strict existing-message delivery/selection transition, and
+observational pinned-run history remain documented seams.
+Legacy pending-queue UI still needs a visual bridge for SQL-only queued
+MCP/scheduler sends; typed `GetQueueState` already exposes them.
 PR settlement still needs project/environment settings and integration of
 queue's Auto marker/provider detach inside the existing sequence fence.
 Launch's documented provider-clone/setup/replicated-progress gaps remain.
@@ -129,3 +135,38 @@ harness output does not contain the early unit-suite aggregate. Its exit
 status was zero, and every retained integration/doc result was `ok`.
 The engine also reports an existing `unused_doc_comments` warning for
 test-only instrumentation in `sessions.rs`; no new warnings were introduced.
+
+### Registry adoption fix validation (2026-10-04)
+
+All runs used the same local Mac wrapper and target above, one suite at a
+time. Final commands/results:
+
+| Engine command suffix | Result |
+| --- | --- |
+| `--lib -- --test-threads=1` | 624 passed, 0 failed, 2 ignored (157.83s) |
+| `--test registry_adoption -- --test-threads=1` | 5 passed |
+| `--test orchestration_bootstrap -- --test-threads=1` | 2 passed |
+| `--test queue_lifecycle_rpc -- --test-threads=1` | 1 passed |
+| `--test scheduler_bootstrap -- --test-threads=1` | 1 passed |
+| `--test orchestration_mcp -- --test-threads=1` | 1 passed |
+| `--test projectless -- --test-threads=1` | 3 passed |
+
+The first default-parallel `--lib` run had 623 passed, 1 failed, 2 ignored.
+Its failure was the existing
+`orchestration::checkpoint::tests::refuses_main_checksum_head_and_checkout_lock`
+assertion at `checkpoint/tests.rs:220` expecting `"HEAD changed since preview"`.
+That test passed immediately in isolation; the final entire serial library
+run above also passed. No checkpoint code was changed.
+
+New regressions exercise real `Mutate createChat`, manual scheduler dispatch
+with acceptance-loss replay (exactly one task run/message, queued behind busy
+work), restart preservation, MCP HTTP `t3_thread_send`/`t3_thread_read`,
+same-chat harness/document execution, queue reads, first-operation lifecycle,
+foreign-device/wrong-project refusal, rollback at adoption recording,
+racing first operations, after-commit response loss and projection rebuild.
+Import creates no runs/effects; existing user/assistant text survives timeline
+reads without replaying history. The original session document remains intact.
+
+Touched-file `rustfmt --edition 2024 --config skip_children=true --check`
+and `git diff --check` passed. Headed QA, live providers and Windows remain
+unverified. No SSH, push, PR or release was performed.

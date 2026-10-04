@@ -75,6 +75,42 @@ Only insignificant JSON whitespace is removed for single-line stdio frames.
 
 ## Integration seams
 
+Production thread lookup now admits ordinary registry chats on demand, including
+the calling chat. Owner and space/project checks precede admission; a known
+foreign-device or wrong-project target keeps T3's thread-not-found error family.
+Project list/search admits the local chats in that project. Queue, metadata,
+lifecycle, PR-link and scheduler paths share the same admission boundary.
+
+Admission uses a stable `registry-adopt:<chatId>` receipt and the kernel's
+`Adopt` transaction: thread creation, historical messages/items, adoption record
+and publication commit together. Racing first calls and acceptance-loss retries
+cannot duplicate the import. Lineage has no parent/relationship; the saved
+instance, model/options, explicit runtime modes and chat cwd (or project root)
+are retained. Native resume identity remains in the existing registry/session
+resume path. Import performs no discovery, provider start, run creation, task
+creation or effect enqueue. Legacy recovery uses projection-only lookup, so a
+startup scan does not itself adopt chats.
+
+Historical user/assistant text maps to `v1_import` timeline items with null
+run/node/provider ownership and server import provenance. Reads and passive
+timeline include these items and retain ordinary pagination/UTF-16 behavior.
+The source is a passive local cached-document or stored-snapshot read, not a
+document open/command drain. Accepted sends still use canonical thread intake
+and Sessions execution on the same chat; queue/steer/restart planners are unchanged.
+
+Historical gaps: this is a one-time local transcript snapshot, not a live mirror
+of later out-of-band legacy writes. Historical reasoning, tool activity,
+attachments, system entries, continuation grouping and streaming/aborted status
+are not reconstructed; imported text items are completed and have no fabricated
+historical runs. The original session document is unchanged and remains readable
+in the chat UI. New V2 runs use the existing full event/timeline projection.
+
+Existing UI seam: SQL-only queued MCP/scheduler sends are exposed through
+`GetQueueState`, but the legacy GPUI pending queue consumes Loro `WatchQueue`
+rows. This fix does not mirror SQL-owned pending rows into that separate
+drainer. Their messages reach the existing session transcript when execution
+starts; pre-execution legacy queue-panel visibility still needs integration.
+
 No methods were added to `OrchestratorService`. Toolkit integration is a
 separate optional service and one domain dispatch call. No generated schemas
 were edited and no extra MCP parameters were added. Domain commands use

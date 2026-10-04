@@ -109,11 +109,27 @@ impl DelegationTargets for HostCatalog {
             .map(serde_json::to_value)
             .transpose()
             .map_err(tool_error)?;
-        let selection = self.0.provider_instances.resolve_target(
-            &self.0,
-            &parent.model_selection,
-            target.as_ref(),
-        )?;
+        let mut inherited = parent.model_selection.clone();
+        // Registry chats with no model and a cold discovery cache retain the
+        // ordinary intake's implicit default. Resolve it only on actual send,
+        // never by doing provider discovery/work during transcript import.
+        if inherited.model == "default"
+            && parent.history_origin.as_ref() == Some(&OrchestrationV2ThreadHistoryOrigin::V1Import)
+            && let Some(provider) = self
+                .0
+                .provider_instances
+                .snapshot(&self.0)
+                .into_iter()
+                .find(|p| p.provider_instance_id == inherited.instance_id)
+            && !provider.models.iter().any(|m| m.id == inherited.model)
+            && let Some(model) = provider.models.first()
+        {
+            inherited.model = model.id.clone();
+        }
+        let selection =
+            self.0
+                .provider_instances
+                .resolve_target(&self.0, &inherited, target.as_ref())?;
         let instance = self
             .0
             .provider_instances
@@ -292,6 +308,13 @@ impl OrchestrationHost {
         registry: Arc<HarnessRegistry>,
         device_id: String,
     ) -> Result<Self> {
+        kernel
+            .store
+            .install_admission(super::adoption::RegistryAdmission {
+                workspace: workspace.clone(),
+                docs: doc_host.clone(),
+                registry: registry.clone(),
+            });
         let catalog = Arc::new(HostCatalog(registry.clone()));
         let bridge = Arc::new(RunnerBridge {
             kernel: kernel.clone(),
@@ -625,6 +648,9 @@ impl RunnerBridge {
                 .await?;
         }
         let projection = self.kernel.store.thread(thread)?.unwrap();
+        // Registry admission supplies canonical project identity, including
+        // old projectless rows whose saved cwd differs from an expanded "~".
+        scope.project_id = projection.thread.project_id.clone();
         let run = projection
             .runs
             .iter()

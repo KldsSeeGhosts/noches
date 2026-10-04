@@ -91,10 +91,29 @@ impl QueueDomain {
         input: &Value,
         writable: bool,
     ) -> std::result::Result<ThreadProjection, ToolError> {
+        self.admit_targets(caller, input)?;
         self.kernel
             .store
             .read(|conn| access(conn, caller, input, writable))
             .map_err(map_access_error)
+    }
+
+    fn admit_targets(
+        &self,
+        caller: &CallerScope,
+        input: &Value,
+    ) -> std::result::Result<(), ToolError> {
+        self.kernel
+            .store
+            .thread_in_project(&caller.thread_id, Some(&caller.project_id))
+            .map_err(|_| unavailable())?;
+        if let Some(id) = input["threadId"].as_str() {
+            self.kernel
+                .store
+                .thread_in_project(&ThreadId(id.into()), Some(&caller.project_id))
+                .map_err(|_| unavailable())?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn mutate(
@@ -123,7 +142,7 @@ impl QueueDomain {
     /// ownership is checked by the RPC before entering this local seam.
     pub async fn organize_for_user(
         &self,
-        workspace: &crate::WorkspaceHost,
+        _workspace: &crate::WorkspaceHost,
         docs: &crate::DocHost,
         registry: &Arc<crate::HarnessRegistry>,
         id: &str,
@@ -155,55 +174,10 @@ impl QueueDomain {
             .map_err(|_| unavailable())?
             .is_none()
         {
-            let chat = workspace
-                .chat(id)
-                .map_err(|_| unavailable())?
-                .ok_or_else(|| {
-                    ToolError::new(
-                        Code::ThreadNotFound,
-                        "The thread was not found in the calling project.",
-                    )
-                })?;
-            let config = chat.config.as_ref();
-            // TODO(merge-threads): the shared thread-create path should have
-            // admitted every sidebar chat before lifecycle commands arrive.
-            let harness = docs.harness_for(id);
-            let mut provider = registry
-                .provider_instances
-                .snapshot(registry)
-                .into_iter()
-                .find(|p| p.harness_id == Some(harness))
-                .ok_or_else(unavailable)?;
-            if provider.models.is_empty() && config.and_then(|c| c.model.as_ref()).is_none() {
-                registry
-                    .provider_instances
-                    .refresh(registry, harness)
-                    .await
-                    .map_err(|_| unavailable())?;
-                provider = registry
-                    .provider_instances
-                    .snapshot(registry)
-                    .into_iter()
-                    .find(|p| p.provider_instance_id == provider.provider_instance_id)
-                    .ok_or_else(unavailable)?;
-            }
-            let model = config
-                .and_then(|c| c.model.clone())
-                .or_else(|| provider.models.first().map(|m| m.id.clone()))
-                .ok_or_else(unavailable)?;
-            let create=Command::wire(serde_json::from_value(json!({
-                "type":"thread.create","commandId":format!("lifecycle-adopt:{id}"),
-                "threadId":id,"projectId":chat.space_id.as_deref().unwrap_or("scratch"),
-                "title":chat.title.as_deref().unwrap_or("Conversation"),"createdBy":"user","creationSource":"web",
-                "modelSelection":{"instanceId":provider.provider_instance_id,"model":model},
-                "runtimeMode":config.map(|c|c.runtime_mode).unwrap_or_default(),
-                "interactionMode":config.map(|c|c.interaction_mode).unwrap_or_default(),
-                "branch":chat.branch,"worktreePath":chat.cwd
-            })).map_err(|_|unavailable())?).map_err(|_|unavailable())?;
-            self.kernel
-                .dispatch(&create, crate::now_ms())
-                .await
-                .map_err(|_| unavailable())?;
+            return Err(ToolError::new(
+                Code::ThreadNotFound,
+                "The thread was not found in the calling project.",
+            ));
         }
         let host = host::HostQueue {
             domain: Arc::new(QueueDomain::new(self.kernel.clone())),
@@ -476,6 +450,10 @@ impl QueueService for QueueDomain {
     ) -> std::result::Result<Value, ToolError> {
         if name == "t3_thread_search" {
             let parent = self.target(&caller, &json!({}), false)?;
+            self.kernel
+                .store
+                .admit_project(&parent.thread.project_id)
+                .map_err(|_| unavailable())?;
             return self
                 .kernel
                 .store
@@ -492,6 +470,7 @@ impl QueueService for QueueDomain {
                     | "t3_pending_request_read"
             );
         let p = if metadata {
+            self.admit_targets(&caller, &input)?;
             self.kernel
                 .store
                 .read(|conn| metadata_access(conn, &caller, &input))

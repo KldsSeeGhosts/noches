@@ -534,6 +534,7 @@ fn adoption_never_enqueues_effects_or_fabricates_task_lineage() {
         operation: Operation::Adopt {
             legacy_chat_id: "old-chat".into(),
             thread: Box::new(thread),
+            messages: vec![],
         },
     };
     fixture
