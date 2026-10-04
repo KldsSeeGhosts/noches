@@ -169,6 +169,33 @@ pub fn checkbox(
         .when(disabled, |el| el.opacity(0.5))
 }
 
+/// Shared quiet input shell for Git, PR linking, handoff and restore dialogs.
+pub(crate) fn dialog_field(
+    input: &Entity<ComposerInput>,
+    min_lines: usize,
+    max_lines: usize,
+    theme: &Theme,
+    cx: &gpui::App,
+) -> AnyElement {
+    let height = input
+        .read(cx)
+        .measured_text_height()
+        .clamp(min_lines as f32 * 18.0, max_lines as f32 * 18.0);
+    let pad_y = if max_lines == 1 { 4.0 } else { 8.0 };
+    div()
+        .w_full()
+        .h(px(height + pad_y * 2.0))
+        .overflow_hidden()
+        .px(px(if max_lines == 1 { 8.0 } else { 12.0 }))
+        .py(px(pad_y))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(theme.border)
+        .text_size(crate::typography::ui_rems(13.0))
+        .child(input.clone())
+        .into_any_element()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Inspecting,
@@ -545,24 +572,7 @@ impl GitDialog {
         theme: &Theme,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let height = input
-            .read(cx)
-            .measured_text_height()
-            .clamp(min_lines as f32 * 18.0, max_lines as f32 * 18.0);
-        // Single-line fields sit inside 32px step rows; keep them 28px tall.
-        let pad_y = if max_lines == 1 { 4.0 } else { 8.0 };
-        div()
-            .w_full()
-            .h(px(height + pad_y * 2.0))
-            .overflow_hidden()
-            .px(px(if max_lines == 1 { 8.0 } else { 12.0 }))
-            .py(px(pad_y))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(theme.border)
-            .text_size(crate::typography::ui_rems(13.0))
-            .child(input.clone())
-            .into_any_element()
+        dialog_field(input, min_lines, max_lines, theme, cx)
     }
 
     fn remote_chip(&self, repository: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {

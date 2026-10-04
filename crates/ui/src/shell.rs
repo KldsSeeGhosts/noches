@@ -71,6 +71,7 @@ mod chat_rename;
 #[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
+mod details_binding;
 mod file_mutations;
 mod lifecycle;
 mod panes;
@@ -1907,6 +1908,8 @@ pub struct Shell {
     automations_page: Option<Entity<crate::settings::automations::AutomationsPage>>,
     git_dialog: Option<Entity<crate::git_dialog::GitDialog>>,
     git_dialog_events: Option<Subscription>,
+    details_dialog: Option<Entity<crate::details_dialog::DetailsDialog>>,
+    details_dialog_events: Option<Subscription>,
     import_page: Option<Entity<crate::settings::import::ImportPage>>,
     import_page_events: Option<Subscription>,
     appearance_page: Option<Entity<AppearancePage>>,
@@ -2438,6 +2441,8 @@ impl Shell {
             automations_page: None,
             git_dialog: None,
             git_dialog_events: None,
+            details_dialog: None,
+            details_dialog_events: None,
             import_page: None,
             import_page_events: None,
             appearance_page: None,
@@ -3292,6 +3297,11 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        // Passive owner reads on activation; never start a polling loop.
+        if matches!(surface, RightSurface::Details | RightSurface::Agents) {
+            self.state
+                .update(cx, |state, cx| state.refresh_details(&key, true, cx));
+        }
         match surface {
             RightSurface::Files => {
                 if let Some(files) = self.files.get(&key).cloned() {
@@ -4214,55 +4224,7 @@ impl Shell {
     }
 
     fn details_panel_actions(&self, chat_id: String) -> crate::details::DetailsActions {
-        // Engine-backed actions arrive with their slices (pr-watch,
-        // scheduler, transfer, launch, git-actions); until then they say so.
-        fn pending<T: 'static>(
-            what: &'static str,
-        ) -> std::rc::Rc<dyn Fn(&mut Shell, T, &mut Context<Shell>)> {
-            std::rc::Rc::new(move |this: &mut Shell, _: T, cx: &mut Context<Shell>| {
-                this.sidebar_notice =
-                    Some(format!("{what} is not available on this engine yet").into());
-                cx.notify();
-            })
-        }
-        crate::details::DetailsActions {
-            open_url: std::rc::Rc::new(|_, url, cx| cx.open_url(&url)),
-            toggle_watch: pending("Pull request watch"),
-            link_pull_request: pending("Linking pull requests"),
-            commit: std::rc::Rc::new(move |this, (), cx| {
-                let state = this.state.clone();
-                let chat_id = chat_id.clone();
-                let dialog = cx.new(|cx| crate::git_dialog::GitDialog::new(state, chat_id, cx));
-                this.git_dialog_events = Some(cx.subscribe(&dialog, |this, _, _: &crate::git_dialog::Closed, cx| {
-                    this.git_dialog = None;
-                    this.git_dialog_events = None;
-                    cx.notify();
-                }));
-                this.git_dialog = Some(dialog);
-                cx.notify();
-            }),
-            run_automation: std::rc::Rc::new(|this, id, cx| {
-                this.state
-                    .update(cx, |state, cx| state.run_automation_now(&id, cx));
-            }),
-            toggle_automation: std::rc::Rc::new(|this, (id, enabled), cx| {
-                this.state
-                    .update(cx, |state, cx| state.set_automation_enabled(&id, enabled, cx));
-            }),
-            manage_automations: std::rc::Rc::new(|this, (), cx| {
-                this.open_settings(SettingsSection::Automations, cx);
-            }),
-            restore_checkpoint: pending("Checkpoint restore"),
-            retry_setup: pending("Worktree setup"),
-            continue_setup: pending("Worktree setup"),
-            move_to_worktree: pending("Worktree handoff"),
-            toggle_pull: std::rc::Rc::new(|this, (space_id, enabled), cx| {
-                this.state.update(cx, |state, cx| state.change_pull(&space_id, Some(enabled), cx));
-            }),
-            retry_pull: std::rc::Rc::new(|this, space_id, cx| {
-                this.state.update(cx, |state, cx| state.change_pull(&space_id, None, cx));
-            }),
-        }
+        self.live_details_actions(chat_id)
     }
 
     /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
@@ -8603,6 +8565,7 @@ impl Shell {
         // path close here; the others remain explicit blockers.
         if self.sync_flow.has_visible_overlay()
             || self.git_dialog.is_some()
+            || self.details_dialog.is_some()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
             || self.chat_menu.get().is_some()
@@ -9115,7 +9078,18 @@ impl Shell {
         }
 
         if let Some(dialog) = &self.git_dialog {
-            overlays.push(popover::modal("git-action-dialog", viewport, dialog.clone().into_any_element()));
+            overlays.push(popover::modal(
+                "git-action-dialog",
+                viewport,
+                dialog.clone().into_any_element(),
+            ));
+        }
+        if let Some(dialog) = &self.details_dialog {
+            overlays.push(popover::modal(
+                "thread-details-dialog",
+                viewport,
+                dialog.clone().into_any_element(),
+            ));
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
@@ -10257,16 +10231,9 @@ impl Shell {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
                     let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
-                    let related = {
-                        let state = self.state.read(cx);
-                        crate::delegation::related_rows(&state.delegation, &chat_id, |id| {
-                            state
-                                .chats
-                                .iter()
-                                .find(|chat| chat.id == id)
-                                .and_then(|chat| chat.title.clone())
-                        })
-                    };
+                    self.state
+                        .update(cx, |state, cx| state.refresh_details(&chat_id, false, cx));
+                    let related = self.details_related_rows(&chat_id, cx);
                     let ui = self.agents_ui.get(&chat_id).cloned().unwrap_or_default();
                     let actions = self.agents_panel_actions(chat_id.clone());
                     crate::subagents::agents_panel_body(
@@ -10284,13 +10251,30 @@ impl Shell {
                 RightSurface::Details => {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
-                    let pull_space = self.state.read(cx).chats.iter().find(|chat| chat.id == chat_id)
+                    self.state
+                        .update(cx, |state, cx| state.refresh_details(&chat_id, false, cx));
+                    if let Some(notice) = self
+                        .state
+                        .update(cx, |state, _| state.details.notice.take())
+                    {
+                        self.sidebar_notice = Some(notice.into());
+                    }
+                    let pull_space = self
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .find(|chat| chat.id == chat_id)
                         .and_then(|chat| {
-                            let space = chat.space_id.as_ref().and_then(|id| self.state.read(cx).spaces.iter().find(|s| &s.id == id))?;
-                            crate::git_store::is_root_checkout(chat, space).then(|| space.id.clone())
+                            let space = chat.space_id.as_ref().and_then(|id| {
+                                self.state.read(cx).spaces.iter().find(|s| &s.id == id)
+                            })?;
+                            crate::git_store::is_root_checkout(chat, space)
+                                .then(|| space.id.clone())
                         });
                     if let Some(space) = pull_space {
-                        self.state.update(cx, |state, cx| state.ensure_pull_watch(&space, cx));
+                        self.state
+                            .update(cx, |state, cx| state.ensure_pull_watch(&space, cx));
                     }
                     // Owner-routed: the chat's host device owns its automations.
                     let owner = self
@@ -10303,9 +10287,8 @@ impl Shell {
                     if let Some(owner) = owner
                         && !self.state.read(cx).automations.watching(&owner)
                     {
-                        self.state.update(cx, |state, cx| {
-                            state.ensure_automations_watch(&owner, cx)
-                        });
+                        self.state
+                            .update(cx, |state, cx| state.ensure_automations_watch(&owner, cx));
                     }
                     let model =
                         crate::details::DetailsModel::for_chat(self.state.read(cx), &chat_id);

@@ -30,6 +30,7 @@ mod context_usage;
 pub mod controls;
 pub mod details;
 pub(crate) mod details_data;
+pub(crate) mod details_dialog;
 pub(crate) mod delegation;
 pub(crate) mod elapsed_label;
 pub mod edge_fade;
