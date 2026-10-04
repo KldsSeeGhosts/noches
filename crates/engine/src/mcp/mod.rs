@@ -58,6 +58,13 @@ impl McpServer {
         self.toolkit.set_queue_service(service);
     }
 
+    pub fn set_pull_requests(
+        &self,
+        service: Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>,
+    ) {
+        self.toolkit.set_pull_requests(service);
+    }
+
     pub async fn endpoint(self: &Arc<Self>) -> std::io::Result<&str> {
         self.endpoint
             .get_or_try_init(|| async {

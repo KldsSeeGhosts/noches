@@ -231,7 +231,7 @@ impl RunnerMcp for HostMcp {
                     environment_id: self.device_id.clone(),
                     caller: scope,
                     selection: run.model_selection.clone(),
-                    capabilities: ["orchestration", "worktree"]
+                    capabilities: ["orchestration", "worktree", "pull-requests"]
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
@@ -252,6 +252,7 @@ pub struct OrchestrationHost {
     pub threads: Arc<dyn super::thread_service::ThreadService>,
     pub scheduler: Arc<super::scheduler::Scheduler>,
     pub launch: Option<Arc<super::launch::HostLaunchService>>,
+    pub pull_requests: Arc<super::pull_requests::PullRequestService>,
     stop: CancellationToken,
     workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -371,6 +372,22 @@ impl OrchestrationHost {
         }));
         // ── end P4b assembly ────────────────────────────────────────────────
         // END scheduler slice.
+        // -- PR links/watch/settlement (wave 3 pr-watch) --
+        let pull_requests = Arc::new(super::pull_requests::PullRequestService {
+            kernel: kernel.clone(),
+            host: Arc::new(super::pull_requests::host::GitHubHost::default()),
+        });
+        sessions
+            .mcp_server()
+            .set_pull_requests(pull_requests.clone());
+        workers.push(
+            super::pull_requests::reactor::PullRequestReactor::new(
+                pull_requests.clone(),
+                Arc::new(PrContext(workspace.clone())),
+            )
+            .spawn(stop.clone()),
+        );
+        // -- end PR links/watch/settlement --
         let publisher = PublicationWorker {
             store: kernel.store.clone(),
             publisher: Arc::new(ChatPublisher {
@@ -402,6 +419,7 @@ impl OrchestrationHost {
             threads,
             scheduler,
             launch: None,
+            pull_requests,
             stop,
             workers: std::sync::Mutex::new(workers),
         })
@@ -465,6 +483,25 @@ impl OrchestrationHost {
             .push(self.scheduler.spawn(self.stop.clone()));
         self.launch = Some(service);
         Ok(())
+    }
+}
+
+struct PrContext(WorkspaceHost);
+impl super::pull_requests::reactor::PrThreadContext for PrContext {
+    fn cwd(&self, thread: &OrchestrationV2AppThread) -> Option<std::path::PathBuf> {
+        thread
+            .worktree_path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).is_dir())
+            .cloned()
+            .or_else(|| {
+                self.0
+                    .chat(&thread.id.0)
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.source_context.map(|s| s.repo_root).or(c.cwd))
+            })
+            .map(Into::into)
     }
 }
 

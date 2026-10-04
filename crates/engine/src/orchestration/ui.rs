@@ -58,7 +58,8 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<Value> {
         "forkedFrom":parent.thread.forked_from,"transfers":super::transfer::transfers(conn,id)?,
         "checkpoints":super::checkpoint::timeline(conn,id)?,
         "workState":task::progress(&parent).0,"tasks":tasks,"latestResult":latest_result,
-        "queueState":super::ui_queue::state(conn,id)?}),
+        "queueState":super::ui_queue::state(conn,id)?,
+        "pullRequests":super::ui_pull_requests::state(conn, id)?}),
     )
 }
 

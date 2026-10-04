@@ -13,6 +13,7 @@ pub mod orchestration_threads;
 pub mod preview;
 pub mod provider_instance;
 pub mod provider_settings;
+pub mod pull_requests;
 pub mod runtime_policy;
 pub mod scheduler;
 pub mod thread_lifecycle;

@@ -46,6 +46,7 @@ pub enum Operation {
     Queue(Box<super::queue::QueueCommand>),
     Thread(Box<super::threads::planner::ThreadOperation>),
     Launch(Box<super::launch::LaunchOperation>),
+    PullRequest(Box<super::pull_requests::PrOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,7 @@ impl Command {
             Operation::Queue(operation) => operation.command_type().into(),
             Operation::Thread(operation) => operation.command_type().into(),
             Operation::Launch(_) => "launch.workflow".into(),
+            Operation::PullRequest(operation) => operation.command_type().into(),
         })
     }
 }
@@ -431,6 +433,9 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
     if let Operation::Launch(operation) = &command.operation {
         return super::launch::planner::plan(conn, command, operation, now);
     }
+    if let Operation::PullRequest(operation) = &command.operation {
+        return super::pull_requests::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
     }
@@ -733,6 +738,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
         Operation::Transfer(_) => unreachable!("routed before the kernel subset"),
         Operation::Queue(_) => unreachable!("routed before the kernel subset"),
         Operation::Thread(_) => unreachable!("routed before the kernel subset"),
+        Operation::PullRequest(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

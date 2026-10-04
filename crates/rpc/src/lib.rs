@@ -23,6 +23,7 @@ pub mod device_room;
 pub mod git_actions;
 pub mod launch;
 pub mod provider_instances;
+pub mod pull_requests;
 pub mod remote;
 pub mod scheduled_tasks;
 mod server;
@@ -56,6 +57,7 @@ pub mod methods {
     pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
     /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.
     pub const RESTORE_FILE_CHECKPOINT: &str = "RestoreFileCheckpoint";
+    pub const GET_THREAD_PULL_REQUESTS: &str = "GetThreadPullRequests";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
     /// `task_cancel` under host authority. Resolves on acceptance, not on the
     /// terminal state, which `GetOrchestrationState` reports.

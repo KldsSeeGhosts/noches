@@ -1893,6 +1893,37 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.message))?;
                 RpcReply::value(&serde_json::json!({"accepted":true}))
             }
+            methods::GET_THREAD_PULL_REQUESTS => {
+                let p: ChatParams = parse_params(params)?;
+                let state = if let Some(store) = &self.orchestration
+                    && store
+                        .thread(&p.chat_id.clone().into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_some()
+                {
+                    store
+                        .ui_pull_requests(&p.chat_id.into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    let value = self
+                        .doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .doc()
+                        .orchestration()["projection"]["uiState"]["pullRequests"]
+                        .clone();
+                    if value.is_null() {
+                        zeron_proto::pull_requests::ThreadPullRequestsUi {
+                            thread_id: p.chat_id,
+                            ..Default::default()
+                        }
+                    } else {
+                        serde_json::from_value(value)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?
+                    }
+                };
+                RpcReply::value(&state)
+            }
             methods::LIST_PROVIDER_INSTANCES => {
                 self.registry
                     .provider_instances
