@@ -2,6 +2,8 @@
 pub mod mcp;
 pub mod planner;
 pub(crate) mod runner;
+#[cfg(test)]
+mod tests;
 pub mod timeline;
 pub mod wire;
 
@@ -79,17 +81,16 @@ impl KernelThreadService {
         self.kernel
             .store
             .thread(&caller.thread_id)
-            .map_err(failure)?
+            .map_err(|_| if thread_toolkit {failure("The operation could not be completed.")} else {
+                failure(format!("Unable to read thread {}: Failed to load orchestration projection for thread {}.",caller.thread_id,caller.thread_id))
+            })?
             .filter(|p| !thread_toolkit || p.thread.deleted_at.is_none())
             .ok_or_else(|| {
-                ToolError::new(
-                    Code::ThreadNotFound,
-                    if thread_toolkit {
-                        "The calling thread was not found.".into()
-                    } else {
-                        format!("Thread {} was not found.", caller.thread_id)
-                    },
-                )
+                if thread_toolkit {
+                    ToolError::new(Code::ThreadNotFound,"The calling thread was not found.")
+                } else {
+                    failure(format!("Unable to read thread {}: Failed to load orchestration projection for thread {}.",caller.thread_id,caller.thread_id))
+                }
             })
     }
 
@@ -100,11 +101,34 @@ impl KernelThreadService {
         readable: bool,
     ) -> Result<(ThreadProjection, ThreadProjection), ToolError> {
         let parent = self.caller(caller, false)?;
+        if target == caller.thread_id.0 {
+            if parent.thread.deleted_at.is_some() {
+                return Err(ToolError::new(
+                    Code::ThreadNotFound,
+                    if readable {
+                        format!("Thread {target} is no longer available.")
+                    } else {
+                        format!(
+                            "Thread {target} was not found in project {}.",
+                            parent.thread.project_id
+                        )
+                    },
+                ));
+            }
+            return Ok((parent.clone(), parent));
+        }
+        let load_error = || {
+            failure(format!(
+                "Unable to load thread {target} in project {}.",
+                parent.thread.project_id
+            ))
+        };
         let projection = self
             .kernel
             .store
             .thread(&ThreadId(target.into()))
-            .map_err(failure)?;
+            .map_err(|_| load_error())?
+            .ok_or_else(load_error)?;
         let attached = readable
             && records(&parent, "message").iter().any(|m| {
                 m["role"] == "user"
@@ -114,17 +138,13 @@ impl KernelThreadService {
                             .any(|r| r["kind"] == "thread" && r["threadId"] == target)
                     })
             });
-        if attached
-            && projection
-                .as_ref()
-                .is_some_and(|p| p.thread.deleted_at.is_some())
-        {
+        if attached && projection.thread.deleted_at.is_some() {
             return Err(ToolError::new(
                 Code::ThreadNotFound,
                 format!("Thread {target} is no longer available."),
             ));
         }
-        let target = projection
+        let target = Some(projection)
             .filter(|p| {
                 p.thread.deleted_at.is_none()
                     && (p.thread.project_id == parent.thread.project_id || attached)
@@ -190,7 +210,12 @@ impl ThreadService for KernelThreadService {
             .kernel
             .store
             .thread_summaries(&parent.thread.project_id)
-            .map_err(failure)?;
+            .map_err(|_| {
+                failure(format!(
+                    "Unable to list threads: Unable to list threads in project {}.",
+                    parent.thread.project_id
+                ))
+            })?;
         let filtered: Vec<_> = all
             .into_iter()
             .filter(|t| {
@@ -232,7 +257,12 @@ impl ThreadService for KernelThreadService {
     ) -> Result<timeline::ThreadReadPage, ToolError> {
         let (parent, target) = self.scoped(&caller, &input.thread_id, true)?;
         let (page, selected) =
-            timeline::page(&self.kernel.store, &target, &input).map_err(failure)?;
+            timeline::page(&self.kernel.store, &target, &input).map_err(|_| {
+                failure(format!(
+                    "Failed to load orchestration projection for thread {}.",
+                    target.thread.id
+                ))
+            })?;
         if input.text_offset.as_ref().copied().unwrap_or(0) == 0
             && target.thread.lineage.parent_thread_id.as_ref() == Some(&parent.thread.id)
             && target.thread.lineage.relationship_to_parent
@@ -350,6 +380,20 @@ impl ThreadService for KernelThreadService {
                 ),
             ));
         }
+        // T3 dispatch refuses provider-owned children before resolving any
+        // provider session/model or clearing lifecycle parking. Keep the
+        // planner's guard too, for ownership changes between these reads.
+        if self
+            .kernel
+            .store
+            .read(|conn| planner::native_child(conn, &target))
+            .map_err(failure)?
+        {
+            return Err(failure(format!(
+                "Unable to send to thread {}: This subagent is run by its provider and cannot take messages. Message the parent thread instead.",
+                input.thread_id
+            )));
+        }
         let key = request_key(&input.client_request_id);
         let id = mcp_command_id(&caller.session_id, "thread-send", &key);
         let message = MessageId(format!(
@@ -460,6 +504,12 @@ impl ThreadService for KernelThreadService {
             let (_, current) = self.scoped(&caller, &input.thread_id, false)?;
             run = self.run(&current, run.as_ref().map(|r| &r.id.0))?.cloned();
         }
+        // A terminal event can race the deadline. Like T3, let a final
+        // projection read decide whether the selected run actually timed out.
+        if run.as_ref().is_some_and(|r| !run_terminal(&r.status)) {
+            let (_, current) = self.scoped(&caller, &input.thread_id, false)?;
+            run = self.run(&current, run.as_ref().map(|r| &r.id.0))?.cloned();
+        }
         serde_json::from_value(
             json!({"threadId":target.thread.id,"runId":run.as_ref().map(|r| &r.id),
             "status":run.as_ref().map(|r| json!(r.status)).unwrap_or(json!("idle")),
@@ -542,6 +592,8 @@ impl ThreadService for KernelThreadService {
                     Code::ThreadNotFound,
                     "The thread was not found in the calling project.",
                 )
+            } else if e.code == Code::OrchestrationError {
+                failure("The operation could not be completed.")
             } else {
                 e
             }

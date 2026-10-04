@@ -107,6 +107,7 @@ impl RunnerBridge {
                     effect.request,
                     EffectRequest::ProviderTurnStart { .. }
                         | EffectRequest::ManagedRunInterrupt { .. }
+                        | EffectRequest::ProviderTurnInterrupt { .. }
                         | EffectRequest::ProviderTurnSteer { .. }
                         | EffectRequest::ProviderTurnRestart { .. }
                 )
@@ -629,16 +630,63 @@ impl RunnerBridge {
                 self.settle(&effect.thread_id, &run).await?;
                 Ok(EffectOutcome::Succeeded)
             }
+            EffectRequest::ProviderTurnInterrupt {
+                provider_turn_id, ..
+            } => {
+                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
+                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                let Some(turn) = records(&projection, "provider-turn")
+                    .iter()
+                    .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running")
+                else {
+                    return Ok(EffectOutcome::Succeeded);
+                };
+                let Some(run) = projection
+                    .runs
+                    .iter()
+                    .find(|r| {
+                        r.active_attempt_id
+                            .as_ref()
+                            .is_some_and(|a| turn["runAttemptId"] == a.0)
+                            && !run_terminal(&r.status)
+                    })
+                    .cloned()
+                else {
+                    return Ok(EffectOutcome::Succeeded);
+                };
+                self.sessions
+                    .interrupt(&effect.thread_id.0)
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?;
+                drop(guards);
+                self.record_event(
+                    &effect.thread_id,
+                    &run,
+                    u64::MAX,
+                    AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    None,
+                )
+                .await?;
+                self.settle(&effect.thread_id, &run).await?;
+                Ok(EffectOutcome::Succeeded)
+            }
             EffectRequest::ProviderTurnSteer {
                 message_id,
                 provider_turn_id,
                 ..
             } => {
+                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
                 let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
                 let turn = records(&projection, "provider-turn")
                     .iter()
                     .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running");
                 if turn.is_none() {
+                    drop(guards);
                     super::threads::runner::late_steer(&self.kernel, effect, message_id).await?;
                     return Ok(EffectOutcome::Succeeded);
                 }
@@ -646,7 +694,7 @@ impl RunnerBridge {
                     .iter()
                     .find(|m| m["id"] == message_id.0)
                     .ok_or_else(|| Error::Invariant("Steering message missing.".into()))?;
-                match self
+                let outcome = self
                     .sessions
                     .steer(
                         &effect.thread_id.0,
@@ -654,8 +702,9 @@ impl RunnerBridge {
                         Some(message_id.0.clone()),
                     )
                     .await
-                    .map_err(|e| Error::Invariant(e.to_string()))?
-                {
+                    .map_err(|e| Error::Invariant(e.to_string()))?;
+                drop(guards);
+                match outcome {
                     SteerOutcome::Accepted => Ok(EffectOutcome::Succeeded),
                     SteerOutcome::NotSteerable
                         if !self.sessions.turn_in_flight(&effect.thread_id.0) =>

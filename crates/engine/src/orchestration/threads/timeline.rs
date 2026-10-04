@@ -99,8 +99,10 @@ pub(crate) fn visible(store: &Store, target: &ThreadProjection) -> Result<Vec<Ro
         if let Some(OrchestrationV2AppThreadForkedFrom::Run(fork)) =
             target.thread.forked_from.as_ref()
             && !seen.contains(&fork.thread_id.0)
-            && let Some(parent) = store.thread(&fork.thread_id)?
         {
+            let parent = store
+                .thread(&fork.thread_id)?
+                .ok_or_else(|| Error::Invariant("Fork source thread missing.".into()))?;
             if let Some(run) = parent.runs.iter().find(|r| r.id == fork.run_id) {
                 let mut inherited: Vec<_> = visit(store, &parent, seen)?
                     .into_iter()
@@ -149,6 +151,28 @@ pub(crate) fn visible(store: &Store, target: &ThreadProjection) -> Result<Vec<Ro
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap()
 }
+
+fn pretty_fields(item: &Value, fields: &[&str]) -> String {
+    struct Fields<'a>(&'a Value, &'a [&'a str]);
+    impl serde::Serialize for Fields<'_> {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let mut object = serializer.serialize_map(None)?;
+            for key in self.1 {
+                // JS JSON.stringify omits undefined, but retains explicit null.
+                if let Some(value) = self.0.get(*key) {
+                    object.serialize_entry(key, value)?;
+                }
+            }
+            object.end()
+        }
+    }
+    serde_json::to_string_pretty(&Fields(item, fields)).unwrap()
+}
+
 pub(crate) fn text(item: &Value) -> Option<String> {
     let string = |key: &str| item[key].as_str().map(str::to_owned);
     let join = |parts: Vec<Option<String>>| {
@@ -185,12 +209,8 @@ pub(crate) fn text(item: &Value) -> Option<String> {
             string("input").map(|s| format!("$ {s}")),
             string("output"),
         ]),
-        "file_search" => Some(pretty(
-            &json!({"pattern":item["pattern"],"results":item["results"]}),
-        )),
-        "web_search" => Some(pretty(
-            &json!({"patterns":item["patterns"],"results":item["results"]}),
-        )),
+        "file_search" => Some(pretty_fields(item, &["pattern", "results"])),
+        "web_search" => Some(pretty_fields(item, &["patterns", "results"])),
         "approval_request" => string("prompt").or_else(|| string("requestKind")),
         "checkpoint" => Some(pretty(&item["files"])),
         "run_interrupt_request" | "run_interrupt_result" | "system_notice" => string("message"),
@@ -218,9 +238,7 @@ pub(crate) fn text(item: &Value) -> Option<String> {
         "subagent" => string("result")
             .or_else(|| string("progress"))
             .or_else(|| string("prompt")),
-        "dynamic_tool" => Some(pretty(
-            &json!({"toolName":item["toolName"],"input":item["input"],"output":item["output"]}),
-        )),
+        "dynamic_tool" => Some(pretty_fields(item, &["toolName", "input", "output"])),
         _ => None,
     }
 }

@@ -12,6 +12,20 @@ impl Store {
     }
 
     pub fn ui_thread_timeline(&self, input: ThreadTimelineRequest) -> Result<ThreadTimeline> {
+        if input.limit.as_ref().is_some_and(|n| !(1..=100).contains(n))
+            || input
+                .run_limit
+                .as_ref()
+                .is_some_and(|n| !(1..=50).contains(n))
+            || input
+                .max_chars_per_item
+                .as_ref()
+                .is_some_and(|n| !(1..=50_000).contains(n))
+            || input.after_position.as_ref().is_some_and(|n| *n < 0)
+            || input.text_offset.as_ref().is_some_and(|n| *n < 0)
+        {
+            return Err(Error::Invariant("Invalid thread pagination.".into()));
+        }
         let target = self
             .thread(&ThreadId(input.thread_id.clone()))?
             .filter(|t| t.thread.deleted_at.is_none())

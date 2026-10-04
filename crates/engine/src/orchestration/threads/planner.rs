@@ -119,7 +119,7 @@ fn unsupported(command: &Command, detail: impl Into<String>) -> Error {
     ))
 }
 
-fn native_child(conn: &Connection, projection: &ThreadProjection) -> Result<bool> {
+pub(crate) fn native_child(conn: &Connection, projection: &ThreadProjection) -> Result<bool> {
     if projection.thread.lineage.relationship_to_parent
         != Some(OrchestrationV2AppThreadLineageRelationshipToParent::Subagent)
     {
@@ -185,9 +185,16 @@ pub(crate) fn plan(
                 .and_then(|id| projection.runs.iter().find(|r| r.id == *id));
             let steer = steer.filter(|r| {
                 r.status != OrchestrationV2RunStatus::Completed
-                    && !(matches!(r.status,OrchestrationV2RunStatus::Running | OrchestrationV2RunStatus::Waiting)
-                        && records(&projection,"provider-turn").iter().any(|t| r.active_attempt_id.as_ref().is_some_and(|a| t["runAttemptId"] == a.0)
-                            && r.root_node_id.as_ref().is_some_and(|n| t["nodeId"] == n.0) && t["status"] == "completed"))
+                    && !(matches!(
+                        r.status,
+                        OrchestrationV2RunStatus::Running | OrchestrationV2RunStatus::Waiting
+                    ) && records(&projection, "provider-turn").iter().any(|t| {
+                        r.active_attempt_id
+                            .as_ref()
+                            .is_some_and(|a| t["runAttemptId"] == a.0)
+                            && r.root_node_id.as_ref().is_some_and(|n| t["nodeId"] == n.0)
+                            && t["status"] == "completed"
+                    }))
             });
             if let Some(run) = steer {
                 if run.status != OrchestrationV2RunStatus::Running {
@@ -324,12 +331,29 @@ pub(crate) fn plan(
             } else {
                 let queued = active_run(&projection).is_some();
                 if queued {
-                    let provider = active_run(&projection).and_then(|r| r.provider_thread_id.as_ref())
-                        .and_then(|id| records(&projection,"provider-thread").iter().find(|p| p["id"] == id.0))
-                        .ok_or_else(|| unsupported(command,"Active run has no provider thread for queued dispatch"))?;
-                    if let Some(session) = records(&projection,"provider-session").iter().find(|s| s["id"] == provider["providerSessionId"])
+                    let provider = active_run(&projection)
+                        .and_then(|r| r.provider_thread_id.as_ref())
+                        .and_then(|id| {
+                            records(&projection, "provider-thread")
+                                .iter()
+                                .find(|p| p["id"] == id.0)
+                        })
+                        .ok_or_else(|| {
+                            unsupported(
+                                command,
+                                "Active run has no provider thread for queued dispatch",
+                            )
+                        })?;
+                    if let Some(session) = records(&projection, "provider-session")
+                        .iter()
+                        .find(|s| s["id"] == provider["providerSessionId"])
                         && session["capabilities"]["turns"]["supportsQueuedMessages"] == false
-                    {return Err(unsupported(command,"Provider does not support app-owned queued turns"));}
+                    {
+                        return Err(unsupported(
+                            command,
+                            "Provider does not support app-owned queued turns",
+                        ));
+                    }
                 }
                 if queued
                     && records(&projection, "context-transfer")
@@ -429,20 +453,21 @@ pub(crate) fn plan(
                 .map(|id| RunId(id.into()))
                 .unwrap_or_else(|| run.id.clone());
             crate::orchestration::mailbox::stop(&projection, command, &mut plan, &cohort, now)?;
-            let item = json!({"id":format!("turn-item:{}:interrupt-request",encode_component(&run.id.0)),
-                "type":"run_interrupt_request","threadId":projection.thread.id,"runId":run.id,"nodeId":run.root_node_id,
-                "providerThreadId":run.provider_thread_id,"providerTurnId":null,"nativeItemRef":null,"parentItemId":null,
-                "ordinal":records(&projection,"turn-item").iter().filter_map(|i| i["ordinal"].as_i64()).max().unwrap_or(0)+1,
-                "status":"completed","title":"Interrupt requested","startedAt":iso(now)?,"completedAt":iso(now)?,"updatedAt":iso(now)?,
-                "message":reason.as_deref().unwrap_or("Interrupt requested")});
-            plan.emit(command, "turn-item.updated", &item, now)?;
-            plan.cancel_process_effects = true;
-            let has_turn = records(&projection, "provider-turn").iter().any(|t| {
+            let turn = records(&projection, "provider-turn").iter().find(|t| {
                 run.active_attempt_id
                     .as_ref()
                     .is_some_and(|id| t["runAttemptId"] == id.0)
                     && t["status"] == "running"
             });
+            let item = json!({"id":format!("turn-item:{}:interrupt-request",encode_component(&run.id.0)),
+                "type":"run_interrupt_request","threadId":projection.thread.id,"runId":run.id,"nodeId":run.root_node_id,
+                "providerThreadId":run.provider_thread_id,"providerTurnId":turn.map(|t| &t["id"]),"nativeItemRef":null,"parentItemId":null,
+                "ordinal":records(&projection,"turn-item").iter().filter_map(|i| i["ordinal"].as_i64()).max().unwrap_or(0)+1,
+                "status":"completed","title":"Interrupt requested","startedAt":iso(now)?,"completedAt":iso(now)?,"updatedAt":iso(now)?,
+                "message":reason.as_deref().unwrap_or("Interrupt requested")});
+            plan.emit(command, "turn-item.updated", &item, now)?;
+            plan.cancel_process_effects = true;
+            let has_turn = turn.is_some();
             if !has_turn
                 && matches!(
                     run.status,
@@ -500,8 +525,26 @@ pub(crate) fn plan(
                 result["message"] = json!("Run interrupted before provider start");
                 plan.emit(command, "turn-item.updated", &result, now)?;
             } else {
-                plan.effects.push(EffectRequest::ManagedRunInterrupt {
-                    run_id: run.id.clone(),
+                let turn =
+                    turn.ok_or_else(|| unsupported(command, "No running turn to interrupt"))?;
+                let provider = records(&projection, "provider-thread")
+                    .iter()
+                    .find(|p| p["id"] == turn["providerThreadId"])
+                    .ok_or_else(|| unsupported(command, "Missing provider thread"))?;
+                let session_id = provider["providerSessionId"]
+                    .as_str()
+                    .ok_or_else(|| unsupported(command, "Missing provider session"))?;
+                let session = records(&projection, "provider-session")
+                    .iter()
+                    .find(|s| s["id"] == session_id)
+                    .ok_or_else(|| unsupported(command, "Inactive provider session"))?;
+                if session["capabilities"]["turns"]["supportsInterrupt"] != true {
+                    return Err(unsupported(command, "Provider cannot interrupt"));
+                }
+                plan.effects.push(EffectRequest::ProviderTurnInterrupt {
+                    provider_session_id: session_id.into(),
+                    provider_thread_id: turn["providerThreadId"].as_str().unwrap().into(),
+                    provider_turn_id: turn["id"].as_str().unwrap().into(),
                 });
             }
         }
