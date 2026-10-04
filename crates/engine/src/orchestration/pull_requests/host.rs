@@ -36,6 +36,15 @@ pub struct GitHubHost {
     resolver: ChangeRequestResolver,
     cli: GitHubCli,
 }
+#[cfg(test)]
+impl GitHubHost {
+    pub(crate) fn with_cli(cli: GitHubCli) -> Self {
+        Self {
+            resolver: ChangeRequestResolver::default(),
+            cli,
+        }
+    }
+}
 
 pub fn sibling_url(url: &str, number: i64) -> Option<String> {
     let mut url = reqwest::Url::parse(url).ok()?;
@@ -146,7 +155,7 @@ impl PullRequestHost for GitHubHost {
           repository(owner:$owner,name:$name) {{
             pullRequest(number:$number) {{
               state title headRefName baseRefName isDraft updatedAt closedAt mergedAt
-              author {{ login }} headRefOid mergeable reviewDecision additions deletions changedFiles
+              author {{ login avatarUrl }} headRefOid mergeable reviewDecision additions deletions changedFiles
               commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{
                 contexts(first:100,after:$cursor) {{ nodes {{
                   ... on StatusContext {{ context state targetUrl createdAt {required} }}
@@ -261,7 +270,7 @@ impl PullRequestHost for GitHubHost {
             "state":state,"title":pr["title"],"headBranch":pr["headRefName"],"baseBranch":pr["baseRefName"],
             "isDraft":pr["isDraft"],"updatedAt":pr["updatedAt"],"syncedAt":crate::orchestration::event::iso(crate::now_ms()).map_err(|_| ChangeRequestError::Decode)?,
             "closedAt":pr["closedAt"],"mergedAt":pr["mergedAt"],"mergeability":mergeability,"checksState":checks_state,
-            "author":{"login":pr["author"]["login"],"name":null,"avatarUrl":null},
+            "author":{"login":pr["author"]["login"],"name":null,"avatarUrl":pr["author"]["avatarUrl"]},
             "additions":pr["additions"],"deletions":pr["deletions"],"changedFiles":pr["changedFiles"],
             "reviewDecision":match pr["reviewDecision"].as_str() { Some("APPROVED") => json!("approved"), Some("CHANGES_REQUESTED") => json!("changes-requested"), Some("REVIEW_REQUIRED") => json!("review-required"), _ => Value::Null }
         })).map_err(|_| ChangeRequestError::Decode)?;
@@ -286,29 +295,9 @@ impl PullRequestHost for GitHubHost {
             )
             .await;
         let stack = match stack {
-            Ok(value) => {
-                let decoded = decode_stack(&value);
-                if let Ok(Some(stack)) = decoded {
-                    // The listing can omit details. T3 reads the stack itself.
-                    let detail = self
-                        .cli
-                        .read_json(
-                            cwd,
-                            api(format!(
-                                "repos/{}/stacks/{}",
-                                target.repository, stack.number
-                            )),
-                        )
-                        .await;
-                    match detail {
-                        Ok(value) => decode_stack(&json!([value])),
-                        Err(ChangeRequestError::NotFound) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    decoded
-                }
-            }
+            // PullRequestSyncReactor uses includeDetails:false: the listing
+            // carries the ordered layers, with no second stack-detail read.
+            Ok(value) => decode_stack(&value),
             Err(ChangeRequestError::NotFound) => Ok(None),
             Err(error) => Err(error),
         };

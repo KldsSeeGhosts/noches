@@ -1620,6 +1620,64 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
     }
 
     #[tokio::test]
+    async fn orchestration_pr_host_uses_summary_stack_listing_and_retains_avatar() {
+        use crate::orchestration::pull_requests::{
+            Identity,
+            host::{GitHubHost, PullRequestHost},
+        };
+        let response = serde_json::json!({"data":{
+            "viewer":{"login":"agent"},
+            "repository":{"pullRequest":{
+                "state":"OPEN","title":"PR","headRefName":"topic","baseRefName":"main",
+                "isDraft":false,"updatedAt":"2026-10-02T12:00:00Z",
+                "headRefOid":"aaa","mergeable":"MERGEABLE",
+                "additions":1,"deletions":0,"changedFiles":1,
+                "author":{"login":"author","avatarUrl":"https://github.com/avatar.png"}
+            }}
+        }});
+        let stack = serde_json::json!([{
+            "id":42,"number":3,"html_url":"https://github.com/acme/web/stacks/3",
+            "base":{"ref":"main"},"pull_requests":[
+                {"number":7,"head":{"ref":"topic"},"state":"open"},
+                {"number":8,"head":{"ref":"upper"},"state":"open"}
+            ]
+        }]);
+        let runner = FakeProcessRunner::with_responses([
+            command_success(serde_json::to_vec(&response).unwrap()),
+            command_success(serde_json::to_vec(&stack).unwrap()),
+        ]);
+        let host = GitHubHost::with_cli(GitHubCli::with_runner(runner.clone()));
+        let read = host
+            .read(
+                Path::new("/checkout"),
+                &Identity {
+                    host: "github.com".into(),
+                    repository: "acme/web".into(),
+                    number: 7,
+                    url: "https://github.com/acme/web/pull/7".into(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!read.stack_read_failed);
+        assert_eq!(read.stack.unwrap().layers.len(), 2);
+        assert_eq!(
+            serde_json::to_value(read.snapshot).unwrap()["author"]["avatarUrl"],
+            "https://github.com/avatar.png"
+        );
+        assert_eq!(
+            runner.requests().len(),
+            2,
+            "sync must not request stack details"
+        );
+        assert_eq!(
+            runner.requests()[1].args.last().unwrap(),
+            "repos/acme/web/stacks?pull_request=7"
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_pull_request_is_suppressed_on_default_branch() {
         let source = source("main", "acme", Some("main"));
         let json = serde_json::to_vec(&vec![pull_request(
