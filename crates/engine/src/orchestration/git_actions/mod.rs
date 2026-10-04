@@ -5,6 +5,8 @@ pub(super) mod persistence;
 mod process;
 pub mod pull;
 pub mod rpc;
+#[cfg(test)]
+mod tests;
 mod writer;
 
 use std::collections::HashMap;
