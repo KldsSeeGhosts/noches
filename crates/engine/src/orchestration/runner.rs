@@ -602,12 +602,20 @@ impl RunnerBridge {
             if super::task::progress(&current).0 == "result_available" {
                 break;
             }
+            // Queued runs may have newer ordinals without owning the provider.
+            // Stop observing only once admission transfers this live binding.
             if current
                 .runs
                 .iter()
                 .find(|r| r.id == run.id)
                 .is_none_or(|r| r.active_attempt_id != run.active_attempt_id)
                 || super::task::active_run(&current).is_some_and(|active| active.id != run.id)
+                || records(&current, "provider-thread").iter().any(|provider| {
+                    run.provider_thread_id
+                        .as_ref()
+                        .is_some_and(|id| provider["id"] == id.0)
+                        && provider["lastRunOrdinal"].as_i64() != Some(run.ordinal)
+                })
             {
                 break;
             }
@@ -678,10 +686,13 @@ impl RunnerBridge {
         cancellation: CancellationToken,
     ) -> Result<EffectOutcome> {
         match &effect.request {
-            EffectRequest::ProviderSessionDetach { .. }
-            | EffectRequest::TerminalCleanup
-            | EffectRequest::AttachmentCleanup { .. } => {
+            EffectRequest::TerminalCleanup | EffectRequest::AttachmentCleanup { .. } => {
                 super::launch::deletion::execute(self, effect).await
+            }
+            EffectRequest::ProviderSessionDetach { .. }
+            | EffectRequest::RuntimeRequestRespond { .. }
+            | EffectRequest::ThreadTitleGenerate { .. } => {
+                super::queue::effects::execute(self, effect).await
             }
             EffectRequest::ProviderTurnStart { run_id } => {
                 self.start(effect, run_id, cancellation).await
@@ -766,6 +777,11 @@ impl RunnerBridge {
                 provider_turn_id,
                 ..
             } => {
+                // Promotion consumes an existing queued message, and must
+                // never inherit ordinary send's late-steer/start fallback.
+                if super::queue::effects::is_promotion(&self.kernel.store, effect)? {
+                    return super::queue::effects::execute(self, effect).await;
+                }
                 let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
                 let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
                 let turn = records(&projection, "provider-turn")
@@ -1020,6 +1036,7 @@ pub(crate) fn plan_event(
     if provider["lastRunOrdinal"] != run["ordinal"] {
         return Ok(());
     }
+    super::queue::runtime::observe(projection, command, plan, run_id, &provider, event, now)?;
     let turn_id = format!("provider-turn:{}", encode_component(&attempt_id.0));
     let mut turn = records(projection,"provider-turn").iter().find(|t| t["id"] == turn_id).cloned()
         .unwrap_or(json!({"id":turn_id,"providerThreadId":provider["id"],"nodeId":node["id"],

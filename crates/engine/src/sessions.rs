@@ -498,6 +498,19 @@ impl SessionsEngine {
         let _ = self.inner.titles.set(titles);
     }
 
+    pub(crate) async fn generate_orchestration_title(
+        &self,
+        harness: HarnessId,
+        prompt: &str,
+        cwd: &str,
+    ) -> Option<String> {
+        self.inner
+            .titles
+            .get()?
+            .run_title_model(harness, prompt, cwd)
+            .await
+    }
+
     /// Wire the turn-start listener (called once at engine assembly).
     pub fn set_turn_listener(&self, listener: TurnListener) {
         let _ = self.inner.turn_listener.set(listener);
@@ -1346,6 +1359,22 @@ impl SessionsEngine {
         }
         lock(&self.inner.provider_bindings).retain(|_, (id, _)| id != instance.as_ref());
         Ok(())
+    }
+
+    /// Owner orchestration detach acceptance. Signal teardown under the kernel
+    /// ownership lane, without waiting for the observer that needs that lane.
+    pub(crate) fn request_orchestration_detach(&self, chat_id: &str, revoke_mcp: bool) {
+        if revoke_mcp {
+            self.revoke_session_mcp(chat_id);
+        }
+        if let Some(handle) = lock(&self.inner.runs).get(chat_id) {
+            let _ = handle.cancel.send(true);
+            expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+            for (_, answer) in lock(&handle.pending_inputs).drain() {
+                let _ = answer.send(Vec::new());
+            }
+            handle.interrupt_token.cancel();
+        }
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such

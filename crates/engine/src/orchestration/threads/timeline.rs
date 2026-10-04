@@ -245,7 +245,8 @@ pub(crate) fn text(item: &Value) -> Option<String> {
 
 fn settlement(target: &ThreadProjection) -> (bool, Value) {
     let thread = serde_json::to_value(&target.thread).unwrap();
-    let settled = thread["settledOverride"] == "settled";
+    let settled = thread["settledOverride"] == "settled"
+        && !crate::orchestration::ui_queue::parking_blocked(target);
     (
         settled,
         if settled {

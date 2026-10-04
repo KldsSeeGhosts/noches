@@ -15,6 +15,7 @@ pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
     transfer: RwLock<Option<Arc<dyn crate::orchestration::transfer_service::TransferService>>>,
+    queue_service: RwLock<Option<Arc<dyn crate::orchestration::queue_service::QueueService>>>,
     scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
     threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
     launch_service: RwLock<Option<Arc<dyn crate::orchestration::launch_service::LaunchService>>>,
@@ -33,6 +34,7 @@ impl Toolkit {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
             transfer: RwLock::new(None),
+            queue_service: RwLock::new(None),
             scheduler: RwLock::new(None),
             threads: RwLock::new(None),
             launch_service: RwLock::new(None),
@@ -110,6 +112,16 @@ impl Toolkit {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn set_queue_service(
+        &self,
+        service: Arc<dyn crate::orchestration::queue_service::QueueService>,
+    ) {
+        *self
+            .queue_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub async fn request(&self, scope: InvocationScope, message: Value) -> Option<Value> {
@@ -255,6 +267,11 @@ impl Toolkit {
         {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
+        let queue_service = self
+            .queue_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         match input {
             input @ (OrchestrationToolInput::T3ThreadFork(_)
             | OrchestrationToolInput::T3ThreadMergeBack(_)
@@ -266,6 +283,24 @@ impl Toolkit {
                 )
                 .await,
             ),
+            _ if matches!(
+                name,
+                "t3_queue_list"
+                    | "t3_queue_read"
+                    | "t3_queue_edit"
+                    | "t3_queue_cancel"
+                    | "t3_queue_reorder"
+                    | "t3_queue_promote_to_steer"
+                    | "t3_pending_request_list"
+                    | "t3_pending_request_read"
+                    | "t3_pending_request_respond"
+                    | "t3_thread_update"
+                    | "t3_thread_organize"
+                    | "t3_thread_search"
+            ) =>
+            {
+                crate::orchestration::queue::mcp::dispatch(queue_service, scope, name, args).await
+            }
             input @ (OrchestrationToolInput::ScheduleTask(_)
             | OrchestrationToolInput::ListScheduledTasks(_)
             | OrchestrationToolInput::UpdateScheduledTask(_)

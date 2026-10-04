@@ -156,6 +156,8 @@ struct WorkspaceHostInner {
     config: WorkspaceHostConfig,
     reg: Arc<Mutex<RegistryDoc>>,
     chats_tx: watch::Sender<Vec<Chat>>,
+    thread_lifecycles_tx:
+        watch::Sender<std::collections::HashMap<String, zeron_proto::ChatLifecycle>>,
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
@@ -274,6 +276,7 @@ impl WorkspaceHost {
         })?;
 
         let state = doc.read_all()?;
+        let (thread_lifecycles_tx, _) = watch::channel(doc.thread_lifecycles());
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
@@ -286,6 +289,7 @@ impl WorkspaceHost {
                 config,
                 reg: Arc::new(Mutex::new(doc)),
                 chats_tx,
+                thread_lifecycles_tx,
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
@@ -631,6 +635,18 @@ impl WorkspaceHost {
 
     pub fn orchestration_threads(&self) -> Vec<serde_json::Value> {
         self.read(|doc| doc.orchestration_threads())
+    }
+
+    pub fn thread_lifecycles(
+        &self,
+    ) -> std::collections::HashMap<String, zeron_proto::ChatLifecycle> {
+        self.read(|doc| doc.thread_lifecycles())
+    }
+
+    pub fn watch_thread_lifecycles(
+        &self,
+    ) -> watch::Receiver<std::collections::HashMap<String, zeron_proto::ChatLifecycle>> {
+        self.inner.thread_lifecycles_tx.subscribe()
     }
 
     pub(crate) fn publish_orchestration_summary(
@@ -1152,6 +1168,10 @@ impl WorkspaceHostInner {
     }
 
     fn publish_lists(&self, clock_tick: bool) {
+        publish_if_changed(
+            &self.thread_lifecycles_tx,
+            lock(&self.reg).thread_lifecycles(),
+        );
         match lock(&self.reg).read_all() {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);

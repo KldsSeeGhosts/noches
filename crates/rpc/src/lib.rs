@@ -39,6 +39,10 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const ORGANIZE_THREAD: &str = "OrganizeThread";
+    pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
+    pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
+    pub const GET_QUEUE_STATE: &str = "GetQueueState";
     pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
     pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";

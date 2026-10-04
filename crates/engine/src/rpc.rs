@@ -1268,6 +1268,9 @@ fn forwardable(method: &str) -> bool {
             | methods::UPDATE_PROVIDER_INSTANCE
             | methods::DELETE_PROVIDER_INSTANCE
             | methods::SET_PROVIDER_INSTANCE_ENABLED
+            | methods::ORGANIZE_THREAD
+            | methods::ACKNOWLEDGE_THREAD_WOKE
+            | methods::GET_QUEUE_STATE
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1606,6 +1609,19 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        let mut params = params;
+        // Lifecycle commands keep the concise {chatId,...} desktop contract;
+        // the registry selects the owner, just as the queue UI does explicitly.
+        if matches!(
+            method,
+            methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE
+        ) && params.get("targetDeviceId").is_none()
+            && let Some(chat) = params["chatId"]
+                .as_str()
+                .and_then(|id| self.workspace.chat(id).ok().flatten())
+        {
+            params["targetDeviceId"] = serde_json::json!(chat.device_id);
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -1691,6 +1707,71 @@ impl RpcService for EngineRpc {
             None
         };
         match method {
+            methods::WATCH_THREAD_LIFECYCLES => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_thread_lifecycles(),
+            ))),
+            methods::GET_QUEUE_STATE => {
+                let p: ChatParams = parse_params(params)?;
+                let state = if self.doc_host.is_host(&p.chat_id)
+                    && let Some(store) = &self.orchestration
+                    && store
+                        .thread(&p.chat_id.clone().into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .is_some()
+                {
+                    serde_json::to_value(
+                        store
+                            .queue_ui_state(&p.chat_id.into())
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    self.doc_host
+                        .open(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .doc()
+                        .orchestration()["projection"]["uiState"]["queueState"]
+                        .clone()
+                };
+                RpcReply::value(&state)
+            }
+            methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    #[serde(default)]
+                    action: Option<String>,
+                    #[serde(default)]
+                    snoozed_until: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                if !self.doc_host.is_host(&p.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Thread lifecycle mutations require the owning host.".into(),
+                    ));
+                }
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Thread organization is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                let mut input = serde_json::json!({"threadId":p.chat_id,"action":p.action});
+                if let Some(time) = p.snoozed_until {
+                    input["snoozedUntil"] = serde_json::json!(time);
+                }
+                let result = domain
+                    .organize_for_user(
+                        &self.workspace,
+                        &self.doc_host,
+                        &self.registry,
+                        &p.chat_id,
+                        input,
+                        method == methods::ACKNOWLEDGE_THREAD_WOKE,
+                    )
+                    .await
+                    .map_err(|error| RpcError::Failed(error.message))?;
+                RpcReply::value(&result)
+            }
             method if crate::orchestration::ui_scheduler::is_method(method) => {
                 let service = self.scheduler.as_ref().ok_or_else(|| {
                     RpcError::Failed("Scheduled tasks are unavailable on this host.".into())
