@@ -69,7 +69,8 @@ pub(crate) fn plan(
             .runs
             .iter()
             .find(|run| Some(&run.id) == node.run_id.as_ref());
-        if run.is_some_and(|run| run.status != OrchestrationV2RunStatus::Queued)
+        if (run.is_some_and(|run| run.status != OrchestrationV2RunStatus::Queued)
+            || (node.run_id.is_none() && node.kind == OrchestrationV2ExecutionNodeKind::RootTurn))
             && !node_terminal(&node.status)
             && !message_nodes.contains(&node.id.0.as_str())
         {
@@ -100,11 +101,107 @@ pub(crate) fn plan(
             plan.emit(command, "provider-turn.updated", &turn, now)?;
         }
     }
+    let mut cancelled_work = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for mut task in projection::read_records(conn, &command.thread_id.0, "subagent")? {
+        if task["origin"] == "provider_native"
+            && !super::task::terminal(task["status"].as_str().unwrap_or("running"))
+        {
+            if let Some(provider) = task["providerThreadId"].as_str() {
+                let label = task["title"]
+                    .as_str()
+                    .or(task["prompt"].as_str())
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or("subagent");
+                cancelled_work
+                    .entry(provider.into())
+                    .or_default()
+                    .push(serde_json::json!({
+                        "kind":"subagent","label":compact_label(label),"id":task["id"]
+                    }));
+            }
+            task["status"] = serde_json::json!("cancelled");
+            task["completedAt"] = serde_json::json!(iso(now)?);
+            task["updatedAt"] = serde_json::json!(iso(now)?);
+            plan.emit(command, "subagent.updated", &task, now)?;
+        }
+    }
+    for mut provider in projection::read_records(conn, &command.thread_id.0, "provider-thread")? {
+        let roster = provider["pendingBackgroundTasks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for task in &roster {
+            let id = task["taskId"].as_str().unwrap_or("unknown");
+            let label = task["description"]
+                .as_str()
+                .filter(|label| !label.trim().is_empty())
+                .map(|description| format!("{description} (id {id})"))
+                .unwrap_or_else(|| id.into());
+            cancelled_work.entry(provider["id"].as_str().unwrap().into()).or_default().push(serde_json::json!({
+                "kind":match task["kind"].as_str() { Some("command") => "shell", Some("subagent") => "subagent", Some("monitor") => "monitor", _ => "task" },
+                "label":compact_label(&label),"id":id
+            }));
+        }
+        if !roster.is_empty() || provider["status"] == "active" {
+            provider["pendingBackgroundTasks"] = serde_json::json!([]);
+            if provider["status"] == "active" {
+                provider["status"] = serde_json::json!("idle");
+            }
+            provider["updatedAt"] = serde_json::json!(iso(now)?);
+            plan.emit(command, "provider-thread.updated", &provider, now)?;
+        }
+    }
+    for (provider, work) in cancelled_work {
+        if let Some(run) = projection
+            .runs
+            .iter()
+            .filter(|run| {
+                run.provider_thread_id
+                    .as_ref()
+                    .is_some_and(|id| id.0 == provider)
+                    && run.started_at.is_some()
+            })
+            .max_by_key(|run| run.ordinal)
+        {
+            let mut merged = run
+                .restart_cancelled_background_work
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!([]));
+            let merged = merged.as_array_mut().unwrap();
+            for entry in work {
+                if !merged
+                    .iter()
+                    .any(|old| old["kind"] == entry["kind"] && old["id"] == entry["id"])
+                {
+                    merged.push(entry);
+                }
+            }
+            plan.emit(
+                command,
+                "run.background-work-cancelled",
+                &serde_json::json!({
+                    "runId":run.id,"restartCancelledBackgroundWork":merged
+                }),
+                now,
+            )?;
+        }
+    }
     // Accepted no-op recovery has a receipted event too.
     if plan.events.is_empty() {
         plan.emit(command, "thread.metadata-updated", &projection.thread, now)?;
     }
     Ok(plan)
+}
+
+fn compact_label(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > 160 {
+        format!("{}…", text.chars().take(159).collect::<String>())
+    } else {
+        text
+    }
 }
 
 impl Store {
@@ -149,6 +246,10 @@ impl Store {
                     "provider-turn" => decodable!(OrchestrationV2ProviderTurn),
                     "runtime-request" => decodable!(OrchestrationV2RuntimeRequest),
                     "message" => decodable!(OrchestrationV2ConversationMessage),
+                    "subagent" => decodable!(OrchestrationV2Subagent),
+                    "turn-item" => decodable!(OrchestrationV2TurnItem),
+                    "context-transfer" => decodable!(OrchestrationV2ContextTransfer),
+                    "context-handoff" => decodable!(OrchestrationV2ContextHandoff),
                     _ => false,
                 };
                 if !valid { return Ok(false); }

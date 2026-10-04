@@ -27,6 +27,9 @@ pub struct ThreadProjection {
     pub runs: Vec<OrchestrationV2Run>,
     pub attempts: Vec<OrchestrationV2RunAttempt>,
     pub nodes: Vec<OrchestrationV2ExecutionNode>,
+    /// Lossless auxiliary records participate in the same publication barrier.
+    #[serde(default)]
+    pub records: std::collections::BTreeMap<String, Vec<Value>>,
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
@@ -91,6 +94,23 @@ pub(crate) fn read_thread(
         runs: rows(conn, TABLES[1], &thread_id.0)?,
         attempts: rows(conn, TABLES[2], &thread_id.0)?,
         nodes: rows(conn, TABLES[3], &thread_id.0)?,
+        records: {
+            let mut records = std::collections::BTreeMap::new();
+            for kind in [
+                "subagent",
+                "message",
+                "turn-item",
+                "context-transfer",
+                "context-handoff",
+                "provider-thread",
+                "provider-session",
+                "provider-turn",
+                "runtime-request",
+            ] {
+                records.insert(kind.to_string(), read_records(conn, &thread_id.0, kind)?);
+            }
+            records
+        },
     }))
 }
 
@@ -110,6 +130,17 @@ pub(crate) fn apply_checked(
     let event_type = string(&event, "type").expect("typed event discriminator");
     let thread_id = string(&event, "threadId").expect("typed thread id");
     let mut payload = event["payload"].clone();
+    if event_type == "run.background-work-cancelled" {
+        let mut run = read_entity::<Value>(
+            conn,
+            TABLES[1],
+            string(&payload, "runId").unwrap(),
+            thread_id,
+        )?
+        .ok_or_else(|| Error::Invariant("background roster run missing".into()))?;
+        run["restartCancelledBackgroundWork"] = payload["restartCancelledBackgroundWork"].clone();
+        payload = run;
+    }
     if matches!(event_type, "run.created" | "run.updated")
         && let Some(current) =
             read_entity::<Value>(conn, TABLES[1], string(&payload, "id").unwrap(), thread_id)?
@@ -136,7 +167,9 @@ pub(crate) fn apply_checked(
             (TABLES[0], None)
         } else {
             match event_type {
-                "run.created" | "run.updated" => (TABLES[1], None),
+                "run.created" | "run.updated" | "run.background-work-cancelled" => {
+                    (TABLES[1], None)
+                }
                 "run-attempt.created" | "run-attempt.updated" => (TABLES[2], None),
                 "node.updated" => (TABLES[3], None),
                 "provider-thread.updated" => (TABLES[4], Some("provider-thread")),
@@ -146,6 +179,12 @@ pub(crate) fn apply_checked(
                 "provider-turn.updated" => (TABLES[4], Some("provider-turn")),
                 "runtime-request.updated" => (TABLES[4], Some("runtime-request")),
                 "message.updated" => (TABLES[4], Some("message")),
+                "subagent.updated" => (TABLES[4], Some("subagent")),
+                "turn-item.updated" => (TABLES[4], Some("turn-item")),
+                "context-transfer.created" | "context-transfer.updated" => {
+                    (TABLES[4], Some("context-transfer"))
+                }
+                "context-handoff.updated" => (TABLES[4], Some("context-handoff")),
                 _ => {
                     return Err(Error::Invariant(format!(
                         "event outside kernel slice: {event_type}"

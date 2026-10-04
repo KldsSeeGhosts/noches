@@ -27,6 +27,8 @@ mod dictation;
 mod composer_dock;
 mod context_usage;
 pub mod controls;
+pub(crate) mod delegation;
+pub(crate) mod elapsed_label;
 pub mod edge_fade;
 pub(crate) mod elevation;
 pub mod file_icons;

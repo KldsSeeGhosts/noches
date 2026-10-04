@@ -39,6 +39,9 @@ pub enum Operation {
     },
     /// Trusted host startup only. Does not schedule restart continuations yet.
     Recover,
+    /// Trusted ordinary-session admission updates the next turn's binding.
+    SessionBinding(Box<OrchestrationV2AppThread>),
+    Task(Box<super::task::TaskOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +76,11 @@ impl Command {
     pub fn lock_threads(&self) -> Vec<ThreadId> {
         // Future transfer planners must include all target threads here. Provider
         // batches cannot cross threads, so callers cannot hide lock participants.
-        vec![self.thread_id.clone()]
+        let mut threads = vec![self.thread_id.clone()];
+        if let Operation::Task(operation) = &self.operation {
+            threads.extend(operation.lock_threads(&self.id));
+        }
+        threads
     }
 
     pub fn command_type(&self) -> Result<String> {
@@ -87,6 +94,8 @@ impl Command {
             Operation::ReplaceAttempt { .. } => "kernel.attempt.replace".into(),
             Operation::Adopt { .. } => "kernel.thread.adopt".into(),
             Operation::Recover => "kernel.runtime.recover".into(),
+            Operation::SessionBinding(_) => "kernel.session.binding".into(),
+            Operation::Task(operation) => operation.command_type().into(),
         })
     }
 }
@@ -97,9 +106,32 @@ pub(crate) struct Plan {
     pub effects: Vec<EffectRequest>,
     pub cancel_process_effects: bool,
     pub adoption: Option<String>,
+    pub routed_effects: Vec<(ThreadId, EffectRequest)>,
+    pub cancel_threads: Vec<ThreadId>,
 }
 
 impl Plan {
+    pub(crate) fn emit_on<T: Serialize>(
+        &mut self,
+        command: &Command,
+        thread: &ThreadId,
+        event_type: &str,
+        payload: &T,
+        now: i64,
+    ) -> Result<()> {
+        self.events.push(make(
+            EventId(format!(
+                "event:{}:{}",
+                encode_component(&command.id.0),
+                self.events.len()
+            )),
+            thread,
+            event_type,
+            payload,
+            now,
+        )?);
+        Ok(())
+    }
     pub(crate) fn emit<T: Serialize>(
         &mut self,
         command: &Command,
@@ -376,6 +408,9 @@ fn provider_batch(
 }
 
 pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Plan> {
+    if let Operation::Task(operation) = &command.operation {
+        return super::task::plan(conn, command, operation, now);
+    }
     let projection = projection::read_thread(conn, &command.thread_id)?;
     let mut plan = Plan::default();
     if let Operation::Wire(wire) = &command.operation
@@ -655,7 +690,14 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
                 .push(EffectRequest::ProviderTurnStart { run_id: run.id });
         }
         Operation::Recover => return super::recovery::plan(conn, command, &projection, now),
+        Operation::SessionBinding(thread) => {
+            if thread.id != projection.thread.id || thread.lineage != projection.thread.lineage {
+                return Err(refuse("Session binding cannot change ownership."));
+            }
+            plan.emit(command, "thread.metadata-updated", thread, now)?;
+        }
         Operation::Adopt { .. } => unreachable!(),
+        Operation::Task(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

@@ -1,0 +1,1673 @@
+{
+  "orchestrator_capabilities": [
+    {
+      "path": [
+        "*"
+      ],
+      "description": "Expected never"
+    }
+  ],
+  "delegate_task": [
+    {
+      "path": [
+        "task"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "target"
+      ],
+      "description": "Expected object | undefined"
+    },
+    {
+      "path": [
+        "target",
+        "providerInstanceId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "target",
+        "driverKind"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "target",
+        "model"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "target",
+        "options"
+      ],
+      "description": "Expected array | object | undefined"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "role"
+      ],
+      "description": "Expected \"implementation\" | \"research\" | \"review\" | \"design\" | \"test\" | \"general\" | undefined"
+    },
+    {
+      "path": [
+        "mode"
+      ],
+      "description": "Expected \"async\" | \"wait\" | undefined"
+    },
+    {
+      "path": [
+        "timeoutMs"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "runtimeMode"
+      ],
+      "description": "Expected \"inherit\" | \"approval-required\" | \"auto-accept-edits\" | \"auto\" | \"full-access\" | undefined"
+    },
+    {
+      "path": [
+        "interactionMode"
+      ],
+      "description": "Expected \"inherit\" | \"default\" | \"plan\" | undefined"
+    }
+  ],
+  "task_status": [
+    {
+      "path": [
+        "taskId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "task_cancel": [
+    {
+      "path": [
+        "taskId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "reason"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "schedule_task": [
+    {
+      "path": [
+        "prompt"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "schedule"
+      ],
+      "description": "Expected { readonly \"type\": \"interval\", ... } | { readonly \"type\": \"fixed_time\", ... } | string"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "enabled"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "bindToCurrentThread"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "list_scheduled_tasks": [
+    {
+      "path": [
+        "*"
+      ],
+      "description": "Expected never"
+    }
+  ],
+  "update_scheduled_task": [
+    {
+      "path": [
+        "scheduledTaskId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "prompt"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "schedule"
+      ],
+      "description": "Expected { readonly \"type\": \"interval\", ... } | { readonly \"type\": \"fixed_time\", ... } | string | undefined"
+    },
+    {
+      "path": [
+        "enabled"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "bindToCurrentThread"
+      ],
+      "description": "Expected boolean | undefined"
+    }
+  ],
+  "delete_scheduled_task": [
+    {
+      "path": [
+        "scheduledTaskId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "create_threads": [
+    {
+      "path": [
+        "threads"
+      ],
+      "description": "Expected array"
+    },
+    {
+      "path": [
+        "threads",
+        "*"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "prompt"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "target"
+      ],
+      "description": "Expected object | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "target",
+        "providerInstanceId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "target",
+        "driverKind"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "target",
+        "model"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "target",
+        "options"
+      ],
+      "description": "Expected array | object | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "runtimeMode"
+      ],
+      "description": "Expected \"inherit\" | \"approval-required\" | \"auto-accept-edits\" | \"auto\" | \"full-access\" | undefined"
+    },
+    {
+      "path": [
+        "threads",
+        "*",
+        "interactionMode"
+      ],
+      "description": "Expected \"inherit\" | \"default\" | \"plan\" | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_list": [
+    {
+      "path": [
+        "statuses"
+      ],
+      "description": "Expected array | undefined"
+    },
+    {
+      "path": [
+        "statuses",
+        "*"
+      ],
+      "description": "Expected \"idle\" | \"preparing\" | \"queued\" | \"starting\" | \"running\" | \"waiting\" | \"completed\" | \"interrupted\" | \"failed\" | \"cancelled\" | \"rolled_back\""
+    },
+    {
+      "path": [
+        "titleContains"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "settled"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "includeSubagents"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "cursor"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number | undefined"
+    }
+  ],
+  "t3_thread_read": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "itemId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "textOffset"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "view"
+      ],
+      "description": "Expected \"messages\" | \"activity\" | undefined"
+    },
+    {
+      "path": [
+        "afterPosition"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "runLimit"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "maxCharsPerItem"
+      ],
+      "description": "Expected number | undefined"
+    }
+  ],
+  "t3_thread_update": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "action"
+      ],
+      "description": "Expected \"rename\" | \"regenerate_title\" | \"link_pull_request\" | \"unlink_pull_request\""
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "pullRequest"
+      ],
+      "description": "Expected object | undefined"
+    },
+    {
+      "path": [
+        "pullRequest",
+        "repository"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "pullRequest",
+        "number"
+      ],
+      "description": "Expected number"
+    },
+    {
+      "path": [
+        "pullRequest",
+        "url"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_send": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "message"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "mode"
+      ],
+      "description": "Expected \"auto\" | \"queue\" | \"steer\" | \"restart\" | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_wait": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "runId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "timeoutMs"
+      ],
+      "description": "Expected number | undefined"
+    }
+  ],
+  "t3_thread_interrupt": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "runId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "reason"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "clientRequestId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "run_scheduled_task_now": [
+    {
+      "path": [
+        "taskId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_thread_search": [
+    {
+      "path": [
+        "query"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number"
+    }
+  ],
+  "t3_thread_fork": [
+    {
+      "path": [
+        "sourcePoint"
+      ],
+      "description": "Expected { readonly \"type\": \"latest_stable\", ... } | { readonly \"type\": \"run\", ... } | { readonly \"type\": \"checkpoint\", ... }"
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "type"
+      ],
+      "description": "Expected \"checkpoint\""
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "runId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "checkpointId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_merge_back": [
+    {
+      "path": [
+        "targetThreadId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "sourcePoint"
+      ],
+      "description": "Expected { readonly \"type\": \"latest_stable\", ... } | { readonly \"type\": \"run\", ... } | { readonly \"type\": \"checkpoint\", ... }"
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "type"
+      ],
+      "description": "Expected \"checkpoint\""
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "runId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "sourcePoint",
+        "checkpointId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_thread_transfers": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_configuration": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_configure": [
+    {
+      "path": [
+        "modelSelection"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "instanceId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "model"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options"
+      ],
+      "description": "Expected array | object"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*",
+        "value"
+      ],
+      "description": "Expected string | boolean"
+    }
+  ],
+  "t3_pending_request_list": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_pending_request_read": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "requestId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_pending_request_respond": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "requestId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "answers"
+      ],
+      "description": "Expected object"
+    }
+  ],
+  "t3_thread_organize": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "action"
+      ],
+      "description": "Expected \"pin\" | \"unpin\" | \"snooze\" | \"unsnooze\" | \"settle\" | \"unsettle\" | \"archive\" | \"unarchive\" | \"mark_unread\""
+    },
+    {
+      "path": [
+        "snoozedUntil"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_queue_list": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "cursor"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number | undefined"
+    }
+  ],
+  "t3_queue_read": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "queuedRunId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_queue_edit": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "queuedRunId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "text"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_queue_cancel": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "queuedRunId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_queue_reorder": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "queuedRunId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_queue_promote_to_steer": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "queuedRunId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "targetRunId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_worktree_handoff": [
+    {
+      "path": [
+        "branch"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "baseRef"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "startFromOrigin"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "path"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "runSetupScript"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "continuationPrompt"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_worktree_status": [
+    {
+      "path": [
+        "*"
+      ],
+      "description": "Expected never"
+    }
+  ],
+  "t3_worktree_list": [
+    {
+      "path": [
+        "query"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "cursor"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "refKind"
+      ],
+      "description": "Expected \"all\" | \"local\" | \"remote\" | undefined"
+    },
+    {
+      "path": [
+        "includeMatchingRemoteRefs"
+      ],
+      "description": "Expected boolean | undefined"
+    }
+  ],
+  "link_pull_request": [
+    {
+      "path": [
+        "url"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "repository"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "number"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "host"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "unlink_pull_request": [
+    {
+      "path": [
+        "url"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "repository"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "number"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "host"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "list_thread_pull_requests": [
+    {
+      "path": [
+        "*"
+      ],
+      "description": "Expected never"
+    }
+  ],
+  "watch_pull_request": [
+    {
+      "path": [
+        "url"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "repository"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "number"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "host"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "unwatch_pull_request": [
+    {
+      "path": [
+        "url"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "repository"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "number"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "host"
+      ],
+      "description": "Expected string | undefined"
+    }
+  ],
+  "t3_thread_launch": [
+    {
+      "path": [
+        "projectId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "scratch"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection"
+      ],
+      "description": "Expected object | undefined"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "instanceId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "model"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options"
+      ],
+      "description": "Expected array | object"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "modelSelection",
+        "options",
+        "*",
+        "value"
+      ],
+      "description": "Expected string | boolean"
+    },
+    {
+      "path": [
+        "runtimeMode"
+      ],
+      "description": "Expected \"approval-required\" | \"auto-accept-edits\" | \"auto\" | \"full-access\" | undefined"
+    },
+    {
+      "path": [
+        "interactionMode"
+      ],
+      "description": "Expected \"default\" | \"plan\" | undefined"
+    },
+    {
+      "path": [
+        "workspaceStrategy"
+      ],
+      "description": "Expected { readonly \"type\": \"root\", ... } | { readonly \"type\": \"existing_worktree\", ... } | { readonly \"type\": \"worktree\", ... } | undefined"
+    },
+    {
+      "path": [
+        "message"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "attachments"
+      ],
+      "description": "Expected array | undefined"
+    },
+    {
+      "path": [
+        "attachments",
+        "*"
+      ],
+      "description": "Expected { readonly \"type\": \"image\", ... } | { readonly \"type\": \"file\", ... }"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "type"
+      ],
+      "description": "Expected \"file\""
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "name"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "mimeType"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "sizeBytes"
+      ],
+      "description": "Expected number"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "source"
+      ],
+      "description": "Expected { readonly \"_tag\": \"pasted-text\", ... } | undefined"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "source",
+        "_tag"
+      ],
+      "description": "Expected \"pasted-text\""
+    }
+  ],
+  "t3_project_list": [
+    {
+      "path": [
+        "cursor"
+      ],
+      "description": "Expected number | undefined"
+    },
+    {
+      "path": [
+        "limit"
+      ],
+      "description": "Expected number | undefined"
+    }
+  ],
+  "t3_project_read": [
+    {
+      "path": [
+        "projectId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_project_create": [
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "workspaceRoot"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "createWorkspaceRootIfMissing"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "scripts"
+      ],
+      "description": "Expected array | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "name"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "command"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "icon"
+      ],
+      "description": "Expected \"play\" | \"test\" | \"lint\" | \"configure\" | \"build\" | \"debug\""
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "runOnWorktreeCreate"
+      ],
+      "description": "Expected boolean"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "async"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "previewUrl"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "autoOpenPreview"
+      ],
+      "description": "Expected boolean | undefined"
+    }
+  ],
+  "t3_project_update": [
+    {
+      "path": [
+        "projectId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "title"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "workspaceRoot"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "autoPull"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "scripts"
+      ],
+      "description": "Expected array | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "name"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "command"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "icon"
+      ],
+      "description": "Expected \"play\" | \"test\" | \"lint\" | \"configure\" | \"build\" | \"debug\""
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "runOnWorktreeCreate"
+      ],
+      "description": "Expected boolean"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "async"
+      ],
+      "description": "Expected boolean | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "previewUrl"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "scripts",
+        "*",
+        "autoOpenPreview"
+      ],
+      "description": "Expected boolean | undefined"
+    }
+  ],
+  "t3_project_delete": [
+    {
+      "path": [
+        "projectId"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "force"
+      ],
+      "description": "Expected boolean"
+    }
+  ],
+  "t3_project_clone": [
+    {
+      "path": [
+        "provider"
+      ],
+      "description": "Expected \"github\" | \"gitlab\" | \"forgejo\" | \"azure-devops\" | \"bitbucket\" | \"unknown\" | undefined"
+    },
+    {
+      "path": [
+        "repository"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "remoteUrl"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "destinationPath"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "protocol"
+      ],
+      "description": "Expected \"auto\" | \"ssh\" | \"https\" | undefined"
+    }
+  ],
+  "t3_environment_read": [
+    {
+      "path": [
+        "*"
+      ],
+      "description": "Expected never"
+    }
+  ],
+  "t3_environment_preferences_update": [
+    {
+      "path": [
+        "newWorktreesStartFromOrigin"
+      ],
+      "description": "Expected boolean"
+    },
+    {
+      "path": [
+        "enableProviderUpdateChecks"
+      ],
+      "description": "Expected boolean"
+    },
+    {
+      "path": [
+        "backgroundActivity"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "backgroundActivity",
+        "profile"
+      ],
+      "description": "Expected \"balanced\" | \"performance\" | \"battery-saver\""
+    },
+    {
+      "path": [
+        "sourceControlWritingStyle"
+      ],
+      "description": "Expected object"
+    },
+    {
+      "path": [
+        "sourceControlWritingStyle",
+        "mode"
+      ],
+      "description": "Expected \"repo_conventions\" | \"conventional_commits\" | \"custom\""
+    },
+    {
+      "path": [
+        "sourceControlWritingStyle",
+        "customInstructions"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "sourceControlWritingStyle",
+        "followChangeRequestTemplates"
+      ],
+      "description": "Expected boolean"
+    }
+  ],
+  "t3_attachment_prepare_upload": [
+    {
+      "path": [
+        "upload"
+      ],
+      "description": "Expected { readonly \"type\"?: \"image\", ... } | { readonly \"type\": \"file\", ... }"
+    },
+    {
+      "path": [
+        "upload",
+        "type"
+      ],
+      "description": "Expected \"file\""
+    },
+    {
+      "path": [
+        "upload",
+        "name"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "upload",
+        "mimeType"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "upload",
+        "sizeBytes"
+      ],
+      "description": "Expected number"
+    }
+  ],
+  "t3_attachment_discard": [
+    {
+      "path": [
+        "attachmentId"
+      ],
+      "description": "Expected string"
+    }
+  ],
+  "t3_thread_send_attachments": [
+    {
+      "path": [
+        "threadId"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "message"
+      ],
+      "description": "Expected string | undefined"
+    },
+    {
+      "path": [
+        "attachments"
+      ],
+      "description": "Expected array"
+    },
+    {
+      "path": [
+        "attachments",
+        "*"
+      ],
+      "description": "Expected { readonly \"type\": \"image\", ... } | { readonly \"type\": \"file\", ... }"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "type"
+      ],
+      "description": "Expected \"file\""
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "id"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "name"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "mimeType"
+      ],
+      "description": "Expected string"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "sizeBytes"
+      ],
+      "description": "Expected number"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "source"
+      ],
+      "description": "Expected { readonly \"_tag\": \"pasted-text\", ... } | undefined"
+    },
+    {
+      "path": [
+        "attachments",
+        "*",
+        "source",
+        "_tag"
+      ],
+      "description": "Expected \"pasted-text\""
+    }
+  ]
+}

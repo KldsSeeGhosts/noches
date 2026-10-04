@@ -974,6 +974,46 @@ impl RegistryDoc {
         Ok(chats)
     }
 
+    /// Additive host-owned discovery patch. The chat's ordinary typed fields
+    /// remain untouched; old peers ignore this field and retain it on updates.
+    pub fn set_chat_orchestration(&mut self, id: &str, summary: Value) -> Result<(), DocError> {
+        let row = self
+            .overlay_row(KIND_CHATS, id)
+            .ok_or_else(|| DocError::Schema("orchestration chat missing".into()))?;
+        if let Some(previous) = row.fields.get("orchestration") {
+            if previous["hostId"] != summary["hostId"] {
+                return Err(DocError::Schema(
+                    "foreign orchestration registry owner".into(),
+                ));
+            }
+            let old = (
+                previous["hostEpoch"].as_i64().unwrap_or(-1),
+                previous["version"].as_i64().unwrap_or(-1),
+            );
+            let next = (
+                summary["hostEpoch"].as_i64().unwrap_or(-1),
+                summary["version"].as_i64().unwrap_or(-1),
+            );
+            if next <= old {
+                return Ok(());
+            }
+        }
+        self.write(
+            KIND_CHATS,
+            id,
+            OpKind::Update,
+            fields([("orchestration", summary)]),
+        );
+        Ok(())
+    }
+
+    pub fn orchestration_threads(&self) -> Vec<Value> {
+        self.overlay_rows(KIND_CHATS)
+            .into_iter()
+            .filter_map(|row| row.fields.get("orchestration").cloned())
+            .collect()
+    }
+
     pub fn rename_chat(&mut self, chat_id: &str, title: &str) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);

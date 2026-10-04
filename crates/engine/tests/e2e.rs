@@ -955,6 +955,13 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
     }
+    // The provider's aborted stamp precedes completion of the async command
+    // executor. Wait for its durable receipt, not just the transcript event.
+    wait_for(
+        || command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None)),
+        "interrupt command receipt",
+    )
+    .await;
     assert_eq!(
         command_status(&core, "cmd-int-1"),
         Some((SessionCommandStatus::Applied, None))

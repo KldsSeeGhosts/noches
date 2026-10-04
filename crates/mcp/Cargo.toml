@@ -15,6 +15,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 futures.workspace = true
+zeron-harness.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

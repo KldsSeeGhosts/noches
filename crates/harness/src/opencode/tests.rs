@@ -329,6 +329,7 @@ impl TurnWire {
         if queued {
             steer_tx
                 .send(crate::SteerMessage {
+                    notification_acceptance: None,
                     prompt: "second".into(),
                     message_id: None,
                 })

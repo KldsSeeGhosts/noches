@@ -339,6 +339,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
         .send(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
+            notification_acceptance: None,
         })
         .await
         .expect("steer queued");
@@ -376,12 +377,73 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
 }
 
 #[tokio::test]
+async fn notification_steer_receipts_native_acceptance() {
+    let (controls, steer, _token) = controls("Yes");
+    let (receipt, response) = oneshot::channel();
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: Some("stable-completion-message".into()),
+            notification_acceptance: Some(receipt),
+        })
+        .await
+        .unwrap();
+    let events = run_to_end(&harness(), request("scenario:steer"), controls).await;
+    assert!(response.await.unwrap());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Steered { .. }))
+    );
+}
+
+#[tokio::test]
+async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
+    let (controls, steer, token) = controls("Yes");
+    let (receipt, response) = oneshot::channel();
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: Some("stable-completion-message".into()),
+            notification_acceptance: Some(receipt),
+        })
+        .await
+        .unwrap();
+    let mut stream = harness()
+        .run(request("scenario:steer-race"), controls)
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!matches!(event, AgentEvent::Steered { .. }));
+        if matches!(event, AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    assert!(!response.await.unwrap());
+    // The fixture waits for turn/start after rejecting. Ordinary user steering
+    // sends it; an app notification leaves the durable engine queue in charge.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err()
+    );
+    token.cancel();
+    drop(stream);
+}
+
+#[tokio::test]
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
     steer
         .send(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
+            notification_acceptance: None,
         })
         .await
         .expect("steer queued");
@@ -1022,6 +1084,7 @@ async fn live_subagent_spawn_and_followup_keep_one_transcript() {
     for turn in 0..3 {
         if turn == 1 {
             steer.send(SteerMessage {
+                notification_acceptance: None,
                 prompt: "Reuse the SAME existing subagent for one more task: reply exactly child-second. Use followup_task if available, otherwise send_input. Do not spawn a new agent. Wait for it to finish, then reply exactly parent-second. Do not inspect or change files.".into(),
                 message_id: None,
             }).await.unwrap();

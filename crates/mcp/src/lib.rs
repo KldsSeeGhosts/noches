@@ -9,7 +9,22 @@ pub use jsonrpc::serve_stdio;
 pub use tools::Tools;
 pub use zeron::{Origin, Zeron};
 
+/// The HTTP-backed `t3-code` stdio facade, also used by the shipped CLI's MCP
+/// fast path. It preserves opaque JSON-RPC errors/content and negotiation.
+pub async fn run_t3_code() -> anyhow::Result<()> {
+    zeron_harness::mcp::bridge::cli(&["acp-mcp-bridge".into()])
+        .await
+        .map_err(|error| anyhow::anyhow!(zeron_harness::redact::redact_output(&error.to_string())))
+}
+
 pub async fn run() -> anyhow::Result<()> {
+    // Private engine-issued t3-code bindings use the same negotiated HTTP
+    // facade as ACP, not the older unscoped session IPC tool server.
+    if std::env::var_os(zeron_harness::mcp::MCP_ENTRIES_ENV).is_some()
+        || std::env::var_os(zeron_harness::mcp::ACP_ENDPOINT_ENV).is_some()
+    {
+        return run_t3_code().await;
+    }
     let port = std::env::var("ZERON_IPC_PORT")
         .ok()
         .map(|port| port.parse::<u16>())

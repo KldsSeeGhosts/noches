@@ -3940,6 +3940,10 @@ pub enum ComposerEvent {
     },
     /// The tray chevron / `+N` pill: toggle the right-pane Agents tab.
     ToggleAgentsPanel,
+    /// A delegated child's banner: "Open parent".
+    OpenChat { chat_id: String },
+    /// A tray pill's or banner's Stop: `task_cancel` for one delegated task.
+    StopDelegatedTask { task_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7970,6 +7974,24 @@ impl Render for Composer {
         if wizard_active {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
+        }
+        // A delegated child is read-only: the engine runs it on its own, so a
+        // banner stands where the composer would. Its own agents tray (nested
+        // delegation) still stacks above, like on any chat.
+        if let Some(banner) = self.render_delegated_child_banner(cx) {
+            let tray = self.render_agents_tray(false, cx);
+            motion::drive_hover_owner(cx.entity_id(), window);
+            return container
+                .when_some(tray, |el, tray| {
+                    el.child(motion::fade_quick(
+                        "composer-agents-tray",
+                        div()
+                            .mx(px(QUEUE_SIDE_INSET))
+                            .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                            .child(tray),
+                    ))
+                })
+                .child(banner);
         }
 
         // What is waiting to be sent, stacked directly above the box it was

@@ -205,6 +205,7 @@ impl RuntimeConfig {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    steering_mode: zeron_proto::SteeringMode,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Shared handle to the live run's computer-use bridge (Pi only). The run
@@ -238,11 +239,16 @@ struct RoutedSteer {
     message_id: String,
 }
 
+type ProviderBinding = (String, Arc<dyn Harness>);
+
 struct Inner {
     admission: zeron_update::admission::AdmissionGate,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    mcp_server: Arc<crate::mcp::McpServer>,
+    orchestration_runner:
+        Mutex<Option<std::sync::Weak<crate::orchestration::runner::RunnerBridge>>>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -266,6 +272,9 @@ struct Inner {
     browser_root: OnceLock<std::path::PathBuf>,
     /// Host-only bindings. Never serialized with a session or RunRequest.
     session_mcp: Mutex<HashMap<String, zeron_harness::mcp::SessionMcpContext>>,
+    /// Host-local exact provider-instance bindings for app-owned V2 runs.
+    provider_bindings: Mutex<HashMap<String, ProviderBinding>>,
+    orchestration_store: Mutex<Option<crate::orchestration::Store>>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
@@ -310,6 +319,8 @@ impl SessionsEngine {
                 admission,
                 device_id,
                 journal,
+                mcp_server: Arc::new(crate::mcp::McpServer::new(registry.clone())),
+                orchestration_runner: Mutex::new(None),
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
@@ -322,6 +333,8 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
                 session_mcp: Mutex::new(HashMap::new()),
+                provider_bindings: Mutex::new(HashMap::new()),
+                orchestration_store: Mutex::new(None),
                 turn_listener: OnceLock::new(),
                 computer_use,
             }),
@@ -432,6 +445,34 @@ impl SessionsEngine {
         }
     }
 
+    /// Engine-owned server; the V2 runner supplies the real domain service.
+    pub fn mcp_server(&self) -> Arc<crate::mcp::McpServer> {
+        self.inner.mcp_server.clone()
+    }
+
+    pub(crate) fn set_orchestration_runner(
+        &self,
+        runner: std::sync::Weak<crate::orchestration::runner::RunnerBridge>,
+    ) {
+        *lock(&self.inner.orchestration_runner) = Some(runner);
+    }
+
+    fn bound_mcp_scope(&self, chat_id: &str) -> Option<crate::mcp::auth::InvocationScope> {
+        let context = lock(&self.inner.session_mcp).get(chat_id).cloned()?;
+        let entry = context
+            .entries()
+            .iter()
+            .find(|entry| entry.name == crate::mcp::SERVER_NAME)?;
+        let zeron_harness::mcp::McpTransport::StreamableHttp { headers, .. } = &entry.transport
+        else {
+            return None;
+        };
+        self.inner
+            .mcp_server
+            .credentials
+            .resolve(headers.get("Authorization")?)
+    }
+
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
     pub fn set_generated_images(
         &self,
@@ -452,7 +493,84 @@ impl SessionsEngine {
         let _ = self.inner.turn_listener.set(listener);
     }
 
+    pub fn set_orchestration_store(&self, store: crate::orchestration::Store) {
+        *lock(&self.inner.orchestration_store) = Some(store);
+    }
+
+    /// An instance may have its own executable/environment even when another
+    /// configured instance uses the same vendor driver. Do not collapse it to
+    /// the global HarnessId slot. Bind before registering MCP/starting work.
+    pub fn bind_provider_instance(
+        &self,
+        chat_id: &str,
+        instance_id: &str,
+        harness: Arc<dyn Harness>,
+    ) -> Result<(), EngineError> {
+        let runs = lock(&self.inner.runs);
+        let mut bindings = lock(&self.inner.provider_bindings);
+        if runs.contains_key(chat_id)
+            && bindings
+                .get(chat_id)
+                .is_none_or(|(id, _)| id != instance_id)
+        {
+            return Err(EngineError::Other(
+                "Cannot replace an active provider instance.".into(),
+            ));
+        }
+        bindings.insert(chat_id.into(), (instance_id.into(), harness));
+        Ok(())
+    }
+
+    /// Completion mail is never allowed to use the legacy steer's automatic
+    /// redispatch fallback. The V2 mailbox owns that fallback durably.
+    pub async fn steer_notification(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: String,
+    ) -> Result<SteerOutcome, EngineError> {
+        let _admission = self.admit_work()?;
+        let target = {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            runs.get(chat_id)
+                .filter(|run| {
+                    run.steerable && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
+                })
+                .filter(|_| {
+                    statuses
+                        .get(chat_id)
+                        .is_some_and(|session| session.status == SessionStatus::Working)
+                })
+                .map(|run| run.steer_tx.clone())
+        };
+        let Some(sender) = target else {
+            return Ok(SteerOutcome::NotSteerable);
+        };
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_user_message(&message_id, prompt, now_ms())?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        if sender
+            .try_send(SteerMessage {
+                prompt: prompt.into(),
+                message_id: Some(message_id),
+                notification_acceptance: Some(accepted_tx),
+            })
+            .is_err()
+        {
+            return Ok(SteerOutcome::NotSteerable);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(10), accepted_rx).await {
+            Ok(Ok(true)) => Ok(SteerOutcome::Accepted),
+            Ok(Ok(false)) => Ok(SteerOutcome::NotSteerable),
+            _ => Err(EngineError::Other(
+                "Notification provider acceptance is uncertain.".into(),
+            )),
+        }
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
+        self.inner.mcp_server.credentials.touch(chat_id);
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
         }
@@ -546,6 +664,32 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        self.refuse_readonly_child(chat_id)?;
+        self.dispatch_with(chat_id, harness_id, request, message_id, false)
+            .await
+    }
+
+    fn refuse_readonly_child(&self, chat_id: &str) -> Result<(), EngineError> {
+        if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+            && let Some(thread) = store
+                .thread(&zeron_proto::orchestration::ThreadId(chat_id.into()))
+                .map_err(|error| EngineError::Other(error.to_string()))?
+            && serde_json::to_value(&thread.thread.lineage)
+                .map_err(|error| EngineError::Other(error.to_string()))?["relationshipToParent"]
+                == "subagent"
+        {
+            return Err(EngineError::Other("Child threads are read-only to user session commands; control their owned task from the parent.".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn dispatch_orchestrated(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: Option<String>,
+    ) -> Result<String, EngineError> {
         self.dispatch_with(chat_id, harness_id, request, message_id, false)
             .await
     }
@@ -594,11 +738,30 @@ impl SessionsEngine {
         });
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger, cua_bridge)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
+            // A parked persistent process starts a NEW logical turn when its
+            // mailbox consumes this input. Rebind before enqueueing, not after
+            // a fast provider has already called a tool under the old run.
+            if steerable && same_runtime && !self.turn_in_flight(chat_id) {
+                let runner = lock(&self.inner.orchestration_runner)
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(runner) = runner
+                    && let Some(mut scope) = self.bound_mcp_scope(chat_id)
+                    && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
+                        .is_some_and(|thread| thread.runs.last().is_none_or(|run|
+                            run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
+                    let harness = self.inner.registry.resolve(harness_id)?;
+                    scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &request, &user_id, harness.as_ref())
+                        .await.map_err(|error| EngineError::Other(error.to_string()))?;
+                    self.inner.mcp_server.credentials.advance_session(scope);
+                }
+            }
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
                 let mut pending = lock(&ledger);
                 let message = SteerMessage {
+                    notification_acceptance: None,
                     prompt: request.prompt.clone(),
                     message_id: Some(user_id.clone()),
                 };
@@ -664,7 +827,18 @@ impl SessionsEngine {
             self.interrupt(chat_id).await?;
         }
 
-        let harness = self.inner.registry.resolve(harness_id)?;
+        let bound = lock(&self.inner.provider_bindings)
+            .get(chat_id)
+            .map(|(_, harness)| harness.clone());
+        let harness = match bound {
+            Some(harness) if harness.id() == harness_id => harness,
+            Some(_) => {
+                return Err(EngineError::Other(
+                    "Provider instance/driver mismatch.".into(),
+                ));
+            }
+            None => self.inner.registry.resolve(harness_id)?,
+        };
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -695,6 +869,139 @@ impl SessionsEngine {
             .map_err(|e| EngineError::Other(format!("Cannot persist runtime authority: {e}")))?;
 
         let run_id = new_id();
+        // Issue before provider startup, never in RunRequest/journal/replicas.
+        // Existing explicitly registered bindings (including the V2 runner's
+        // canonical scope) take precedence; warm dispatch keeps its credential.
+        let runner = lock(&self.inner.orchestration_runner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        // Explicitly injected runner turns already own their logical run.
+        // Ordinary sessions must also be adopted on subsequent warm turns.
+        let ordinary = runner.as_ref().is_some_and(|runner| {
+            runner
+                .kernel
+                .store
+                .thread(&chat_id.into())
+                .ok()
+                .flatten()
+                .is_none_or(|thread| {
+                    !thread.runs.last().is_some_and(|run| {
+                        run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
+                    })
+                })
+        });
+        if ordinary || !lock(&self.inner.session_mcp).contains_key(chat_id) {
+            use crate::mcp::auth::InvocationScope;
+            use crate::orchestration::service::CallerScope;
+            use crate::provider_instances::legacy_instance_id;
+            let project = self
+                .inner
+                .doc_host()
+                .and_then(|host| {
+                    host.workspace()
+                        .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                        .and_then(|chat| chat.space_id)
+                })
+                .unwrap_or_else(|| request.cwd.clone());
+            let instance_id = self
+                .inner
+                .registry
+                .provider_instances
+                .snapshot(&self.inner.registry)
+                .iter()
+                .find(|instance| instance.harness_id == Some(harness_id))
+                .map(|instance| instance.provider_instance_id.clone())
+                .unwrap_or_else(|| legacy_instance_id(harness_id));
+            let model = request.model.clone().unwrap_or_else(|| {
+                self.inner
+                    .registry
+                    .provider_instances
+                    .snapshot(&self.inner.registry)
+                    .iter()
+                    .find(|p| p.provider_instance_id == instance_id)
+                    .and_then(|p| p.models.first())
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| "default".into())
+            });
+            let mut inherited_options = request.model_options.clone();
+            // The legacy composer/harness option chip uses on/off strings.
+            // Canonical T3 boolean descriptors retain actual boolean values.
+            if let Some(model_row) = self
+                .inner
+                .registry
+                .provider_instances
+                .snapshot(&self.inner.registry)
+                .iter()
+                .find(|p| p.provider_instance_id == instance_id)
+                .and_then(|p| p.models.iter().find(|m| m.id == model))
+            {
+                for descriptor in model_row.options.as_ref().into_iter().flatten() {
+                    if let zeron_proto::provider_instance::ProviderOptionDescriptor::Boolean(option) =
+                        descriptor
+                        && let Some(value) = inherited_options.get_mut(&option.id)
+                        && let Some(text) = value.as_str()
+                    {
+                        *value = serde_json::Value::Bool(matches!(text, "on" | "true"));
+                    }
+                }
+            }
+            if let Some(reasoning) = request.reasoning {
+                let option_id = match harness_id {
+                    HarnessId::ClaudeCode => "effort",
+                    HarnessId::Pi => "thinking",
+                    _ => "reasoningEffort",
+                };
+                inherited_options
+                    .entry(option_id)
+                    .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));
+            }
+            let selection = serde_json::from_value(serde_json::json!({
+                "instanceId":instance_id,"model":model,"options":inherited_options
+            }))
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+            let mut scope = InvocationScope {
+                environment_id: self.inner.device_id.clone(),
+                caller: CallerScope {
+                    thread_id: chat_id.into(),
+                    run_id: run_id.clone().into(),
+                    session_id: String::new(),
+                    project_id: project.into(),
+                    workspace_root: request.cwd.clone().into(),
+                    runtime_mode: request.runtime_mode,
+                    interaction_mode: request.interaction_mode,
+                    provider_instance_id: instance_id,
+                },
+                selection,
+                capabilities: ["orchestration", "worktree", "pull-requests"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                issued_at: 0,
+                task_id: None,
+            };
+            if ordinary && let Some(runner) = runner {
+                scope.caller = runner
+                    .admit_parent(
+                        scope.caller,
+                        scope.selection.clone(),
+                        &request,
+                        &user_id,
+                        harness.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| EngineError::Other(error.to_string()))?;
+            }
+            if lock(&self.inner.session_mcp).contains_key(chat_id) {
+                // A warm runtime retains its secret/config; only trusted host
+                // admission advances the token's logical run scope.
+                if let Some(current) = self.bound_mcp_scope(chat_id) {
+                    scope.caller.session_id = current.caller.session_id;
+                    self.inner.mcp_server.credentials.advance_session(scope);
+                }
+            } else {
+                self.inner.mcp_server.register(self, chat_id, scope).await?;
+            }
+        }
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -757,6 +1064,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                steering_mode: harness.steering_mode(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 cua_bridge: cua_bridge.clone(),
@@ -810,6 +1118,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        self.refuse_readonly_child(chat_id)?;
         let _admission = self.admit_work()?;
         let configured = self
             .inner
@@ -837,6 +1146,7 @@ impl SessionsEngine {
         };
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
+            notification_acceptance: None,
             prompt: prompt.to_string(),
             message_id: Some(user_id.clone()),
         };
@@ -1009,6 +1319,17 @@ impl SessionsEngine {
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
         for chat_id in stale {
+            if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+                && (store
+                    .is_v2_managed(&chat_id)
+                    .map_err(|error| EngineError::Other(error.to_string()))?
+                    || store
+                        .thread(&zeron_proto::orchestration::ThreadId(chat_id.clone()))
+                        .map_err(|error| EngineError::Other(error.to_string()))?
+                        .is_some())
+            {
+                continue; // V2 recovery, not legacy auto-resume, owns this chat.
+            }
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
@@ -1154,6 +1475,7 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        self.inner.mcp_server.shutdown();
         let contexts = std::mem::take(&mut *lock(&self.inner.session_mcp));
         for context in contexts.into_values() {
             context.revoke();

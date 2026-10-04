@@ -629,6 +629,8 @@ impl Shell {
                         ComposerEvent::NewThreadTransitionStarted
                         | ComposerEvent::WorktreeSetup { .. }
                         | ComposerEvent::OpenSubagentSummary { .. }
+                        | ComposerEvent::OpenChat { .. }
+                        | ComposerEvent::StopDelegatedTask { .. }
                         | ComposerEvent::ToggleAgentsPanel => {}
                     });
                 }
@@ -650,6 +652,10 @@ impl Shell {
                 self.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
             }
             ComposerEvent::ToggleAgentsPanel => self.toggle_agents_panel(cx),
+            ComposerEvent::OpenChat { chat_id } => self.open_chat(chat_id.clone(), cx),
+            ComposerEvent::StopDelegatedTask { task_id } => {
+                self.stop_delegated_task(task_id.clone(), cx)
+            }
         }
     }
 

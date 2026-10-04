@@ -10,6 +10,30 @@ fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
 
+#[test]
+fn orchestration_discovery_is_idempotent_monotonic_and_preserves_chat_fields() {
+    let mut doc = RegistryDoc::new("host");
+    let original = chat("child", "host");
+    doc.upsert_chat(&original).unwrap();
+    let summary = json!({"id":"child","hostId":"host","hostEpoch":2,"version":4,
+        "lineage":{"parentThreadId":"parent","relationshipToParent":"subagent","rootThreadId":"parent"}});
+    doc.set_chat_orchestration("child", summary.clone())
+        .unwrap();
+    doc.set_chat_orchestration("child", summary.clone())
+        .unwrap();
+    let mut stale = summary.clone();
+    stale["version"] = json!(3);
+    doc.set_chat_orchestration("child", stale).unwrap();
+    let mut foreign = summary.clone();
+    foreign["hostId"] = json!("foreign");
+    assert!(doc.set_chat_orchestration("child", foreign).is_err());
+    assert_eq!(doc.orchestration_threads(), vec![summary]);
+    assert_eq!(doc.chat("child").unwrap().unwrap(), original);
+    let bytes = doc.to_bytes().unwrap();
+    let replica = RegistryDoc::from_bytes(&bytes, "viewer").unwrap();
+    assert_eq!(replica.orchestration_threads(), doc.orchestration_threads());
+}
+
 fn hlc(ms: i64) -> String {
     encode_hlc(ms, 0, "dev-a")
 }

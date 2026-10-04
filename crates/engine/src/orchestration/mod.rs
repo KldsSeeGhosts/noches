@@ -1,15 +1,27 @@
-//! Opt-in V2 transactional kernel. SQLite owns execution; replicas never do.
-//! This module deliberately has no dependency on `sessions` and starts no runner.
+//! V2 transactional kernel. SQLite owns execution; replicas never do.
+//! `assembly` enables the production host by default. Opening only the kernel
+//! starts no workers; `runner` bridges its effects to ordinary sessions.
 
+pub mod assembly;
 pub mod command;
+pub mod continuation;
+#[cfg(test)]
+mod delegation_live_tests;
+#[cfg(test)]
+mod delegation_tests;
 pub mod effects;
 pub mod event;
+pub mod mailbox;
 pub mod projection;
 pub mod recovery;
+pub mod runner;
+pub mod service;
 pub mod store;
 pub mod sync_publish;
+pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod ui;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

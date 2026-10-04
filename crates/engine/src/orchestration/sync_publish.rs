@@ -61,7 +61,18 @@ pub(crate) fn enqueue(
         documents.push(PublicationDocument {
             doc_id: format!("orchestration/thread/{id}"),
             version: projection.through_sequence,
-            payload: serde_json::to_value(&projection)?,
+            payload: {
+                let mut payload = serde_json::to_value(&projection)?;
+                if let Some(records) = payload["records"].as_object_mut() {
+                    // Runtime bindings/callback authority are host-local.
+                    // Task/message/transfer publication must not accidentally
+                    // replicate the kernel's broader internal read model.
+                    records.remove("provider-session");
+                    records.remove("runtime-request");
+                }
+                payload["uiState"] = super::ui::state(conn, &ThreadId(id.clone()))?;
+                payload
+            },
         });
     }
     documents.push(PublicationDocument {
