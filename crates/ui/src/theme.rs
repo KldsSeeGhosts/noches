@@ -853,7 +853,7 @@ impl Theme {
     /// to the bottom.
     pub const TRANSCRIPT_FADE_BAND: f32 = 24.0;
     /// Message bubble corner radius.
-    pub const BUBBLE_RADIUS: f32 = 16.0;
+    pub const BUBBLE_RADIUS: f32 = 18.0;
     /// Panel / card corner radius.
     pub const PANEL_RADIUS: f32 = 10.0;
     /// Small control radius (buttons, chips).
@@ -1763,6 +1763,71 @@ impl Theme {
             }
         }
         self
+    }
+}
+
+/// Transcript tokens: each reads the theme's optional role when it carries one
+/// (an imported T3 theme such as Claude) and otherwise derives a neutral
+/// equivalent from the base roles, so built-in themes stay quiet.
+impl Theme {
+    /// The explicit override of an optional role, if the theme set one.
+    fn explicit(&self, role: impl FnOnce(&ThemeColors) -> Option<ModelColor>) -> Option<Hsla> {
+        self.optional_colors
+            .as_ref()
+            .and_then(role)
+            .map(model_color)
+    }
+
+    /// Assistant body copy: the text tone at 80% over the canvas (T3 renders
+    /// prose as `text-foreground/80`), flattened to an opaque tone so the chip
+    /// and veil layers never double-darken it. Headings and strong runs stay
+    /// at full [`Self::text`].
+    pub fn prose_text(&self) -> Hsla {
+        flatten(self.text.opacity(0.80), self.bg)
+    }
+
+    /// Inline-code chip fill (T3 `--muted` behind `code`): the theme's `muted`
+    /// role when it has one, else a quiet neutral plate from the ink ladder.
+    pub fn code_chip_fill(&self) -> Hsla {
+        self.explicit(|c| c.muted).unwrap_or_else(|| self.ink(0.07))
+    }
+
+    /// Hover plate under a Calm tool row (T3 `hover:bg-accent/20`): the
+    /// `accent_surface` role at 20% when the theme has one, else a whisper of
+    /// neutral ink (the accent-wash fallback would tint every built-in theme).
+    pub fn row_hover_fill(&self) -> Hsla {
+        match self.explicit(|c| c.accent_surface) {
+            Some(surface) => surface.opacity(0.2),
+            None => self.ink(0.06),
+        }
+    }
+
+    /// Plate behind expanded tool output (T3 `bg-muted/40`): the `muted` role
+    /// at 40% when the theme has one, else neutral ink.
+    pub fn detail_panel_fill(&self) -> Hsla {
+        match self.explicit(|c| c.muted) {
+            Some(muted) => muted.opacity(0.4),
+            None => self.ink(0.045),
+        }
+    }
+
+    /// Fence surface (T3 `code-background`): the theme's role when it has one,
+    /// else the quiet ink plate fences have always sat on.
+    pub fn code_surface(&self) -> Hsla {
+        self.explicit(|c| c.code_background)
+            .unwrap_or_else(|| self.ink(0.035))
+    }
+
+    /// Link tone: T3's info blue (Tailwind blue-700 on light, blue-400 on
+    /// dark). A deliberate product decision, not a missing role: links keep
+    /// T3's blue rather than the accent (the [`Self::link`] fallback) or an
+    /// imported theme's `updateForeground`.
+    pub fn link_text(&self) -> Hsla {
+        gpui::rgb(match self.appearance {
+            Appearance::Light => 0x1447e6,
+            Appearance::Dark => 0x51a2ff,
+        })
+        .into()
     }
 }
 
@@ -3298,6 +3363,6 @@ mod tests {
     fn layout_numbers_match_zeron() {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
-        assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+        assert_eq!(Theme::BUBBLE_RADIUS, 18.0);
     }
 }
