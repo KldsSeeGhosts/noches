@@ -19,6 +19,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 mod client;
+pub mod provider_instances;
 pub mod device_room;
 pub mod remote;
 mod server;
@@ -42,6 +43,12 @@ pub mod methods {
     pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
+    pub const GET_PROVIDER_INSTANCE_SETTINGS: &str = "GetProviderInstanceSettings";
+    pub const CREATE_PROVIDER_INSTANCE: &str = "CreateProviderInstance";
+    pub const DUPLICATE_PROVIDER_INSTANCE: &str = "DuplicateProviderInstance";
+    pub const UPDATE_PROVIDER_INSTANCE: &str = "UpdateProviderInstance";
+    pub const DELETE_PROVIDER_INSTANCE: &str = "DeleteProviderInstance";
+    pub const SET_PROVIDER_INSTANCE_ENABLED: &str = "SetProviderInstanceEnabled";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);

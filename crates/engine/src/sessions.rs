@@ -161,6 +161,7 @@ fn expire_permissions(pending: &PendingPermissions, engine_tx: &mpsc::UnboundedS
 struct HarnessSessionRef {
     session_id: String,
     cwd: String,
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
 }
 
 /// Configuration baked into a live harness runtime. The steering mailbox only
@@ -170,6 +171,7 @@ struct HarnessSessionRef {
 #[derive(Debug, Clone, PartialEq)]
 struct RuntimeConfig {
     harness_id: HarnessId,
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
     model: Option<String>,
     reasoning: Option<zeron_proto::ReasoningLevel>,
     model_options: serde_json::Map<String, serde_json::Value>,
@@ -185,6 +187,7 @@ impl RuntimeConfig {
     fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
         Self {
             harness_id,
+            instance_id: request.instance_id.clone(),
             model: request.model.clone(),
             reasoning: request.reasoning,
             model_options: request.model_options.clone(),
@@ -719,6 +722,59 @@ impl SessionsEngine {
         startup_retry: bool,
     ) -> Result<String, EngineError> {
         let _admission = self.admit_work()?;
+        // Resolve before any interruption, message write, worktree use, or
+        // process startup. Never select the first matching driver row.
+        let requested_instance = request
+            .instance_id
+            .clone()
+            .or_else(|| {
+                self.inner
+                    .workspace()
+                    .and_then(|ws| ws.chat_config(chat_id))
+                    .and_then(|config| config.instance_id)
+            })
+            .unwrap_or_else(|| crate::provider_instances::legacy_instance_id(harness_id));
+        let _instance_lifecycle = self
+            .inner
+            .registry
+            .provider_instances
+            .lifecycle(&requested_instance)
+            .await;
+        let instance = self
+            .inner
+            .registry
+            .provider_instances
+            .snapshot(&self.inner.registry)
+            .into_iter()
+            .find(|row| row.provider_instance_id == requested_instance)
+            .ok_or_else(|| {
+                EngineError::Other("Provider is absent from the live catalog.".into())
+            })?;
+        let driver = instance
+            .harness_id
+            .ok_or_else(|| EngineError::Other("Missing adapter.".into()))?;
+        if request.harness.is_some() && driver != harness_id {
+            return Err(EngineError::Other(
+                "Provider instance/driver mismatch.".into(),
+            ));
+        }
+        let harness_id = driver;
+        let bound = lock(&self.inner.provider_bindings).get(chat_id).cloned();
+        if bound
+            .as_ref()
+            .is_some_and(|(id, _)| id != requested_instance.as_ref())
+        {
+            return Err(EngineError::Other(
+                "Provider instance/driver mismatch.".into(),
+            ));
+        }
+        let harness = self.inner.registry.provider_instances.resolve_runtime(
+            &self.inner.registry,
+            &requested_instance,
+            true,
+        )?;
+        let harness = bound.map(|(_, harness)| harness).unwrap_or(harness);
+        request.instance_id = Some(requested_instance.clone());
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
@@ -750,7 +806,6 @@ impl SessionsEngine {
                     && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
                         .is_some_and(|thread| thread.runs.last().is_none_or(|run|
                             run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
-                    let harness = self.inner.registry.resolve(harness_id)?;
                     scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &request, &user_id, harness.as_ref())
                         .await.map_err(|error| EngineError::Other(error.to_string()))?;
                     self.inner.mcp_server.credentials.advance_session(scope);
@@ -827,18 +882,6 @@ impl SessionsEngine {
             self.interrupt(chat_id).await?;
         }
 
-        let bound = lock(&self.inner.provider_bindings)
-            .get(chat_id)
-            .map(|(_, harness)| harness.clone());
-        let harness = match bound {
-            Some(harness) if harness.id() == harness_id => harness,
-            Some(_) => {
-                return Err(EngineError::Other(
-                    "Provider instance/driver mismatch.".into(),
-                ));
-            }
-            None => self.inner.registry.resolve(harness_id)?,
-        };
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -853,7 +896,12 @@ impl SessionsEngine {
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
         if request.resume.is_none() {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            request.resume = self.inner.resume_for_instance(
+                chat_id,
+                &request.cwd,
+                &requested_instance,
+                harness_id,
+            );
             resume_injected = request.resume.is_some();
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
@@ -893,7 +941,6 @@ impl SessionsEngine {
         if ordinary || !lock(&self.inner.session_mcp).contains_key(chat_id) {
             use crate::mcp::auth::InvocationScope;
             use crate::orchestration::service::CallerScope;
-            use crate::provider_instances::legacy_instance_id;
             let project = self
                 .inner
                 .doc_host()
@@ -903,15 +950,7 @@ impl SessionsEngine {
                         .and_then(|chat| chat.space_id)
                 })
                 .unwrap_or_else(|| request.cwd.clone());
-            let instance_id = self
-                .inner
-                .registry
-                .provider_instances
-                .snapshot(&self.inner.registry)
-                .iter()
-                .find(|instance| instance.harness_id == Some(harness_id))
-                .map(|instance| instance.provider_instance_id.clone())
-                .unwrap_or_else(|| legacy_instance_id(harness_id));
+            let instance_id = requested_instance.clone();
             let model = request.model.clone().unwrap_or_else(|| {
                 self.inner
                     .registry
@@ -1241,6 +1280,25 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Removing/replacing a configured instance retires only its live scope.
+    pub async fn interrupt_provider_instance(
+        &self,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
+    ) -> Result<(), EngineError> {
+        let chats: Vec<_> = lock(&self.inner.runs)
+            .iter()
+            .filter(|(_, run)| run.runtime_config.instance_id.as_ref() == Some(instance))
+            .map(|(chat, _)| chat.clone())
+            .collect();
+        for chat in chats {
+            self.interrupt(&chat).await?;
+            lock(&self.inner.provider_bindings).remove(&chat);
+            self.inner.mcp_server.credentials.revoke_thread(&chat);
+        }
+        lock(&self.inner.provider_bindings).retain(|_, (id, _)| id != instance.as_ref());
+        Ok(())
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -1339,8 +1397,12 @@ impl SessionsEngine {
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (zeron recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
-                self.inner
-                    .remember_harness_session(&chat_id, &session_id, &cwd);
+                self.inner.remember_harness_session(
+                    &chat_id,
+                    &session_id,
+                    &cwd,
+                    self.inner.journal_harness_instance(&chat_id),
+                );
             }
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
@@ -1424,6 +1486,7 @@ impl SessionsEngine {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         let (runtime_mode, interaction_mode) = authority.unwrap_or_default();
                         Some(RunRequest {
+                            instance_id: None,
                             prompt: String::new(),
                             harness: None,
                             model: None,
@@ -1486,7 +1549,6 @@ impl SessionsEngine {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
-                            instance_id: None,
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -1728,7 +1790,13 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (zeron sessions.ts:1039).
-    fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+    fn remember_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
+    ) {
         if session_id.is_empty() {
             return;
         }
@@ -1737,10 +1805,11 @@ impl Inner {
             HarnessSessionRef {
                 session_id: session_id.to_string(),
                 cwd: cwd.to_string(),
+                instance_id: instance_id.clone(),
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
+            ws.set_chat_harness_session_binding(chat_id, session_id, cwd, instance_id.as_ref());
         }
     }
 
@@ -1773,8 +1842,56 @@ impl Inner {
         }
         let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
-        self.remember_harness_session(chat_id, &session_id, &session_cwd);
+        self.remember_harness_session(
+            chat_id,
+            &session_id,
+            &session_cwd,
+            self.journal_harness_instance(chat_id),
+        );
         cwd_ok(&session_cwd).then_some(session_id)
+    }
+
+    fn journal_harness_instance(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_proto::provider_instance::ProviderInstanceId> {
+        self.journal
+            .replay(chat_id, 0)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|(_, event)| match event {
+                AgentEvent::SessionStarted { instance_id, .. } => Some(instance_id),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    fn resume_for_instance(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        instance: &zeron_proto::provider_instance::ProviderInstanceId,
+        harness: HarnessId,
+    ) -> Option<String> {
+        let owner = lock(&self.harness_sessions)
+            .get(chat_id)
+            .and_then(|r| r.instance_id.clone())
+            .or_else(|| {
+                self.workspace()
+                    .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                    .and_then(|chat| chat.harness_session_instance_id)
+            })
+            .or_else(|| self.journal_harness_instance(chat_id));
+        let matches = owner
+            .as_ref()
+            .map(|id| id == instance)
+            .unwrap_or_else(|| *instance == crate::provider_instances::legacy_instance_id(harness));
+        if matches {
+            self.resume_for(chat_id, cwd)
+        } else {
+            None
+        }
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
@@ -2200,6 +2317,7 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    let run_instance = request.instance_id.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
@@ -2426,7 +2544,7 @@ async fn drive_run(
 
     let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
@@ -2627,6 +2745,9 @@ async fn drive_run(
             };
             event
         };
+        if let AgentEvent::SessionStarted { instance_id, .. } = &mut event {
+            *instance_id = run_instance.clone();
+        }
 
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
@@ -3082,13 +3203,18 @@ async fn drive_run(
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
-                inner.remember_harness_session(&chat_id, session_id, cwd);
+                inner.remember_harness_session(&chat_id, session_id, cwd, run_instance.clone());
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
                 ..
             } => {
-                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                inner.remember_harness_session(
+                    &chat_id,
+                    session_id,
+                    &run_cwd,
+                    run_instance.clone(),
+                );
             }
             AgentEvent::InputRequested { .. } | AgentEvent::PermissionRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
@@ -3343,6 +3469,57 @@ impl Drop for SessionMcpCleanup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_resume_requires_the_same_instance_and_legacy_defaults_remain_routable() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        sessions.inner.remember_harness_session(
+            "chat",
+            "native",
+            "/repo",
+            Some("codex_work".into()),
+        );
+        assert_eq!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/repo", &"codex_work".into(), HarnessId::Codex)
+                .as_deref(),
+            Some("native")
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/repo", &"codex".into(), HarnessId::Codex)
+                .is_none()
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("chat", "/other", &"codex_work".into(), HarnessId::Codex)
+                .is_none()
+        );
+        sessions
+            .inner
+            .remember_harness_session("old", "legacy", "/repo", None);
+        assert_eq!(
+            sessions
+                .inner
+                .resume_for_instance("old", "/repo", &"codex".into(), HarnessId::Codex)
+                .as_deref(),
+            Some("legacy")
+        );
+        assert!(
+            sessions
+                .inner
+                .resume_for_instance("old", "/repo", &"codex_work".into(), HarnessId::Codex)
+                .is_none()
+        );
+    }
     use super::*;
 
     #[tokio::test]
@@ -3623,6 +3800,7 @@ mod tests {
 
     fn request() -> RunRequest {
         RunRequest {
+            instance_id: None,
             prompt: "first".into(),
             harness: None,
             model: Some("grok-4.6".into()),
@@ -3788,6 +3966,7 @@ mod tests {
             .await
             .unwrap();
         feed.send(AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],
@@ -3800,7 +3979,6 @@ mod tests {
             parent_tool_use_id: "tool-1".into(),
             event: Box::new(AgentEvent::ReasoningDelta {
                 text: String::new(),
-            instance_id: None,
             }),
         })
         .unwrap();
@@ -3827,4 +4005,3 @@ mod tests {
         core.sessions.shutdown().await;
     }
 }
-            instance_id: None,

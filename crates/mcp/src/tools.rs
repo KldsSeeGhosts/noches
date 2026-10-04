@@ -515,6 +515,7 @@ impl Tools {
 
 fn run_request(config: &ChatConfig, cwd: &str, prompt: String) -> RunRequest {
     RunRequest {
+        instance_id: config.instance_id.clone(),
         prompt,
         harness: Some(config.harness),
         model: config.model.clone(),

@@ -818,6 +818,32 @@ impl WorkspaceHost {
         }
     }
 
+    pub fn set_chat_harness_session_instance(
+        &self,
+        chat_id: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) {
+        if let Err(err) =
+            self.mutate(|doc| doc.set_chat_harness_session_instance(chat_id, instance))
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "registry provider-session write failed");
+        }
+    }
+
+    pub fn set_chat_harness_session_binding(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        instance: Option<&zeron_proto::provider_instance::ProviderInstanceId>,
+    ) {
+        if let Err(err) = self
+            .mutate(|doc| doc.set_chat_harness_session_binding(chat_id, session_id, cwd, instance))
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "registry provider-session binding write failed");
+        }
+    }
+
     /// The chat row's stored harness session `(session_id, cwd)`, if stamped.
     /// The empty-string tombstone passes through — callers must treat it as
     /// "explicitly no resume" (and must NOT fall back to older sources).
@@ -901,6 +927,7 @@ impl WorkspaceHost {
                 // go through the seed+flip path (the host migration sweep).
                 room_gen: Some(2),
                 harness_session_cwd: None,
+                harness_session_instance_id: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
             })
@@ -927,7 +954,6 @@ impl WorkspaceHost {
             .iter()
             .any(|s| s.id == space_id || (s.device_id == device_id && s.path == path))
         {
-                harness_session_instance_id: None,
             return Ok(());
         }
         self.mutate(|doc| {

@@ -5236,6 +5236,7 @@ impl DocHost {
                     && ws.chat_config(chat_id).is_none()
                 {
                     let config = zeron_proto::ChatConfig {
+                        instance_id: request.instance_id.clone(),
                         harness,
                         model: request.model.clone(),
                         reasoning: request.reasoning,
@@ -5678,6 +5679,7 @@ impl DocHost {
         };
         let config = chat.config;
         Some(zeron_proto::RunRequest {
+            instance_id: config.as_ref().and_then(|c| c.instance_id.clone()),
             prompt: prompt.to_string(),
             harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),

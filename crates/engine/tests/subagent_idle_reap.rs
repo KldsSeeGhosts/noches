@@ -202,6 +202,7 @@ async fn park_after_spawn() -> Parked {
         .expect("dispatch");
 
     feed.send(AgentEvent::SessionStarted {
+        instance_id: None,
         harness: HarnessId::Mock,
         model: "mock-1".into(),
         tools: vec![],
