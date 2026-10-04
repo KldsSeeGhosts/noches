@@ -360,6 +360,7 @@ mod tests {
 
     fn run_request() -> RunRequest {
         RunRequest {
+            instance_id: None,
             prompt: "hello".into(),
             harness: None,
             model: None,

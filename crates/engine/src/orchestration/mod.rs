@@ -29,6 +29,7 @@ pub mod ui;
 pub mod ui_scheduler;
 pub mod ui_git_actions;
 pub mod ui_threads;
+pub mod ui_provider_instances;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

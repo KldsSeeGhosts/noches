@@ -77,6 +77,7 @@ impl Catalog {
         &self,
         exe: &Path,
         timeout: Duration,
+        launch: &crate::instance::InstanceLaunch,
     ) -> Result<Vec<Model>, HarnessError> {
         let requested_at = Instant::now();
         let mut latest = self.latest.lock().await;
@@ -88,6 +89,7 @@ impl Catalog {
         let mut cmd = Command::new(exe);
         cmd.args(["models", "list", "--format", "json"]);
         crate::compose_child_environment(&mut cmd, exe);
+        launch.apply(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -994,6 +994,7 @@ fn run_request(
     cwd: String,
 ) -> zeron_proto::RunRequest {
     zeron_proto::RunRequest {
+        instance_id: config.instance_id.clone(),
         prompt: prompt.into(),
         harness: Some(config.harness),
         model: config.model.clone(),

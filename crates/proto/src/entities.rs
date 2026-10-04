@@ -88,6 +88,8 @@ impl Space {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<crate::provider_instance::ProviderInstanceId>,
     pub harness: HarnessId,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
@@ -149,6 +151,9 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
+    /// Instance that owns the native session. Missing on legacy rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_instance_id: Option<crate::provider_instance::ProviderInstanceId>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).
