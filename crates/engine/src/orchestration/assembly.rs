@@ -11,6 +11,7 @@ use zeron_proto::orchestration_mcp::{DelegateTaskInputTarget, OrchestratorMcpFai
 use zeron_proto::provider_instance::{ModelSelection, ProviderInstanceId};
 
 use super::command::Command;
+use super::launch::host_intake::HostLaunchIntake;
 use super::runner::{RunnerBridge, RunnerInstances, RunnerMcp, RunnerProvider};
 use super::service::{CallerScope, ToolError};
 use super::sync_publish::{
@@ -224,7 +225,10 @@ impl RunnerMcp for HostMcp {
                     environment_id: self.device_id.clone(),
                     caller: scope,
                     selection: run.model_selection.clone(),
-                    capabilities: ["orchestration"].into_iter().map(str::to_owned).collect(),
+                    capabilities: ["orchestration", "worktree"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     issued_at: 0,
                     task_id: None,
                 },
@@ -240,6 +244,7 @@ pub struct OrchestrationHost {
     /// The same service the MCP tools call; the UI's user-authority Stop uses it.
     pub service: Arc<DelegationService>,
     pub scheduler: Arc<super::scheduler::Scheduler>,
+    pub launch: Option<Arc<super::launch::HostLaunchService>>,
     stop: CancellationToken,
     workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -351,6 +356,7 @@ impl OrchestrationHost {
             bridge,
             service,
             scheduler,
+            launch: None,
             stop,
             workers: std::sync::Mutex::new(workers),
         })
@@ -367,6 +373,42 @@ impl OrchestrationHost {
         for worker in workers {
             let _ = worker.await;
         }
+    }
+
+    /// -- wave-3 launch assembly --
+    pub fn install_launch(
+        &mut self,
+        repos: crate::Repos,
+        actions: crate::ProjectActionsStore,
+        terminals: crate::Terminals,
+        registry: Arc<HarnessRegistry>,
+        data_dir: std::path::PathBuf,
+    ) -> Result<()> {
+        let service = Arc::new(super::launch::HostLaunchService::new(
+            self.bridge.kernel.clone(),
+            self.bridge.workspace.clone(),
+            repos,
+            actions,
+            terminals,
+            registry,
+            data_dir,
+            Arc::new(HostLaunchIntake {
+                bridge: self.bridge.clone(),
+            }),
+        )?);
+        self.bridge
+            .sessions
+            .mcp_server()
+            .toolkit
+            .set_launch_service(service.clone());
+        service
+            .projects()
+            .map_err(|e| Error::Invariant(e.message))?;
+        service
+            .recover_preparations()
+            .map_err(|e| Error::Invariant(e.message))?;
+        self.launch = Some(service);
+        Ok(())
     }
 }
 
@@ -420,7 +462,17 @@ impl RunnerBridge {
         projection.thread.provider_instance_id = scope.provider_instance_id.clone();
         projection.thread.runtime_mode = scope.runtime_mode;
         projection.thread.interaction_mode = scope.interaction_mode;
-        projection.thread.worktree_path = Some(request.cwd.clone());
+        let project_root = self
+            .workspace
+            .space(&scope.project_id.0)
+            .ok()
+            .flatten()
+            .map(|s| s.path);
+        projection.thread.worktree_path = if project_root.as_deref() == Some(request.cwd.as_str()) {
+            None
+        } else {
+            Some(request.cwd.clone())
+        };
         let update = Command {
             id: CommandId(format!("session-binding:{message_id}")),
             thread_id: thread.clone(),
@@ -491,7 +543,14 @@ impl ProjectionPublisher for ChatPublisher {
             .parent_thread_id
             .as_ref()
             .and_then(|p| self.workspace.chat(&p.0).ok().flatten())
-            .and_then(|c| c.space_id);
+            .and_then(|c| c.space_id)
+            .or_else(|| {
+                self.workspace
+                    .space(&thread.project_id.0)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            });
         self.workspace
             .create_chat(
                 id,

@@ -242,6 +242,41 @@ impl ProjectActionsStore {
             .find(|action| action.run_on_worktree_create))
     }
 
+    /// MCP-authored scripts are explicit trusted owner actions, not repo imports.
+    pub(crate) fn replace_orchestration_scripts(
+        &self,
+        space_id: &str,
+        root: &Path,
+        scripts: &[serde_json::Value],
+    ) -> Result<(), EngineError> {
+        let actions = scripts
+            .iter()
+            .map(|script| {
+                let action: ProjectAction = serde_json::from_value(script.clone())
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                normalize_draft(ProjectActionDraft {
+                    name: action.name.clone(),
+                    command: action.command.clone(),
+                    icon: action.icon,
+                    run_on_worktree_create: action.run_on_worktree_create,
+                })?;
+                Ok(action)
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        let mut state = lock(&self.inner.state);
+        let mut next = state.clone();
+        next.projects.insert(
+            space_id.into(),
+            StoredProjectActions {
+                project_root: root_string(root),
+                actions,
+            },
+        );
+        persist(&self.inner.path, &next)?;
+        *state = next;
+        Ok(())
+    }
+
     /// Publish the non-durable UI handoff for setup launched while the durable
     /// Run command is drained. The command remains the source of truth; this
     /// cache only lets the sender attach the resulting terminal.

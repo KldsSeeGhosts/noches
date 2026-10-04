@@ -16,6 +16,7 @@ pub struct Toolkit {
     service: RwLock<Arc<dyn OrchestratorService>>,
     scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
     threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
+    launch_service: RwLock<Option<Arc<dyn crate::orchestration::launch_service::LaunchService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -32,6 +33,7 @@ impl Toolkit {
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
             scheduler: RwLock::new(None),
             threads: RwLock::new(None),
+            launch_service: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -59,11 +61,30 @@ impl Toolkit {
             .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
+    pub fn set_launch_service(
+        &self,
+        service: Arc<dyn crate::orchestration::launch_service::LaunchService>,
+    ) {
+        *self
+            .launch_service
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
     pub fn set_thread_service(
         &self,
         service: Arc<dyn crate::orchestration::thread_service::ThreadService>,
     ) {
         *self.threads.write().unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn launch_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::launch_service::LaunchService>> {
+        self.launch_service
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -226,6 +247,19 @@ impl Toolkit {
                 )
                 .await
             }
+            _ if matches!(
+                tool.group.as_str(),
+                "project" | "environment" | "attachment" | "worktree"
+            ) =>
+            {
+                crate::orchestration::launch::mcp::dispatch(
+                    self.launch_service(),
+                    scope,
+                    name,
+                    args,
+                )
+                .await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances
@@ -360,12 +394,6 @@ impl Toolkit {
             | OrchestrationToolInput::T3ThreadConfigure(_)
             | OrchestrationToolInput::CreateThreads(_)) => {
                 crate::orchestration::threads::mcp::dispatch(&self.threads, scope, input).await
-            }
-            _ if matches!(name, "t3_worktree_handoff" | "t3_worktree_status") => {
-                codec::result(json!({
-                    "_tag":"WorktreeMcpFailure","code":"operation_failed",
-                    "message":format!("Unable to read thread {}: The operation could not be completed.", scope.caller.thread_id)
-                }))
             }
             // Future domains deliberately refuse; there is no legacy RPC
             // emulation, mutation, receipt, provider call, or hidden success.

@@ -590,6 +590,7 @@ enum MutateParams {
 
 pub struct EngineRpc {
     git_actions: Option<crate::orchestration::git_actions::GitActionsService>,
+    launch: Option<std::sync::Arc<crate::orchestration::launch::HostLaunchService>>,
     orchestration: Option<crate::orchestration::Store>,
     delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
     scheduler: Option<std::sync::Arc<crate::orchestration::scheduler::Scheduler>>,
@@ -643,6 +644,7 @@ impl EngineRpc {
         Self {
             git_actions: None,
             orchestration: None,
+            launch: None,
             delegation: None,
             scheduler: None,
             sessions,
@@ -705,6 +707,14 @@ impl EngineRpc {
         scheduler: std::sync::Arc<crate::orchestration::scheduler::Scheduler>,
     ) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_launch(
+        mut self,
+        service: std::sync::Arc<crate::orchestration::launch::HostLaunchService>,
+    ) -> Self {
+        self.launch = Some(service);
         self
     }
 
@@ -1247,6 +1257,7 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1744,6 +1755,41 @@ impl RpcService for EngineRpc {
                         .clone()
                 };
                 RpcReply::value(&state)
+            }
+            methods::LIST_LAUNCH_PROJECTS => {
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                RpcReply::value(
+                    &store
+                        .launch_projects()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_LAUNCH_STATE => {
+                let p: zeron_proto::launch::LaunchReadParams = parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                RpcReply::value(
+                    &store
+                        .launch_state(&p.chat_id.into())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::CONTROL_WORKTREE_SETUP => {
+                let p: zeron_proto::launch::SetupControlParams = parse_params(params)?;
+                let service = self
+                    .launch
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Launch service unavailable.".into()))?;
+                service
+                    .setup_control(p)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.message))?;
+                RpcReply::value(&serde_json::json!({"accepted":true}))
             }
             methods::LIST_PROVIDER_INSTANCES => {
                 self.registry

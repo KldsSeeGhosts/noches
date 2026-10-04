@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("schema_scheduler.sql"),
     include_str!("schema_git_actions.sql"),
+    include_str!("schema_launch.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

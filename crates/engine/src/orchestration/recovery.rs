@@ -38,6 +38,9 @@ pub(crate) fn plan(
         .filter_map(|request| request["nodeId"].as_str())
         .collect();
     for run in &projection.runs {
+        if run.status == OrchestrationV2RunStatus::Preparing {
+            continue; // launch journal owns recovery; no provider has started
+        }
         if run.status == OrchestrationV2RunStatus::Queued {
             if run.queue_held.as_ref() != Some(&true) {
                 let mut next = run.clone();
@@ -55,8 +58,12 @@ pub(crate) fn plan(
     for attempt in &projection.attempts {
         // Queued/preparing intents retain execution identity; no live work to retire.
         let run = projection.runs.iter().find(|run| run.id == attempt.run_id);
-        if run.is_some_and(|run| run.status != OrchestrationV2RunStatus::Queued)
-            && !attempt_terminal(&attempt.status)
+        if run.is_some_and(|run| {
+            !matches!(
+                run.status,
+                OrchestrationV2RunStatus::Queued | OrchestrationV2RunStatus::Preparing
+            )
+        }) && !attempt_terminal(&attempt.status)
         {
             let mut next = attempt.clone();
             next.status = OrchestrationV2RunAttemptStatus::Cancelled;
@@ -69,8 +76,13 @@ pub(crate) fn plan(
             .runs
             .iter()
             .find(|run| Some(&run.id) == node.run_id.as_ref());
-        if (run.is_some_and(|run| run.status != OrchestrationV2RunStatus::Queued)
-            || (node.run_id.is_none() && node.kind == OrchestrationV2ExecutionNodeKind::RootTurn))
+        if (run.is_some_and(|run| {
+            !matches!(
+                run.status,
+                OrchestrationV2RunStatus::Queued | OrchestrationV2RunStatus::Preparing
+            )
+        }) || (node.run_id.is_none()
+            && node.kind == OrchestrationV2ExecutionNodeKind::RootTurn))
             && !node_terminal(&node.status)
             && !message_nodes.contains(&node.id.0.as_str())
         {

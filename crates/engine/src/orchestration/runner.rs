@@ -284,16 +284,36 @@ impl RunnerBridge {
                 harness.clone(),
             )
             .map_err(|error| Error::Invariant(error.to_string()))?;
-        let cwd = projection.thread.worktree_path.as_deref().ok_or_else(|| {
-            Error::Invariant("Runner requires a resolved workspace binding.".into())
-        })?;
+        let project_root = self
+            .kernel
+            .store
+            .launch_projects()?
+            .projects
+            .into_iter()
+            .find(|p| p["id"] == projection.thread.project_id.0)
+            .and_then(|p| p["workspaceRoot"].as_str().map(str::to_owned));
+        let cwd = projection
+            .thread
+            .worktree_path
+            .as_deref()
+            .or(project_root.as_deref())
+            .ok_or_else(|| {
+                Error::Invariant("Runner requires a resolved workspace binding.".into())
+            })?;
         let parent_space = projection
             .thread
             .lineage
             .parent_thread_id
             .as_ref()
             .and_then(|id| self.workspace.chat(&id.0).ok().flatten())
-            .and_then(|chat| chat.space_id);
+            .and_then(|chat| chat.space_id)
+            .or_else(|| {
+                self.workspace
+                    .space(&projection.thread.project_id.0)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            });
         let options_value = serde_json::to_value(&run.model_selection)?;
         let mut options = serde_json::Map::new();
         if let Some(selections) = options_value["options"].as_array() {
@@ -335,6 +355,9 @@ impl RunnerBridge {
             .set_chat_config(&effect.thread_id.0, &config)
             .map_err(|error| Error::Invariant(error.to_string()))?;
         self.workspace
+            .set_chat_cwd(&effect.thread_id.0, cwd)
+            .map_err(|error| Error::Invariant(error.to_string()))?;
+        self.workspace
             .rename_chat(&effect.thread_id.0, &projection.thread.title)
             .map_err(|error| Error::Invariant(error.to_string()))?;
         if let Some(branch) = &projection.thread.branch {
@@ -356,15 +379,31 @@ impl RunnerBridge {
             .bind(scope, &self.sessions)
             .await
             .map_err(|error| Error::Invariant(error.to_string()))?;
-        let prompt = records(&projection, "message")
+        let input = records(&projection, "message")
             .iter()
             .find(|message| message["id"] == run.user_message_id.0)
-            .and_then(|message| message["text"].as_str())
+            .cloned()
             .ok_or_else(|| Error::Invariant("Run input missing.".into()))?;
+        let mut prompt = input["text"].as_str().unwrap_or("").to_owned();
+        let mut attachment_paths = vec![];
+        for attachment in input["attachments"].as_array().into_iter().flatten() {
+            if let Some(path) = self.kernel.store.launch_attachment_path(
+                attachment["id"].as_str().unwrap_or(""),
+                &effect.thread_id.0,
+            )? {
+                if attachment["type"] == "image" {
+                    attachment_paths.push(path.clone());
+                }
+                prompt.push_str(&format!(
+                    "\nAttached {} (local file): {path}",
+                    attachment["type"].as_str().unwrap_or("file")
+                ));
+            }
+        }
         let request: RunRequest = serde_json::from_value(json!({
             "prompt":prompt,"harness":harness.id(),"model":run.model_selection.model,"reasoning":reasoning,
             "modelOptions":options,"cwd":cwd,"sandbox":"workspace-write","autoApprove":false,
-            "runtimeMode":projection.thread.runtime_mode,"interactionMode":projection.thread.interaction_mode,"resume":null
+            "runtimeMode":projection.thread.runtime_mode,"interactionMode":projection.thread.interaction_mode,"resume":null,"attachments":attachment_paths
         }))?;
         if cancellation.is_cancelled() {
             return Ok(EffectOutcome::Succeeded);
@@ -597,6 +636,11 @@ impl RunnerBridge {
         cancellation: CancellationToken,
     ) -> Result<EffectOutcome> {
         match &effect.request {
+            EffectRequest::ProviderSessionDetach { .. }
+            | EffectRequest::TerminalCleanup
+            | EffectRequest::AttachmentCleanup { .. } => {
+                super::launch::deletion::execute(self, effect).await
+            }
             EffectRequest::ProviderTurnStart { run_id } => {
                 self.start(effect, run_id, cancellation).await
             }

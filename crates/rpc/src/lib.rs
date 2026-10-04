@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 pub mod git_actions;
+pub mod launch;
 pub mod remote;
 pub mod scheduled_tasks;
 mod server;
@@ -39,6 +40,9 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
     pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
+    pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";
+    pub const GET_LAUNCH_STATE: &str = "GetLaunchState";
+    pub const CONTROL_WORKTREE_SETUP: &str = "ControlWorktreeSetup";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// User Stop of one app-owned delegated task, `{chatId (parent), taskId}`:
