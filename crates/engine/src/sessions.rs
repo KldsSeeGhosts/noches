@@ -1461,7 +1461,7 @@ impl SessionsEngine {
                     .is_v2_managed(&chat_id)
                     .map_err(|error| EngineError::Other(error.to_string()))?
                     || store
-                        .thread(&zeron_proto::orchestration::ThreadId(chat_id.clone()))
+                        .stored_thread(&zeron_proto::orchestration::ThreadId(chat_id.clone()))
                         .map_err(|error| EngineError::Other(error.to_string()))?
                         .is_some())
             {

@@ -80,12 +80,15 @@ impl KernelThreadService {
     ) -> Result<ThreadProjection, ToolError> {
         self.kernel
             .store
-            .thread(&caller.thread_id)
+            .thread_in_project(&caller.thread_id, Some(&caller.project_id))
             .map_err(|_| if thread_toolkit {failure("The operation could not be completed.")} else {
                 failure(format!("Unable to read thread {}: Failed to load orchestration projection for thread {}.",caller.thread_id,caller.thread_id))
             })?
             .filter(|p| !thread_toolkit || p.thread.deleted_at.is_none())
             .ok_or_else(|| {
+                if self.kernel.store.registry_unavailable(&caller.thread_id, Some(&caller.project_id)) {
+                    return ToolError::new(Code::ThreadNotFound,"The calling thread was not found.");
+                }
                 if thread_toolkit {
                     ToolError::new(Code::ThreadNotFound,"The calling thread was not found.")
                 } else {
@@ -118,17 +121,24 @@ impl KernelThreadService {
             return Ok((parent.clone(), parent));
         }
         let load_error = || {
+            if self
+                .kernel
+                .store
+                .registry_unavailable(&ThreadId(target.into()), Some(&parent.thread.project_id))
+            {
+                return ToolError::new(
+                    Code::ThreadNotFound,
+                    format!(
+                        "Thread {target} was not found in project {}.",
+                        parent.thread.project_id
+                    ),
+                );
+            }
             failure(format!(
                 "Unable to load thread {target} in project {}.",
                 parent.thread.project_id
             ))
         };
-        let projection = self
-            .kernel
-            .store
-            .thread(&ThreadId(target.into()))
-            .map_err(|_| load_error())?
-            .ok_or_else(load_error)?;
         let attached = readable
             && records(&parent, "message").iter().any(|m| {
                 m["role"] == "user"
@@ -138,6 +148,19 @@ impl KernelThreadService {
                             .any(|r| r["kind"] == "thread" && r["threadId"] == target)
                     })
             });
+        let projection = self
+            .kernel
+            .store
+            .thread_in_project(
+                &ThreadId(target.into()),
+                if attached {
+                    None
+                } else {
+                    Some(&parent.thread.project_id)
+                },
+            )
+            .map_err(|_| load_error())?
+            .ok_or_else(load_error)?;
         if attached && projection.thread.deleted_at.is_some() {
             return Err(ToolError::new(
                 Code::ThreadNotFound,
@@ -375,12 +398,12 @@ impl ThreadService for KernelThreadService {
 
     async fn send_to_thread(
         &self,
-        input: ThreadSendRequest,
+        mut input: ThreadSendRequest,
     ) -> Result<T3ThreadSendResult, ToolError> {
         let target = self
             .kernel
             .store
-            .thread(&input.thread_id)
+            .thread_in_project(&input.thread_id, Some(&input.project_id))
             .map_err(|_| {
                 failure(format!(
                     "Unable to load thread {} in project {}.",
@@ -388,6 +411,19 @@ impl ThreadService for KernelThreadService {
                 ))
             })?
             .ok_or_else(|| {
+                if self
+                    .kernel
+                    .store
+                    .registry_unavailable(&input.thread_id, Some(&input.project_id))
+                {
+                    return ToolError::new(
+                        Code::ThreadNotFound,
+                        format!(
+                            "Thread {} was not found in project {}.",
+                            input.thread_id, input.project_id
+                        ),
+                    );
+                }
                 failure(format!(
                     "Unable to load thread {} in project {}.",
                     input.thread_id, input.project_id
@@ -456,12 +492,15 @@ impl ThreadService for KernelThreadService {
         let driver = match (driver, input.model_selection.as_ref()) {
             (Some(d), None) => d,
             (None, None) => {
-                self.delegation
+                let resolved = self
+                    .delegation
                     .targets
                     .resolve(&target.thread, None)
-                    .await?
-                    .driver
-                    .0
+                    .await?;
+                if target.thread.model_selection.model == "default" {
+                    input.model_selection = Some(resolved.selection);
+                }
+                resolved.driver.0
             }
             _ => {
                 let selection = input.model_selection.as_ref().unwrap();
