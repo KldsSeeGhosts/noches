@@ -37,17 +37,20 @@ fn quoted_units(units: &[u16]) -> String {
     result
 }
 
-/// Only the read result's `items[].text` slots accept private markers. Arbitrary
-/// tool output, user JSON and other fields can never trigger raw substitution.
+/// Only read `items[].text` and search `matches[].snippet` slots accept private
+/// markers. Arbitrary user JSON and other fields cannot trigger substitution.
 pub fn read_json(value: &Value) -> String {
     let mut safe = value.clone();
     let mut replacements = vec![];
-    if let Some(items) = safe.get_mut("items").and_then(Value::as_array_mut) {
+    for (collection, field) in [("items", "text"), ("matches", "snippet")] {
+        let Some(items) = safe.get_mut(collection).and_then(Value::as_array_mut) else {
+            continue;
+        };
         for item in items {
-            if let Some(units) = item["text"][UNITS].as_array() {
+            if let Some(units) = item[field][UNITS].as_array() {
                 let units: Vec<_> = units.iter().map(|n| n.as_u64().unwrap() as u16).collect();
                 let token = format!("\0utf16:{}:{}", uuid::Uuid::new_v4(), replacements.len());
-                item["text"] = json!(token);
+                item[field] = json!(token);
                 replacements.push((json!(token).to_string(), quoted_units(&units)));
             }
         }
@@ -64,7 +67,9 @@ pub fn response_json(value: &Value) -> String {
     let Some(content) = value.pointer("/result/structuredContent") else {
         return value.to_string();
     };
-    if !content.get("items").is_some_and(Value::is_array) {
+    if !content.get("items").is_some_and(Value::is_array)
+        && !content.get("matches").is_some_and(Value::is_array)
+    {
         return value.to_string();
     }
     let encoded = read_json(content);

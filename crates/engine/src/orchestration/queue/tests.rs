@@ -838,6 +838,60 @@ async fn successful_promotion_preserves_attachments_and_only_enqueues_steering()
         Ok(rows)
     }).unwrap();
     assert_eq!(effects, vec!["provider-turn.start", "provider-turn.steer"]);
+    let promoted_effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|effect| {
+            matches!(&effect.request, crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == "queue-one")
+        })
+        .unwrap();
+    assert!(super::effects::is_promotion(&f.service.kernel.store, &promoted_effect).unwrap());
+    // The same wire effect from ordinary ThreadService send must still use
+    // that slice's late-steer recovery, never the strict promotion adapter.
+    let receipt = f
+        .service
+        .kernel
+        .dispatch(
+            &Command {
+                id: "ordinary-steer".into(),
+                thread_id: "target".into(),
+                operation: Operation::Thread(Box::new(
+                    crate::orchestration::threads::planner::ThreadOperation::Send(
+                        crate::orchestration::threads::planner::Send {
+                            message_id: "ordinary-steering-message".into(),
+                            text: "ordinary".into(),
+                            mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+                            driver: "mock".into(),
+                            sender: "parent".into(),
+                            target_run: Some(active.id.clone()),
+                        },
+                    ),
+                )),
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.status,
+        ReceiptStatus::Accepted,
+        "{:?}",
+        receipt.error
+    );
+    let ordinary_effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|effect| effect.command_id.0 == "ordinary-steer")
+        .unwrap();
+    assert!(!super::effects::is_promotion(&f.service.kernel.store, &ordinary_effect).unwrap());
     // The host can remove/sync the promoted intent before a delayed effect.
     f.service
         .mutate(
@@ -1078,6 +1132,151 @@ async fn auto_settle_source_and_reopen_are_synced_without_hiding_failed_work() {
 }
 
 #[tokio::test]
+async fn shared_thread_send_clears_synced_settlement_source_and_snooze() {
+    let f = Fixture::new();
+    f.service
+        .settle_for_host("target".into(), zeron_proto::SettleSource::Auto, NOW)
+        .await
+        .unwrap();
+    let receipt = f.service.mutate(
+        Some(f.caller.clone()),
+        "target".into(),
+        "t3_thread_organize",
+        json!({"threadId":"target","action":"snooze","snoozedUntil":super::super::event::iso(NOW+1000).unwrap()}),
+        "shared-send-snooze".into(),
+        NOW,
+    ).await.unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Accepted);
+    let receipt = f
+        .service
+        .kernel
+        .dispatch(
+            &Command {
+                id: "shared-send-reengages".into(),
+                thread_id: "target".into(),
+                operation: Operation::Thread(Box::new(
+                    crate::orchestration::threads::planner::ThreadOperation::Send(
+                        crate::orchestration::threads::planner::Send {
+                            message_id: "shared-send-input".into(),
+                            text: "continue".into(),
+                            mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Auto,
+                            driver: "mock".into(),
+                            sender: "parent".into(),
+                            target_run: None,
+                        },
+                    ),
+                )),
+            },
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.status,
+        ReceiptStatus::Accepted,
+        "{:?}",
+        receipt.error
+    );
+    // Check after successful completion, not only while active work masks
+    // stale lifecycle fields.
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut run = p.runs.last().unwrap().clone();
+    run.status = OrchestrationV2RunStatus::Completed;
+    run.completed_at = Some(super::super::event::iso(NOW + 2).unwrap());
+    f.seed("target", "run.updated", serde_json::to_value(run).unwrap());
+    let lifecycle = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"target".into())
+        .unwrap()
+        .lifecycle;
+    assert!(lifecycle.settled_at.is_none());
+    assert!(lifecycle.settled_by.is_none());
+    assert!(lifecycle.snoozed_until.is_none());
+}
+
+#[tokio::test]
+async fn delayed_promotion_effect_cannot_become_a_late_send() {
+    use crate::orchestration::effects::{EffectExecutor, EffectOutcome, EffectRequest};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    let queued = f.sync("strict promotion").await;
+    f.call(
+        "t3_queue_promote_to_steer",
+        json!({"threadId":"target","queuedRunId":queued,"targetRunId":active.id}),
+    )
+    .await
+    .unwrap();
+    let effect = f.service.kernel.store.effects().unwrap().into_iter().find(|e| {
+        matches!(&e.request, EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == "queue-one")
+    }).unwrap();
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut ended = p.runs.iter().find(|r| r.id == active.id).unwrap().clone();
+    ended.status = OrchestrationV2RunStatus::Completed;
+    ended.completed_at = Some(super::super::event::iso(NOW + 1).unwrap());
+    f.seed(
+        "target",
+        "run.updated",
+        serde_json::to_value(ended).unwrap(),
+    );
+    // Use the production executor, but no live provider is needed: the stale
+    // target must be refused before any session dispatch or fallback planning.
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(crate::HarnessRegistry::new());
+    registry.register(Arc::new(zeron_harness::mock::MockHarness {
+        script: vec![],
+    }));
+    let core = crate::EngineCore::assemble(
+        runtime_dir.path(),
+        registry,
+        zeron_proto::HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    let mut bridge = core
+        .orchestration_host
+        .as_ref()
+        .unwrap()
+        .bridge
+        .as_ref()
+        .clone();
+    bridge.kernel = f.service.kernel.clone();
+    let frontier = bridge.kernel.store.projection_frontier().unwrap();
+    assert_eq!(
+        bridge
+            .execute(&effect, tokio_util::sync::CancellationToken::new())
+            .await,
+        EffectOutcome::Failed,
+    );
+    assert_eq!(bridge.kernel.store.projection_frontier().unwrap(), frontier);
+    let after = bridge
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs.len(), p.runs.len());
+    assert_eq!(
+        task::records(&after, "message").len(),
+        task::records(&p, "message").len()
+    );
+    assert!(!bridge.sessions.turn_in_flight("target"));
+}
+
+#[tokio::test]
 async fn settling_idle_work_detaches_provider_and_archive_disposes_after_metadata() {
     let f = Fixture::new();
     let active = f.start_target().await;
@@ -1232,4 +1431,22 @@ async fn failed_work_stays_visible_after_later_queue_cancellation() {
         .lifecycle;
     assert!(lifecycle.settled_at.is_none());
     assert!(lifecycle.snoozed_until.is_none());
+    let projection = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let summary = crate::orchestration::threads::timeline::summary(&projection, 0);
+    assert_eq!(summary["settled"], false);
+    assert!(summary["settledAt"].is_null());
+    let (page, _) = crate::orchestration::threads::timeline::page(
+        &f.service.kernel.store,
+        &projection,
+        &serde_json::from_value(json!({"threadId":"target"})).unwrap(),
+    )
+    .unwrap();
+    assert!(!page.result.thread.settled);
+    assert!(page.result.thread.settled_at.is_none());
 }

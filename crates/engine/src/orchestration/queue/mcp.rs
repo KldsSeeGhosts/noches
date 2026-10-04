@@ -15,8 +15,11 @@ pub async fn dispatch(
         Some(service) => service.call(scope.caller.clone(), name, input).await,
         None => Err(super::unavailable()),
     };
-    codec::result(match result {
-        Ok(value) => value,
-        Err(error) => serde_json::to_value(error.into_failure()).expect("failure"),
-    })
+    match result {
+        Ok(value) if name == "t3_thread_search" => {
+            crate::orchestration::threads::wire::result(value)
+        }
+        Ok(value) => codec::result(value),
+        Err(error) => codec::result(serde_json::to_value(error.into_failure()).expect("failure")),
+    }
 }

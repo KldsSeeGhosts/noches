@@ -69,7 +69,7 @@ pub(crate) fn search(conn: &Connection, project: &ProjectId, input: &Value) -> R
     Ok(json!({"matches":matches}))
 }
 
-fn snippet(text: &str, query: &str) -> String {
+fn snippet(text: &str, query: &str) -> Value {
     let text = text
         .split(js_whitespace)
         .filter(|s| !s.is_empty())
@@ -77,7 +77,7 @@ fn snippet(text: &str, query: &str) -> String {
         .join(" ");
     let units: Vec<_> = text.encode_utf16().collect();
     if units.len() <= 240 {
-        return text;
+        return json!(text);
     }
     let normalized = text.to_ascii_lowercase();
     let query = query
@@ -92,12 +92,15 @@ fn snippet(text: &str, query: &str) -> String {
         .unwrap_or(0);
     let start = index.saturating_sub(72).min(units.len() - 236);
     let end = (start + 236).min(units.len());
-    format!(
-        "{}{}{}",
-        if start > 0 { "…" } else { "" },
-        String::from_utf16_lossy(&units[start..end]),
-        if end < units.len() { "…" } else { "" }
-    )
+    let mut snippet = vec![];
+    if start > 0 {
+        snippet.push('…' as u16);
+    }
+    snippet.extend_from_slice(&units[start..end]);
+    if end < units.len() {
+        snippet.push('…' as u16);
+    }
+    crate::orchestration::threads::wire::text_value(&snippet)
 }
 
 pub(crate) fn js_whitespace(c: char) -> bool {
@@ -111,9 +114,32 @@ mod tests {
     #[test]
     fn snippets_are_bounded_and_centered() {
         let text = format!("{}needle{}", "x".repeat(300), "y".repeat(400));
-        let snippet = super::snippet(&text, "needle");
+        let value = super::snippet(&text, "needle");
+        let snippet = value.as_str().unwrap();
         assert_eq!(snippet.encode_utf16().count(), 238);
         assert!(snippet.contains("needle"));
         assert_eq!(super::snippet("a \n b", "a"), "a b");
+    }
+
+    #[test]
+    fn search_snippets_preserve_surrogate_boundaries_over_mcp() {
+        use crate::orchestration::threads::wire;
+        // Match is at UTF-16 index 73, so start=1 and end=237. Place a
+        // surrogate pair across the end boundary to exercise JS slice.
+        let text = format!(
+            "{}needle{}😀{}",
+            "x".repeat(73),
+            "y".repeat(157),
+            "y".repeat(400)
+        );
+        let snippet = super::snippet(&text, "needle");
+        let page = serde_json::json!({"matches":[{"snippet":snippet}]});
+        let encoded = wire::read_json(&page);
+        assert!(encoded.contains(r"\ud83d"));
+        assert!(!encoded.contains("noches.thread.utf16"));
+        let response = serde_json::json!({"result":wire::result(page)});
+        let encoded = wire::response_json(&response);
+        assert!(encoded.contains(r"\ud83d"));
+        assert!(!encoded.contains("noches.thread.utf16"));
     }
 }

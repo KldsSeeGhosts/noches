@@ -98,6 +98,36 @@ fn time(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.to_utc())
 }
 
+/// Shared presentation guard for lifecycle sync and thread list/read. Durable
+/// parking metadata must never conceal active, input-needed, or failed work.
+pub(crate) fn parking_blocked(p: &projection::ThreadProjection) -> bool {
+    p.runs
+        .iter()
+        .any(|r| !super::command::run_terminal(&r.status))
+        || p.runs
+            .iter()
+            .rev()
+            .find(|r| {
+                r.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Queued
+                    && (r.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Cancelled
+                        || r.started_at.is_some())
+            })
+            .is_some_and(|r| {
+                r.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Failed
+            })
+        || task::records(p, "runtime-request")
+            .iter()
+            .any(|r| r["status"] == "pending")
+        || task::records(p, "subagent")
+            .iter()
+            .any(|t| !task::terminal(t["status"].as_str().unwrap_or("running")))
+        || task::records(p, "provider-thread").iter().any(|t| {
+            t["pendingBackgroundTasks"]
+                .as_array()
+                .is_some_and(|tasks| !tasks.is_empty())
+        })
+}
+
 pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
     let Some(p) = projection::read_thread(conn, id)? else {
         return Ok(QueueUiState {
@@ -165,32 +195,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
     let marker = marker(conn, id)?;
     // Durable parked fields remain in the source; presentation never conceals
     // active/blocked/error work, including post-terminal background nodes.
-    let blocked = p
-        .runs
-        .iter()
-        .any(|r| !super::command::run_terminal(&r.status))
-        || p.runs
-            .iter()
-            .rev()
-            .find(|r| {
-                r.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Queued
-                    && (r.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Cancelled
-                        || r.started_at.is_some())
-            })
-            .is_some_and(|r| {
-                r.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Failed
-            })
-        || task::records(&p, "runtime-request")
-            .iter()
-            .any(|r| r["status"] == "pending")
-        || task::records(&p, "subagent")
-            .iter()
-            .any(|t| !task::terminal(t["status"].as_str().unwrap_or("running")))
-        || task::records(&p, "provider-thread").iter().any(|t| {
-            t["pendingBackgroundTasks"]
-                .as_array()
-                .is_some_and(|tasks| !tasks.is_empty())
-        });
+    let blocked = parking_blocked(&p);
     let lifecycle = ChatLifecycle {
         pinned_at: time(&thread["pinnedAt"]),
         snoozed_until: (!blocked).then(|| time(&thread["snoozedUntil"])).flatten(),

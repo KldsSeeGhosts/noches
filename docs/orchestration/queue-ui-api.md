@@ -20,6 +20,9 @@ expiry clears its snooze and records `woke_at`; acknowledgement clears only the
 wake marker. Active, queued, awaiting-input, failed, or background-working
 threads never expose a snoozed/settled presentation. Their source lifecycle
 fields remain durable, rather than being erased by presentation filtering.
+The same guard applies to the merged thread list/read settlement fields.
+Ordinary shared thread sends unpark the thread; `settledBy` is absent whenever
+`settledAt` is absent, including after the re-engaged run completes.
 
 ## Synced map and desktop
 
@@ -114,9 +117,9 @@ approve permissions, deliver messages, or execute on replicas.
 - Search matches finished user/assistant content, not titles (the T3 source
   implementation contradicts its tool description in exactly this way).
   Global ranking happens before project filtering; query content is never logged.
-- Search's isolated UTF-16 surrogate snippet boundary uses Rust's replacement
-  character; ordinary Unicode and all queue code-point truncation are covered.
-  A lossless JS-string boundary codec is a remaining conformance seam.
+- Search reuses the merged threads slice's lossless UTF-16 MCP boundary codec,
+  including isolated surrogate snippet boundaries. Private markers never enter
+  SQL, lifecycle sync, or desktop RPC; queue truncation counts code points.
 - The launch slice's canonical project-deletion authority must be joined into
   search at merge; this slice filters deleted/archived threads, but has no
   canonical project table to exclude deleted projects yet.
@@ -128,3 +131,27 @@ approve permissions, deliver messages, or execute on replicas.
 
 Regression tests mirror R3 C03/C08/C19/C20/C21/C32 and the pinned schemas. They are
 reference-derived Rust tests, not a completed two-application trace runner.
+
+## Validation after wave3 merge
+
+All commands below ran locally on macOS through the updated wrapper, with no
+SSH or Linux build. Prefix:
+
+```sh
+LINUX_TARGET=target-w3-queue /Volumes/DevDrive/AiStack/noches-t3-program/linux-test.sh /Volumes/DevDrive/AiStack/noches-wt/w3-queue
+```
+
+- `test -p zeron-engine --lib`: 512 passed, 0 failed, 2 ignored at the merge
+  boundary. Final `test -p zeron-engine --lib orchestration::`: 163 passed,
+  0 failed, 1 ignored, including the subsequent read/codec/dispatch regressions.
+- `test -p zeron-proto -p zeron-doc -p zeron-rpc -p zeron-mcp`: all suites
+  passed, including the 14-test pinned schema oracle; 2 live RPC tests ignored.
+- `test -p zeron-engine --test message_queue --test orchestration_bootstrap
+  --test orchestration_mcp --test queue_lifecycle_rpc --test queued_attachments
+  --test acp_lifecycle`: 31 passed, 0 failed.
+- `test -p zeron-ui --lib`: 1464 passed, 0 failed, 1 native-font test ignored.
+- Touched-file `rustfmt --check` and `git diff --check`: passed.
+
+No full two-app trace runner, authenticated provider matrix, or headed visual
+QA was performed. Full provider-transition parity and the documented shared
+integration seams remain deferred, rather than silently using legacy send-now.
