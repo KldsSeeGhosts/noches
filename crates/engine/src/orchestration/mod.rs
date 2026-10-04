@@ -23,6 +23,7 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod ui;
+pub mod ui_scheduler;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

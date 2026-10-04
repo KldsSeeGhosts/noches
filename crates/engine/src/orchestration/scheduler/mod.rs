@@ -1,6 +1,8 @@
 //! Durable host scheduler. Success records dispatch acceptance, never completion
 //! of a provider turn. SQLite claims fence overlap and restart uncertainty.
+pub mod mcp;
 pub mod schedule;
+pub mod service;
 
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;

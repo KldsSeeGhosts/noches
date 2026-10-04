@@ -591,6 +591,7 @@ enum MutateParams {
 pub struct EngineRpc {
     orchestration: Option<crate::orchestration::Store>,
     delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
+    scheduler: Option<std::sync::Arc<crate::orchestration::scheduler::Scheduler>>,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -641,6 +642,7 @@ impl EngineRpc {
         Self {
             orchestration: None,
             delegation: None,
+            scheduler: None,
             sessions,
             doc_host,
             workspace,
@@ -677,6 +679,14 @@ impl EngineRpc {
 
     pub fn with_orchestration(mut self, store: crate::orchestration::Store) -> Self {
         self.orchestration = Some(store);
+        self
+    }
+
+    pub fn with_scheduler(
+        mut self,
+        scheduler: std::sync::Arc<crate::orchestration::scheduler::Scheduler>,
+    ) -> Self {
+        self.scheduler = Some(scheduler);
         self
     }
 
@@ -1209,6 +1219,9 @@ const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
 fn forwardable(method: &str) -> bool {
+    if crate::orchestration::ui_scheduler::is_method(method) {
+        return true;
+    }
     matches!(
         method,
         methods::LIST_HARNESSES
@@ -1295,6 +1308,9 @@ fn forwardable(method: &str) -> bool {
 
 /// Forwardable methods whose reply is a stream (proxied item-by-item).
 fn is_stream_method(method: &str) -> bool {
+    if method == zeron_rpc::scheduled_tasks::methods::WATCH {
+        return true;
+    }
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
@@ -1617,6 +1633,12 @@ impl RpcService for EngineRpc {
             None
         };
         match method {
+            method if crate::orchestration::ui_scheduler::is_method(method) => {
+                let service = self.scheduler.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Scheduled tasks are unavailable on this host.".into())
+                })?;
+                crate::orchestration::ui_scheduler::dispatch(service, method, params).await
+            }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())

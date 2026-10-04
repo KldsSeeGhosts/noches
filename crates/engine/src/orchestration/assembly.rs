@@ -170,6 +170,7 @@ pub struct OrchestrationHost {
     pub bridge: Arc<RunnerBridge>,
     /// The same service the MCP tools call; the UI's user-authority Stop uses it.
     pub service: Arc<DelegationService>,
+    pub scheduler: Arc<super::scheduler::Scheduler>,
     stop: CancellationToken,
     workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -226,7 +227,19 @@ impl OrchestrationHost {
         sessions.mcp_server().set_service(service.clone());
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
+        // BEGIN scheduler slice (TODO(merge-threads): install send/launch adapter).
+        let scheduler = Arc::new(super::scheduler::Scheduler::new(
+            kernel.store.clone(),
+            Arc::new(super::scheduler::UnavailableDispatch),
+        ));
+        scheduler.recover()?;
+        sessions
+            .mcp_server()
+            .toolkit
+            .set_scheduler(scheduler.clone());
         let mut workers = bridge.spawn_workers(stop.clone());
+        workers.push(scheduler.spawn(stop.clone()));
+        // END scheduler slice.
         let publisher = PublicationWorker {
             store: kernel.store.clone(),
             publisher: Arc::new(ChatPublisher {
@@ -255,6 +268,7 @@ impl OrchestrationHost {
         Ok(Self {
             bridge,
             service,
+            scheduler,
             stop,
             workers: std::sync::Mutex::new(workers),
         })
