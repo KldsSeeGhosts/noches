@@ -108,6 +108,7 @@ impl GitActionsService {
         let request = RunRequest {
             prompt,
             harness: Some(harness_id),
+            instance_id: Some(instance.provider_instance_id.clone()),
             model: settings.model.clone(),
             reasoning: Some(zeron_proto::ReasoningLevel::Minimal),
             model_options: Default::default(),
