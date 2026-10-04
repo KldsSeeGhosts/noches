@@ -92,6 +92,9 @@ impl Harness for HeldHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // Publishing the prompt is the fixture's readiness signal. Install the
+        // finish receiver first so the test cannot send into an empty channel.
+        let mut finish = self.finish.subscribe();
         self.prompts.lock().unwrap().push(request.prompt.clone());
         self.requests.lock().unwrap().push(request.clone());
         if self.asks {
@@ -105,7 +108,6 @@ impl Harness for HeldHarness {
                 multi_select: false,
             }]);
         }
-        let mut finish = self.finish.subscribe();
         let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             instance_id: None,
@@ -859,11 +861,10 @@ async fn a_message_with_attachments_holds_even_for_a_steerable_agent() {
         "the held message to flush at turn end",
     )
     .await;
-    assert!(
-        user_messages(&core)
-            .iter()
-            .any(|message| message.contains("Attached images (local files")),
-        "the transport trailer is materialized only when the queued row dispatches"
+    assert_eq!(
+        user_messages(&core),
+        ["opening", "with a file"],
+        "the attachment transport trailer belongs only in provider input, not app history"
     );
 
     let _ = harness.finish.send(());

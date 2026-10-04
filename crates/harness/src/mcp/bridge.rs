@@ -16,7 +16,7 @@ use super::{
 use crate::{
     HarnessError,
     jsonrpc::{Incoming, RpcClient},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
 };
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
@@ -323,9 +323,9 @@ pub async fn cli(args: &[String]) -> Result<(), HarnessError> {
                     command_builder.args(args).envs(env);
                     crate::compose_child_environment(&mut command_builder, &command);
                     command_builder
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
                         .kill_on_drop(true);
                     let mut child = command_builder.spawn()?;
                     let mut input = child.stdin.take().expect("piped stdin");
@@ -536,9 +536,9 @@ impl ToolPeer {
                 let mut cmd = Command::new(&command);
                 cmd.args(args).envs(env);
                 crate::compose_child_environment(&mut cmd, &command);
-                cmd.stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
                     .kill_on_drop(true);
                 let mut child = cmd.spawn()?;
                 let (rpc, incoming) = RpcClient::new(

@@ -4076,9 +4076,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Task<()> {
         use futures::StreamExt as _;
-        let state = state.clone();
+        // The sync can park indefinitely. Do not keep AppState alive after the
+        // window closes while cancellation is waiting for another executor tick.
+        let state = state.downgrade();
         cx.spawn(async move |this, cx| {
-            let mut nudges = state.update(cx, |state, _| state.take_delegation_nudges());
+            let Ok(mut nudges) = state.update(cx, |state, _| state.take_delegation_nudges()) else {
+                return;
+            };
             let mut cache = crate::delegation::SnapshotCache::default();
             let mut failures = 0u32;
             loop {
@@ -4090,9 +4094,11 @@ impl Shell {
                 if let Some(rx) = nudges.as_mut() {
                     while rx.try_next().is_ok_and(|n| n.is_some()) {}
                 }
-                let (engine, always) = state.read_with(cx, |s, _| {
+                let Ok((engine, always)) = state.read_with(cx, |s, _| {
                     (s.engine().cloned(), s.delegation_always_parents())
-                });
+                }) else {
+                    break;
+                };
                 let api = crate::delegation::select_api(engine, &fallback);
                 let result = crate::delegation::with_timeout(
                     api.snapshot(always, cache.clone()),
@@ -4104,15 +4110,22 @@ impl Shell {
                     Ok((snapshot, next)) => {
                         failures = 0;
                         cache = next;
-                        state.update(cx, |state, cx| {
-                            if state.apply_delegation_snapshot(snapshot) {
-                                cx.notify();
-                            }
-                        });
+                        if state
+                            .update(cx, |state, cx| {
+                                if state.apply_delegation_snapshot(snapshot) {
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     Err(_) => failures = failures.saturating_add(1),
                 }
-                let busy = state.read_with(cx, |s, _| s.delegation_busy());
+                let Ok(busy) = state.read_with(cx, |s, _| s.delegation_busy()) else {
+                    break;
+                };
                 let timeout = match (failures, busy, nudges.is_some()) {
                     (0, true, _) => Some(Duration::from_millis(2000)),
                     (0, false, true) => None,
@@ -14555,6 +14568,55 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn parked_delegation_sync_does_not_retain_app_state(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    remote: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let (state, sync) = window
+            .update(cx, |shell, _, cx| {
+                let state = shell.state.downgrade();
+                let sync = Shell::spawn_delegation_sync(
+                    &shell.state,
+                    std::sync::Arc::new(crate::delegation::NullDelegationApi),
+                    cx,
+                );
+                (state, sync)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            state.upgrade().is_none(),
+            "sync retained the closed window's state"
+        );
+        drop(sync);
     }
 
     #[gpui::test]
