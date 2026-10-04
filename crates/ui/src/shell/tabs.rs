@@ -381,12 +381,14 @@ impl Shell {
                         "expand-changes",
                         right_pane_expand_icon(self.right_pane_expanded),
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
                     .child(header_icon_button(
                         "toggle-changes",
                         icons::SIDEBAR_MINIMALISTIC,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                     ))
                     .into_any_element(),
@@ -397,6 +399,7 @@ impl Shell {
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,
                     &theme,
+                    cx.entity_id(),
                     cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                 )
                 .into_any_element(),

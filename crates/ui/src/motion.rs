@@ -727,10 +727,84 @@ impl HoverFades {
         });
         active
     }
+
+    fn snap_to_targets(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.origin = entry.target;
+        }
+    }
 }
 
 thread_local! {
     static HOVER_FADES: RefCell<HoverFades> = RefCell::new(HoverFades::default());
+    static OWNED_HOVER_FADES: RefCell<HashMap<EntityId, HoverFades>> = RefCell::new(HashMap::new());
+}
+
+/// Drop hover state with its render owner, including a hovered element that
+/// unmounts without receiving a leave event.
+pub fn init_hover_owner<V: 'static>(cx: &mut gpui::Context<V>) {
+    let owner = cx.entity_id();
+    cx.on_release(move |_, _| {
+        clear_hover_owner(owner);
+    })
+    .detach();
+}
+
+/// Reset retained surfaces when their content unmounts or starts a fresh open.
+/// A hovered element can disappear without ever receiving its leave event.
+pub fn clear_hover_owner(owner: EntityId) {
+    OWNED_HOVER_FADES.with(|fades| fades.borrow_mut().remove(&owner));
+}
+
+pub fn set_hover_owned(owner: EntityId, key: &str, hovered: bool, reduced: bool) {
+    OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .entry(owner)
+            .or_default()
+            .set_at(key, hovered, reduced, Instant::now());
+    });
+}
+
+pub fn hover_t_owned(owner: EntityId, key: &str) -> f32 {
+    OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .get_mut(&owner)
+            .map(|fades| fades.value_at(key, Instant::now()))
+            .unwrap_or(0.0)
+    })
+}
+
+pub fn hover_blend_owned(owner: EntityId, key: &str, from: Hsla, to: Hsla) -> Hsla {
+    mix(from, to, hover_t_owned(owner, key))
+}
+
+/// Event dispatch invalidates only the owner. Draw-phase scheduling belongs
+/// to `drive_hover_owner`, never to this callback or the window root.
+pub fn hover_listener_owned(
+    owner: EntityId,
+    key: impl Into<SharedString>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let key = key.into();
+    move |hovered, _, cx| {
+        set_hover_owned(owner, &key, *hovered, reduced_motion(cx));
+        cx.notify(owner);
+    }
+}
+
+/// Call after the owner's hover reads, once per render. Each owner has its own
+/// liveness clock, so rendering one window cannot prune another window's fades.
+pub fn drive_hover_owner(owner: EntityId, window: &mut Window) {
+    let active = OWNED_HOVER_FADES.with(|fades| {
+        fades
+            .borrow_mut()
+            .get_mut(&owner)
+            .is_some_and(|fades| fades.tick_at(Instant::now()))
+    });
+    if active {
+        window.request_animation_frame();
+    }
 }
 
 /// Hover progress (0..1) for `key` this frame.
@@ -822,6 +896,14 @@ pub fn speed_scale() -> f32 {
 /// Global reduced-motion flag. gpui snaps every `with_animation` element when
 /// set (end state for oneshots, rest state for loops) and schedules no frames.
 pub fn set_reduced_motion(cx: &mut App, reduced: bool) {
+    if reduced {
+        HOVER_FADES.with(|fades| fades.borrow_mut().snap_to_targets());
+        OWNED_HOVER_FADES.with(|fades| {
+            for fades in fades.borrow_mut().values_mut() {
+                fades.snap_to_targets();
+            }
+        });
+    }
     cx.set_reduce_motion(reduced);
 }
 
@@ -934,6 +1016,65 @@ mod tests {
     }
 
     use super::*;
+
+    #[gpui::test]
+    fn owned_hover_isolates_windows_and_reduced_motion(cx: &mut gpui::TestAppContext) {
+        struct Owner;
+        impl gpui::Render for Owner {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                gpui::div()
+            }
+        }
+        let first = cx.add_window(|_, cx| {
+            init_hover_owner(cx);
+            Owner
+        });
+        let second = cx.add_window(|_, cx| {
+            init_hover_owner(cx);
+            Owner
+        });
+        let first_id = cx.update(|cx| first.entity(cx).unwrap().entity_id());
+        let second_id = cx.update(|cx| second.entity(cx).unwrap().entity_id());
+        let second_notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = second_notifications.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&second.entity(cx).unwrap(), move |_, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        cx.update(|cx| set_reduced_motion(cx, true));
+        first
+            .update(cx, |_, window, cx| {
+                hover_listener_owned(first_id, "same-control")(&true, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(hover_t_owned(first_id, "same-control"), 1.0);
+        assert_eq!(hover_t_owned(second_id, "same-control"), 0.0);
+        assert_eq!(second_notifications.get(), 0);
+        set_hover_owned(second_id, "same-control", true, true);
+        // One owner's frame bookkeeping never ages another owner's entries.
+        OWNED_HOVER_FADES.with(|fades| {
+            let mut fades = fades.borrow_mut();
+            assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
+            assert!(!fades.get_mut(&first_id).unwrap().tick_at(Instant::now()));
+        });
+        assert_eq!(hover_t_owned(second_id, "same-control"), 1.0);
+        first
+            .update(cx, |_, window, cx| {
+                hover_listener_owned(first_id, "same-control")(&false, window, cx);
+            })
+            .unwrap();
+        assert_eq!(hover_t_owned(first_id, "same-control"), 0.0);
+        cx.update(|cx| set_reduced_motion(cx, false));
+        set_hover_owned(first_id, "same-control", true, false);
+        cx.update(|cx| set_reduced_motion(cx, true));
+        assert_eq!(
+            hover_t_owned(first_id, "same-control"),
+            1.0,
+            "enabling reduced motion settles an in-flight fade"
+        );
+    }
 
     fn assert_close(actual: f32, expected: f32, tol: f32, ctx: &str) {
         assert!(
