@@ -118,8 +118,8 @@ pub fn map_checkpoints(state: &ThreadTransferState) -> Vec<Checkpoint> {
                 // The checkpoint API has no prose turn summary. Don't invent one.
                 summary: match (file.phase.as_str(), c.app_run_ordinal) {
                     ("backup", _) => "Restore backup".into(),
-                    ("started", Some(n)) => format!("Turn {n} · before"),
-                    ("completed", Some(n)) => format!("Turn {n} · after"),
+                    ("started", _) => "Start".into(),
+                    ("completed", Some(n)) => format!("Turn {n}"),
                     _ => "File checkpoint".into(),
                 },
                 additions: sum(true),
@@ -128,6 +128,15 @@ pub fn map_checkpoints(state: &ThreadTransferState) -> Vec<Checkpoint> {
         })
         .collect();
     rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
+    // One row per turn: a turn's "before" state is the previous turn's
+    // "after", so only the oldest "before" stays, as the Start baseline.
+    let start = rows.iter().rposition(|row| row.summary == "Start");
+    let mut index = 0;
+    rows.retain(|row| {
+        let keep = row.summary != "Start" || Some(index) == start;
+        index += 1;
+        keep
+    });
     rows
 }
 
@@ -138,10 +147,15 @@ pub fn apply_snapshot(model: &mut DetailsModel, row: &DetailsSnapshot) {
         model.pull_requests = map_pull_requests(prs);
     }
     if let Some(launch) = &row.launch {
-        model.workspace.worktree_branch = launch
+        // A worktree binding is a path other than the project root. A root
+        // checkout reports its own path as `worktreePath` with no root.
+        let in_worktree = launch
             .worktree_path
-            .as_ref()
-            .map(|_| launch.branch.clone().unwrap_or_else(|| "Worktree".into()));
+            .as_deref()
+            .zip(launch.project_workspace_root.as_deref())
+            .is_some_and(|(path, root)| path != root);
+        model.workspace.worktree_branch =
+            in_worktree.then(|| launch.branch.clone().unwrap_or_else(|| "Worktree".into()));
         if launch.branch.is_some() {
             model.workspace.branch = launch.branch.clone();
         }
@@ -380,6 +394,7 @@ mod tests {
     fn launch_json_maps_setup_and_root_without_inferred_cwd() {
         let launch: LaunchUiState = serde_json::from_value(json!({
             "threadId":"chat", "branch":"feature", "worktreePath":"/worktrees/feature",
+            "projectWorkspaceRoot":"/repo",
             "setup":{"runId":"run","status":"running","scriptName":"Install"}
         }))
         .unwrap();
@@ -451,9 +466,39 @@ mod tests {
         let rows = map_checkpoints(&state);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "new");
-        assert_eq!(rows[0].summary, "Turn 4 · after");
+        assert_eq!(rows[0].summary, "Turn 4");
+        assert_eq!(rows[1].summary, "Start");
         assert_eq!((rows[0].additions, rows[0].deletions), (12, 3));
         assert_eq!(fork_source(&state), Some("parent"));
+    }
+
+    #[test]
+    fn root_checkout_is_not_a_worktree_and_only_the_first_before_stays() {
+        let launch: LaunchUiState = serde_json::from_value(json!({
+            "threadId":"chat", "worktreePath":"/repo", "projectWorkspaceRoot":null
+        }))
+        .unwrap();
+        let mut model = DetailsModel::default();
+        apply_snapshot(
+            &mut model,
+            &DetailsSnapshot {
+                launch: Some(launch),
+                ..Default::default()
+            },
+        );
+        assert!(model.workspace.worktree_branch.is_none());
+        let state: ThreadTransferState = serde_json::from_value(json!({
+            "threadId":"chat",
+            "checkpoints":[
+                checkpoint("s1", "2026-10-04T14:00:00Z", "started"),
+                checkpoint("c1", "2026-10-04T14:01:00Z", "completed"),
+                checkpoint("s2", "2026-10-04T14:02:00Z", "started"),
+                checkpoint("c2", "2026-10-04T14:03:00Z", "completed")
+            ]
+        }))
+        .unwrap();
+        let ids: Vec<_> = map_checkpoints(&state).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["c2", "c1", "s1"]);
     }
 
     #[test]

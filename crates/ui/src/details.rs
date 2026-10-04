@@ -141,21 +141,33 @@ impl DetailsModel {
         }
         let mut model = Self::default();
         if let Some(chat) = chat {
-            if let Some(space) = chat.space_id.as_ref().and_then(|id| state.spaces.iter().find(|s| &s.id == id)) {
+            if let Some(space) = chat
+                .space_id
+                .as_ref()
+                .and_then(|id| state.spaces.iter().find(|s| &s.id == id))
+            {
                 let root = crate::git_store::is_root_checkout(chat, space);
                 if !root {
-                    model.workspace.worktree_branch = chat.branch.clone().or_else(|| Some("Worktree".into()));
+                    model.workspace.worktree_branch =
+                        chat.branch.clone().or_else(|| Some("Worktree".into()));
                 } else if let Some(row) = state.git_actions.pulls.get(&space.id) {
                     let branch = if !row.state.policy.default_branch.is_empty() {
                         row.state.policy.default_branch.clone()
                     } else {
-                        row.checkout.as_ref().and_then(|c| c.upstream.as_deref())
+                        row.checkout
+                            .as_ref()
+                            .and_then(|c| c.upstream.as_deref())
                             .and_then(|u| u.split_once('/').map(|(_, b)| b.to_string()))
                             .unwrap_or_else(|| "default branch".into())
                     };
                     model.workspace.auto_pull = Some(AutoPullInfo {
-                        space_id: space.id.clone(), branch, enabled: row.state.policy.enabled,
-                        summary: crate::git_store::pull_summary(&row.state, Utc::now().timestamp_millis()),
+                        space_id: space.id.clone(),
+                        branch,
+                        enabled: row.state.policy.enabled,
+                        summary: crate::git_store::pull_summary(
+                            &row.state,
+                            Utc::now().timestamp_millis(),
+                        ),
                         error: row.error.clone().or_else(|| row.state.last_error.clone()),
                         busy: row.busy,
                     });
@@ -507,23 +519,70 @@ fn workspace_section(
             let enabled = pull.enabled;
             let busy = pull.busy;
             rows.push(
-                hover_row(row(format!("details-{chat_id}-pull").into(), Some(icons::GIT_BRANCH), theme), theme)
-                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.0))
-                        .child(div().min_w_0().truncate().line_height(px(16.0)).child(format!("Keep {} up to date", pull.branch)))
-                        .child(mono(pull.error.clone().unwrap_or_else(|| pull.summary.clone()),
-                            if pull.error.is_some() { theme.danger } else { theme.text_muted }, theme).line_height(px(13.0)).min_w_0().truncate()))
-                    .when(pull.error.is_some(), |el| el.child(
-                        icon_action(format!("details-{chat_id}-pull-retry").into(), icons::RESTART, "Retry", theme)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !busy { retry(this, retry_space.clone(), cx); }
-                            }))))
-                    .child(crate::settings::widgets::toggle_switch(theme, enabled)
-                        .id(SharedString::from(format!("details-{chat_id}-pull-switch")))
-                        .when(busy, |el| el.opacity(0.5)).cursor_pointer()
+                hover_row(
+                    row(
+                        format!("details-{chat_id}-pull").into(),
+                        Some(icons::GIT_BRANCH),
+                        theme,
+                    ),
+                    theme,
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .line_height(px(16.0))
+                                .child(format!("Keep {} up to date", pull.branch)),
+                        )
+                        .child(
+                            mono(
+                                pull.error.clone().unwrap_or_else(|| pull.summary.clone()),
+                                if pull.error.is_some() {
+                                    theme.danger
+                                } else {
+                                    theme.text_muted
+                                },
+                                theme,
+                            )
+                            .line_height(px(13.0))
+                            .min_w_0()
+                            .truncate(),
+                        ),
+                )
+                .when(pull.error.is_some(), |el| {
+                    el.child(
+                        icon_action(
+                            format!("details-{chat_id}-pull-retry").into(),
+                            icons::RESTART,
+                            "Retry",
+                            theme,
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if !busy { toggle(this, (toggle_space.clone(), !enabled), cx); }
-                        })))
-                    .into_any_element(),
+                            if !busy {
+                                retry(this, retry_space.clone(), cx);
+                            }
+                        })),
+                    )
+                })
+                .child(
+                    crate::settings::widgets::toggle_switch(theme, enabled)
+                        .id(SharedString::from(format!("details-{chat_id}-pull-switch")))
+                        .when(busy, |el| el.opacity(0.5))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !busy {
+                                toggle(this, (toggle_space.clone(), !enabled), cx);
+                            }
+                        })),
+                )
+                .into_any_element(),
             );
         }
         let handoff = actions.move_to_worktree.clone();
@@ -830,21 +889,24 @@ fn checkpoints_section(
                 .group(group.clone())
                 .child(mono(stamp, theme.text_faint, theme).w(px(40.0)))
                 .child(label(checkpoint.summary.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(4.0))
-                        .child(mono(
-                            format!("+{}", checkpoint.additions),
-                            theme.diff_add,
-                            theme,
-                        ))
-                        .child(mono(
-                            format!("−{}", checkpoint.deletions),
-                            theme.diff_del,
-                            theme,
-                        )),
-                )
+                // A checkpoint with no file changes shows no counts.
+                .when(checkpoint.additions + checkpoint.deletions > 0, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .gap(px(4.0))
+                            .child(mono(
+                                format!("+{}", checkpoint.additions),
+                                theme.diff_add,
+                                theme,
+                            ))
+                            .child(mono(
+                                format!("−{}", checkpoint.deletions),
+                                theme.diff_del,
+                                theme,
+                            )),
+                    )
+                })
                 .child(
                     icon_action(
                         format!("details-{chat_id}-cp-{}-restore", checkpoint.id).into(),
