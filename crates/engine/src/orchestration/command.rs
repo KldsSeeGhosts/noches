@@ -42,6 +42,7 @@ pub enum Operation {
     /// Trusted ordinary-session admission updates the next turn's binding.
     SessionBinding(Box<OrchestrationV2AppThread>),
     Task(Box<super::task::TaskOperation>),
+    PullRequest(Box<super::pull_requests::PrOperation>),
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,7 @@ impl Command {
             Operation::Recover => "kernel.runtime.recover".into(),
             Operation::SessionBinding(_) => "kernel.session.binding".into(),
             Operation::Task(operation) => operation.command_type().into(),
+            Operation::PullRequest(operation) => operation.command_type().into(),
         })
     }
 }
@@ -408,6 +410,9 @@ fn provider_batch(
 }
 
 pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Plan> {
+    if let Operation::PullRequest(operation) = &command.operation {
+        return super::pull_requests::plan(conn, command, operation, now);
+    }
     if let Operation::Task(operation) = &command.operation {
         return super::task::plan(conn, command, operation, now);
     }
@@ -698,6 +703,7 @@ pub(crate) fn plan(conn: &Connection, command: &Command, now: i64) -> Result<Pla
         }
         Operation::Adopt { .. } => unreachable!(),
         Operation::Task(_) => unreachable!("routed before the kernel subset"),
+        Operation::PullRequest(_) => unreachable!("routed before the kernel subset"),
     }
     Ok(plan)
 }

@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    pull_requests: RwLock<Option<Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -28,6 +29,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            pull_requests: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -43,6 +45,16 @@ impl Toolkit {
 
     pub fn set_service(&self, service: Arc<dyn OrchestratorService>) {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
+    }
+
+    pub fn set_pull_requests(
+        &self,
+        service: Arc<dyn crate::orchestration::pull_requests::PullRequestLinks>,
+    ) {
+        *self
+            .pull_requests
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -159,7 +171,13 @@ impl Toolkit {
     ) -> Value {
         let name = tool.name.as_str();
         if tool.group == "pullRequests" {
-            return self.pull_request_unavailable(scope, name);
+            let service = self
+                .pull_requests
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            return crate::orchestration::pull_requests::mcp::dispatch(service, scope, name, args)
+                .await;
         }
         if tool.group == "worktree" && !scope.capabilities.contains("worktree") {
             return codec::result(if name == "t3_worktree_list" {
@@ -327,19 +345,5 @@ impl Toolkit {
             // emulation, mutation, receipt, provider call, or hidden success.
             _ => codec::result(codec::unavailable()),
         }
-    }
-
-    fn pull_request_unavailable(&self, scope: &InvocationScope, name: &str) -> Value {
-        if !scope.capabilities.contains("pull-requests") {
-            return codec::error_text(
-                "MCP credential does not grant the pull-requests capability.",
-            );
-        }
-        codec::error_text(match name {
-            "link_pull_request" => "Could not link the pull request.",
-            "unlink_pull_request" => "Could not unlink the pull request.",
-            "list_thread_pull_requests" => "Could not list the pull request.",
-            _ => "Could not change whether the pull request is watched.",
-        })
     }
 }
