@@ -7,7 +7,7 @@ use serde_json::Value;
 pub struct LaunchUiState {
     pub thread_id: String,
     pub project_id: String,
-    /// preparing | ready | failed | cancelled
+    /// preparing | ready | blocked | failed | cancelled
     pub status: String,
     /// fetch | checkout | bind | setup-script | agent
     pub stage: String,
@@ -52,4 +52,23 @@ pub struct SetupControlParams {
     pub run_id: String,
     /// cancel | retry | continue
     pub action: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn additive_launch_read_fields_default_for_old_clients() {
+        let state: LaunchUiState =
+            serde_json::from_value(json!({"threadId":"thread","projectId":"project"})).unwrap();
+        assert!(state.setup.is_none());
+        assert!(state.worktree_path.is_none());
+        let setup: SetupRun =
+            serde_json::from_value(json!({"runId":"setup","status":"running"})).unwrap();
+        assert!(setup.terminal_id.is_none());
+        assert!(!setup.blocking);
+        assert_eq!(serde_json::to_value(setup).unwrap()["runId"], "setup");
+    }
 }

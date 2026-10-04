@@ -6,6 +6,8 @@ pub mod mcp;
 pub(crate) mod planner;
 mod projects;
 pub mod setup;
+#[cfg(test)]
+mod tests;
 mod workflow;
 
 use super::launch_service::LaunchThreadIntake;
