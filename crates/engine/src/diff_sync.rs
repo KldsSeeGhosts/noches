@@ -1823,11 +1823,39 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
             use std::os::windows::process::CommandExt;
             cmd.as_std_mut().creation_flags(0x08000000);
         }
-        cmd.arg("-C").arg(root).args(args);
+        cmd.arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "core.fsync=objects,reference",
+                "-c",
+                "core.fsyncMethod=fsync",
+            ])
+            .args(args);
         cmd.env("GIT_INDEX_FILE", &index);
         cmd.stdin(std::process::Stdio::null());
         cmd.output()
     };
+    // Seed tracked paths from HEAD: a fresh index alone would silently drop a
+    // tracked file newly matched by .gitignore. HEAD's fresh entries have no
+    // racy stat cache/assume-unchanged bits, so add rehashes working content.
+    let head = Box::pin(run(&["rev-parse", "--verify", "HEAD"]))
+        .await
+        .map_err(|e| EngineError::Other(format!("git HEAD check failed: {e}")))?;
+    if head.status.success() {
+        let seeded = Box::pin(run(&["read-tree", "HEAD"]))
+            .await
+            .map_err(|e| EngineError::Other(format!("git checkpoint index seed failed: {e}")))?;
+        if !seeded.status.success() {
+            let _ = tokio::fs::remove_file(&index).await;
+            return Err(EngineError::Other(format!(
+                "git read-tree: {}",
+                String::from_utf8_lossy(&seeded.stderr).trim()
+            )));
+        }
+    }
     let added = Box::pin(run(&["add", "-A", "--ignore-errors", "."]))
         .await
         .map_err(|e| EngineError::Other(format!("git add failed: {e}")))?;

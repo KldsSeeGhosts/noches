@@ -361,6 +361,13 @@ pub(crate) fn plan(
                 plan.emit(command, "turn-item.updated", &item, now)?;
             } else {
                 let queued = active_run(&projection).is_some();
+                // T3 refuses a pending merge before resolving the queued
+                // provider/session. No input or unparking events may publish.
+                crate::orchestration::transfer::ensure_start_allowed(
+                    &crate::orchestration::transfer::transfers(conn, &command.thread_id)?,
+                    &command.thread_id,
+                    queued,
+                )?;
                 if queued {
                     let provider = active_run(&projection)
                         .and_then(|r| r.provider_thread_id.as_ref())
@@ -385,13 +392,6 @@ pub(crate) fn plan(
                             "Provider does not support app-owned queued turns",
                         ));
                     }
-                }
-                if queued
-                    && records(&projection, "context-transfer")
-                        .iter()
-                        .any(|t| t["type"] == "merge_back" && t["status"] == "pending")
-                {
-                    return Err(unsupported(command, "Pending merge back"));
                 }
                 let ordinal = projection.runs.iter().map(|r| r.ordinal).max().unwrap_or(0) + 1;
                 let mut thread = projection.thread.clone();

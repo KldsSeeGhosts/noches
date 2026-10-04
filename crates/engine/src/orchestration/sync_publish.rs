@@ -69,6 +69,18 @@ pub(crate) fn enqueue(
                     // replicate the kernel's broader internal read model.
                     records.remove("provider-session");
                     records.remove("runtime-request");
+                    if let Some(handoffs) = records
+                        .get_mut("context-handoff")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for handoff in handoffs {
+                            if let Some(record) = handoff.as_object_mut() {
+                                record.insert("summaryText".into(), serde_json::json!(""));
+                                record.remove("history");
+                                record.remove("delivery");
+                            }
+                        }
+                    }
                 }
                 payload["uiState"] = super::ui::state(conn, &ThreadId(id.clone()))?;
                 payload

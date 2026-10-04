@@ -648,8 +648,14 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
 
     harness.finish.send(()).unwrap();
     wait_for(
-        || user_messages(&core).iter().any(|m| m == "first queued"),
-        "first queued turn",
+        || {
+            user_messages(&core).iter().any(|m| m == "first queued")
+                && prompts.lock().unwrap().iter().any(|p| p == "first queued")
+                && harness.finish.receiver_count() > 0
+        },
+        // User entries publish before async admission/checkpoint work. They
+        // cannot be used as proof that the next mock turn can receive finish.
+        "first queued provider turn ready",
     )
     .await;
     assert_eq!(queue_texts(&core), vec!["second queued"]);

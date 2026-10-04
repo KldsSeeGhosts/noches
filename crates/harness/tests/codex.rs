@@ -54,6 +54,45 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
+#[tokio::test]
+async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn() {
+    use zeron_harness::session_lifecycle::{NativeForkRequest, SessionLifecycle};
+    let cwd = tempfile::tempdir().unwrap();
+    let harness = harness();
+    let forked = harness
+        .fork_thread(NativeForkRequest {
+            source_thread_id: "native-source".into(),
+            source_turn_id: Some("stable-turn".into()),
+            source_next_turn_id: None,
+            cwd: cwd.path().to_string_lossy().into_owned(),
+            model: "gpt-5.6-sol".into(),
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
+            mcp: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(forked, "native-fork");
+    let refused = harness
+        .fork_thread(NativeForkRequest {
+            source_thread_id: "native-source".into(),
+            source_turn_id: None,
+            source_next_turn_id: None,
+            cwd: cwd.path().to_string_lossy().into_owned(),
+            model: "gpt-5.6-sol".into(),
+            runtime_mode: Default::default(),
+            interaction_mode: Default::default(),
+            mcp: Default::default(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("without a native turn reference")
+    );
+}
+
 /// Controls whose `request_input` answers every question with `answer_label`.
 fn controls(
     answer_label: &'static str,

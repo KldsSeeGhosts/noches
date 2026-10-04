@@ -14,6 +14,7 @@ use crate::orchestration::service::OrchestratorService;
 pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
+    transfer: RwLock<Option<Arc<dyn crate::orchestration::transfer_service::TransferService>>>,
     scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
     threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
     launch_service: RwLock<Option<Arc<dyn crate::orchestration::launch_service::LaunchService>>>,
@@ -31,6 +32,7 @@ impl Toolkit {
         Self {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
+            transfer: RwLock::new(None),
             scheduler: RwLock::new(None),
             threads: RwLock::new(None),
             launch_service: RwLock::new(None),
@@ -49,6 +51,16 @@ impl Toolkit {
 
     pub fn set_service(&self, service: Arc<dyn OrchestratorService>) {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
+    }
+
+    pub fn set_transfer_service(
+        &self,
+        service: Arc<dyn crate::orchestration::transfer_service::TransferService>,
+    ) {
+        *self
+            .transfer
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub fn set_scheduler(
@@ -89,6 +101,15 @@ impl Toolkit {
 
     pub fn tools(&self) -> &[Value] {
         &self.descriptors
+    }
+
+    fn transfer_service(
+        &self,
+    ) -> Option<Arc<dyn crate::orchestration::transfer_service::TransferService>> {
+        self.transfer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub async fn request(&self, scope: InvocationScope, message: Value) -> Option<Value> {
@@ -235,6 +256,16 @@ impl Toolkit {
             return codec::result(codec::failure("task_not_found", "The task was not found."));
         }
         match input {
+            input @ (OrchestrationToolInput::T3ThreadFork(_)
+            | OrchestrationToolInput::T3ThreadMergeBack(_)
+            | OrchestrationToolInput::T3ThreadTransfers(_)) => codec::result(
+                crate::orchestration::transfer::mcp::dispatch(
+                    self.transfer_service(),
+                    scope.caller.clone(),
+                    input,
+                )
+                .await,
+            ),
             input @ (OrchestrationToolInput::ScheduleTask(_)
             | OrchestrationToolInput::ListScheduledTasks(_)
             | OrchestrationToolInput::UpdateScheduledTask(_)

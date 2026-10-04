@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_scheduler.sql"),
     include_str!("schema_git_actions.sql"),
     include_str!("schema_launch.sql"),
+    include_str!("schema_transfer.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,7 @@ pub struct CommandReceipt {
 
 #[derive(Clone)]
 pub struct Store {
+    pub(crate) thread_locks: Arc<super::ThreadLocks>,
     pub(crate) docs: Arc<DocsStore>,
     pub(crate) host_id: Arc<str>,
     pub(crate) cancellations: Arc<Cancellations>,
@@ -102,13 +104,17 @@ impl Store {
             }
             for (index, sql) in MIGRATIONS.iter().enumerate() {
                 let version = index as i64 + 1;
-                if version <= current {
+                if index == 0 && version <= current {
                     continue;
                 }
+                // Wave slices appended domain scripts independently, so a
+                // positional version can denote different domains before
+                // integration. Replay the IF-NOT-EXISTS domain DDL on open;
+                // the original, non-idempotent kernel schema runs only once.
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute_batch(sql)?;
                 tx.execute(
-                    "INSERT INTO orchestration_schema_migrations VALUES(?1,?2)",
+                    "INSERT OR IGNORE INTO orchestration_schema_migrations VALUES(?1,?2)",
                     params![version, crate::now_ms()],
                 )?;
                 tx.commit()?;
@@ -128,6 +134,7 @@ impl Store {
             Ok(())
         })?;
         Ok(Self {
+            thread_locks: Arc::default(),
             docs,
             host_id: host_id.into(),
             cancellations: Arc::default(),

@@ -453,6 +453,13 @@ impl SessionsEngine {
         self.inner.mcp_server.clone()
     }
 
+    pub(crate) fn registered_mcp(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_harness::mcp::SessionMcpContext> {
+        lock(&self.inner.session_mcp).get(chat_id).cloned()
+    }
+
     pub(crate) fn set_orchestration_runner(
         &self,
         runner: std::sync::Weak<crate::orchestration::runner::RunnerBridge>,
@@ -729,6 +736,25 @@ impl SessionsEngine {
         startup_retry: bool,
     ) -> Result<String, EngineError> {
         let _admission = self.admit_work()?;
+        // A kernel-owned start may already carry imported provider context.
+        // Keep the original app message separate from that native-only input.
+        let display_prompt = if let Some(store) = lock(&self.inner.orchestration_store).as_ref()
+            && let Some(id) = message_id.as_ref()
+        {
+            store
+                .thread(&chat_id.into())
+                .map_err(|e| EngineError::Other(e.to_string()))?
+                .and_then(|p| {
+                    crate::orchestration::task::records(&p, "message")
+                        .iter()
+                        .find(|m| m["id"] == *id)
+                        .and_then(|m| m["text"].as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| request.prompt.clone())
+        } else {
+            request.prompt.clone()
+        };
         // Resolve before any interruption, message write, worktree use, or
         // process startup. Never select the first matching driver row.
         let requested_instance = request
@@ -813,9 +839,11 @@ impl SessionsEngine {
                     && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
                         .is_some_and(|thread| thread.runs.last().is_none_or(|run|
                             run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
-                    scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &request, &user_id, harness.as_ref())
+                    scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &mut request, &user_id, harness.as_ref())
                         .await.map_err(|error| EngineError::Other(error.to_string()))?;
                     self.inner.mcp_server.credentials.advance_session(scope);
+                    runner.prepare_external_turn(&chat_id.into(),&mut request,harness.as_ref())
+                        .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
             }
             let accepted = if steerable && same_runtime {
@@ -837,7 +865,7 @@ impl SessionsEngine {
                         bridge.turn_started();
                     }
                     pending.push_back(RoutedSteer {
-                        prompt: request.prompt.clone(),
+                        prompt: display_prompt.clone(),
                         message_id: user_id.clone(),
                     });
                     true
@@ -849,7 +877,7 @@ impl SessionsEngine {
             };
             if accepted {
                 let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                handle.write_user_message(&user_id, &display_prompt, now_ms())?;
                 if self.is_live(chat_id, &run_id) {
                     // Working BEFORE the lastMessageAt bump: both ride the
                     // workspace doc from this one peer, so causal order makes it
@@ -857,7 +885,7 @@ impl SessionsEngine {
                     // — that gap read as unseen-with-no-live-run = a phantom
                     // "completed" flash on every remote send (2026-07-31).
                     self.set_status(chat_id, SessionStatus::Working, false);
-                    self.inner.note_message(chat_id, &request.prompt);
+                    self.inner.note_message(chat_id, &display_prompt);
                     return Ok(run_id);
                 }
                 // The run died around the send. If its exit drain already
@@ -870,7 +898,7 @@ impl SessionsEngine {
                     ledger.len() != before
                 };
                 if !reclaimed {
-                    self.inner.note_message(chat_id, &request.prompt);
+                    self.inner.note_message(chat_id, &display_prompt);
                     return Ok(run_id);
                 }
                 // Keep the already-written doc entry's id for the fresh run
@@ -887,12 +915,13 @@ impl SessionsEngine {
             // the routed run died with the message reclaimed, or configuration
             // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
+            request.prompt = display_prompt.clone();
         }
 
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        handle.write_user_message(&user_id, &display_prompt, now_ms())?;
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -911,7 +940,13 @@ impl SessionsEngine {
             );
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        lock(&self.inner.last_requests).insert(
+            chat_id.to_string(),
+            RunRequest {
+                prompt: display_prompt.clone(),
+                ..request.clone()
+            },
+        );
         self.inner
             .journal
             .append(
@@ -1025,12 +1060,12 @@ impl SessionsEngine {
                 issued_at: 0,
                 task_id: None,
             };
-            if ordinary && let Some(runner) = runner {
+            if ordinary && let Some(runner) = runner.as_ref() {
                 scope.caller = runner
                     .admit_parent(
                         scope.caller,
                         scope.selection.clone(),
-                        &request,
+                        &mut request,
                         &user_id,
                         harness.as_ref(),
                     )
@@ -1046,6 +1081,12 @@ impl SessionsEngine {
                 }
             } else {
                 self.inner.mcp_server.register(self, chat_id, scope).await?;
+            }
+            if ordinary && let Some(runner) = runner.as_ref() {
+                runner
+                    .prepare_external_turn(&chat_id.into(), &mut request, harness.as_ref())
+                    .await
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
             }
         }
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -1125,7 +1166,7 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        self.inner.note_message(chat_id, &display_prompt);
 
         // Name the chat NOW, off the first prompt — not after the first
         // exchange completes ("called New session for a long time for no
@@ -1133,7 +1174,7 @@ impl SessionsEngine {
         // the Done-time call below stays as the retry for a failed
         // generation).
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, harness_id, &display_prompt, &request.cwd);
         }
 
         tokio::spawn(drive_run(
@@ -1147,6 +1188,7 @@ impl SessionsEngine {
             engine_rx,
             cancel_rx,
             RunResumeState {
+                display_prompt,
                 user_message_id: user_id,
                 resume_injected,
                 startup_retry,
@@ -2231,6 +2273,7 @@ fn finish_segment<'a>(
 /// engine-injected resumes retry — a caller-specified resume fails loudly),
 /// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
+    display_prompt: String,
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
@@ -2322,7 +2365,7 @@ async fn drive_run(
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
-    let user_prompt = request.prompt.clone();
+    let user_prompt = resume_state.display_prompt.clone();
     let run_cwd = request.cwd.clone();
     let run_instance = request.instance_id.clone();
     if request.resume.is_none() {
@@ -2333,6 +2376,7 @@ async fn drive_run(
     // the event loop) can take ownership.
     let mut retry_request = Some(RunRequest {
         resume: None,
+        prompt: user_prompt.clone(),
         ..request.clone()
     });
     // Startup can stop before the SDK saves user text, with no new session
@@ -3949,6 +3993,76 @@ mod tests {
                 .expect("FeedHarness serves one run per test");
             Ok(futures::stream::poll_fn(move |cx| feed.poll_recv(cx).map(|e| e.map(Ok))).boxed())
         }
+    }
+
+    #[tokio::test]
+    async fn imported_provider_context_never_rewrites_app_user_message_or_retry_prompt() {
+        use super::*;
+        let (_feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            feed: Mutex::new(Some(rx)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let command = crate::orchestration::Command::wire(serde_json::from_value(serde_json::json!({
+            "type":"thread.create","commandId":"create-context-target","threadId":"context-target",
+            "projectId":"project","title":"Target","createdBy":"user","creationSource":"web",
+            "modelSelection":{"instanceId":"mock","model":"mock-1"},"runtimeMode":"full-access",
+            "interactionMode":"default","branch":null,"worktreePath":dir.path()
+        })).unwrap()).unwrap();
+        core.orchestration
+            .dispatch(&command, now_ms())
+            .await
+            .unwrap();
+        core.orchestration
+            .task_command(
+                &"context-target".into(),
+                "context-input".into(),
+                crate::orchestration::task::TaskOperation::ExternalMessage {
+                    prompt: "Original request.".into(),
+                    driver: "mock".into(),
+                    message_id: "user-input".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut input = request();
+        input.cwd = dir.path().to_string_lossy().into_owned();
+        input.prompt = "Imported historical context.\n\nOriginal request.".into();
+        core.sessions
+            .dispatch_orchestrated(
+                "context-target",
+                HarnessId::Mock,
+                input,
+                Some("user-input".into()),
+            )
+            .await
+            .unwrap();
+        let entries = core
+            .doc_host
+            .open("context-target")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        let user = entries.iter().find(|e| e.id == "user-input").unwrap();
+        let text = user
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Original request.");
+        assert_eq!(
+            lock(&core.sessions.inner.last_requests)["context-target"].prompt,
+            "Original request."
+        );
+        core.sessions.shutdown().await;
     }
 
     // A tagged subagent event that folds to NO parts used to leave its sink

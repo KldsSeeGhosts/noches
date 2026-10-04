@@ -916,8 +916,8 @@ impl GitActionsService {
         };
         self.0.registry.resolve(harness)?;
         let config = zeron_proto::ChatConfig {
-            harness,
             instance_id: None,
+            harness,
             model: None,
             reasoning: None,
             model_options: Default::default(),
