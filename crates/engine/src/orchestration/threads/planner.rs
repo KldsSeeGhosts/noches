@@ -19,6 +19,33 @@ pub struct Send {
     pub driver: String,
     pub sender: ThreadId,
     pub target_run: Option<RunId>,
+    pub metadata: Option<SendMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendMetadata {
+    pub scheduled_task_id: Option<ScheduledTaskId>,
+    pub sender_thread_id: Option<ThreadId>,
+    pub attachments: Vec<Value>,
+    pub model_selection: Option<zeron_proto::provider_instance::ModelSelection>,
+    pub created_by: OrchestrationV2Actor,
+    pub creation_source: OrchestrationV2CreationSource,
+}
+
+fn message_metadata(message: &mut Value, input: &Send) {
+    if let Some(meta) = &input.metadata {
+        if let Some(sender) = &meta.sender_thread_id {
+            message["senderThreadId"] = json!(sender);
+        }
+        if let Some(task) = &meta.scheduled_task_id {
+            message["scheduledTaskId"] = json!(task);
+        }
+        message["attachments"] = json!(meta.attachments);
+        message["createdBy"] = json!(meta.created_by);
+        message["creationSource"] = json!(meta.creation_source);
+    } else {
+        message["senderThreadId"] = json!(input.sender);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,16 +97,20 @@ pub(crate) fn user_item(
     intent: &str,
     now: i64,
 ) -> Result<Value> {
-    Ok(
-        json!({"id":format!("turn-item:user:{}",encode_component(message["id"].as_str().unwrap())),
+    let mut item = json!({"id":format!("turn-item:user:{}",encode_component(message["id"].as_str().unwrap())),
         "threadId":projection.thread.id,"runId":run.id,"nodeId":run.root_node_id,
         "providerThreadId":run.provider_thread_id,"providerTurnId":projection.attempts.iter().find(|a| Some(&a.id) == run.active_attempt_id.as_ref()).and_then(|a| a.provider_turn_id.as_ref()),
         "nativeItemRef":null,"parentItemId":null,
         "ordinal":records(projection,"turn-item").iter().filter_map(|i| i["ordinal"].as_i64()).max().unwrap_or(0)+1,
         "status":"completed","title":null,"startedAt":iso(now)?,"completedAt":iso(now)?,"updatedAt":iso(now)?,
         "type":"user_message","messageId":message["id"],"inputIntent":intent,"text":message["text"],
-        "attachments":message["attachments"],"createdBy":message["createdBy"],"creationSource":message["creationSource"]}),
-    )
+        "attachments":message["attachments"],"createdBy":message["createdBy"],"creationSource":message["creationSource"]});
+    for key in ["scheduledTaskId", "senderThreadId"] {
+        if let Some(value) = message.get(key) {
+            item[key] = value.clone();
+        }
+    }
+    Ok(item)
 }
 
 pub(crate) fn assistant_item(
@@ -324,7 +355,7 @@ pub(crate) fn plan(
                     "user",
                     now,
                 )?;
-                message["senderThreadId"] = json!(input.sender);
+                message_metadata(&mut message, input);
                 let item = user_item(&projection, &run, &message, "steer", now)?;
                 plan.emit(command, "message.updated", &message, now)?;
                 plan.emit(command, "turn-item.updated", &item, now)?;
@@ -363,8 +394,17 @@ pub(crate) fn plan(
                     return Err(unsupported(command, "Pending merge back"));
                 }
                 let ordinal = projection.runs.iter().map(|r| r.ordinal).max().unwrap_or(0) + 1;
+                let mut thread = projection.thread.clone();
+                if let Some(selection) = input
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.model_selection.as_ref())
+                {
+                    thread.provider_instance_id = selection.instance_id.clone();
+                    thread.model_selection = selection.clone();
+                }
                 let mut seed = execution_seed(
-                    &projection.thread,
+                    &thread,
                     ordinal,
                     &input.message_id.0,
                     if queued { "queued" } else { "starting" },
@@ -415,7 +455,7 @@ pub(crate) fn plan(
                     "user",
                     now,
                 )?;
-                message["senderThreadId"] = json!(input.sender);
+                message_metadata(&mut message, input);
                 plan.emit(command, "message.updated", &message, now)?;
                 if !queued {
                     plan.emit(

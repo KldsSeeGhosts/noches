@@ -1313,6 +1313,7 @@ impl DelegationService {
                                         sender: caller.thread_id.clone(),
                                         mode: T3ThreadSendInputMode::Auto,
                                         target_run: None,
+                                        metadata: None,
                                     },
                                 ),
                             )),

@@ -295,19 +295,24 @@ impl OrchestrationHost {
         });
         sessions.mcp_server().set_service(service.clone());
         // BEGIN wave3 threads: shared controls, passive read model, MCP facade.
-        sessions.mcp_server().toolkit.set_thread_service(Arc::new(
-            super::threads::KernelThreadService {
-                kernel: kernel.clone(),
-                delegation: service.clone(),
-            },
-        ));
+        let threads = Arc::new(super::threads::KernelThreadService {
+            kernel: kernel.clone(),
+            delegation: service.clone(),
+        });
+        sessions
+            .mcp_server()
+            .toolkit
+            .set_thread_service(threads.clone());
         // END wave3 threads.
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
-        // BEGIN scheduler slice (TODO(merge-threads): install send/launch adapter).
+        // BEGIN scheduler slice: ordinary thread/launch intake.
         let scheduler = Arc::new(super::scheduler::Scheduler::new(
             kernel.store.clone(),
-            Arc::new(super::scheduler::UnavailableDispatch),
+            Arc::new(super::scheduler::dispatch::ThreadDispatch {
+                store: kernel.store.clone(),
+                threads,
+            }),
         ));
         scheduler.recover()?;
         sessions

@@ -5,7 +5,7 @@ use crate::orchestration::command::{Command, Operation};
 use crate::orchestration::effects::Effect;
 use crate::orchestration::task::records;
 use crate::orchestration::{Error, Kernel, ReceiptStatus, Result};
-use zeron_proto::orchestration::MessageId;
+use zeron_proto::orchestration::{MessageId, OrchestrationV2Actor, OrchestrationV2CreationSource};
 use zeron_proto::orchestration_mcp::T3ThreadSendInputMode;
 
 pub(crate) async fn late_steer(kernel: &Kernel, effect: &Effect, id: &MessageId) -> Result<()> {
@@ -37,6 +37,23 @@ pub(crate) async fn late_steer(kernel: &Kernel, effect: &Effect, id: &MessageId)
                         .unwrap_or(&effect.thread_id.0)
                         .into(),
                     target_run: None,
+                    metadata: Some(super::planner::SendMetadata {
+                        scheduled_task_id: serde_json::from_value(
+                            message["scheduledTaskId"].clone(),
+                        )
+                        .ok()
+                        .flatten(),
+                        sender_thread_id: serde_json::from_value(message["senderThreadId"].clone())
+                            .ok()
+                            .flatten(),
+                        attachments: serde_json::from_value(message["attachments"].clone())
+                            .unwrap_or_default(),
+                        model_selection: None,
+                        created_by: serde_json::from_value(message["createdBy"].clone())
+                            .unwrap_or(OrchestrationV2Actor::Agent),
+                        creation_source: serde_json::from_value(message["creationSource"].clone())
+                            .unwrap_or(OrchestrationV2CreationSource::Mcp),
+                    }),
                 }))),
             },
             crate::now_ms(),

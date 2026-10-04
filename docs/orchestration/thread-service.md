@@ -6,6 +6,14 @@
 generated tool input. `KernelThreadService` implements it on the existing
 transactional kernel, delegation catalog, runner, receipts and mailbox.
 
+Host integrations use `send_to_thread(ThreadSendRequest)` rather than inventing
+an authenticated MCP caller. This request carries trusted project scope,
+stable command/message IDs, optional schedule/sender IDs, attachments,
+selection, mode and actor/source. MCP `send` applies caller permission checks
+before entering the same intake. Schedules use `auto`, read the current
+thread binding, and accept the ordinary command queue without waiting for a
+provider turn to complete.
+
 Launch, schedule, transfer and queue slices should call this service rather
 than legacy chat RPCs. A thread send creates ordinary conversation activity,
 not a new delegated task. A subsequent run on an app-owned child's backing

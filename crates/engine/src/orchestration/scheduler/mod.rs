@@ -1,5 +1,6 @@
 //! Durable host scheduler. Success records dispatch acceptance, never completion
 //! of a provider turn. SQLite claims fence overlap and restart uncertainty.
+pub mod dispatch;
 pub mod mcp;
 pub mod schedule;
 pub mod service;
@@ -45,11 +46,7 @@ impl SchedulerError {
 }
 pub type SchedulerResult<T> = std::result::Result<T, SchedulerError>;
 
-/// TODO(merge-threads): adapt the threads slice's normal sendToThread(mode=auto)
-/// and launch service here. Bound sends must honour the *current* worktree;
-/// unbound sends launch a fresh top-level worktree with the stored strategy.
-/// Carry scheduledTaskId, actor/source and these stable command/message IDs
-/// into the ordinary command queue. Never start a harness directly.
+/// Dispatch acceptance only, through ordinary thread/launch intake.
 #[async_trait]
 pub trait ScheduledTaskDispatch: Send + Sync + 'static {
     async fn dispatch(&self, run: ScheduledDispatch) -> std::result::Result<(), String>;

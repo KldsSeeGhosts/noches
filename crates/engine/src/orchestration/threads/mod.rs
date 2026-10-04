@@ -19,7 +19,7 @@ use super::event::{encode_component, mcp_command_id};
 use super::projection::ThreadProjection;
 use super::service::{CallerScope, ToolError};
 use super::task::{DelegationService, active_run, records};
-use super::thread_service::ThreadService;
+use super::thread_service::{ThreadSendRequest, ThreadService};
 use super::{Kernel, ReceiptStatus};
 use OrchestratorMcpFailureCode as Code;
 
@@ -347,6 +347,61 @@ impl ThreadService for KernelThreadService {
     ) -> Result<T3ThreadSendResult, ToolError> {
         let (parent, target) = self.scoped(&caller, &input.thread_id, false)?;
         modes(&parent, &target)?;
+        let key = request_key(&input.client_request_id);
+        self.send_to_thread(ThreadSendRequest {
+            project_id: parent.thread.project_id,
+            thread_id: target.thread.id,
+            command_id: mcp_command_id(&caller.session_id, "thread-send", &key),
+            message_id: MessageId(format!(
+                "message:mcp:{}:thread-send:{}",
+                encode_component(&caller.session_id),
+                encode_component(&key)
+            )),
+            scheduled_task_id: None,
+            sender_thread_id: Some(caller.thread_id),
+            text: input.message,
+            attachments: vec![],
+            model_selection: None,
+            mode: input
+                .mode
+                .as_ref()
+                .cloned()
+                .unwrap_or(T3ThreadSendInputMode::Auto),
+            created_by: OrchestrationV2Actor::Agent,
+            creation_source: OrchestrationV2CreationSource::Mcp,
+        })
+        .await
+    }
+
+    async fn send_to_thread(
+        &self,
+        input: ThreadSendRequest,
+    ) -> Result<T3ThreadSendResult, ToolError> {
+        let target = self
+            .kernel
+            .store
+            .thread(&input.thread_id)
+            .map_err(|_| {
+                failure(format!(
+                    "Unable to load thread {} in project {}.",
+                    input.thread_id, input.project_id
+                ))
+            })?
+            .ok_or_else(|| {
+                failure(format!(
+                    "Unable to load thread {} in project {}.",
+                    input.thread_id, input.project_id
+                ))
+            })?;
+        if target.thread.deleted_at.is_some() || target.thread.project_id != input.project_id {
+            return Err(ToolError::new(
+                Code::ThreadNotFound,
+                format!(
+                    "Thread {} was not found in project {}.",
+                    input.thread_id, input.project_id
+                ),
+            ));
+        }
         if target.thread.archived_at.is_some() {
             return Err(ToolError::new(
                 Code::ThreadNotSendable,
@@ -356,11 +411,7 @@ impl ThreadService for KernelThreadService {
                 ),
             ));
         }
-        let mode = input
-            .mode
-            .as_ref()
-            .cloned()
-            .unwrap_or(T3ThreadSendInputMode::Auto);
+        let mode = input.mode.clone();
         let steerable = planner::steerable(&target);
         if matches!(
             mode,
@@ -394,22 +445,17 @@ impl ThreadService for KernelThreadService {
                 input.thread_id
             )));
         }
-        let key = request_key(&input.client_request_id);
-        let id = mcp_command_id(&caller.session_id, "thread-send", &key);
-        let message = MessageId(format!(
-            "message:mcp:{}:thread-send:{}",
-            encode_component(&caller.session_id),
-            encode_component(&key)
-        ));
+        let id = input.command_id;
+        let message = input.message_id;
         // Driver identity belongs to the saved instance, not the calling provider.
         let driver = records(&target, "provider-thread")
             .iter()
             .find(|p| p["providerInstanceId"] == target.thread.provider_instance_id.0)
             .and_then(|p| p["driver"].as_str())
             .map(str::to_owned);
-        let driver = match driver {
-            Some(d) => d,
-            None => {
+        let driver = match (driver, input.model_selection.as_ref()) {
+            (Some(d), None) => d,
+            (None, None) => {
                 self.delegation
                     .targets
                     .resolve(&target.thread, None)
@@ -417,18 +463,45 @@ impl ThreadService for KernelThreadService {
                     .driver
                     .0
             }
+            _ => {
+                let selection = input.model_selection.as_ref().unwrap();
+                let mut requested =
+                    json!({"providerInstanceId":selection.instance_id,"model":selection.model});
+                if let Some(options) = selection.options.as_ref() {
+                    requested["options"] = json!(options);
+                }
+                let requested: DelegateTaskInputTarget =
+                    serde_json::from_value(requested).map_err(failure)?;
+                self.delegation
+                    .targets
+                    .resolve(&target.thread, Some(&requested))
+                    .await?
+                    .driver
+                    .0
+            }
         };
         let requested = planner::Send {
             message_id: message.clone(),
-            text: input.message,
+            text: input.text,
             mode: mode.clone(),
             driver,
-            sender: caller.thread_id,
+            sender: input
+                .sender_thread_id
+                .clone()
+                .unwrap_or_else(|| target.thread.id.clone()),
             target_run: if mode == T3ThreadSendInputMode::Queue {
                 None
             } else {
                 steerable.map(|r| r.id.clone())
             },
+            metadata: Some(planner::SendMetadata {
+                scheduled_task_id: input.scheduled_task_id,
+                sender_thread_id: input.sender_thread_id,
+                attachments: input.attachments,
+                model_selection: input.model_selection,
+                created_by: input.created_by,
+                creation_source: input.creation_source,
+            }),
         };
         self.command(Command {
             id,
@@ -469,7 +542,7 @@ impl ThreadService for KernelThreadService {
         let delivery = match item.map(|i| i["inputIntent"].as_str().unwrap_or_default()) {
             None | Some("queued_turn") => "queued",
             Some("turn_start") => "started",
-            _ if input.mode.as_ref() == Some(&T3ThreadSendInputMode::Restart) => "restarted",
+            _ if input.mode == T3ThreadSendInputMode::Restart => "restarted",
             _ => "steered",
         };
         serde_json::from_value(json!({"threadId":current.thread.id,"messageId":message,"runId":run.id,"status":run.status,"delivery":delivery})).map_err(failure)
