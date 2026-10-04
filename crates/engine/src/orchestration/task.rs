@@ -1145,7 +1145,15 @@ impl DelegationService {
         caller: CallerScope,
         input: CreateThreadsInput,
     ) -> std::result::Result<CreateThreadsResult, ToolError> {
-        let parent = self.parent(&caller, true)?;
+        let parent = self.parent(&caller, false)?;
+        if active_run(&parent).is_none_or(|r| {
+            r.root_node_id.is_none() || r.provider_instance_id != caller.provider_instance_id
+        }) {
+            return Err(ToolError::new(
+                OrchestratorMcpFailureCode::ParentNotActive,
+                "Thread creation requires an active run owned by this MCP provider session.",
+            ));
+        }
         if input.threads.is_empty() || input.threads.len() > 20 {
             return Err(ToolError::new(
                 OrchestratorMcpFailureCode::InvalidRequest,
@@ -1182,8 +1190,7 @@ impl DelegationService {
                         .map_err(tool_error)?
                 }
             };
-            if !caller.runtime_mode.permits(runtime) || !parent.thread.runtime_mode.permits(runtime)
-            {
+            if !parent.thread.runtime_mode.permits(runtime) {
                 return Err(ToolError::new(
                     OrchestratorMcpFailureCode::RuntimeModeEscalationDenied,
                     format!(
@@ -1196,9 +1203,7 @@ impl DelegationService {
                     ),
                 ));
             }
-            if !caller.interaction_mode.permits(interaction)
-                || !parent.thread.interaction_mode.permits(interaction)
-            {
+            if !parent.thread.interaction_mode.permits(interaction) {
                 return Err(ToolError::new(
                     OrchestratorMcpFailureCode::InteractionModeEscalationDenied,
                     format!(
@@ -1235,36 +1240,60 @@ impl DelegationService {
                 "type":"thread.create","commandId":format!("{}:{index}",mcp_command_id(&caller.session_id,"create-thread",&key).0),
                 "createdBy":"agent","creationSource":"mcp","threadId":thread,"projectId":parent.thread.project_id,
                 "title":title,"modelSelection":target.selection,"runtimeMode":runtime,"interactionMode":interaction,
-                "branch":parent.thread.branch,"worktreePath":parent.thread.worktree_path.as_ref().cloned().unwrap_or_else(|| caller.workspace_root.to_string_lossy().into_owned())
+                "branch":parent.thread.branch,"worktreePath":parent.thread.worktree_path
             })).map_err(tool_error)?).map_err(tool_error)?;
             let receipt = self
                 .kernel
                 .dispatch(&command, crate::now_ms())
                 .await
-                .map_err(tool_error)?;
+                .map_err(|e| tool_error(format!("Unable to create thread {}: {e}", index + 1)))?;
             if receipt.status == ReceiptStatus::Rejected {
-                return Err(tool_error(receipt.error.unwrap_or_default()));
+                return Err(tool_error(format!(
+                    "Unable to create thread {}: Failed to dispatch orchestration command thread.create ({}).",
+                    index + 1,
+                    command.id
+                )));
             }
             if let Some(prompt) = request.prompt.as_ref() {
-                self.kernel
-                    .task_command(
-                        &thread,
-                        CommandId(format!(
-                            "{}:{index}",
-                            mcp_command_id(&caller.session_id, "dispatch-thread", &key).0
-                        )),
-                        TaskOperation::StartMessage {
-                            prompt: prompt.clone(),
-                            driver: target.driver,
-                            message_id: MessageId(format!(
-                                "message:mcp:{}:{}:{index}",
-                                encode_component(&caller.session_id),
-                                encode_component(&key)
+                let id = CommandId(format!(
+                    "{}:{index}",
+                    mcp_command_id(&caller.session_id, "dispatch-thread", &key).0
+                ));
+                let receipt = self
+                    .kernel
+                    .dispatch(
+                        &Command {
+                            id: id.clone(),
+                            thread_id: thread.clone(),
+                            operation: Operation::Thread(Box::new(
+                                super::threads::planner::ThreadOperation::Send(
+                                    super::threads::planner::Send {
+                                        text: prompt.clone(),
+                                        driver: target.driver.0,
+                                        message_id: MessageId(format!(
+                                            "message:mcp:{}:{}:{index}",
+                                            encode_component(&caller.session_id),
+                                            encode_component(&key)
+                                        )),
+                                        sender: caller.thread_id.clone(),
+                                        mode: T3ThreadSendInputMode::Auto,
+                                        target_run: None,
+                                    },
+                                ),
                             )),
                         },
+                        crate::now_ms(),
                     )
                     .await
-                    .map_err(tool_error)?;
+                    .map_err(|e| {
+                        tool_error(format!("Unable to start thread {}: {e}", index + 1))
+                    })?;
+                if receipt.status == ReceiptStatus::Rejected {
+                    return Err(tool_error(format!(
+                        "Unable to start thread {}: Failed to dispatch orchestration command message.dispatch ({id}).",
+                        index + 1
+                    )));
+                }
             }
             self.kernel
                 .task_command(
@@ -1278,7 +1307,12 @@ impl DelegationService {
                     },
                 )
                 .await
-                .map_err(tool_error)?;
+                .map_err(|e| {
+                    tool_error(format!(
+                        "Unable to record thread {} in the parent timeline: {e}",
+                        index + 1
+                    ))
+                })?;
             let projection = self
                 .kernel
                 .store
@@ -1288,7 +1322,7 @@ impl DelegationService {
             created.push(json!({"threadId":thread,"runId":projection.runs.last().map(|run| &run.id),
                 "status":projection.runs.last().map(|run| serde_json::to_value(&run.status).unwrap()).unwrap_or(json!("idle")),
                 "title":projection.thread.title,"createdBy":projection.thread.created_by,"creationSource":projection.thread.creation_source,
-                "providerInstanceId":projection.thread.provider_instance_id,"model":projection.thread.model_selection.model}));
+                "providerInstanceId":target.selection.instance_id,"model":target.selection.model}));
         }
         serde_json::from_value(json!({"threads":created})).map_err(tool_error)
     }

@@ -21,6 +21,8 @@ pub mod sync_publish;
 pub mod task;
 #[cfg(test)]
 mod tests;
+pub mod thread_service;
+pub mod threads;
 pub mod ui;
 
 use std::collections::BTreeMap;

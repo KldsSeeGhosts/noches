@@ -30,6 +30,7 @@ impl DelegationTargets for HostCatalog {
         parent: &OrchestrationV2AppThread,
         target: Option<&DelegateTaskInputTarget>,
     ) -> std::result::Result<ResolvedTarget, ToolError> {
+        self.0.provider_instances.refresh_all(&self.0).await;
         let target = target
             .map(serde_json::to_value)
             .transpose()
@@ -104,7 +105,8 @@ pub fn capabilities(harness: &dyn zeron_harness::Harness) -> OrchestrationV2Prov
             "canForkThread":false,"canForkFromTurn":false,"canForkFromSubagentThread":false,"exposesNativeThreadId":false},
         "turns":{"exposesNativeTurnId":false,"emitsTurnStarted":true,"emitsTurnCompleted":true,
             "supportsInterrupt":true,"supportsActiveSteering":harness.supports_steering() && harness.steering_mode() == zeron_proto::SteeringMode::StepBoundary,
-            "supportsSteeringByInterruptRestart":false,"supportsQueuedMessages":true,"terminalStatusQuality":"strong"},
+            "supportsSteeringByInterruptRestart":!matches!(harness.id(), zeron_proto::HarnessId::ClaudeCode | zeron_proto::HarnessId::Pi),
+            "supportsQueuedMessages":true,"terminalStatusQuality":"strong"},
         "streaming":{"streamsAssistantText":true,"streamsReasoning":false,"streamsToolOutput":false,
             "streamsPlanText":false,"emitsMessageCompleted":true},
         "tools":{"exposesToolItemIds":false,"emitsToolStarted":false,"emitsToolCompleted":false,
@@ -224,6 +226,14 @@ impl OrchestrationHost {
             targets: catalog,
         });
         sessions.mcp_server().set_service(service.clone());
+        // BEGIN wave3 threads: shared controls, passive read model, MCP facade.
+        sessions.mcp_server().toolkit.set_thread_service(Arc::new(
+            super::threads::KernelThreadService {
+                kernel: kernel.clone(),
+                delegation: service.clone(),
+            },
+        ));
+        // END wave3 threads.
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
         let mut workers = bridge.spawn_workers(stop.clone());
