@@ -408,6 +408,7 @@ impl Normalizer {
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
                 vec![AgentEvent::SessionStarted {
+                    instance_id: None,
                     harness: HarnessId::ClaudeCode,
                     model: f.model,
                     tools: f.tools,

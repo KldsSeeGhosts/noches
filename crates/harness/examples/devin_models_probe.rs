@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         computer_use_socket: None,
     };
     let request = RunRequest {
+        instance_id: None,
         prompt: "Reply with exactly: Devin model discovery verified. Do not use tools.".into(),
         harness: None,
         model: Some(model.clone()),

@@ -131,6 +131,7 @@ mod tests {
             checkout_id: None,
             source_context: None,
             config: Some(zeron_proto::ChatConfig {
+                instance_id: None,
                 harness,
                 model: None,
                 reasoning: None,
@@ -144,6 +145,7 @@ mod tests {
             created_at: chrono::DateTime::UNIX_EPOCH,
             harness_session_id: Some("thread/one".into()),
             harness_session_cwd: None,
+            harness_session_instance_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

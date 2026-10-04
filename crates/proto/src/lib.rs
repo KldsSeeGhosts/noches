@@ -5,12 +5,16 @@
 
 pub mod agent;
 pub mod entities;
+pub mod git_actions;
 pub mod motion;
 pub mod orchestration;
 pub mod orchestration_mcp;
+pub mod orchestration_threads;
 pub mod preview;
 pub mod provider_instance;
+pub mod provider_settings;
 pub mod runtime_policy;
+pub mod scheduler;
 pub mod transfer;
 pub mod view;
 pub mod workspace;

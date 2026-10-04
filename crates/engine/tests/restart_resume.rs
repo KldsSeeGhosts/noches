@@ -37,6 +37,7 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -113,6 +114,7 @@ impl Harness for RecordingHarness {
         } else {
             vec![
                 Ok(AgentEvent::SessionStarted {
+                    instance_id: None,
                     harness: HarnessId::Mock,
                     model: "mock-1".into(),
                     tools: vec![],
@@ -370,6 +372,7 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
             .append(
                 CHAT,
                 &AgentEvent::SessionStarted {
+                    instance_id: None,
                     harness: HarnessId::Mock,
                     model: "mock-1".into(),
                     tools: vec![],
@@ -479,6 +482,7 @@ impl Harness for PersistentHarness {
                 ]
             };
             let first = vec![AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -635,6 +639,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
                 checkout_id: None,
                 source_context: None,
                 config: Some(zeron_proto::ChatConfig {
+                    instance_id: None,
                     harness: HarnessId::Mock,
                     model: None,
                     reasoning: None,
@@ -649,6 +654,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
                 harness_session_id: Some("hs-crash".into()),
                 room_gen: None,
                 harness_session_cwd: Some("/tmp".into()),
+                harness_session_instance_id: None,
                 space_id: None,
                 last_seen_at: None,
             })
@@ -660,6 +666,7 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
             .append(
                 CHAT,
                 &AgentEvent::SessionStarted {
+                    instance_id: None,
                     harness: HarnessId::Mock,
                     model: "mock-1".into(),
                     tools: vec![],
@@ -891,6 +898,7 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
     let cwd = cwd.to_string_lossy().to_string();
 
     let real_request = |prompt: &str| RunRequest {
+        instance_id: None,
         prompt: prompt.into(),
         harness: None,
         model: Some("haiku".into()),

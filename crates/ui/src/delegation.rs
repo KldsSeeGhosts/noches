@@ -1087,6 +1087,7 @@ mod tests {
             None,
         );
         let config = zeron_proto::ChatConfig {
+            instance_id: None,
             harness: HarnessId::ClaudeCode,
             model: Some("anthropic/claude-sonnet".into()),
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),

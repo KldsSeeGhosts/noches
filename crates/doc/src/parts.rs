@@ -836,6 +836,7 @@ mod tests {
         fold_event_into_parts(
             &mut parts,
             &AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: zeron_proto::HarnessId::Mock,
                 model: "m".into(),
                 tools: vec![],

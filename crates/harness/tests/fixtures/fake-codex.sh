@@ -41,6 +41,17 @@ if has "$line" '"method":"skills/list"'; then
   exec sleep 30
 fi
 if has "$line" '"method":"model/list"'; then
+  if [ -n "$NOCHES_TEST_INSTANCE_MODEL" ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"$NOCHES_TEST_INSTANCE_MODEL\",\"model\":\"$NOCHES_TEST_INSTANCE_MODEL\",\"displayName\":\"Instance model\",\"supportedReasoningEfforts\":[],\"isDefault\":true}],\"nextCursor\":null}}"
+    read -r line || exit 1
+    has "$line" '"method":"account/read"' || exit 1
+    if [ "$NOCHES_TEST_INSTANCE_SIGNED_OUT" = "true" ]; then
+      emit "{\"id\":$(rid "$line"),\"result\":{\"account\":null,\"requiresOpenaiAuth\":true}}"
+    else
+      emit "{\"id\":$(rid "$line"),\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":false}}"
+    fi
+    exec sleep 30
+  fi
   # Live model discovery: force pagination and put the default model second,
   # proving the harness consumes nextCursor and honors isDefault.
   has "$line" '"includeHidden":false' || exit 1
@@ -84,6 +95,13 @@ read -r turnline || exit 1
 tid=$(rid "$turnline")
 
 case "$turnline" in
+
+*scenario:instance*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-instance\"}}}"
+  emit "{\"method\":\"item/started\",\"params\":{\"threadId\":\"th-1\",\"turnId\":\"t-instance\",\"item\":{\"id\":\"instance-msg\",\"type\":\"agentMessage\",\"text\":\"$CODEX_HOME | $NOCHES_TEST_INSTANCE_MODEL\"}}}"
+  emit "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"th-1\",\"turnId\":\"t-instance\",\"item\":{\"id\":\"instance-msg\",\"type\":\"agentMessage\",\"text\":\"$CODEX_HOME | $NOCHES_TEST_INSTANCE_MODEL\"}}}"
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-instance","status":"completed","error":null}}}'
+  ;;
 
 *scenario:image-*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

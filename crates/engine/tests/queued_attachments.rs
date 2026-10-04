@@ -67,6 +67,7 @@ impl Harness for AckHarness {
         }
         let events: Vec<Result<AgentEvent, HarnessError>> = vec![
             Ok(AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -118,6 +119,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 fn run_payload(message_id: &str, pending_ref: &str) -> SessionCommandPayload {
     SessionCommandPayload::Run {
         request: RunRequest {
+            instance_id: None,
             prompt: format!(
                 "look at this\n\nAttached images (local files — open them to view):\n- {pending_ref}"
             ),

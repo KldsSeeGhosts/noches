@@ -596,6 +596,7 @@ async fn original_result_is_immutable_across_later_runs_and_terminal_cancel() {
             &child.thread.id,
             &seed.run,
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -1260,6 +1261,7 @@ async fn startup_recovers_unreceipted_provider_acceptance_with_same_message_iden
             &parent.thread.id,
             &parent.runs[0],
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -1333,6 +1335,7 @@ async fn crash_at_child_start_acceptance_disposes_process_effect_without_relaunc
             &child.thread.id,
             &child.runs[0],
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -1404,6 +1407,7 @@ impl Harness for SteeringMock {
     > {
         self.starts.fetch_add(1, Ordering::SeqCst);
         let started = AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: "mock-1".into(),
             tools: vec![],
@@ -1463,6 +1467,7 @@ async fn live_parent_steer_is_noninterrupting_and_acceptance_does_not_acknowledg
             &parent.thread.id,
             &parent.runs[0],
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -1558,6 +1563,7 @@ impl Harness for GatedMock {
         );
         self.requests.lock().unwrap().push(request.clone());
         let started = AgentEvent::SessionStarted {
+            instance_id: None,
             harness: HarnessId::Mock,
             model: request.model.clone().unwrap(),
             tools: vec![],
@@ -1717,6 +1723,7 @@ async fn parent_starting_running_waiting_idle_stopped_archived_deleted_matrix() 
                         &parent.thread.id,
                         &parent.runs[0],
                         AgentEvent::SessionStarted {
+                            instance_id: None,
                             harness: HarnessId::Mock,
                             model: "mock-1".into(),
                             tools: vec![],
@@ -1921,6 +1928,7 @@ async fn steering_requires_always_wake_live_turn_capability_and_not_maintenance(
             &parent.thread.id,
             &parent.runs[0],
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],
@@ -2027,6 +2035,7 @@ async fn recovery_keeps_cancelled_background_roster_and_validates_new_records() 
             &child.thread.id,
             &child.runs[0],
             AgentEvent::SessionStarted {
+                instance_id: None,
                 harness: HarnessId::Mock,
                 model: "mock-1".into(),
                 tools: vec![],

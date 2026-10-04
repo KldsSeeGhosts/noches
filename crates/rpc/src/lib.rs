@@ -20,8 +20,12 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod git_actions;
+pub mod provider_instances;
 pub mod remote;
+pub mod scheduled_tasks;
 mod server;
+mod threads;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
@@ -34,6 +38,8 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
+    pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     /// Passive host/replica task state, `{chatId}`; never acknowledges results.
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
@@ -48,6 +54,12 @@ pub mod methods {
     pub const CANCEL_DELEGATED_TASK: &str = "CancelDelegatedTask";
     pub const LIST_ORCHESTRATION_THREADS: &str = "ListOrchestrationThreads";
     pub const LIST_PROVIDER_INSTANCES: &str = "ListProviderInstances";
+    pub const GET_PROVIDER_INSTANCE_SETTINGS: &str = "GetProviderInstanceSettings";
+    pub const CREATE_PROVIDER_INSTANCE: &str = "CreateProviderInstance";
+    pub const DUPLICATE_PROVIDER_INSTANCE: &str = "DuplicateProviderInstance";
+    pub const UPDATE_PROVIDER_INSTANCE: &str = "UpdateProviderInstance";
+    pub const DELETE_PROVIDER_INSTANCE: &str = "DeleteProviderInstance";
+    pub const SET_PROVIDER_INSTANCE_ENABLED: &str = "SetProviderInstanceEnabled";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);

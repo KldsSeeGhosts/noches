@@ -15,6 +15,8 @@ pub struct Toolkit {
     pub registry: Arc<HarnessRegistry>,
     service: RwLock<Arc<dyn OrchestratorService>>,
     transfer: RwLock<Option<Arc<dyn crate::orchestration::transfer_service::TransferService>>>,
+    scheduler: RwLock<Option<Arc<dyn crate::orchestration::scheduler::service::SchedulerService>>>,
+    threads: RwLock<Option<Arc<dyn crate::orchestration::thread_service::ThreadService>>>,
     inventory: Vec<ToolDescriptor>,
     descriptors: Vec<Value>,
     null_refusals: Value,
@@ -30,6 +32,8 @@ impl Toolkit {
             registry,
             service: RwLock::new(Arc::new(UnavailableOrchestratorService)),
             transfer: RwLock::new(None),
+            scheduler: RwLock::new(None),
+            threads: RwLock::new(None),
             inventory: pinned_tool_inventory(),
             null_refusals: serde_json::from_str(include_str!(
                 "../../tests/t3_mcp_oracle/null-refusals.json"
@@ -55,6 +59,23 @@ impl Toolkit {
             .transfer
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_scheduler(
+        &self,
+        service: Arc<dyn crate::orchestration::scheduler::service::SchedulerService>,
+    ) {
+        *self
+            .scheduler
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(service);
+    }
+
+    pub fn set_thread_service(
+        &self,
+        service: Arc<dyn crate::orchestration::thread_service::ThreadService>,
+    ) {
+        *self.threads.write().unwrap_or_else(PoisonError::into_inner) = Some(service);
     }
 
     pub fn tools(&self) -> &[Value] {
@@ -205,6 +226,7 @@ impl Toolkit {
             ));
         }
         if let Some(task) = &scope.task_id
+            && name != "run_scheduled_task_now"
             && args
                 .get("taskId")
                 .and_then(Value::as_str)
@@ -223,6 +245,18 @@ impl Toolkit {
                 )
                 .await,
             ),
+            input @ (OrchestrationToolInput::ScheduleTask(_)
+            | OrchestrationToolInput::ListScheduledTasks(_)
+            | OrchestrationToolInput::UpdateScheduledTask(_)
+            | OrchestrationToolInput::DeleteScheduledTask(_)
+            | OrchestrationToolInput::RunScheduledTaskNow(_)) => {
+                crate::orchestration::scheduler::mcp::dispatch(
+                    &self.scheduler,
+                    scope.caller.clone(),
+                    input,
+                )
+                .await
+            }
             OrchestrationToolInput::OrchestratorCapabilities(_) => {
                 self.registry
                     .provider_instances
@@ -347,6 +381,16 @@ impl Toolkit {
                         Err(error) => serde_json::to_value(error.into_failure()).expect("failure"),
                     },
                 )
+            }
+            input @ (OrchestrationToolInput::T3ThreadList(_)
+            | OrchestrationToolInput::T3ThreadRead(_)
+            | OrchestrationToolInput::T3ThreadSend(_)
+            | OrchestrationToolInput::T3ThreadWait(_)
+            | OrchestrationToolInput::T3ThreadInterrupt(_)
+            | OrchestrationToolInput::T3ThreadConfiguration(_)
+            | OrchestrationToolInput::T3ThreadConfigure(_)
+            | OrchestrationToolInput::CreateThreads(_)) => {
+                crate::orchestration::threads::mcp::dispatch(&self.threads, scope, input).await
             }
             _ if matches!(name, "t3_worktree_handoff" | "t3_worktree_status") => {
                 codec::result(json!({

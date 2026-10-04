@@ -14,6 +14,8 @@ use super::{Error, Result};
 const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("schema_transfer.sql"),
+    include_str!("schema_scheduler.sql"),
+    include_str!("schema_git_actions.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

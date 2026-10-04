@@ -91,7 +91,10 @@ struct ChatParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
-    harness: HarnessId,
+    #[serde(default)]
+    harness: Option<HarnessId>,
+    #[serde(default)]
+    instance_id: Option<zeron_proto::provider_instance::ProviderInstanceId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -589,8 +592,10 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    git_actions: Option<crate::orchestration::git_actions::GitActionsService>,
     orchestration: Option<crate::orchestration::Store>,
     delegation: Option<std::sync::Arc<crate::orchestration::task::DelegationService>>,
+    scheduler: Option<std::sync::Arc<crate::orchestration::scheduler::Scheduler>>,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -639,8 +644,10 @@ impl EngineRpc {
             },
         };
         Self {
+            git_actions: None,
             orchestration: None,
             delegation: None,
+            scheduler: None,
             sessions,
             doc_host,
             workspace,
@@ -667,6 +674,22 @@ impl EngineRpc {
         self
     }
 
+    pub fn with_git_actions(
+        mut self,
+        service: crate::orchestration::git_actions::GitActionsService,
+    ) -> Self {
+        self.git_actions = Some(service);
+        if !self
+            .engine_info
+            .capabilities
+            .iter()
+            .any(|c| c == "git-actions-v1")
+        {
+            self.engine_info.capabilities.push("git-actions-v1".into());
+        }
+        self
+    }
+
     pub fn with_delegation(
         mut self,
         service: std::sync::Arc<crate::orchestration::task::DelegationService>,
@@ -677,6 +700,14 @@ impl EngineRpc {
 
     pub fn with_orchestration(mut self, store: crate::orchestration::Store) -> Self {
         self.orchestration = Some(store);
+        self
+    }
+
+    pub fn with_scheduler(
+        mut self,
+        scheduler: std::sync::Arc<crate::orchestration::scheduler::Scheduler>,
+    ) -> Self {
+        self.scheduler = Some(scheduler);
         self
     }
 
@@ -991,7 +1022,9 @@ impl EngineRpc {
         if is_stream_method(method) {
             // Streams are unbounded by design (a quiet WATCH_* is healthy);
             // only unary calls below get the reply deadline.
-            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                || zeron_rpc::git_actions::methods::is_stream(method)
+            {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
                     Err(err) => {
@@ -1209,9 +1242,21 @@ const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
 fn forwardable(method: &str) -> bool {
+    if crate::orchestration::ui_scheduler::is_method(method)
+        || zeron_rpc::git_actions::methods::handles(method)
+    {
+        return true;
+    }
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::LIST_PROVIDER_INSTANCES
+            | methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1295,6 +1340,11 @@ fn forwardable(method: &str) -> bool {
 
 /// Forwardable methods whose reply is a stream (proxied item-by-item).
 fn is_stream_method(method: &str) -> bool {
+    if method == zeron_rpc::scheduled_tasks::methods::WATCH
+        || zeron_rpc::git_actions::methods::is_stream(method)
+    {
+        return true;
+    }
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
@@ -1597,6 +1647,19 @@ impl RpcService for EngineRpc {
         if AuthRpc::handles(method) {
             return Box::pin(AuthRpc::new(self.auth()?.clone()).handle(method, params)).await;
         }
+        if zeron_rpc::git_actions::methods::handles(method) {
+            if let Some(cwd) = params.get("cwd").and_then(serde_json::Value::as_str) {
+                self.change_request_root(cwd).await?;
+            }
+            return crate::orchestration::git_actions::rpc::dispatch(
+                self.git_actions
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Git actions unavailable".into()))?,
+                method,
+                params,
+            )
+            .await;
+        }
         let _work = if matches!(
             method,
             methods::WRITE_WORKSPACE_FILE
@@ -1617,6 +1680,12 @@ impl RpcService for EngineRpc {
             None
         };
         match method {
+            method if crate::orchestration::ui_scheduler::is_method(method) => {
+                let service = self.scheduler.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Scheduled tasks are unavailable on this host.".into())
+                })?;
+                crate::orchestration::ui_scheduler::dispatch(service, method, params).await
+            }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::GET_THREAD_TRANSFER_STATE
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
@@ -1631,6 +1700,32 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_ORCHESTRATION_THREADS => {
                 RpcReply::value(&self.workspace.orchestration_threads())
+            }
+            methods::GET_THREAD_SUMMARIES => {
+                let input: zeron_proto::orchestration_threads::ThreadSummariesRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_summaries(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_THREAD_TIMELINE => {
+                let input: zeron_proto::orchestration_threads::ThreadTimelineRequest =
+                    parse_params(params)?;
+                let store = self
+                    .orchestration
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("thread reads are unavailable".into()))?;
+                RpcReply::value(
+                    &store
+                        .ui_thread_timeline(input)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
             }
             methods::CANCEL_DELEGATED_TASK => {
                 #[derive(Deserialize)]
@@ -1678,6 +1773,20 @@ impl RpcService for EngineRpc {
                     .await;
                 RpcReply::value(&self.registry.provider_instances.snapshot(&self.registry))
             }
+            methods::GET_PROVIDER_INSTANCE_SETTINGS
+            | methods::CREATE_PROVIDER_INSTANCE
+            | methods::DUPLICATE_PROVIDER_INSTANCE
+            | methods::UPDATE_PROVIDER_INSTANCE
+            | methods::DELETE_PROVIDER_INSTANCE
+            | methods::SET_PROVIDER_INSTANCE_ENABLED => {
+                crate::orchestration::ui_provider_instances::dispatch(
+                    &self.registry,
+                    &self.sessions,
+                    method,
+                    params,
+                )
+                .await
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
@@ -1697,18 +1806,70 @@ impl RpcService for EngineRpc {
                     zeron_harness::AcpHarness::antigravity().sign_out(),
                 )
                 .await?;
+                // Compatibility UI toggles control the canonical identity,
+                // never all accounts/routes of the same driver.
+                let instance_id = crate::provider_instances::legacy_instance_id(p.harness);
+                if self
+                    .registry
+                    .provider_instances
+                    .config(&instance_id)
+                    .is_some()
+                {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::SET_PROVIDER_INSTANCE_ENABLED,
+                        serde_json::json!({"instanceId":instance_id,"enabled":p.enabled}),
+                    )
+                    .await?;
+                } else if p.enabled {
+                    crate::orchestration::ui_provider_instances::dispatch(
+                        &self.registry,
+                        &self.sessions,
+                        methods::CREATE_PROVIDER_INSTANCE,
+                        serde_json::json!({"instanceId":instance_id,"instance":{
+                            "driver":crate::provider_instances::legacy_driver(p.harness),
+                            "enabled":true,"config":{"legacyCatalogImport":true}
+                        }}),
+                    )
+                    .await?;
+                }
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let models = self
-                    .registry
-                    .provider_instances
-                    .refresh(&self.registry, p.harness)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let models = if let Some(instance) = p.instance_id {
+                    if let Some(harness) = p.harness
+                        && self
+                            .registry
+                            .provider_instances
+                            .snapshot(&self.registry)
+                            .iter()
+                            .find(|p| p.provider_instance_id == instance)
+                            .is_some_and(|p| p.harness_id != Some(harness))
+                    {
+                        return Err(RpcError::Failed(
+                            "Provider instance/driver mismatch.".into(),
+                        ));
+                    }
+                    self.registry
+                        .provider_instances
+                        .refresh_instance(&self.registry, &instance)
+                        .await
+                } else {
+                    self.registry
+                        .provider_instances
+                        .refresh(
+                            &self.registry,
+                            p.harness.ok_or_else(|| {
+                                RpcError::Failed("harness or instanceId is required.".into())
+                            })?,
+                        )
+                        .await
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
@@ -1719,9 +1880,27 @@ impl RpcService for EngineRpc {
                 // no listing (cursor, mock) fall through to the trait's
                 // empty default.
                 let p: ListModelsParams = parse_params(params)?;
+                if let (Some(instance), Some(harness)) = (&p.instance_id, p.harness)
+                    && self
+                        .registry
+                        .provider_instances
+                        .snapshot(&self.registry)
+                        .iter()
+                        .find(|p| &p.provider_instance_id == instance)
+                        .is_some_and(|p| p.harness_id != Some(harness))
+                {
+                    return Err(RpcError::Failed(
+                        "Provider instance/driver mismatch.".into(),
+                    ));
+                }
+                let instance = p
+                    .instance_id
+                    .or_else(|| p.harness.map(crate::provider_instances::legacy_instance_id))
+                    .ok_or_else(|| RpcError::Failed("harness or instanceId is required.".into()))?;
                 let harness = self
                     .registry
-                    .resolve(p.harness)
+                    .provider_instances
+                    .resolve_runtime(&self.registry, &instance, false)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
                     .commands()
@@ -3141,6 +3320,24 @@ impl RpcService for EngineRpc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_action_watches_route_as_streams_not_mutating_unary_calls() {
+        use zeron_rpc::git_actions::methods::*;
+        for method in [WATCH_GIT_ACTION, WATCH_SCAN, WATCH_IMPORT] {
+            assert!(super::forwardable(method));
+            assert!(super::is_stream_method(method));
+        }
+        for method in [
+            GET_GIT_STATUS,
+            PREVIEW_GIT,
+            START_GIT,
+            SET_PULL,
+            IMPORT_HISTORY,
+        ] {
+            assert!(super::forwardable(method));
+            assert!(!super::is_stream_method(method));
+        }
+    }
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

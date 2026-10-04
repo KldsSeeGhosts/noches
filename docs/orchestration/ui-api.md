@@ -36,8 +36,9 @@ IDs, boolean/select types, and choice membership are validated. Same-selection
 model/option inheritance is revalidated against the current inventory and
 descriptors; removed custom models cannot bypass membership checks by omission.
 
-The optional profile `provider-instances.json` is the explicit inventory.
-Without it, compatibility instances are derived from the installed adapters.
+The private profile `provider-instances.json` is the persisted explicit inventory.
+Its first load migrates exactly one canonical instance per enabled harness;
+subsequent loads respect the explicit map, including an empty map.
 On enrolled CPA hosts, refresh additionally reads the installed discovery
 paths from `CPA_SYNC_CONFIG` or `~/.config/cpa-catalog/sync.json`: Codex
 `models[].slug`, reasoning/service-tier descriptors, and Claude
@@ -45,20 +46,21 @@ paths from `CPA_SYNC_CONFIG` or `~/.config/cpa-catalog/sync.json`: Codex
 `opencode-go/deepseek-v4.1-flash`, `gpt-6.1-sol`, and
 `cpa/claude-opus-5-5[1m]` remain distinct exact selections. This is a read-only
 metadata compatibility import; it does not publish/sync the CPA catalog or
-create inference routes. Explicit inventory disables this automatic import.
+create inference routes. Only migrated `legacyCatalogImport` entries retain
+this compatibility import; new instances use their own discovered/custom models.
 Removed installed metadata disappears on the next refresh.
 
 Startup account discovery is bounded and not dependent on opening Settings.
 Unknown authentication is non-blocking while discovery runs; detected signed
-out providers are constrained. Explicit configured auth overrides discovery;
-configured `unknown` follows the underlying adapter's discovered state.
+out providers are constrained. Readiness is discovered per instance; global
+account discovery is used only for canonical instances without home/env overrides.
 Claude's native `auth status --json` readiness bit covers API-key logins as
 well as OAuth: an absent OAuth slot alone does not mean unauthenticated.
 
-Multiple entries can resolve to one installed adapter, but **independent
-per-instance executable/env/account lifecycles and a multi-instance composer
-selector are not implemented here**. An inventory row is not a new inference
-route or independent credential store. Adapter capability snapshots are
+Multiple entries of one driver have independent runtime, env/home, readiness,
+and model caches. Settings RPCs and the nonvisual picker-selection seam are
+documented in [provider-instances.md](provider-instances.md); the designer owns
+the multi-instance Settings UI and grouped composer rows. Adapter snapshots are
 conservative; only actual StepBoundary adapters advertise active steering.
 
 ## Read APIs
@@ -73,7 +75,8 @@ They are passive: no result acknowledgement, provider start, or cancellation.
   `id`, `projectId`, `title`, `lineage`, archive/delete stamps, host/epoch,
   publication version and batch identity.
 - `ListProviderInstances {}` refreshes and returns the canonical inventory,
-  models/options/readiness. Existing `ListModels {harness}` is unchanged.
+  models/options/readiness. `ListModels` and `ListCommands` accept `{instanceId}`;
+  `{harness}` selects only that driver's canonical compatibility identity.
 
 `CancelDelegatedTask {chatId, taskId}` is the one UI write: the signed-in user's
 Stop of an app-owned task of parent `chatId`. It is `task_cancel` under the
