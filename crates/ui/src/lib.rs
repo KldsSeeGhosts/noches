@@ -53,6 +53,7 @@ pub mod pickers;
 pub mod popover;
 pub mod project_actions;
 pub mod queue;
+pub mod queue_api;
 pub mod rail;
 pub mod remote_access;
 pub mod settings;

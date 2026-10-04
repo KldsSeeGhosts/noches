@@ -11,6 +11,7 @@ pub mod orchestration_mcp;
 pub mod preview;
 pub mod provider_instance;
 pub mod runtime_policy;
+pub mod thread_lifecycle;
 pub mod view;
 pub mod workspace;
 
@@ -19,6 +20,7 @@ pub use entities::*;
 pub use orchestration::ProviderInteractionMode;
 pub use preview::*;
 pub use runtime_policy::*;
+pub use thread_lifecycle::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

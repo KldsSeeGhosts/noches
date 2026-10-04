@@ -778,6 +778,7 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    pub thread_lifecycles: HashMap<String, zeron_proto::ChatLifecycle>,
     sessions: Vec<Session>,
     /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
     /// ([`Self::replace_sessions`]) so [`Self::session_for`] is O(1) on the
@@ -975,6 +976,7 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            thread_lifecycles: HashMap::new(),
             sessions: Vec::new(),
             session_index: HashMap::new(),
             session_presentation: None,
@@ -1258,6 +1260,10 @@ impl AppState {
     }
 
     // ---- reducers (pure) ----
+
+    pub fn chat_lifecycle(&self, chat_id: &str) -> Option<&zeron_proto::ChatLifecycle> {
+        self.thread_lifecycles.get(chat_id)
+    }
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
@@ -2344,6 +2350,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.thread_lifecycles.clear();
         self.replace_sessions(Vec::new());
         self.session_presentation = None;
         self.selected_space = None;
@@ -2475,6 +2482,18 @@ impl AppState {
                 AppState::apply_sessions,
             ),
             spawn_chats_watch(cx, handle.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_THREAD_LIFECYCLES,
+                |state, value: HashMap<String, zeron_proto::ChatLifecycle>| {
+                    if state.thread_lifecycles == value {
+                        return false;
+                    }
+                    state.thread_lifecycles = value;
+                    true
+                },
+            ),
             spawn_watch(
                 cx,
                 handle.clone(),
