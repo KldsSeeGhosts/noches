@@ -358,11 +358,31 @@ impl RunnerBridge {
             .find(|message| message["id"] == run.user_message_id.0)
             .and_then(|message| message["text"].as_str())
             .ok_or_else(|| Error::Invariant("Run input missing.".into()))?;
-        let request: RunRequest = serde_json::from_value(json!({
+        let mut request: RunRequest = serde_json::from_value(json!({
             "prompt":prompt,"harness":harness.id(),"model":run.model_selection.model,"reasoning":reasoning,
             "modelOptions":options,"cwd":cwd,"sandbox":"workspace-write","autoApprove":false,
             "runtimeMode":projection.thread.runtime_mode,"interactionMode":projection.thread.interaction_mode,"resume":null
         }))?;
+        super::transfer::delivery::prepare_run(
+            &self.kernel,
+            &effect.thread_id,
+            &run,
+            &mut request,
+            harness.as_ref(),
+            &provider.capabilities,
+            self.sessions
+                .registered_mcp(&effect.thread_id.0)
+                .unwrap_or_default(),
+        )
+        .await?;
+        if let Err(error) = (super::checkpoint::FileCheckpointService {
+            kernel: self.kernel.clone(),
+        })
+        .capture_turn(&effect.thread_id, &run, "started")
+        .await
+        {
+            tracing::warn!(%error,"turn-start file checkpoint unavailable");
+        }
         if cancellation.is_cancelled() {
             return Ok(EffectOutcome::Succeeded);
         }
@@ -424,7 +444,7 @@ impl RunnerBridge {
         }
     }
 
-    async fn record_event(
+    pub(crate) async fn record_event(
         &self,
         thread: &ThreadId,
         run: &OrchestrationV2Run,
@@ -507,6 +527,21 @@ impl RunnerBridge {
                 let _ = accepted.send(EffectOutcome::Succeeded);
             }
             if terminal {
+                let current = self.kernel.store.thread(&thread)?;
+                if let Some(completed) = current
+                    .as_ref()
+                    .and_then(|p| p.runs.iter().find(|r| r.id == run.id))
+                    && completed.status == OrchestrationV2RunStatus::Completed
+                {
+                    if let Err(error) = (super::checkpoint::FileCheckpointService {
+                        kernel: self.kernel.clone(),
+                    })
+                    .capture_turn(&thread, completed, "completed")
+                    .await
+                    {
+                        tracing::warn!(%error,"completed-turn file checkpoint unavailable");
+                    }
+                }
                 self.settle(&thread, &run).await?;
                 // Native background observations may arrive after root Done.
                 // Keep the receiver until another app run takes ownership.
@@ -529,7 +564,7 @@ impl RunnerBridge {
         Ok(())
     }
 
-    async fn settle(&self, thread: &ThreadId, run: &OrchestrationV2Run) -> Result<()> {
+    pub(crate) async fn settle(&self, thread: &ThreadId, run: &OrchestrationV2Run) -> Result<()> {
         let projection = self.kernel.store.thread(thread)?.unwrap();
         if let Some(message) = records(&projection, "message")
             .iter()
@@ -824,9 +859,61 @@ pub(crate) fn plan_event(
         return Ok(());
     }
     let turn_id = format!("provider-turn:{}", encode_component(&attempt_id.0));
-    let mut turn = json!({"id":turn_id,"providerThreadId":provider["id"],"nodeId":node["id"],
-        "runAttemptId":attempt_id,"nativeTurnRef":null,"ordinal":run["ordinal"],"status":"running","startedAt":iso(now)?,"completedAt":null});
+    let mut turn = records(projection,"provider-turn").iter().find(|t| t["id"] == turn_id).cloned()
+        .unwrap_or(json!({"id":turn_id,"providerThreadId":provider["id"],"nodeId":node["id"],
+        "runAttemptId":attempt_id,"nativeTurnRef":null,"ordinal":run["ordinal"],"status":"running","startedAt":iso(now)?,"completedAt":null}));
     match event {
+        AgentEvent::ContextUsage { tokens, window } => {
+            let mut usage = provider["contextUsage"].clone();
+            if !usage.is_object() {
+                usage = json!({});
+            }
+            if let Some(tokens) = tokens {
+                usage["usedTokens"] = json!(tokens);
+            }
+            if let Some(window) = window.filter(|window| *window > 0) {
+                usage["maxTokens"] = json!(window);
+            }
+            if usage["usedTokens"].is_number() {
+                provider["contextUsage"] = usage.clone();
+                usage["updatedAt"] = json!(iso(now)?);
+                turn["tokenUsage"] = usage;
+                plan.emit(command, "provider-thread.updated", &provider, now)?;
+                plan.emit(command, "provider-turn.updated", &turn, now)?;
+            }
+            return Ok(());
+        }
+        AgentEvent::ContextUsageSnapshot { usage } => {
+            if let Some(tokens) = usage.tokens {
+                let mut context = json!({"usedTokens":tokens});
+                if let Some(window) = usage.window.filter(|window| *window > 0) {
+                    context["maxTokens"] = json!(window);
+                }
+                if let Some(threshold) = usage.compact_at.filter(|threshold| *threshold > 0) {
+                    context["autoCompactThreshold"] = json!(threshold);
+                }
+                provider["contextUsage"] = context.clone();
+                turn["tokenUsage"] = context;
+                turn["tokenUsage"]["updatedAt"] = json!(iso(now)?);
+            } else {
+                provider.as_object_mut().unwrap().remove("contextUsage");
+                turn.as_object_mut().unwrap().remove("tokenUsage");
+            }
+            plan.emit(command, "provider-thread.updated", &provider, now)?;
+            plan.emit(command, "provider-turn.updated", &turn, now)?;
+            return Ok(());
+        }
+        AgentEvent::NativeReference { thread_id, turn_id } => {
+            provider["nativeThreadRef"] =
+                json!({"driver":provider["driver"],"nativeId":thread_id,"strength":"strong"});
+            if let Some(id) = turn_id {
+                turn["nativeTurnRef"] =
+                    json!({"driver":provider["driver"],"nativeId":id,"strength":"strong"});
+            }
+            plan.emit(command, "provider-thread.updated", &provider, now)?;
+            plan.emit(command, "provider-turn.updated", &turn, now)?;
+            return Ok(());
+        }
         AgentEvent::SessionStarted {
             session_id,
             model,
@@ -840,8 +927,17 @@ pub(crate) fn plan_event(
                 "status":"running","cwd":cwd,"model":model,"capabilities":capabilities,"createdAt":iso(now)?,"updatedAt":iso(now)?,"lastError":null});
             plan.emit(command, "provider-session.attached", &session, now)?;
             provider["providerSessionId"] = session["id"].clone();
-            provider["nativeThreadRef"] =
-                json!({"driver":provider["driver"],"nativeId":session_id,"strength":"weak"});
+            provider["nativeThreadRef"] = json!({"driver":provider["driver"],"nativeId":session_id,
+                    "strength":if capabilities.identity.native_thread_ids == OrchestrationV2NativeRefStrength::Strong {"strong"} else {"weak"}});
+            super::transfer::delivery::accepted(
+                _conn,
+                projection,
+                command,
+                plan,
+                &serde_json::from_value::<OrchestrationV2Run>(run.clone())?,
+                session_id,
+                now,
+            )?;
             provider["status"] = json!("active");
             provider["updatedAt"] = json!(iso(now)?);
             run["startedAt"] = json!(iso(now)?);

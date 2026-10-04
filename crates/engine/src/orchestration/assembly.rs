@@ -97,7 +97,7 @@ fn tool_error(error: impl std::fmt::Display) -> ToolError {
 /// Conservative adapter snapshot: do not infer native fork/checkpoint/context
 /// support from generic session operations.
 pub fn capabilities(harness: &dyn zeron_harness::Harness) -> OrchestrationV2ProviderCapabilities {
-    serde_json::from_value(json!({
+    let mut capabilities: OrchestrationV2ProviderCapabilities = serde_json::from_value(json!({
         "sessions":{"supportsMultipleProviderThreadsPerSession":false,"supportsModelSwitchInSession":false,
             "supportsProviderSwitchingViaHandoff":false,"supportsRuntimeModeSwitchInSession":false,"pendingRequestsSurviveRestart":false},
         "threads":{"canCreateEmptyThread":false,"canReadThreadSnapshot":false,"canRollbackThread":false,
@@ -116,11 +116,20 @@ pub fn capabilities(harness: &dyn zeron_harness::Harness) -> OrchestrationV2Prov
             "canWaitForSubagents":false,"canCloseSubagents":false,"canForkSubagentThread":false},
         "context":{"acceptsSystemContext":false,"acceptsDeveloperContext":false,"acceptsSyntheticUserContext":true,
             "canGenerateSummaries":false,"canConsumeHandoffSummaries":false,"supportsDeltaHandoff":false,"supportsFullThreadHandoff":false,"maxRecommendedHandoffChars":null},
-        "checkpointing":{"appCanCheckpointFilesystem":false,"supportsNestedCheckpointScopes":false,
+        "checkpointing":{"appCanCheckpointFilesystem":true,"supportsNestedCheckpointScopes":false,
             "providerCanRollbackConversation":false,"providerRollbackReturnsSnapshot":false,"providerCanReadConversationSnapshot":false},
         "identity":{"nativeThreadIds":"weak","nativeTurnIds":"weak","nativeItemIds":"weak","nativeRequestIds":"weak"},
         "runtimePolicy":{"enforcement":"client-boundary"}
-    })).expect("host capability shape")
+    })).expect("host capability shape");
+    if let Some(lifecycle) = harness.session_lifecycle() {
+        capabilities.threads.can_fork_thread = true;
+        capabilities.threads.can_fork_from_turn = lifecycle.can_fork_from_turn();
+        capabilities.threads.exposes_native_thread_id = true;
+        capabilities.turns.exposes_native_turn_id = true;
+        capabilities.identity.native_thread_ids = OrchestrationV2NativeRefStrength::Strong;
+        capabilities.identity.native_turn_ids = OrchestrationV2NativeRefStrength::Strong;
+    }
+    capabilities
 }
 
 struct HostMcp {
@@ -224,6 +233,13 @@ impl OrchestrationHost {
             targets: catalog,
         });
         sessions.mcp_server().set_service(service.clone());
+        // --- transfer slice assembly ---
+        sessions.mcp_server().toolkit.set_transfer_service(Arc::new(
+            super::transfer::mcp::EngineTransferService {
+                kernel: kernel.clone(),
+            },
+        ));
+        // --- end transfer slice assembly ---
         sessions.set_orchestration_runner(Arc::downgrade(&bridge));
         let stop = CancellationToken::new();
         let mut workers = bridge.spawn_workers(stop.clone());
@@ -287,11 +303,16 @@ impl RunnerBridge {
         &self,
         mut scope: CallerScope,
         selection: ModelSelection,
-        request: &RunRequest,
+        request: &mut RunRequest,
         message_id: &str,
         harness: &dyn zeron_harness::Harness,
     ) -> Result<CallerScope> {
         let thread = &scope.thread_id;
+        super::transfer::ensure_start_allowed(
+            &self.kernel.store.thread_transfers(thread)?,
+            thread,
+            false,
+        )?;
         // Sessions publishes Idle before this independent observer commits
         // Done. Bound the admission race without inventing another active run.
         for _ in 0..100 {
@@ -348,9 +369,62 @@ impl RunnerBridge {
         let projection = self.kernel.store.thread(thread)?.unwrap();
         let run = projection.runs.last().unwrap().clone();
         scope.run_id = run.id.clone();
+        if let Err(error) = (super::checkpoint::FileCheckpointService {
+            kernel: self.kernel.clone(),
+        })
+        .capture_turn(thread, &run, "started")
+        .await
+        {
+            tracing::warn!(%error,"turn-start file checkpoint unavailable");
+        }
         self.observe_external(thread.clone(), run, capabilities(harness))
             .await?;
         Ok(scope)
+    }
+
+    pub(crate) async fn prepare_external_turn(
+        &self,
+        thread: &ThreadId,
+        request: &mut RunRequest,
+        harness: &dyn zeron_harness::Harness,
+    ) -> Result<()> {
+        let projection = self
+            .kernel
+            .store
+            .thread(thread)?
+            .ok_or_else(|| Error::Invariant("Transfer thread missing.".into()))?;
+        let run = projection
+            .runs
+            .last()
+            .ok_or_else(|| Error::Invariant("Transfer run missing.".into()))?;
+        let prepared = super::transfer::delivery::prepare_run(
+            &self.kernel,
+            thread,
+            run,
+            request,
+            harness,
+            &capabilities(harness),
+            self.sessions.registered_mcp(&thread.0).unwrap_or_default(),
+        )
+        .await;
+        if let Err(error) = prepared {
+            self.record_event(
+                thread,
+                run,
+                0,
+                zeron_proto::AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Errored,
+                    result: None,
+                    error: Some(error.to_string()),
+                    session_id: None,
+                },
+                None,
+            )
+            .await?;
+            self.settle(thread, run).await?;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 

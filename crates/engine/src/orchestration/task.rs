@@ -907,6 +907,17 @@ pub(crate) fn plan(
             super::mailbox::plan_delivery(&projection, command, &mut plan, delivery, now)?
         }
         TaskOperation::DrainQueue => {
+            if projection
+                .runs
+                .iter()
+                .any(|r| r.status == OrchestrationV2RunStatus::Queued)
+            {
+                super::transfer::ensure_start_allowed(
+                    &super::transfer::transfers(conn, &command.thread_id)?,
+                    &command.thread_id,
+                    true,
+                )?;
+            }
             super::continuation::drain(&projection, command, &mut plan, now)?
         }
         TaskOperation::StopCohort { run_id } => {
@@ -922,6 +933,11 @@ pub(crate) fn plan(
             driver,
             message_id,
         } => {
+            super::transfer::ensure_start_allowed(
+                &super::transfer::transfers(conn, &command.thread_id)?,
+                &command.thread_id,
+                false,
+            )?;
             if active_run(&projection).is_some()
                 || projection.thread.archived_at.is_some()
                 || projection.thread.deleted_at.is_some()
