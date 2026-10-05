@@ -154,6 +154,10 @@ impl Harness for InstantHarness {
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
     }
+    async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
+        // This fixture never launches Codex or uses the machine's credentials.
+        Ok(Some(true))
+    }
     async fn run(
         &self,
         _request: RunRequest,
@@ -206,9 +210,10 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     std::fs::write(remote_dir.join("device-id"), "device-b").unwrap();
     let profile = zeron_engine::EngineProfile::development(&remote_dir, "dev-org", "dev-user");
     let remote_store = zeron_sync::DocsStore::open(profile.store_root()).unwrap();
+    let remote_registry = registry_for(HarnessId::Codex);
     let b = EngineCore::assemble_with_profile(
         profile,
-        registry_for(HarnessId::Codex),
+        remote_registry.clone(),
         HarnessId::Codex,
         None,
     )
@@ -267,6 +272,22 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     assert!(
         invalid.is_err(),
         "project membership mismatch must fail before writing"
+    );
+    // Reproduce a clean CI host with no OAuth account, even on a developer
+    // machine that happens to be signed in. Native fixture readiness must win.
+    remote_registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Unauthenticated,
+    );
+    remote_registry
+        .provider_instances
+        .refresh(&remote_registry, HarnessId::Codex)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_registry.provider_instances.snapshot(&remote_registry)[0].authentication,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+        "native readiness must override missing OAuth accounts"
     );
     let created = tools
         .call(
