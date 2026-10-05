@@ -84,7 +84,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Cold debug builds plus the full engine/restart matrix exceed 20 minutes.
+    # Keep a bounded budget without cancelling healthy validation mid-suite.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
