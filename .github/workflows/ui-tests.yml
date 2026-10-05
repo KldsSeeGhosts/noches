@@ -2,6 +2,8 @@ name: UI tests
 
 on:
   pull_request:
+    # Main's protected check names are emitted by the release caller instead.
+    branches-ignore: [main]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -20,28 +22,17 @@ on:
       - 'scripts/install-linux.sh'
       - '.github/workflows/release.yml'
       - '.github/workflows/ui-tests.yml'
-  push:
-    branches: [main, dev]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'scripts/test-linux-browser.sh'
-      - 'scripts/build-chromium.sh'
-      - 'scripts/test-chromium-runtime.py'
-      - 'dist/browser/**'
-      - 'scripts/run-macos-browser-fixture.sh'
-      - 'dist/macos/Info.plist'
-      - 'apps/ios/**'
-      - 'apps/zeron/**'
-      - 'scripts/*release*'
-      - 'scripts/package-*.sh'
-      - 'scripts/install-linux.sh'
-      - '.github/workflows/release.yml'
-      - '.github/workflows/ui-tests.yml'
+      - '.github/workflows/cursor-*.yml'
+      - 'scripts/*cursor-sdk*'
+      - 'scripts/ci/**'
+      - 'vendor/**'
+  # Push validation is owned by release.yml, which calls this workflow once.
   workflow_dispatch:
   workflow_call:
+    inputs:
+      skip-compatibility:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,21 +42,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Pull requests that only touch the iOS app skip the Rust jobs, and
-  # Rust-only pull requests skip the simulator. Pushes and manual runs run all.
+  # iOS has an independent workflow. Desktop release commits always run the
+  # full desktop matrix; mobile-only PRs do not allocate desktop runners.
   changes:
     runs-on: ubuntu-24.04
     permissions:
       pull-requests: read
     outputs:
-      ios: ${{ steps.filter.outputs.ios }}
       native: ${{ steps.filter.outputs.native }}
+      ios: ${{ steps.filter.outputs.ios }}
     steps:
       - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         id: filter
         with:
           script: |
-            const all = () => { core.setOutput('ios', 'true'); core.setOutput('native', 'true'); };
+            const all = () => {
+              core.setOutput('native', 'true');
+              core.setOutput('ios', String(context.eventName === 'pull_request'
+                && context.payload.pull_request.base.ref === 'main'));
+            };
             if (context.eventName !== 'pull_request') return all();
             const files = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
@@ -75,15 +70,28 @@ jobs:
             // Run everything if the API did not return the full diff.
             if (files.length < context.payload.pull_request.changed_files) return all();
             const paths = files.flatMap(f => [f.filename, f.previous_filename]).filter(Boolean);
-            const workflow = p => p === '.github/workflows/ui-tests.yml';
             const ios = p => p.startsWith('apps/ios/');
-            core.setOutput('ios', String(paths.some(p => ios(p) || workflow(p))));
             core.setOutput('native', String(paths.some(p => !ios(p))));
+            // Only main PRs need the historical protected iOS check here.
+            // Other mobile PRs/pushes have an independent iOS workflow.
+            const mobileWorkflow = p => ['.github/workflows/ios-tests.yml',
+              '.github/workflows/testflight.yml', '.github/workflows/ui-tests.yml'].includes(p)
+              || p.startsWith('.github/actions/ios-tests/');
+            core.setOutput('ios', String(context.payload.pull_request.base.ref === 'main'
+              && paths.some(p => ios(p) || mobileWorkflow(p))));
+
+  compatibility:
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && !inputs.skip-compatibility
+    uses: ./.github/workflows/cursor-compatibility.yml
 
   session-sync-regressions:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-session-sync-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     # Cold debug builds plus the full engine/restart matrix exceed 20 minutes.
     # Keep a bounded budget without cancelling healthy validation mid-suite.
     timeout-minutes: 40
@@ -94,26 +102,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          # Cursor compatibility restores this cache; only dev saves it.
+          # GitHub scopes PR caches to refs/pull/N/merge: they warm retries
+          # without being restored by protected-branch release builds.
           shared-key: linux-debug
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - name: OpenCode protocol and permission regressions
-        run: |
-          cargo test --locked -p zeron-harness --lib opencode::
-          cargo test --locked -p zeron-harness --test opencode
-      - name: Durable session publication and recovery
-        run: |
-          cargo test --locked -p zeron-mcp
-          cargo test --locked -p zeron-engine --test e2e start_failure_lands_in_the_transcript
-          cargo test --locked -p zeron-engine --test device_routing mcp_standalone_session_executes_on_the_selected_device
-          cargo test --locked -p zeron-sync --lib
-          cargo test --locked -p zeron-update --lib
-          cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Unified build and durable session regressions
+        run: python3 scripts/ci/run-session-sync.py
 
   ui-tests:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-ui-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 30
     env:
       # Test binaries never ship, so skip the release profile's cross-crate
@@ -146,6 +149,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-app-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -165,7 +171,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Application and updater tests
         run: cargo test --release --locked -p zeron -p zeron-update
 
@@ -175,6 +182,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
+    concurrency:
+      group: ci-macos-ui-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 45
     env:
       CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -200,6 +210,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
+    concurrency:
+      group: ci-macos-browser-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 45
     env:
       CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -212,7 +225,7 @@ jobs:
           cache-bin: false
           cache-on-failure: true
           shared-key: macos-gpui
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Build native browser fixture
         run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture,webkit-browser
       - name: Native browser regression and screenshots
@@ -253,6 +266,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
+    concurrency:
+      group: ci-macos-frame-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -273,53 +289,30 @@ jobs:
         with:
           cache-bin: false
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           workspaces: frame-source-tests
       - name: Native frame-source recovery regression
         working-directory: frame-source-tests
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
 
+  # Preserve main's required `validation / ios-tests` check without coupling
+  # mobile tests to post-merge desktop publishing or duplicating their steps.
   ios-tests:
     needs: changes
-    if: needs.changes.outputs.ios == 'true'
-    # Keep this on GitHub-hosted macOS. Two self-hosted instances on one
-    # Mac Studio still share CPU/RAM, and overlapping a --release LTO compile
-    # with the iOS simulator jetsams the sim (signal kill / 600s bootstrap timeout).
+    if: github.event_name == 'pull_request' && needs.changes.outputs.ios == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Select an available iPhone simulator
-        run: |
-          python3 - <<'PYTHON'
-          import json, os, subprocess
-          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "--json"]))["devices"]
-          iphones = [device for runtime, group in devices.items() if "iOS" in runtime
-                     for device in group if device["name"].startswith("iPhone")]
-          if not iphones:
-              raise SystemExit("No iPhone simulator is installed")
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write("IOS_SIMULATOR_ID=" + iphones[0]["udid"] + "\n")
-          PYTHON
-      - name: Run iOS unit tests
-        working-directory: apps/ios
-        run: |
-          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
-            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
-            -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
-            -only-testing:ZeronTests CODE_SIGNING_ALLOWED=NO test
-      - name: Upload iOS test results
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ios-test-results
-          path: ${{ runner.temp }}/ios-tests.xcresult
-          if-no-files-found: ignore
+      - uses: ./.github/actions/ios-tests
 
   linux-browser:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-linux-browser-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -341,7 +334,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: linux-gpui
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Build browser fixture
         run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture,webkit-browser
       - name: X11 and Wayland browser regressions
@@ -367,6 +361,9 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    concurrency:
+      group: ci-chromium-${{ matrix.os }}-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -383,7 +380,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Build Chromium and shared-page fixture
         run: |
           scripts/build-chromium.sh "$RUNNER_TEMP/chromium" debug
