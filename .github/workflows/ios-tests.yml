@@ -1,0 +1,36 @@
+name: iOS tests
+
+on:
+  pull_request:
+    branches-ignore: [main]
+    paths:
+      - 'apps/ios/**'
+      - '.github/workflows/ios-tests.yml'
+      - '.github/workflows/testflight.yml'
+      - '.github/actions/ios-tests/**'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'apps/ios/**'
+      - '.github/workflows/ios-tests.yml'
+      - '.github/workflows/testflight.yml'
+      - '.github/actions/ios-tests/**'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ios-tests:
+    # Hosted Macs isolate the simulator from desktop LTO builds. Mobile
+    # validation still runs on mobile changes and before every TestFlight upload.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/ios-tests

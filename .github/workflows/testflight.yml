@@ -21,7 +21,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validation:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ios-tests.yml
+
   upload:
+    needs: validation
     if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
     timeout-minutes: 45
@@ -109,13 +114,6 @@ jobs:
 
       - name: Xcode version
         run: xcodebuild -version
-
-      - name: Compile iOS app and tests
-        working-directory: apps/ios
-        run: |
-          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
-            -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build-for-testing
 
       - name: Archive build
         working-directory: apps/ios
