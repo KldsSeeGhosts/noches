@@ -12,14 +12,34 @@ use zeron_proto::{HarnessId, RunRequest, SandboxLevel, SessionStatus};
 
 const CHAT: &str = "codex-subagents";
 
-fn assemble(dir: &Path) -> (EngineCore, EngineProfile) {
+async fn assemble(dir: &Path) -> (EngineCore, EngineProfile) {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness/tests/fixtures/fake-codex.sh");
     let registry = Arc::new(HarnessRegistry::new());
     registry.register(Arc::new(CodexHarness::new().with_executable(fixture)));
     let profile = EngineProfile::development(dir, "test-org", "test-user");
-    let core = EngineCore::assemble_with_profile(profile.clone(), registry, HarnessId::Codex, None)
+    let core = EngineCore::assemble_with_profile(
+        profile.clone(),
+        registry.clone(),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    // Exercise the fixture's native readiness even on machines with a real
+    // login. Wait for discovery before dispatching, including after restart.
+    registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Unauthenticated,
+    );
+    registry
+        .provider_instances
+        .refresh(&registry, HarnessId::Codex)
+        .await
         .unwrap();
+    assert_eq!(
+        registry.provider_instances.snapshot(&registry)[0].authentication,
+        zeron_engine::provider_instances::Authentication::Authenticated
+    );
     (core, profile)
 }
 
@@ -51,7 +71,7 @@ async fn check_persistence(
     alpha_users: &str,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let (core, profile) = assemble(dir.path());
+    let (core, profile) = assemble(dir.path()).await;
     let request = RunRequest {
         instance_id: None,
         prompt: format!("scenario:{scenario}"),
@@ -159,7 +179,7 @@ async fn check_persistence(
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(ids, [alpha_doc.clone(), beta_doc.clone()]);
     drop(db);
-    let (reopened, _) = assemble(dir.path());
+    let (reopened, _) = assemble(dir.path()).await;
     assert_eq!(entries(&reopened, &alpha_doc), alpha);
     assert_eq!(entries(&reopened, &beta_doc), beta);
     let mut request = request;

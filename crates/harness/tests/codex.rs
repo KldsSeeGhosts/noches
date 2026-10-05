@@ -742,7 +742,9 @@ async fn missing_binary_is_not_installed() {
 
 #[tokio::test]
 async fn models_discovers_visible_catalog_with_pagination() {
-    let models = harness().models().await.expect("models");
+    let harness = harness();
+    let models = harness.models().await.expect("models");
+    assert_eq!(harness.authenticated().await.unwrap(), Some(true));
     assert_eq!(models.len(), 3);
     assert_eq!(models[0].id, "gpt-6-astra");
     assert_eq!(models[1].id, "gpt-5.6-terra");
