@@ -635,11 +635,21 @@ async fn lane_retry_blocks_followers_but_not_titles_or_other_threads() {
         "worker".into(),
     );
     assert!(worker.step(NOW).await.unwrap());
+    // The worker schedules retry from completion, including real elapsed SQL
+    // and executor time. Do not assume execution finished in less than 1ms.
+    let retry_at = fixture
+        .kernel
+        .store
+        .effect("rollback")
+        .unwrap()
+        .unwrap()
+        .available_at;
+    assert!(retry_at >= NOW + retry_delay_ms(1));
     assert!(worker.step(NOW).await.unwrap());
     assert!(worker.step(NOW).await.unwrap());
-    assert!(!worker.step(NOW + 99).await.unwrap());
-    assert!(worker.step(NOW + 100).await.unwrap());
-    assert!(worker.step(NOW + 100).await.unwrap());
+    assert!(!worker.step(retry_at - 1).await.unwrap());
+    assert!(worker.step(retry_at).await.unwrap());
+    assert!(worker.step(retry_at).await.unwrap());
     assert_eq!(
         *executor.calls.lock().unwrap(),
         ["rollback", "title", "other", "rollback", "start"]
