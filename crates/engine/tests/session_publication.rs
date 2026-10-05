@@ -206,7 +206,7 @@ async fn wait(mut f: impl FnMut() -> bool) {
     .await
     .expect("condition converges");
 }
-fn assemble(profile: &EngineProfile, live: bool) -> EngineCore {
+async fn assemble(profile: &EngineProfile, live: bool) -> EngineCore {
     let harness = if live {
         CodexHarness::new().with_executable(
             std::env::var_os("SESSION_SYNC_CODEX")
@@ -221,13 +221,31 @@ fn assemble(profile: &EngineProfile, live: bool) -> EngineCore {
     let registry = Arc::new(HarnessRegistry::new());
     registry.register(Arc::new(harness));
     // The closed port guarantees no bytes escape to a production relay.
-    EngineCore::assemble_with_profile(
+    let core = EngineCore::assemble_with_profile(
         profile.clone(),
-        registry,
+        registry.clone(),
         HarnessId::Codex,
         Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
     )
-    .unwrap()
+    .unwrap();
+    if !live {
+        // Await native fixture readiness on every boot. A restarted engine
+        // otherwise races account discovery on runners with no real login.
+        registry.provider_instances.set_authentication(
+            HarnessId::Codex,
+            zeron_engine::provider_instances::Authentication::Unauthenticated,
+        );
+        registry
+            .provider_instances
+            .refresh(&registry, HarnessId::Codex)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.provider_instances.snapshot(&registry)[0].authentication,
+            zeron_engine::provider_instances::Authentication::Authenticated
+        );
+    }
+    core
 }
 async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool) {
     let prompt = if live {
@@ -289,7 +307,7 @@ async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool
 async fn regression(live: bool) {
     let temp = tempfile::tempdir().unwrap();
     let profile = EngineProfile::development(temp.path(), "test-org", "test-user");
-    let core = assemble(&profile, live);
+    let core = assemble(&profile, live).await;
     turn(&core, temp.path(), live, false).await;
     println!("first turn complete");
     core.shutdown().await;
@@ -313,7 +331,7 @@ async fn regression(live: bool) {
     store
         .save_snapshot_with_cursor(CHAT, &orphan_snapshot, 42, 2)
         .unwrap();
-    let core = assemble(&profile, live);
+    let core = assemble(&profile, live).await;
     turn(&core, temp.path(), live, true).await;
     println!("resumed turn complete");
     let handle = core.doc_host.open(CHAT).unwrap();

@@ -61,6 +61,11 @@ if has "$line" '"method":"model/list"'; then
   has "$line" '"method":"model/list"' || exit 1
   has "$line" '"cursor":"page-2"' || exit 1
   emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"displayName\":\"GPT-5.6-Sol\",\"description\":\"Reliable agentic workhorse for everyday tasks.\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"ultra\"}],\"additionalSpeedTiers\":[],\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":null}}"
+  # Discovery probes readiness after the final model page. This offline
+  # fixture must not inherit the runner's missing real Codex login.
+  read -r line || exit 1
+  has "$line" '"method":"account/read"' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":false}}"
   exec sleep 30
 fi
 if has "$line" '"method":"thread/fork"'; then
