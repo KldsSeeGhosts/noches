@@ -211,13 +211,9 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     let profile = zeron_engine::EngineProfile::development(&remote_dir, "dev-org", "dev-user");
     let remote_store = zeron_sync::DocsStore::open(profile.store_root()).unwrap();
     let remote_registry = registry_for(HarnessId::Codex);
-    let b = EngineCore::assemble_with_profile(
-        profile,
-        remote_registry.clone(),
-        HarnessId::Codex,
-        None,
-    )
-    .unwrap();
+    let b =
+        EngineCore::assemble_with_profile(profile, remote_registry.clone(), HarnessId::Codex, None)
+            .unwrap();
     let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
     a.workspace.connect_registry_url(&registry.url());
     b.workspace.connect_registry_url(&registry.url());
@@ -285,7 +281,10 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         .await
         .unwrap();
     assert_eq!(
-        remote_registry.provider_instances.snapshot(&remote_registry)[0].authentication,
+        remote_registry
+            .provider_instances
+            .snapshot(&remote_registry)[0]
+            .authentication,
         zeron_engine::provider_instances::Authentication::Authenticated,
         "native readiness must override missing OAuth accounts"
     );
