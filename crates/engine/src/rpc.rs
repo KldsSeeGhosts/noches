@@ -1278,6 +1278,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CHANGE_THREAD_PULL_REQUEST
             | methods::HANDOFF_THREAD_WORKTREE
             | methods::GET_THREAD_TRANSFER_STATE
+            | methods::FORK_THREAD
+            | methods::MERGE_THREAD_BACK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
@@ -1800,6 +1802,8 @@ impl RpcService for EngineRpc {
             }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::GET_THREAD_TRANSFER_STATE
+            | methods::FORK_THREAD
+            | methods::MERGE_THREAD_BACK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT => {
                 crate::orchestration::ui_transfer::rpc(
@@ -1807,6 +1811,8 @@ impl RpcService for EngineRpc {
                     method,
                     params,
                     &self.sessions,
+                    &self.workspace,
+                    &self.registry,
                 )
                 .await
             }

@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use zeron_proto::transfer::{CheckpointPreviewParams, CheckpointRestoreParams};
+use zeron_proto::transfer::{
+    CheckpointPreviewParams, CheckpointRestoreParams, ForkThreadParams, MergeThreadBackParams,
+    ThreadSourcePoint,
+};
 use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 struct DetailsApi;
@@ -13,6 +16,24 @@ impl RpcService for DetailsApi {
         let value = match method {
             methods::GET_THREAD_PULL_REQUESTS => json!({"threadId":"chat"}),
             methods::GET_THREAD_TRANSFER_STATE => json!({"threadId":"chat"}),
+            methods::FORK_THREAD => {
+                assert_eq!(params["commandId"], "stable-fork");
+                assert_eq!(params["targetChatId"], "child");
+                assert_eq!(
+                    params["sourcePoint"],
+                    json!({"type":"checkpoint","checkpointId":"checkpoint"})
+                );
+                json!({"targetChatId":"child","sequence":42,"chat":null})
+            }
+            methods::MERGE_THREAD_BACK => {
+                assert_eq!(params["commandId"], "stable-merge");
+                assert_eq!(params["targetChatId"], "parent");
+                assert_eq!(
+                    params["sourcePoint"],
+                    json!({"type":"run","runId":"exact-run"})
+                );
+                json!({"targetChatId":"parent","sequence":43,"refusal":"Source run is not finished."})
+            }
             methods::GET_LAUNCH_STATE => Value::Null,
             methods::CONTROL_WORKTREE_SETUP => {
                 assert_eq!(params["runId"], "exact-run");
@@ -58,6 +79,42 @@ async fn details_roundtrip() {
         .await
         .unwrap();
     client.thread_transfer_state("chat", "owner").await.unwrap();
+    let fork = client
+        .fork_thread(
+            ForkThreadParams {
+                chat_id: "chat".into(),
+                command_id: "stable-fork".into(),
+                target_chat_id: "child".into(),
+                source_point: ThreadSourcePoint::Checkpoint {
+                    checkpoint_id: "checkpoint".into(),
+                },
+                title: None,
+            },
+            "owner",
+        )
+        .await
+        .unwrap();
+    assert_eq!(fork.target_chat_id, "child");
+    assert_eq!(fork.sequence, 42);
+    assert!(fork.refusal.is_none());
+    let merge = client
+        .merge_thread_back(
+            MergeThreadBackParams {
+                chat_id: "chat".into(),
+                command_id: "stable-merge".into(),
+                target_chat_id: "parent".into(),
+                source_point: ThreadSourcePoint::Run {
+                    run_id: "exact-run".into(),
+                },
+            },
+            "owner",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merge.refusal.as_deref(),
+        Some("Source run is not finished.")
+    );
     assert!(
         client
             .launch_state("chat", Some("owner"))

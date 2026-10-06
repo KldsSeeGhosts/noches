@@ -488,10 +488,13 @@ fn enqueue_answer(
         .iter()
         .any(|r| !crate::orchestration::command::run_terminal(&r.status));
     let driver = records(p, "provider-thread")
-        .first()
+        .iter()
+        .rev()
+        .find(|provider| provider["providerInstanceId"] == p.thread.provider_instance_id.0)
         .and_then(|t| t["driver"].as_str())
         .unwrap_or("unknown");
-    let seed = task::execution_seed(
+    let seed = task::execution_seed_for(
+        p,
         &p.thread,
         ordinal,
         id,
@@ -819,7 +822,8 @@ fn sync_loro(
             }
         } else {
             ordinal += 1;
-            let seed = task::execution_seed(
+            let seed = task::execution_seed_for(
+                p,
                 &p.thread,
                 ordinal,
                 &row.id,
@@ -864,30 +868,55 @@ fn adopt_delivery(
         .into_iter()
         .find(|r| r.user_message_id.0 == input["messageId"].as_str().unwrap_or(""))
         .ok_or_else(|| refuse("Queued run no longer exists."))?;
-    let mut value = serde_json::to_value(run)?;
-    value["status"] = json!("starting");
-    value["queuePosition"] = Value::Null;
-    plan.emit(command, "run.updated", &value, now)?;
-    let seed = task::execution_seed(
+    let seed = task::execution_seed_for(
+        p,
         &p.thread,
         run.ordinal,
         &run.user_message_id.0,
         "starting",
-        records(p, "provider-thread")
-            .first()
-            .and_then(|p| p["driver"].as_str())
+        input["driver"]
+            .as_str()
+            .or_else(|| {
+                records(p, "provider-thread")
+                    .iter()
+                    .rev()
+                    .find(|provider| {
+                        provider["providerInstanceId"] == p.thread.provider_instance_id.0
+                    })
+                    .and_then(|provider| provider["driver"].as_str())
+            })
             .unwrap_or("unknown"),
         now,
     )?;
-    let mut provider = serde_json::to_value(seed.provider_thread)?;
-    if let Some(previous) = records(p, "provider-thread")
+    // Queue admission only reserves identities. At delivery, bind the existing
+    // run/attempt/root together to the selected provider generation, retaining
+    // the queue's message identity and the user's current model selection.
+    let mut value = serde_json::to_value(run)?;
+    value["status"] = json!("starting");
+    value["queuePosition"] = Value::Null;
+    value["providerInstanceId"] = json!(seed.run.provider_instance_id);
+    value["modelSelection"] = json!(seed.run.model_selection);
+    value["providerThreadId"] = json!(seed.provider_thread.id);
+    plan.emit(command, "run.updated", &value, now)?;
+    let mut attempt = p
+        .attempts
         .iter()
-        .find(|r| r["id"] == provider["id"])
-    {
-        provider = previous.clone();
-        provider["lastRunOrdinal"] = json!(run.ordinal);
-    }
-    provider["ownerNodeId"] = json!(run.root_node_id);
+        .find(|attempt| run.active_attempt_id.as_ref() == Some(&attempt.id))
+        .cloned()
+        .ok_or_else(|| refuse("Queued run has no active attempt."))?;
+    attempt.provider_instance_id = seed.run.provider_instance_id;
+    attempt.provider_thread_id = seed.provider_thread.id.clone();
+    plan.emit(command, "run-attempt.updated", &attempt, now)?;
+    let mut root = p
+        .nodes
+        .iter()
+        .find(|node| run.root_node_id.as_ref() == Some(&node.id))
+        .cloned()
+        .ok_or_else(|| refuse("Queued run has no root node."))?;
+    root.provider_thread_id = Some(seed.provider_thread.id.clone());
+    plan.emit(command, "node.updated", &root, now)?;
+    let mut provider = seed.provider_thread;
+    provider.owner_node_id = run.root_node_id.clone();
     plan.emit(command, "provider-thread.updated", &provider, now)?;
     Ok(())
 }

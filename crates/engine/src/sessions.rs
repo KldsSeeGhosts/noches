@@ -851,12 +851,14 @@ impl SessionsEngine {
                 if let Some(runner) = runner
                     && let Some(mut scope) = self.bound_mcp_scope(chat_id)
                     && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
-                        .is_some_and(|thread| thread.runs.last().is_none_or(|run|
-                            run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
+                        .is_some_and(|thread| !thread.runs.iter().any(|run|
+                            run.user_message_id.0 == user_id
+                                && run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
                     scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &mut request, &user_id, harness.as_ref())
                         .await.map_err(|error| EngineError::Other(error.to_string()))?;
+                    let canonical_run = scope.caller.run_id.clone();
                     self.inner.mcp_server.credentials.advance_session(scope);
-                    runner.prepare_external_turn(&chat_id.into(),&mut request,harness.as_ref())
+                    runner.prepare_external_turn(&chat_id.into(), &canonical_run, &mut request, harness.as_ref())
                         .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
             }
@@ -989,8 +991,9 @@ impl SessionsEngine {
                 .ok()
                 .flatten()
                 .is_none_or(|thread| {
-                    !thread.runs.last().is_some_and(|run| {
-                        run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
+                    !thread.runs.iter().any(|run| {
+                        run.user_message_id.0 == user_id
+                            && run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
                     })
                 })
         });
@@ -1086,6 +1089,7 @@ impl SessionsEngine {
                     .await
                     .map_err(|error| EngineError::Other(error.to_string()))?;
             }
+            let canonical_run = scope.caller.run_id.clone();
             if lock(&self.inner.session_mcp).contains_key(chat_id) {
                 // A warm runtime retains its secret/config; only trusted host
                 // admission advances the token's logical run scope.
@@ -1098,7 +1102,7 @@ impl SessionsEngine {
             }
             if ordinary && let Some(runner) = runner.as_ref() {
                 runner
-                    .prepare_external_turn(&chat_id.into(), &mut request, harness.as_ref())
+                    .prepare_external_turn(&chat_id.into(), &canonical_run, &mut request, harness.as_ref())
                     .await
                     .map_err(|e| EngineError::Other(e.to_string()))?;
             }

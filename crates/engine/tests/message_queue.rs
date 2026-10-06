@@ -344,6 +344,54 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
     )
     .await;
     wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs.iter().any(|run| {
+                        run.user_message_id.0 == third_id
+                            && run.status
+                                == zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+                    })
+                })
+        },
+        "the third queued run to accept its provider turn",
+    )
+    .await;
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.runs.len(),
+        3,
+        "delivery never creates another logical run"
+    );
+    let provider = projection.runs[0].provider_thread_id.as_ref().unwrap();
+    for run in &projection.runs {
+        assert_eq!(run.provider_thread_id.as_ref(), Some(provider));
+        let attempt = projection
+            .attempts
+            .iter()
+            .find(|attempt| run.active_attempt_id.as_ref() == Some(&attempt.id))
+            .unwrap();
+        assert_eq!(&attempt.provider_thread_id, provider);
+        assert_eq!(
+            attempt.native_thread_id.as_ref().map(String::as_str),
+            Some("sess-queue")
+        );
+        let root = projection
+            .nodes
+            .iter()
+            .find(|node| run.root_node_id.as_ref() == Some(&node.id))
+            .unwrap();
+        assert_eq!(root.provider_thread_id.as_ref(), Some(provider));
+    }
+    wait_for(
         || user_message_id(&core, "third").as_deref() == Some(third_id.as_str()),
         "the next held queue id to remain stable too",
     )
@@ -1591,7 +1639,53 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
             assert_eq!(requests[1].model, config.model);
             assert_eq!(requests[1].reasoning, config.reasoning);
             assert_eq!(requests[1].model_options, config.model_options);
+            assert!(
+                requests[1].resume.is_none(),
+                "a changed model cannot resume the old generation"
+            );
         }
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .thread(&CHAT.into())
+                    .unwrap()
+                    .is_some_and(|p| {
+                        p.runs.iter().any(|run| {
+                            run.user_message_id.0 == id
+                                && run.status
+                                    == zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+                        })
+                    })
+            },
+            "the queued selection to be accepted canonically",
+        )
+        .await;
+        let projection = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        let selected = projection
+            .runs
+            .iter()
+            .find(|run| run.user_message_id.0 == id)
+            .unwrap();
+        assert_eq!(selected.model_selection.model, "new-model");
+        assert_ne!(
+            selected.provider_thread_id,
+            projection.runs[0].provider_thread_id
+        );
+        let attempt = projection
+            .attempts
+            .iter()
+            .find(|attempt| selected.active_attempt_id.as_ref() == Some(&attempt.id))
+            .unwrap();
+        assert_eq!(
+            Some(&attempt.provider_thread_id),
+            selected.provider_thread_id.as_ref()
+        );
         let _ = harness.finish.send(());
         core.shutdown().await;
     }

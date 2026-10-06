@@ -54,6 +54,8 @@ pub mod methods {
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
     pub const GET_THREAD_TRANSFER_STATE: &str = "GetThreadTransferState";
+    pub const FORK_THREAD: &str = "ForkThread";
+    pub const MERGE_THREAD_BACK: &str = "MergeThreadBack";
     /// `{chatId,checkpointId}` -> RestorePreview. Does not change files.
     pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
     /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.

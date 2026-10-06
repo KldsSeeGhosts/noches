@@ -49,9 +49,23 @@ pub(crate) fn local_items(projection: &ThreadProjection, ordinal: i64) -> Vec<Va
         .filter(|r| r.ordinal <= ordinal && r.status != OrchestrationV2RunStatus::RolledBack)
         .map(|r| (r.id.0.as_str(), r))
         .collect();
-    let mut items: Vec<_> = super::super::task::records(projection, "turn-item")
+    let turn_items = super::super::task::records(projection, "turn-item");
+    let canonical_messages: std::collections::HashSet<_> = turn_items
         .iter()
-        .filter(|i| i["runId"].as_str().is_some_and(|id| runs.contains_key(id)))
+        .filter(|item| item["runId"].is_string())
+        .filter_map(|item| item["messageId"].as_str())
+        .collect();
+    let mut items: Vec<_> = turn_items
+        .iter()
+        .filter(|i| {
+            i["runId"].as_str().is_some_and(|id| runs.contains_key(id))
+                || (i["runId"].is_null()
+                    && projection.thread.history_origin.as_ref()
+                        == Some(&OrchestrationV2ThreadHistoryOrigin::V1Import)
+                    && !i["messageId"]
+                        .as_str()
+                        .is_some_and(|id| canonical_messages.contains(id)))
+        })
         .cloned()
         .collect();
     // Canonical turn-items come from threads; legacy ordinary runs may still
@@ -98,6 +112,90 @@ pub fn native_fork_eligible(
         && capabilities.threads.can_fork_thread
         && capabilities.threads.can_fork_from_turn
         && capabilities.identity.native_thread_ids == OrchestrationV2NativeRefStrength::Strong
+}
+
+/// Native resume is authorized by the *selected* provider handle's accepted
+/// root, not the last session on the app chat. Retired process records can be
+/// recovered from the event log after restart without reviving a process.
+fn resumable_native(
+    kernel: &Kernel,
+    projection: &ThreadProjection,
+    run: &OrchestrationV2Run,
+    cwd: &str,
+) -> Result<Option<String>> {
+    let Some(provider) = provider_for_run(projection, run).filter(|p| {
+        p["providerInstanceId"] == run.provider_instance_id.0
+            && !matches!(p["status"].as_str(), Some("closed" | "archived" | "error"))
+    }) else {
+        return Ok(None);
+    };
+    let Some(native) = provider["nativeThreadRef"]["nativeId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let accepted = projection.runs.iter().rev().find(|previous| {
+        previous.ordinal <= run.ordinal
+            && previous.provider_thread_id == run.provider_thread_id
+            && previous.provider_instance_id == run.provider_instance_id
+            && (previous.id == run.id || super::forkable(&previous.status))
+            && projection.attempts.iter().any(|attempt| {
+                attempt.run_id == previous.id
+                    && previous.active_attempt_id.as_ref() == Some(&attempt.id)
+                    && attempt.native_thread_id.as_ref().map(String::as_str) == Some(native)
+                    && super::super::task::records(projection, "provider-turn")
+                        .iter()
+                        .any(|turn| {
+                            turn["runAttemptId"] == attempt.id.0
+                                && turn["nodeId"] == attempt.root_node_id.0
+                        })
+            })
+    });
+    let Some(accepted) =
+        accepted.filter(|previous| previous.model_selection == run.model_selection)
+    else {
+        return Ok(None);
+    };
+    let Some(session_id) = provider["providerSessionId"].as_str() else {
+        return Ok(None);
+    };
+    let session = super::super::task::records(projection, "provider-session")
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .cloned();
+    let session = match session {
+        Some(session) => Some(session),
+        None => kernel.store.read(|conn| {
+            use rusqlite::OptionalExtension;
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(envelope_json,'$.event.payload')
+                 FROM orchestration_events WHERE stream_id=?1
+                 AND event_type='provider-session.attached'
+                 AND json_extract(envelope_json,'$.event.payload.id')=?2
+                 ORDER BY sequence DESC LIMIT 1",
+                    rusqlite::params![projection.thread.id.0, session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|raw| Ok(serde_json::from_str::<Value>(&raw)?))
+                .transpose()
+        })?,
+    };
+    let Some(session) =
+        session.filter(|s| s["providerInstanceId"] == accepted.provider_instance_id.0)
+    else {
+        return Ok(None);
+    };
+    let same_checkout = session["cwd"].as_str().is_some_and(|saved| {
+        saved == cwd
+            || std::fs::canonicalize(saved)
+                .ok()
+                .zip(std::fs::canonicalize(cwd).ok())
+                .is_some_and(|(saved, current)| saved == current)
+    });
+    Ok(same_checkout.then(|| native.to_owned()))
 }
 
 /// ProviderTurnStartService.ts retains ready handoffs from failed/interrupted
@@ -410,12 +508,25 @@ pub async fn prepare_run(
         .collect();
     let mut handoffs = vec![];
     let mut durable_transfers = vec![];
+    let target_native = resumable_native(kernel, &projection, run, &request.cwd)?;
+    if request.resume.is_none()
+        || target_native.is_some()
+        || provider_for_run(&projection, run)
+            .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
+    {
+        request.resume = target_native.clone();
+    }
     if let Some(previous) = projection
         .runs
         .iter()
         .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
         .max_by_key(|r| r.ordinal)
-        && previous.provider_instance_id != run.provider_instance_id
+        && (previous.provider_instance_id != run.provider_instance_id
+            || previous.model_selection != run.model_selection
+            || (provider_for_run(&projection, run)
+                .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
+                && target_native.is_none()
+                && request.resume.is_none()))
     {
         let id = format!("provider-handoff:{}", encode_component(&run.id.0));
         let existing = kernel
@@ -431,7 +542,7 @@ pub async fn prepare_run(
                 .ok_or_else(|| Error::Invariant("Provider handoff missing.".into()))?;
             (transfer, handoff)
         } else {
-            let seen = if needs_full_switch {
+            let seen = if needs_full_switch || target_native.is_none() {
                 None
             } else {
                 projection
@@ -440,7 +551,13 @@ pub async fn prepare_run(
                     .filter(|r| {
                         r.ordinal < run.ordinal
                             && r.provider_instance_id == run.provider_instance_id
+                            && r.provider_thread_id == run.provider_thread_id
                             && super::forkable(&r.status)
+                            && projection.attempts.iter().any(|a| {
+                                a.run_id == r.id
+                                    && a.native_thread_id.as_ref().map(String::as_str)
+                                        == target_native.as_deref()
+                            })
                     })
                     .max_by_key(|r| r.ordinal)
             };
@@ -450,7 +567,8 @@ pub async fn prepare_run(
                 i["runId"]
                     .as_str()
                     .and_then(|id| projection.runs.iter().find(|r| r.id.0 == id))
-                    .is_some_and(|r| r.ordinal >= from)
+                    .map(|r| r.ordinal >= from)
+                    .unwrap_or(seen.is_none() && i["runId"].is_null())
             });
             if seen.is_none() {
                 items.splice(0..0, super::inherited_items(&kernel.store, &projection)?);
@@ -493,8 +611,10 @@ pub async fn prepare_run(
         };
         handoffs.push(handoff);
         durable_transfers.push(transfer);
-        // IDs from another instance cannot be resumed as if native portable.
-        request.resume = None;
+        // A delta is valid only on the exact accepted target conversation.
+        // Returning to a provider must not start a fresh process with only its
+        // missed delta, nor resume the provider we have just left.
+        request.resume = target_native.clone();
     }
     for mut transfer in relevant {
         // Restart after logical consumption belongs to this run, never to a
@@ -699,20 +819,7 @@ pub async fn prepare_run(
     if handoffs.is_empty() {
         return Ok(());
     }
-    let native = request.resume.as_deref().or_else(|| {
-        super::super::task::records(&projection, "provider-thread")
-            .iter()
-            .find(|p| {
-                p["providerInstanceId"] == run.provider_instance_id.0
-                    && p["id"].as_str()
-                        == projection
-                            .thread
-                            .active_provider_thread_id
-                            .as_ref()
-                            .map(|id| id.0.as_str())
-            })
-            .and_then(|p| p["nativeThreadRef"]["nativeId"].as_str())
-    });
+    let native = request.resume.as_deref();
     // Refuse resuming an ambiguous receipt even on a text-only adapter.
     if native.is_some()
         && handoffs.iter().any(|h| {

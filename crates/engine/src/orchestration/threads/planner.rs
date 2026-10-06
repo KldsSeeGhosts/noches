@@ -8,7 +8,7 @@ use crate::orchestration::command::{Command, Plan, run_terminal};
 use crate::orchestration::effects::EffectRequest;
 use crate::orchestration::event::{encode_component, iso};
 use crate::orchestration::projection::{self, ThreadProjection};
-use crate::orchestration::task::{active_run, emit_execution, execution_seed, message, records};
+use crate::orchestration::task::{active_run, emit_execution, message, records};
 use crate::orchestration::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -403,7 +403,8 @@ pub(crate) fn plan(
                     thread.provider_instance_id = selection.instance_id.clone();
                     thread.model_selection = selection.clone();
                 }
-                let mut seed = execution_seed(
+                let mut seed = crate::orchestration::task::execution_seed_for(
+                    &projection,
                     &thread,
                     ordinal,
                     &input.message_id.0,

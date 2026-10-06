@@ -15,6 +15,7 @@ pub mod capabilities {
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
     pub const RUNTIME_POLICY_V1: &str = "runtime-policy-v1";
+    pub const THREAD_TRANSFERS_V1: &str = "thread-transfers-v1";
 
     pub const CURRENT: &[&str] = &[
         QUEUED_ATTACHMENTS_V1,
@@ -25,6 +26,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         RUNTIME_POLICY_V1,
+        THREAD_TRANSFERS_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -105,7 +107,8 @@ mod tests {
                     "message-queue-attachments-v1",
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
-                    "runtime-policy-v1"
+                    "runtime-policy-v1",
+                    "thread-transfers-v1"
                 ],
             })
         );

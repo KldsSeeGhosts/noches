@@ -594,6 +594,262 @@ async fn provider_switch_and_telemetry_use_only_accepted_root_native_identity() 
     assert!(run.context_handoff_id.is_some());
 }
 
+async fn select_instance(kernel: &Kernel, instance: &str, model: Option<&str>) {
+    let mut thread = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .thread;
+    thread.provider_instance_id = instance.into();
+    thread.model_selection.instance_id = instance.into();
+    if let Some(model) = model {
+        thread.model_selection.model = model.into();
+    }
+    let command = Command {
+        id: format!("select:{}", uuid::Uuid::new_v4()).into(),
+        thread_id: thread.id.clone(),
+        operation: Operation::SessionBinding(Box::new(thread)),
+    };
+    assert_eq!(
+        kernel
+            .dispatch(&command, crate::now_ms())
+            .await
+            .unwrap()
+            .status,
+        ReceiptStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn returning_provider_resumes_its_own_native_history_and_only_receives_the_missed_delta() {
+    for restart in [false, true] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (db, kernel, _) = fixture(cwd.path());
+        let original = kernel
+            .store
+            .thread(&"source".into())
+            .unwrap()
+            .unwrap()
+            .thread
+            .model_selection;
+        let first = start(&kernel, "source", "a-input").await;
+        observe(&kernel, &first, acceptance(cwd.path(), "native-a")).await;
+        observe(
+            &kernel,
+            &first,
+            zeron_proto::AgentEvent::TextDelta {
+                text: "A already knows this decision.".into(),
+            },
+        )
+        .await;
+        observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+        select_instance(&kernel, "provider-b", None).await;
+        let second = start(&kernel, "source", "b-input").await;
+        assert_ne!(first.provider_thread_id, second.provider_thread_id);
+        let mut input = request(cwd.path());
+        input.resume = Some("native-a".into());
+        prepare(&kernel, &second, &mut input).await.unwrap();
+        assert_eq!(
+            input.resume, None,
+            "a different instance cannot receive A's native ID"
+        );
+        assert!(input.prompt.contains("full_thread_summary"));
+        assert!(input.prompt.contains("A already knows this decision."));
+        observe(&kernel, &second, acceptance(cwd.path(), "native-b")).await;
+        observe(
+            &kernel,
+            &second,
+            zeron_proto::AgentEvent::TextDelta {
+                text: "B changed the implementation and verified it.".into(),
+            },
+        )
+        .await;
+        observe(&kernel, &second, done(zeron_proto::DoneStatus::Completed)).await;
+        let kernel = if restart {
+            let reopened =
+                Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+            reopened.recover(crate::now_ms()).await.unwrap();
+            reopened
+        } else {
+            kernel
+        };
+        select_instance(&kernel, &original.instance_id.0, None).await;
+        let returned = start(&kernel, "source", "return-to-a").await;
+        assert_eq!(returned.provider_thread_id, first.provider_thread_id);
+        let mut input = request(cwd.path());
+        input.resume = Some("native-b".into());
+        prepare(&kernel, &returned, &mut input).await.unwrap();
+        assert_eq!(
+            input.resume.as_deref(),
+            Some("native-a"),
+            "restart={restart}"
+        );
+        assert!(input.prompt.contains("delta_since_target_last_seen"));
+        assert!(
+            input
+                .prompt
+                .contains("B changed the implementation and verified it.")
+        );
+        assert!(!input.prompt.contains("A already knows this decision."));
+        let p = kernel.store.thread(&returned.thread_id).unwrap().unwrap();
+        let handoff = p.records["context-handoff"]
+            .iter()
+            .find(|h| h["targetRunId"] == returned.id.0)
+            .unwrap();
+        assert_eq!(
+            handoff["coveredRunOrdinals"],
+            json!({"from":second.ordinal,"to":second.ordinal})
+        );
+        let provider_a = provider_for_run(&p, &first).unwrap();
+        let provider_b = provider_for_run(&p, &second).unwrap();
+        assert_eq!(provider_a["nativeThreadRef"]["nativeId"], "native-a");
+        assert_eq!(provider_b["nativeThreadRef"]["nativeId"], "native-b");
+        assert!(
+            provider_a["handoffIds"]
+                .as_array()
+                .unwrap()
+                .contains(&handoff["id"])
+        );
+        observe(&kernel, &returned, acceptance(cwd.path(), "native-a")).await;
+        let mut accepted = request(cwd.path());
+        prepare(&kernel, &returned, &mut accepted).await.unwrap();
+        assert_eq!(
+            accepted.prompt,
+            request(cwd.path()).prompt,
+            "accepted context cannot be delivered twice"
+        );
+        assert_eq!(
+            accepted.resume.as_deref(),
+            Some("native-a"),
+            "preparing an already accepted run retains its native identity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn changed_model_options_or_checkout_uses_full_context_and_never_a_foreign_native_delta() {
+    for changed in ["model", "options", "checkout"] {
+        let cwd = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let (_db, kernel, _) = fixture(cwd.path());
+        let first = start(&kernel, "source", "initial-input").await;
+        observe(&kernel, &first, acceptance(cwd.path(), "native-original")).await;
+        observe(
+            &kernel,
+            &first,
+            zeron_proto::AgentEvent::TextDelta {
+                text: "The original complete decision.".into(),
+            },
+        )
+        .await;
+        observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+        if changed == "model" {
+            select_instance(
+                &kernel,
+                &first.provider_instance_id.0,
+                Some("different-model"),
+            )
+            .await;
+        } else if changed == "options" {
+            let mut thread = kernel
+                .store
+                .thread(&"source".into())
+                .unwrap()
+                .unwrap()
+                .thread;
+            let mut selection = json!(thread.model_selection);
+            selection["options"] = json!([{"id":"reasoningEffort","value":"high"}]);
+            thread.model_selection = serde_json::from_value(selection).unwrap();
+            kernel
+                .dispatch(
+                    &Command {
+                        id: "changed-options".into(),
+                        thread_id: thread.id.clone(),
+                        operation: Operation::SessionBinding(Box::new(thread)),
+                    },
+                    crate::now_ms(),
+                )
+                .await
+                .unwrap();
+        }
+        let next = start(&kernel, "source", "changed-input").await;
+        let mut input = request(if changed == "checkout" {
+            other.path()
+        } else {
+            cwd.path()
+        });
+        input.resume = Some("unrelated-native".into());
+        prepare(&kernel, &next, &mut input).await.unwrap();
+        assert!(input.resume.is_none());
+        assert!(input.prompt.contains("full_thread_summary"));
+        assert!(input.prompt.contains("The original complete decision."));
+        assert!(!input.prompt.contains("delta_since_target_last_seen"));
+    }
+}
+
+#[tokio::test]
+async fn same_provider_followup_preserves_its_native_handle_and_replaces_a_stale_caller_resume() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, _) = fixture(cwd.path());
+    let first = start(&kernel, "source", "same-provider-first").await;
+    observe(&kernel, &first, acceptance(cwd.path(), "native-owned")).await;
+    observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+    let next = start(&kernel, "source", "same-provider-next").await;
+    assert_eq!(first.provider_thread_id, next.provider_thread_id);
+    let mut input = request(cwd.path());
+    input.resume = Some("native-from-another-conversation".into());
+    prepare(&kernel, &next, &mut input).await.unwrap();
+    assert_eq!(input.resume.as_deref(), Some("native-owned"));
+    assert_eq!(input.prompt, request(cwd.path()).prompt);
+    assert!(
+        kernel
+            .store
+            .thread_transfers(&"source".into())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn imported_runless_history_survives_portable_handoffs_without_duplicate_current_input() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, _) = fixture(cwd.path());
+    let mut thread = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .thread;
+    thread.history_origin = Optional::Present(OrchestrationV2ThreadHistoryOrigin::V1Import);
+    let command = Command {
+        id: "import-marker".into(),
+        thread_id: thread.id.clone(),
+        operation: Operation::SessionBinding(Box::new(thread)),
+    };
+    kernel.dispatch(&command, crate::now_ms()).await.unwrap();
+    let imported = json!({"id":"legacy-item","threadId":"source","runId":null,
+        "messageId":"legacy-message","type":"assistant_message","text":"Legacy goal and constraints.",
+        "status":"completed","ordinal":0});
+    kernel.store.write(|tx| {
+        tx.execute("INSERT INTO orchestration_projection_records(thread_id,kind,id,payload_json,last_sequence)
+            VALUES('source','turn-item','legacy-item',?1,1)",[imported.to_string()])?;
+        Ok(())
+    }).unwrap();
+    select_instance(&kernel, "new-provider", None).await;
+    let run = start(&kernel, "source", "new-input").await;
+    let mut input = request(cwd.path());
+    prepare(&kernel, &run, &mut input).await.unwrap();
+    assert!(input.prompt.contains("Legacy goal and constraints."));
+    assert_eq!(
+        input
+            .prompt
+            .matches("Current request stays intact.")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn mcp_project_scope_refusal_order_and_passive_transfer_shapes_match_t3() {
     use crate::orchestration::transfer_service::TransferService;

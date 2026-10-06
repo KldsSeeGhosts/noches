@@ -255,7 +255,12 @@ fn send(
     driver: &str,
     now: i64,
 ) -> Result<()> {
-    let mut seed = task::execution_seed(thread, ordinal, message_id, status, driver, now)?;
+    let projection = projection::read_thread(conn, &thread.id)?;
+    let mut seed = if let Some(projection) = &projection {
+        task::execution_seed_for(projection, thread, ordinal, message_id, status, driver, now)?
+    } else {
+        task::execution_seed(thread, ordinal, message_id, status, driver, now)?
+    };
     let mut message = task::message(
         &thread.id,
         Some(&seed.run.id),

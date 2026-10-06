@@ -384,7 +384,7 @@ impl OrchestrationHost {
         let queue_host = Arc::new(super::queue::host::HostQueue {
             domain: queue_domain.clone(),
             docs: doc_host.clone(),
-            registry,
+            registry: registry.clone(),
         });
         sessions.mcp_server().set_queue_service(queue_host.clone());
         doc_host.set_orchestration_queue(Arc::downgrade(&queue_host));
@@ -426,6 +426,7 @@ impl OrchestrationHost {
                 doc_host,
                 workspace,
                 device_id,
+                registry: registry.clone(),
             }),
         };
         let publisher_stop = stop.clone();
@@ -626,7 +627,8 @@ impl RunnerBridge {
                     None,
                     thread.clone(),
                     "host.adopt_loro_delivery",
-                    json!({"messageId":message_id}),
+                    json!({"messageId":message_id,
+                        "driver":crate::provider_instances::legacy_driver(harness.id())}),
                     CommandId(format!("session-run:{message_id}")),
                     crate::now_ms(),
                 )
@@ -674,6 +676,7 @@ impl RunnerBridge {
     pub(crate) async fn prepare_external_turn(
         &self,
         thread: &ThreadId,
+        run_id: &RunId,
         request: &mut RunRequest,
         harness: &dyn zeron_harness::Harness,
     ) -> Result<()> {
@@ -684,7 +687,8 @@ impl RunnerBridge {
             .ok_or_else(|| Error::Invariant("Transfer thread missing.".into()))?;
         let run = projection
             .runs
-            .last()
+            .iter()
+            .find(|run| &run.id == run_id)
             .ok_or_else(|| Error::Invariant("Transfer run missing.".into()))?;
         let prepared = super::transfer::delivery::prepare_run(
             &self.kernel,
@@ -721,6 +725,127 @@ struct ChatPublisher {
     doc_host: DocHost,
     workspace: WorkspaceHost,
     device_id: String,
+    registry: Arc<HarnessRegistry>,
+}
+
+/// Materialize browsing identity without starting or discovering a provider.
+/// Forks need their inherited selection and checkout *before* their first send;
+/// otherwise the composer silently chooses its own default harness/cwd.
+pub(crate) fn materialize_thread(
+    workspace: &WorkspaceHost,
+    registry: &HarnessRegistry,
+    thread: &OrchestrationV2AppThread,
+) -> Result<()> {
+    let existing = workspace
+        .chat(&thread.id.0)
+        .map_err(|e| Error::Invariant(e.to_string()))?;
+    if existing
+        .as_ref()
+        .is_some_and(|c| c.device_id != workspace.device_id())
+    {
+        return Err(Error::NotOwner);
+    }
+    let parent = thread
+        .lineage
+        .parent_thread_id
+        .as_ref()
+        .and_then(|id| workspace.chat(&id.0).ok().flatten());
+    let space = parent
+        .as_ref()
+        .and_then(|c| c.space_id.clone())
+        .or_else(|| {
+            workspace
+                .space(&thread.project_id.0)
+                .ok()
+                .flatten()
+                .map(|s| s.id)
+        });
+    let cwd = thread
+        .worktree_path
+        .clone()
+        .or_else(|| parent.as_ref().and_then(|c| c.cwd.clone()))
+        .or_else(|| {
+            space
+                .as_ref()
+                .and_then(|id| workspace.space(id).ok().flatten())
+                .map(|s| s.path)
+        });
+    if space
+        .as_ref()
+        .and_then(|id| workspace.space(id).ok().flatten())
+        .is_some_and(|s| s.device_id != workspace.device_id())
+    {
+        return Err(Error::NotOwner);
+    }
+    let provider = registry
+        .provider_instances
+        .snapshot(registry)
+        .into_iter()
+        .find(|p| p.provider_instance_id == thread.provider_instance_id);
+    let harness = provider.and_then(|p| p.harness_id).or_else(|| {
+        parent
+            .as_ref()
+            .and_then(|c| c.config.as_ref())
+            .filter(|c| c.instance_id.as_ref() == Some(&thread.provider_instance_id))
+            .map(|c| c.harness)
+    });
+    let config = harness.map(|harness| {
+        let selection = json!(thread.model_selection);
+        let options: serde_json::Map<_, _> = selection["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| Some((o["id"].as_str()?.to_owned(), o["value"].clone())))
+            .collect();
+        let reasoning_key = match harness {
+            zeron_proto::HarnessId::ClaudeCode => "effort",
+            zeron_proto::HarnessId::Pi => "thinking",
+            _ => "reasoningEffort",
+        };
+        zeron_proto::ChatConfig {
+            instance_id: Some(thread.provider_instance_id.clone()),
+            harness,
+            model: Some(thread.model_selection.model.clone()),
+            reasoning: options
+                .get(reasoning_key)
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            model_options: options,
+            sandbox: parent
+                .as_ref()
+                .and_then(|c| c.config.as_ref())
+                .map(|c| c.sandbox)
+                .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
+            runtime_mode: thread.runtime_mode,
+            interaction_mode: thread.interaction_mode,
+        }
+    });
+    workspace
+        .create_chat(
+            &thread.id.0,
+            space.as_deref(),
+            Some(workspace.device_id()),
+            config.clone(),
+            cwd,
+        )
+        .map_err(|e| Error::Invariant(e.to_string()))?;
+    if existing.is_none() {
+        workspace
+            .rename_chat(&thread.id.0, &thread.title)
+            .map_err(|e| Error::Invariant(e.to_string()))?;
+        if let Some(branch) = &thread.branch {
+            workspace
+                .set_chat_branch(&thread.id.0, branch)
+                .map_err(|e| Error::Invariant(e.to_string()))?;
+        }
+    } else if existing.as_ref().is_some_and(|c| c.config.is_none())
+        && thread.lineage.parent_thread_id.is_some()
+        && let Some(config) = config
+    {
+        workspace
+            .set_chat_config(&thread.id.0, &config)
+            .map_err(|e| Error::Invariant(e.to_string()))?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -753,28 +878,7 @@ impl ProjectionPublisher for ChatPublisher {
         };
         let thread: OrchestrationV2AppThread =
             serde_json::from_value(document.payload["thread"].clone())?;
-        let space = thread
-            .lineage
-            .parent_thread_id
-            .as_ref()
-            .and_then(|p| self.workspace.chat(&p.0).ok().flatten())
-            .and_then(|c| c.space_id)
-            .or_else(|| {
-                self.workspace
-                    .space(&thread.project_id.0)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.id)
-            });
-        self.workspace
-            .create_chat(
-                id,
-                space.as_deref(),
-                Some(&self.device_id),
-                None,
-                thread.worktree_path.clone(),
-            )
-            .map_err(|e| Error::Invariant(e.to_string()))?;
+        materialize_thread(&self.workspace, &self.registry, &thread)?;
         let handle = self
             .doc_host
             .open(id)

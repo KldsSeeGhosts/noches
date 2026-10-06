@@ -4,12 +4,34 @@ use zeron_proto::{
     orchestration_mcp::{LinkPullRequestInput, T3WorktreeHandoffInput},
     pull_requests::ThreadPullRequestsUi,
     transfer::{
-        CheckpointPreviewParams, CheckpointRestoreParams, RestorePreview, RestoreResult,
-        ThreadTransferState,
+        CheckpointPreviewParams, CheckpointRestoreParams, ForkThreadParams, MergeThreadBackParams,
+        RestorePreview, RestoreResult, ThreadTransferResult, ThreadTransferState,
     },
 };
 
 impl crate::RpcClient {
+    pub async fn fork_thread(
+        &self,
+        params: ForkThreadParams,
+        owner: &str,
+    ) -> Result<ThreadTransferResult, crate::RpcError> {
+        let mut value =
+            serde_json::to_value(params).map_err(|e| crate::RpcError::BadParams(e.to_string()))?;
+        value["targetDeviceId"] = json!(owner);
+        self.call_as(crate::methods::FORK_THREAD, value).await
+    }
+
+    pub async fn merge_thread_back(
+        &self,
+        params: MergeThreadBackParams,
+        owner: &str,
+    ) -> Result<ThreadTransferResult, crate::RpcError> {
+        let mut value =
+            serde_json::to_value(params).map_err(|e| crate::RpcError::BadParams(e.to_string()))?;
+        value["targetDeviceId"] = json!(owner);
+        self.call_as(crate::methods::MERGE_THREAD_BACK, value).await
+    }
+
     pub async fn thread_pull_requests_on(
         &self,
         chat: &str,
