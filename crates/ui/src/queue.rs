@@ -515,7 +515,9 @@ impl Composer {
             "edit",
             "Edit",
             icons::PEN,
-            !being_removed && (canonical.is_none() || canonical_supported),
+            !being_removed
+                && self.queue_edit_controls_ready()
+                && (canonical.is_none() || canonical_supported),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
@@ -1481,11 +1483,7 @@ impl Composer {
 
     /// Borrow the composer while the leased row reserves its queue position.
     pub(crate) fn begin_queue_edit(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.queue_edit_pending_id.is_some()
-            || self.queue_edit_finishing
-            || self.editing_queued.is_some()
-            || !self.can_edit_queue_in_composer()
-        {
+        if !self.queue_edit_controls_ready() {
             return;
         }
         if let Some(entry) = self
@@ -1672,6 +1670,13 @@ impl Composer {
             .ok();
         });
         self.queue_edit_task = Some(task);
+    }
+
+    fn queue_edit_controls_ready(&self) -> bool {
+        self.queue_edit_pending_id.is_none()
+            && !self.queue_edit_finishing
+            && self.editing_queued.is_none()
+            && self.can_edit_queue_in_composer()
     }
 
     /// Save the composer into the existing row, including its attachments.
@@ -2286,6 +2291,24 @@ mod tests {
         assert_eq!(state.canonical_queues["selected"].version, 11);
         state.apply_canonical_queue("pane", None);
         assert_eq!(state.canonical_queues["pane"].version, 9);
+    }
+
+    #[gpui::test]
+    fn edit_buttons_use_the_same_admission_as_the_composer(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let state = cx.new(|_| crate::state::AppState::new());
+        let composer = cx.new(|cx| super::Composer::new(state, cx));
+        composer.update(cx, |composer, _| {
+            assert!(composer.queue_edit_controls_ready());
+            composer.editing_queued = Some("editing".into());
+            assert!(!composer.queue_edit_controls_ready());
+            composer.editing_queued = None;
+            composer.queue_edit_pending_id = Some("acquiring".into());
+            assert!(!composer.queue_edit_controls_ready());
+            composer.queue_edit_pending_id = None;
+            composer.queue_edit_finishing = true;
+            assert!(!composer.queue_edit_controls_ready());
+        });
     }
 
     #[gpui::test]
