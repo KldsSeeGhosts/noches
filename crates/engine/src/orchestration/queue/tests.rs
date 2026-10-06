@@ -184,6 +184,107 @@ impl Fixture {
     }
 }
 
+fn host_for_repair(f: &Fixture) -> super::host::HostQueue {
+    super::host::HostQueue {
+        domain: Arc::new(QueueDomain::new(f.service.kernel.clone())),
+        docs: crate::DocHost::new(
+            f.service.kernel.store.docs.clone(),
+            crate::DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        ),
+        registry: Arc::new(crate::HarnessRegistry::new()),
+    }
+}
+
+#[tokio::test]
+async fn idle_queue_repair_compares_intents_before_loading_retained_history() {
+    let f = Fixture::new();
+    let host = host_for_repair(&f);
+    let handle = host.docs.open("target").unwrap();
+    let store = &f.service.kernel.store;
+    let before = store.access_counts();
+    host.repair_all().await.unwrap();
+    let after = store.access_counts();
+    assert_eq!(
+        after[0] - before[0],
+        2,
+        "patch IDs and the small intent row only"
+    );
+    assert_eq!(after[1], before[1], "unchanged queues must not dispatch");
+
+    // A real Loro change still enters the authority/reconciliation path.
+    handle
+        .doc()
+        .push_queued(&zeron_doc::QueuedMessage::new("new", "new prompt", "host"))
+        .unwrap();
+    host.repair_all().await.unwrap();
+    let p = store.thread(&ThreadId("target".into())).unwrap().unwrap();
+    assert_eq!(p.runs.len(), 1);
+    let before = store.access_counts();
+    host.repair_all().await.unwrap();
+    assert_eq!(store.access_counts(), [before[0] + 2, before[1]]);
+}
+
+#[tokio::test]
+async fn idle_empty_legacy_queue_does_not_trigger_passive_admission() {
+    let f = Fixture::new();
+    let host = host_for_repair(&f);
+    host.docs.open("legacy").unwrap();
+    host.repair_all().await.unwrap();
+    assert!(
+        f.service
+            .kernel
+            .store
+            .thread(&ThreadId("legacy".into()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!f.service.kernel.store.is_v2_managed("legacy").unwrap());
+}
+
+#[tokio::test]
+#[ignore = "comparative optimized-test benchmark; run without concurrent builds"]
+async fn profile_unchanged_queue_repair() {
+    let f = Fixture::new();
+    let host = host_for_repair(&f);
+    let handle = host.docs.open("target").unwrap();
+    let store = &f.service.kernel.store;
+    let raw = serde_json::to_string(&json!({"text": "x".repeat(2_160)})).unwrap();
+    store
+        .write(|tx| {
+            let mut insert = tx.prepare(
+                "INSERT INTO orchestration_projection_records
+                 (kind,id,thread_id,last_sequence,payload_json) VALUES('message',?1,'target',0,?2)",
+            )?;
+            for index in 0..10_000 {
+                insert.execute(rusqlite::params![format!("retained-{index}"), raw])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Reference the former repair order against the SAME store/indexes:
+    // full projection, lock, then equality check. No mutation in either path.
+    let start = std::time::Instant::now();
+    for _ in 0..50 {
+        let p = store.thread(&ThreadId("target".into())).unwrap().unwrap();
+        let _guard = handle.orchestration_queue_lock().await;
+        host.synchronize(&p, &handle).await.unwrap();
+    }
+    let legacy_us = start.elapsed().as_micros();
+    let start = std::time::Instant::now();
+    for _ in 0..50 {
+        host.repair_all().await.unwrap();
+    }
+    let equality_first_us = start.elapsed().as_micros();
+    eprintln!(
+        "queue_repair_profile retained_records=10000 history_bytes=21600000 \
+         repairs=50 legacy_full_projection_us={legacy_us} equality_first_us={equality_first_us}"
+    );
+}
+
 #[tokio::test]
 async fn unicode_code_points_pages_and_stale_mutations() {
     let f = Fixture::new();

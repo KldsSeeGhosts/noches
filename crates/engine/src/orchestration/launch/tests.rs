@@ -74,6 +74,8 @@ impl Rig {
             crate::Repos::with_worktrees_root(dir.path(), "host", dir.path().join("worktrees"));
         for args in [
             vec!["init", "-b", "main"],
+            // Keep byte-level checkout assertions independent of global EOL settings.
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.name", "Test"],
             vec!["config", "user.email", "test@example.invalid"],
         ] {
@@ -401,16 +403,27 @@ async fn project_force_delete_never_removes_repository_and_can_register_again() 
 #[tokio::test]
 async fn clone_refuses_existing_destination_without_adopting_or_removing_it() {
     let rig = Rig::new().await;
-    let result=rig.call("t3_project_clone",json!({"remoteUrl":rig.scope.caller.workspace_root,"destinationPath":rig.scope.caller.workspace_root})).await;
+    // Git interprets Windows verbatim paths as remote hosts; file URLs preserve
+    // local transport and handle drive letters, UNC paths and percent encoding.
+    let remote = reqwest::Url::from_directory_path(&rig.scope.caller.workspace_root)
+        .unwrap()
+        .to_string();
+    let result = rig
+        .call(
+            "t3_project_clone",
+            json!({"remoteUrl":remote,"destinationPath":rig.scope.caller.workspace_root}),
+        )
+        .await;
     assert_eq!(result["code"], "orchestration_error");
     assert!(rig.scope.caller.workspace_root.join("base.txt").exists());
     let destination = rig.dir.path().join("clone");
     let result = rig
         .call(
             "t3_project_clone",
-            json!({"remoteUrl":rig.scope.caller.workspace_root,"destinationPath":destination}),
+            json!({"remoteUrl":remote,"destinationPath":destination}),
         )
         .await;
+    assert!(result.get("_tag").is_none(), "{result}");
     assert_eq!(result["cwd"], destination.to_string_lossy().as_ref());
     assert!(destination.join("base.txt").exists());
 }
@@ -868,17 +881,16 @@ async fn worktree_refs_are_branches_not_detached_checkouts_and_keep_remote_ident
     let refs = rig.call("t3_worktree_list", json!({})).await;
     assert_eq!(refs["totalCount"], 1);
     assert_eq!(refs["refs"][0]["name"], "main");
+    // Git emits forward-slash Windows paths; canonical paths have a verbatim
+    // prefix. Assert checkout identity rather than platform-specific spelling.
     assert_eq!(
-        refs["refs"][0]["worktreePath"],
-        root.to_string_lossy().as_ref()
+        std::fs::canonicalize(refs["refs"][0]["worktreePath"].as_str().unwrap()).unwrap(),
+        *root
     );
-    assert!(
-        refs["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|r| r["worktreePath"] != detached.to_string_lossy().as_ref())
-    );
+    let detached = std::fs::canonicalize(detached).unwrap();
+    assert!(refs["refs"].as_array().unwrap().iter().all(|r| {
+        std::fs::canonicalize(r["worktreePath"].as_str().unwrap()).unwrap() != detached
+    }));
     let remote = rig
         .call(
             "t3_worktree_list",
@@ -893,17 +905,13 @@ async fn worktree_refs_are_branches_not_detached_checkouts_and_keep_remote_ident
 async fn origin_launch_uses_upstream_commit_not_local_dirty_or_unpushed_commits() {
     let rig = Rig::new().await;
     let root = &rig.scope.caller.workspace_root;
+    let remote = reqwest::Url::from_directory_path(root).unwrap().to_string();
     let origin = rig.dir.path().join("origin.git");
     rig.service
         .repos
         .orchestration_git(
             root,
-            &[
-                "clone",
-                "--bare",
-                root.to_str().unwrap(),
-                origin.to_str().unwrap(),
-            ],
+            &["clone", "--bare", &remote, origin.to_str().unwrap()],
         )
         .await
         .unwrap();

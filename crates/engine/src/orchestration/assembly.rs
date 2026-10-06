@@ -428,23 +428,7 @@ impl OrchestrationHost {
                 device_id,
             }),
         };
-        let publisher_stop = stop.clone();
-        workers.push(tokio::spawn(async move {
-            loop {
-                if publisher_stop.is_cancelled() {
-                    break;
-                }
-                match publisher.step().await {
-                    Ok(true) => continue,
-                    Err(error) => tracing::error!(%error, "orchestration publication failed"),
-                    Ok(false) => {}
-                }
-                tokio::select! {
-                    _ = publisher_stop.cancelled() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-                }
-            }
-        }));
+        workers.push(publisher.spawn(stop.clone()));
         Ok(Self {
             bridge,
             service,

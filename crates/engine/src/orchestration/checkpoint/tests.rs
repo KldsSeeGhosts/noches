@@ -8,6 +8,10 @@ async fn repository() -> (tempfile::TempDir, PathBuf, PathBuf) {
     git::run(&main, &["init", "-b", "main"], None)
         .await
         .unwrap();
+    // These fixtures assert exact restored bytes, not the runner's checkout EOL.
+    git::run(&main, &["config", "core.autocrlf", "false"], None)
+        .await
+        .unwrap();
     tokio::fs::write(main.join("file.txt"), "initial\n")
         .await
         .unwrap();

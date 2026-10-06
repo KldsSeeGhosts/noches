@@ -121,6 +121,20 @@ pub(crate) fn enqueue(
 }
 
 impl Store {
+    fn first_pending_publication(&self) -> Result<Option<PublicationBatch>> {
+        self.read(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT payload_json FROM orchestration_publication_batches
+                     WHERE status='pending' ORDER BY ordinal LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.as_deref().map(decode).transpose()
+        })
+    }
+
     pub fn pending_publications(&self) -> Result<Vec<PublicationBatch>> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -191,9 +205,40 @@ pub struct PublicationWorker {
 }
 
 impl PublicationWorker {
+    pub fn spawn(self, stop: tokio_util::sync::CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut changes = self.store.subscribe_writes();
+            loop {
+                changes.borrow_and_update();
+                let step = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    result = self.step() => result,
+                };
+                match step {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        if !super::wake::wait(&mut changes, &stop, super::wake::REPAIR_INTERVAL)
+                            .await
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "orchestration publication failed");
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(super::wake::ERROR_BACKOFF) => {}
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn step(&self) -> Result<bool> {
         let _lane = self.store.publication_lane.lock().await;
-        let Some(batch) = self.store.pending_publications()?.into_iter().next() else {
+        let Some(batch) = self.store.first_pending_publication()? else {
             return Ok(false);
         };
         for document in &batch.documents {

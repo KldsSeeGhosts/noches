@@ -44,6 +44,7 @@ pub mod ui_queue;
 pub mod ui_scheduler;
 pub mod ui_threads;
 pub mod ui_transfer;
+mod wake;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
