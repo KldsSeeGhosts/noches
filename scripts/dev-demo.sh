@@ -26,7 +26,7 @@ done
 # Use the distributable build by default when judging interaction smoothness.
 BUILD_FLAGS=()
 if [[ "$PROFILE" == release ]]; then BUILD_FLAGS=(--release); fi
-BIN="./target/$PROFILE/zeron"
+BIN="${CARGO_TARGET_DIR:-target}/$PROFILE/zeron"
 echo "▸ building $PROFILE demo (first run takes a few minutes)…"
 cargo build -p zeron ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} -q
 
@@ -42,6 +42,15 @@ for _ in $(seq 1 40); do
 done
 
 probe() { cargo run -q -p zeron-rpc --example rpc_probe -- "ws://127.0.0.1:$IPC" "$@"; }
+
+# The persisted instance catalog intentionally does not auto-enable the test
+# adapter. Register it in this isolated demo profile so sends can actually run.
+HAS_MOCK=$(probe GetProviderInstanceSettings '{}' | python3 -c \
+  'import json,sys; print(any(row["instanceId"] == "mock" for row in json.load(sys.stdin)))')
+if [[ "$HAS_MOCK" != True ]]; then
+  probe CreateProviderInstance \
+    '{"instanceId":"mock","instance":{"driver":"mock","enabled":true,"displayName":"Mock"}}' >/dev/null
+fi
 
 if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   echo "▸ seeding demo chats"

@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_launch.sql"),
     include_str!("schema_transfer.sql"),
     include_str!("schema_queue.sql"),
+    include_str!("schema_performance.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,9 @@ pub struct Store {
     pub(crate) publication_lane: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<Mutex<Option<(WriteBoundary, usize)>>>,
     admission: Arc<OnceLock<super::adoption::RegistryAdmission>>,
+    writes_committed: tokio::sync::watch::Sender<()>,
+    #[cfg(test)]
+    accesses: Arc<[std::sync::atomic::AtomicUsize; 2]>,
 }
 
 impl Store {
@@ -143,7 +147,25 @@ impl Store {
             publication_lane: Arc::default(),
             failure: Arc::default(),
             admission: Arc::default(),
+            writes_committed: tokio::sync::watch::channel(()).0,
+            #[cfg(test)]
+            accesses: Arc::default(),
         })
+    }
+
+    /// Subscribe before inspecting work, and mark the current version seen
+    /// before each inspection. A commit racing the check-to-wait transition
+    /// then remains observable. Diagnostic Store handles have their own
+    /// channel, so workers also keep a bounded repair timer.
+    pub(crate) fn subscribe_writes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.writes_committed.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn access_counts(&self) -> [usize; 2] {
+        self.accesses
+            .each_ref()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Deterministic one-shot crash seam. `occurrence=2`, for example, targets
@@ -168,6 +190,8 @@ impl Store {
     }
 
     pub(crate) fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        self.accesses[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.docs.with_connection(|conn| {
             // One consistent frontier even if a diagnostic handle has opened
             // another connection to the same profile.
@@ -179,7 +203,10 @@ impl Store {
     }
 
     pub(crate) fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        self.accesses[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.docs.with_connection(|conn| {
+            let before = conn.total_changes();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let owner: String = tx.query_row(
                 "SELECT host_id FROM orchestration_host WHERE singleton=1",
@@ -192,6 +219,12 @@ impl Store {
             let value = f(&tx)?;
             self.boundary(WriteBoundary::BeforeCommit)?;
             tx.commit()?;
+            if conn.total_changes() != before {
+                // Empty claims and fenced-out acknowledgements must not wake the
+                // workers themselves. Notify after durability, even when the
+                // AfterCommit seam loses the response to the caller.
+                self.writes_committed.send_replace(());
+            }
             self.boundary(WriteBoundary::AfterCommit)?;
             Ok(value)
         })

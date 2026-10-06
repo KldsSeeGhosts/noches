@@ -180,34 +180,16 @@ impl RunnerBridge {
         self: &Arc<Self>,
         stop: CancellationToken,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        (0..super::effects::DEFAULT_WORKER_CONCURRENCY).map(|index| {
-            let bridge = self.clone();
-            let stop = stop.clone();
-            tokio::spawn(async move {
-                let worker = EffectWorker::new(bridge.kernel.store.clone(),bridge,format!("delegation-{index}"));
-                loop {
-                    if stop.is_cancelled() {break;}
-                    let step = tokio::select! {
-                        _ = stop.cancelled() => break,
-                        step = worker.step(crate::now_ms()) => step,
-                    };
-                    match step {
-                        Ok(true) => {}
-                        Ok(false) => tokio::select! {
-                            _ = stop.cancelled() => break,
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
-                        },
-                        Err(error) => {
-                            tracing::error!(%error,"orchestration effect worker failed");
-                            tokio::select! {
-                                _ = stop.cancelled() => break,
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
-                            }
-                        }
-                    }
-                }
+        (0..super::effects::DEFAULT_WORKER_CONCURRENCY)
+            .map(|index| {
+                EffectWorker::new(
+                    self.kernel.store.clone(),
+                    self.clone(),
+                    format!("delegation-{index}"),
+                )
+                .spawn(stop.clone())
             })
-        }).collect()
+            .collect()
     }
 
     async fn delivery_command(

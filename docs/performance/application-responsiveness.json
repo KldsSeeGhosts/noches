@@ -1,0 +1,113 @@
+{
+  "date": "2026-10-06",
+  "baselineCommit": "d0e08ba26f891e1101629a7ea0bdb838e5dfb752",
+  "candidateSource": "application code changes in this PR",
+  "host": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "model": "Mac17,14",
+    "cpu": "Apple M5 Max",
+    "ramGiB": 36,
+    "osVersion": "27.0.1",
+    "osBuild": "26A434",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "node": "v26.9.0"
+  },
+  "artifactsSha256": {
+    "baselineRelease": "ef6c7c890061c83d270f11f9666f5837a507d778ed188967d168c8c88f66a657",
+    "candidateRelease": "4dd7acec8bd204070570dd23cc575b249fd341ffaa288cc8a9b040ff159f6017",
+    "baselineEngineTests": "c6e2451403741b867690dbfff798326c47a5485bbc8b8e4f4ef18c9ef4d82daa",
+    "baselineUiTests": "9230a9fe671335ade497f0fa7b1c8078451e3d9bb570a44d0ae8266b2cd656be",
+    "candidateEngineTests": "246b77dca18d9f1f5044809ccd5c26d10224a3f292d8f14c2547ccdd1cb7178e",
+    "candidateUiTests": "6c9753bb6a216e6bccac1d5e8d15c00282af757fd07ec3aa330262df66ffb3e8"
+  },
+  "microbenchmarks": {
+    "profile": "test, zeron-engine and zeron-ui opt-level=2; dependencies use normal test profile",
+    "baselineFixtureChanges": "Only identical ignored outbox and streaming benchmark bodies and engine test-module declaration; no optimization changes.",
+    "testArgs": ["profile_", "--ignored", "--nocapture", "--test-threads=1"],
+    "order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate", "candidate", "baseline"],
+    "concurrentBuildsObserved": false,
+    "outboxWorkload": {
+      "terminalEffects": 50000,
+      "publishedBatches": 50000,
+      "emptyClaims": 1000,
+      "emptyPublicationSteps": 1000,
+      "pendingBatchesDrained": 100,
+      "textBytesPerBatch": 32768,
+      "publisher": "in-process discard, no I/O"
+    },
+    "streamWorkload": {
+      "historyEntries": 10000,
+      "historyTextBytes": 21600000,
+      "oneByteAppends": 500,
+      "scope": "AppState primary transcript reducer, no background preparation, rendering, or presentation"
+    },
+    "queueWorkload": {
+      "scope": "Candidate-only in-process former repair order versus equality-first order, same Store/indexes, not a historical binary",
+      "retainedRecords": 10000,
+      "retainedTextBytes": 21600000,
+      "unchangedRepairs": 50
+    },
+    "columns": ["variant", "emptyClaimsUs", "emptyPublicationsUs", "publicationBacklogUs", "streamNoAgentsUs", "streamWithAgentsUs", "noAgentScans", "withAgentScans"],
+    "runs": [
+      ["baseline", 3623836, 1164421, 191540, 36309, 37224, 500, 500],
+      ["candidate", 13985, 2224, 14898, 25545, 24964, 0, 0],
+      ["candidate", 13100, 2044, 14341, 22427, 22344, 0, 0],
+      ["baseline", 3502639, 1232431, 179829, 35359, 35823, 500, 500],
+      ["baseline", 3465426, 1187760, 187160, 35273, 37398, 500, 500],
+      ["candidate", 13159, 2141, 13799, 22689, 22425, 0, 0],
+      ["candidate", 14051, 2059, 14225, 23255, 23042, 0, 0],
+      ["baseline", 3536536, 1148126, 184840, 36400, 36411, 500, 500]
+    ],
+    "queueColumns": ["candidateRunNumber", "formerOrderUs", "equalityFirstUs"],
+    "queueRuns": [
+      [1, 1787932, 287],
+      [2, 1796949, 283],
+      [3, 1738754, 285],
+      [4, 1811768, 268]
+    ]
+  },
+  "releaseIdle": {
+    "mode": "headless-idle-terminal-outbox-history",
+    "profile": "release --locked -p zeron",
+    "cpuUnits": "percent, 100% per core",
+    "warmupAfterSeedingSeconds": 10,
+    "sampleIntervalMs": 500,
+    "uiOrModelTurn": false,
+    "concurrentBuildsObservedInRetainedRuns": false,
+    "retainedHistoryOrder": ["baseline", "candidate", "candidate", "baseline"],
+    "columns": ["variant", "rowsPerOutbox", "durationSeconds", "cpuPercent", "peakRssMiB", "peakFootprintMiB", "idleWakeups", "firstAtMs", "lastAtMs", "firstCpuSeconds", "lastCpuSeconds", "firstIdleWakeups", "lastIdleWakeups"],
+    "runs": [
+      ["baseline", 50000, 15.058603125, 54.231804233169875, 105.546875, 72.829453, 35, 11396.325292, 26454.928417, 5.532259, 13.698811167, 21, 56],
+      ["candidate", 50000, 15.106398958, 0.09611407086737157, 102.546875, 69.470078, 5, 11420.795, 26527.193958, 0.093660375, 0.10817975, 2, 7],
+      ["candidate", 50000, 15.089260249999997, 0.08922322749387264, 101.53125, 67.845055, 7, 11398.178416, 26487.438666, 0.087607, 0.101070125, 0, 7],
+      ["baseline", 50000, 15.034550875, 51.84046305606718, 103.96875, 71.235634, 32, 11388.004084, 26422.554959, 5.384868833, 13.178849625, 15, 47],
+      ["baseline", 0, 15.106072417000002, 1.975684789278076, 102.640625, 69.25135, 19, 11292.687958, 26398.760375, 0.281005208, 0.579453583, 10, 29],
+      ["candidate", 0, 15.115098, 0.09832994136061844, 101.78125, 68.1576, 4, 11264.444209, 26379.542209, 0.088341333, 0.103204, 5, 9],
+      ["candidate", 0, 15.065128, 0.09520745525693518, 101.546875, 67.938782, 5, 11253.168917, 26318.296917, 0.085413042, 0.099756167, 4, 9]
+    ],
+    "cpuFormula": "100000 * (lastCpuSeconds - firstCpuSeconds) / (lastAtMs - firstAtMs)",
+    "binaryHashes": "variant + Release in artifactsSha256",
+    "excludedAttempts": [
+      "Two retained-history baseline attempts and one empty-outbox baseline attempt detected concurrent worktree builds; no timings retained.",
+      "Earlier native UI resource attempt lost foreground; no native UI timing retained."
+    ],
+    "notes": [
+      "Counter endpoints are retained for CPU/wakeup recomputation; memory values are observed sample peaks.",
+      "Idle wakeups is the macOS process counter, not the number of Tokio timers or database queries.",
+      "Engine-only; excludes UI and provider/discovery child process resource usage. Normal startup provider discovery is enabled."
+    ]
+  },
+  "validation": {
+    "engineLibPassed": 637,
+    "engineLibIgnored": 4,
+    "uiLibPassed": 1498,
+    "uiLibIgnored": 2,
+    "targetedIntegrationPassed": 40,
+    "targetedIntegrationIgnored": 2,
+    "failures": 0,
+    "releaseBuild": "passed",
+    "nativeFunctionalQa": "Isolated candidate release, two-pane mock fixture, light and dark, streamed Markdown/reasoning/tools/subagents, secondary draft editing, keyboard selection, independent scroll, sidebar navigation and draft restoration",
+    "notVerified": ["native model picker", "native divider drag", "120 Hz input/presentation latency", "whole-app CPU comparison", "long mixed-use sessions", "real-provider end-to-end timing", "Linux runtime", "Windows", "mobile"]
+  }
+}
