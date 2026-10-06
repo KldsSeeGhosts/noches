@@ -20,6 +20,20 @@ pub struct DetailsStore {
     pending: HashSet<(String, String)>,
     refresh_again: HashSet<(String, String)>,
     pub notice: Option<String>,
+    pub(crate) transfer_actions: HashSet<String>,
+    pub(crate) transfer_retries: HashMap<String, ConversationTransfer>,
+}
+
+#[derive(Clone)]
+pub(crate) enum ConversationTransfer {
+    Fork(zeron_proto::transfer::ForkThreadParams),
+    Merge(zeron_proto::transfer::MergeThreadBackParams),
+}
+
+impl DetailsStore {
+    pub(crate) fn transfer_busy(&self, chat: &str) -> bool {
+        self.transfer_actions.contains(chat)
+    }
 }
 
 #[derive(Default)]
@@ -27,6 +41,8 @@ pub struct DetailsSnapshot {
     pub prs: Option<ThreadPullRequestsUi>,
     pub launch: Option<LaunchUiState>,
     pub transfer: Option<ThreadTransferState>,
+    /// Frozen presentation only; these rows never enter the child's document.
+    pub(crate) inherited: Option<std::sync::Arc<Vec<crate::transcript::Row>>>,
     /// The API has no start timestamp: keep first observation stable across reads.
     setup_observed: Option<(String, DateTime<Utc>)>,
     pub error: Option<String>,
@@ -36,6 +52,108 @@ impl DetailsStore {
     pub fn get(&self, owner: &str, chat: &str) -> Option<&DetailsSnapshot> {
         self.rows.get(&(owner.to_string(), chat.to_string()))
     }
+
+    pub(crate) fn inherited_rows(
+        &self,
+        chat: &zeron_proto::Chat,
+    ) -> Option<&[crate::transcript::Row]> {
+        self.get(&chat.device_id, &chat.id)?
+            .inherited
+            .as_deref()
+            .map(Vec::as_slice)
+    }
+}
+
+/// Text-only history: no private reasoning, replayed approvals, active tools,
+/// synthetic provider events, or writes to either conversation. Bound the
+/// passive preview; the parent remains the source for its complete transcript.
+fn prepare_inherited(
+    state: &ThreadTransferState,
+) -> Option<std::sync::Arc<Vec<crate::transcript::Row>>> {
+    use crate::transcript::{Row, RowKind, rows_for_entry};
+    use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+    let parent = fork_source(state)?;
+    let messages: Vec<_> = state
+        .inherited_items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("user_message" | "assistant_message")
+            ) && item["text"].as_str().is_some_and(|text| !text.is_empty())
+        })
+        .collect();
+    let skipped = messages.len().saturating_sub(100);
+    let mut rows = Vec::new();
+    for item in messages.iter().skip(skipped) {
+        let (Some(source), Some(id), Some(text)) = (
+            item["sourceThreadId"]
+                .as_str()
+                .or_else(|| item["threadId"].as_str()),
+            item["sourceItemId"]
+                .as_str()
+                .or_else(|| item["id"].as_str()),
+            item["text"].as_str(),
+        ) else {
+            continue;
+        };
+        // JSON tuple encoding prevents collisions between nested source IDs.
+        let identity = format!(
+            "inherited:{}",
+            serde_json::to_string(&(source, id)).expect("string identity")
+        );
+        let mut visible: String = text.chars().take(10_000).collect();
+        if visible.len() < text.len() {
+            visible.push_str("\n\n[Preview shortened; open the parent for the complete message.]");
+        }
+        let entry = SessionMessageEntry {
+            id: identity,
+            role: if item["type"] == "user_message" {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            parts: vec![MessagePart::Text {
+                id: "text".into(),
+                text: visible,
+            }],
+            // Inherited turn-items need not carry a wall-clock timestamp.
+            // Never invent one or offer the inherited attachment transport.
+            created_at: 0,
+            device_id: String::new(),
+            status: None,
+            continuation_of: None,
+        };
+        let mut prepared = rows_for_entry(&entry, false, &mut |_, text| {
+            std::sync::Arc::new(crate::markdown::parser::parse_full(text))
+        });
+        for row in &mut prepared {
+            row.timestamp = None;
+            if let RowKind::User { attachments, .. } = &mut row.kind {
+                *attachments = std::sync::Arc::new(vec![]);
+            }
+        }
+        rows.extend(prepared);
+    }
+    let label = if skipped > 0 {
+        format!("Fork continues here · {skipped} earlier messages in parent")
+    } else {
+        "Fork continues here · inherited conversation above".into()
+    };
+    let identity = format!("fork-boundary:{}", state.thread_id);
+    rows.push(Row {
+        id: identity.clone().into(),
+        entry_id: identity.into(),
+        version: state.version as u64,
+        turn_start: true,
+        timestamp: None,
+        copy_text: None,
+        kind: RowKind::ForkBoundary {
+            label: label.into(),
+            source_chat_id: parent.into(),
+        },
+    });
+    Some(std::sync::Arc::new(rows))
 }
 
 /// Honor chain order, retaining insertion order for unrelated links. Native wins.
@@ -124,6 +242,10 @@ pub fn map_checkpoints(state: &ThreadTransferState) -> Vec<Checkpoint> {
                 },
                 additions: sum(true),
                 deletions: sum(false),
+                forkable: file.phase == "completed"
+                    && c.run_id.is_some()
+                    && c.status
+                        == zeron_proto::orchestration::OrchestrationV2CheckpointStatus::Ready,
             })
         })
         .collect();
@@ -180,7 +302,88 @@ pub fn apply_snapshot(model: &mut DetailsModel, row: &DetailsSnapshot) {
     }
     if let Some(transfer) = &row.transfer {
         model.checkpoints = map_checkpoints(transfer);
+        model.fork_run_id = transfer.latest_forkable_run_id.clone();
+        model.merge_run_id = transfer.latest_mergeable_run_id.clone();
+        model.merge_target = fork_source(transfer).map(str::to_owned);
+        model.transfers = map_transfers(transfer);
     }
+}
+
+pub fn map_transfers(state: &ThreadTransferState) -> Vec<crate::details::ContextTransferRow> {
+    let mut transfers: Vec<_> = state
+        .transfers
+        .iter()
+        .filter_map(|t| {
+            let id = t["id"].as_str()?;
+            let handoff = state.handoffs.iter().find(|h| h["transferId"] == id);
+            let strategy = t["resolution"]["strategy"].as_str();
+            let status = t["status"].as_str().unwrap_or("pending");
+            // Consuming a transfer reserves it for a run; native acceptance, not
+            // logical consumption, confirms delivery of portable history.
+            let delivery = handoff.and_then(|h| h["deliveryStatus"].as_str());
+            let label = match status {
+                "failed" => "Failed",
+                "superseded" => "Superseded",
+                "consumed"
+                    if strategy == Some("native_fork")
+                        || matches!(delivery, Some("inline" | "injected")) =>
+                {
+                    "Delivered"
+                }
+                "consumed" => "Prepared",
+                "resolved_native" | "resolved_portable" => "Ready",
+                _ => "Pending",
+            };
+            let method = match strategy {
+                Some("native_fork") => "Native fork",
+                Some("delta_context" | "fork_delta_context") => "Delta context",
+                Some("portable_context") => "Portable context",
+                _ => "Resolves on the next message",
+            };
+            let mut detail = method.to_owned();
+            if let Some(h) = handoff {
+                if let (Some(from), Some(to)) = (
+                    h["coveredRunOrdinals"]["from"].as_i64(),
+                    h["coveredRunOrdinals"]["to"].as_i64(),
+                ) {
+                    detail.push_str(&format!(" · runs {from}–{to}"));
+                }
+                if let Some(omitted) = h["omittedItems"].as_u64().filter(|n| *n > 0) {
+                    detail.push_str(&format!(" · {omitted} items omitted"));
+                }
+            }
+            let title = match t["type"].as_str() {
+                Some("fork") => "Conversation fork",
+                Some("merge_back") => "Merge-back context",
+                Some("provider_handoff") => "Agent handoff",
+                Some("subagent_spawn") => "Delegated task",
+                Some("subagent_result") => "Agent result",
+                _ => "Context transfer",
+            };
+            let source = t["sourceThreadId"]
+                .as_str()
+                .filter(|id| *id != state.thread_id.0);
+            let providers = t["sourceProviderInstanceId"]
+                .as_str()
+                .zip(t["targetProviderInstanceId"].as_str())
+                .filter(|(a, b)| a != b)
+                .map(|(a, b)| format!("{a} → {b}"));
+            Some(crate::details::ContextTransferRow {
+                id: id.to_owned(),
+                title: title.into(),
+                status: label.into(),
+                detail,
+                source_chat_id: source.map(str::to_owned),
+                providers,
+                failed: status == "failed",
+                error: (status == "failed")
+                    .then(|| t["error"].as_str().map(str::to_owned))
+                    .flatten(),
+            })
+        })
+        .collect();
+    transfers.reverse();
+    transfers
 }
 
 pub fn fork_source(state: &ThreadTransferState) -> Option<&str> {
@@ -220,6 +423,13 @@ impl AppState {
                 engine.client().launch_state(&key.1, Some(&key.0)),
                 engine.client().thread_transfer_state(&key.1, &key.0),
             );
+            let (transfer, inherited) = cx
+                .background_executor()
+                .spawn(async move {
+                    let inherited = transfer.as_ref().ok().and_then(prepare_inherited);
+                    (transfer, inherited)
+                })
+                .await;
             this.update(cx, |state, cx| {
                 state.details.pending.remove(&key);
                 let row = state.details.rows.entry(key.clone()).or_default();
@@ -229,7 +439,17 @@ impl AppState {
                     Err(e) => row.error = Some(e.to_string()),
                 }
                 match transfer {
-                    Ok(v) => row.transfer = Some(v),
+                    Ok(v) => {
+                        if row
+                            .transfer
+                            .as_ref()
+                            .is_none_or(|current| current.version <= v.version)
+                        {
+                            row.transfer = Some(v);
+                            row.inherited = inherited;
+                            state.transcript_revision = state.transcript_revision.wrapping_add(1);
+                        }
+                    }
                     Err(e) => row.error = Some(e.to_string()),
                 }
                 match launch {
@@ -468,6 +688,11 @@ mod tests {
         assert_eq!(rows[0].id, "new");
         assert_eq!(rows[0].summary, "Turn 4");
         assert_eq!(rows[1].summary, "Start");
+        assert!(rows[0].forkable);
+        assert!(
+            !rows[1].forkable,
+            "a before-run file snapshot is not a conversation boundary"
+        );
         assert_eq!((rows[0].additions, rows[0].deletions), (12, 3));
         assert_eq!(fork_source(&state), Some("parent"));
     }
@@ -526,5 +751,110 @@ mod tests {
             .insert(("host-a".into(), "chat".into()), DetailsSnapshot::default());
         assert!(store.get("host-a", "chat").is_some());
         assert!(store.get("host-b", "chat").is_none());
+    }
+
+    #[test]
+    fn transfer_rows_distinguish_prepared_context_from_confirmed_delivery_and_hide_private_content()
+    {
+        let state: ThreadTransferState = serde_json::from_value(json!({
+            "threadId":"target",
+            "transfers":[
+                {"id":"one","type":"provider_handoff","sourceThreadId":"target","status":"consumed",
+                    "sourceProviderInstanceId":"a","targetProviderInstanceId":"b",
+                    "resolution":{"strategy":"portable_context","summaryText":"PRIVATE SUMMARY"}},
+                {"id":"two","type":"merge_back","sourceThreadId":"fork","status":"consumed",
+                    "resolution":{"strategy":"delta_context"}},
+                {"id":"three","type":"fork","sourceThreadId":"parent","status":"consumed",
+                    "resolution":{"strategy":"native_fork"}},
+                {"id":"four","type":"provider_handoff","status":"failed","error":"Provider unavailable"}
+            ],
+            "handoffs":[
+                {"id":"h1","transferId":"one","deliveryStatus":"pending",
+                    "coveredRunOrdinals":{"from":1,"to":3},"omittedItems":12,
+                    "summaryText":"PRIVATE SUMMARY","history":{"messages":[{"text":"PRIVATE HISTORY"}]}},
+                {"id":"h2","transferId":"two","deliveryStatus":"inline","omittedItems":0}
+            ]
+        })).unwrap();
+        let rows = map_transfers(&state);
+        assert_eq!(
+            rows.iter().map(|r| r.status.as_str()).collect::<Vec<_>>(),
+            ["Failed", "Delivered", "Delivered", "Prepared"]
+        );
+        assert!(rows[0].failed);
+        assert_eq!(rows[0].error.as_deref(), Some("Provider unavailable"));
+        assert_eq!(rows[2].source_chat_id.as_deref(), Some("fork"));
+        assert_eq!(rows[3].providers.as_deref(), Some("a → b"));
+        assert!(rows[3].source_chat_id.is_none());
+        assert!(rows[3].detail.contains("runs 1–3"));
+        assert!(rows[3].detail.contains("12 items omitted"));
+        assert!(!format!("{rows:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn inherited_preview_is_frozen_text_with_unique_source_ids_and_an_explicit_boundary() {
+        use crate::transcript::RowKind;
+        let state: ThreadTransferState = serde_json::from_value(json!({
+            "threadId":"child","forkedFrom":{"threadId":"parent","runId":"pinned"},
+            "inheritedItems":[
+                {"id":"same","threadId":"grandparent","type":"assistant_message","text":"Earlier decision"},
+                {"id":"same","threadId":"parent","type":"user_message","text":"Continue from this"},
+                {"id":"private","threadId":"parent","type":"reasoning","text":"PRIVATE REASONING"},
+                {"id":"approval","threadId":"parent","type":"approval","text":"LIVE APPROVAL"},
+                {"id":"tool","threadId":"parent","type":"command_execution","text":"LIVE TOOL"},
+                {"id":"question","threadId":"parent","type":"user_input_request","text":"LIVE QUESTION"}
+            ]
+        })).unwrap();
+        let rows = prepare_inherited(&state).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_ne!(rows[0].entry_id, rows[1].entry_id);
+        assert!(rows.iter().all(|r| r.timestamp.is_none()));
+        assert!(
+            matches!(&rows[1].kind, RowKind::User { pending: false, attachments, .. } if attachments.is_empty())
+        );
+        assert!(
+            matches!(&rows[2].kind, RowKind::ForkBoundary { source_chat_id, .. } if source_chat_id == "parent")
+        );
+        assert!(rows.iter().all(|r| !matches!(
+            r.kind,
+            RowKind::LiveMarkdown { .. } | RowKind::ToolGroup { .. } | RowKind::InputChip { .. }
+        )));
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| r.copy_text.as_deref())
+                .collect::<Vec<_>>(),
+            ["Earlier decision", "Continue from this"]
+        );
+        let root: ThreadTransferState = serde_json::from_value(json!({"threadId":"root"})).unwrap();
+        assert!(prepare_inherited(&root).is_none());
+    }
+
+    #[test]
+    fn inherited_preview_bounds_are_visible_and_unicode_safe() {
+        use crate::transcript::RowKind;
+        let items: Vec<_> = (0..102)
+            .map(|i| {
+                json!({
+                    "id":format!("item:{i}"), "threadId":"parent","type":"assistant_message",
+                    "text": if i == 101 { "🧪".repeat(10_010) } else { format!("Message {i}") }
+                })
+            })
+            .collect();
+        let state: ThreadTransferState = serde_json::from_value(json!({
+            "threadId":"child","lineage":{"parentThreadId":"parent","relationshipToParent":"fork"},
+            "inheritedItems":items,
+        }))
+        .unwrap();
+        let rows = prepare_inherited(&state).unwrap();
+        assert_eq!(rows.iter().filter(|r| r.copy_text.is_some()).count(), 100);
+        let last_text = rows
+            .iter()
+            .filter_map(|r| r.copy_text.as_deref())
+            .last()
+            .unwrap();
+        assert_eq!(last_text.matches('🧪').count(), 10_000);
+        assert!(last_text.contains("Preview shortened"));
+        assert!(
+            matches!(&rows.last().unwrap().kind, RowKind::ForkBoundary { label, .. } if label.contains("2 earlier messages"))
+        );
     }
 }

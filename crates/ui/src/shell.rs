@@ -1730,6 +1730,39 @@ enum PendingExit {
     InstallUpdate(PathBuf),
 }
 
+#[derive(Clone)]
+pub(super) struct SidebarNotice {
+    text: SharedString,
+    failed: bool,
+}
+
+impl SidebarNotice {
+    fn information(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            failed: false,
+        }
+    }
+}
+
+impl From<SharedString> for SidebarNotice {
+    fn from(text: SharedString) -> Self {
+        Self { text, failed: true }
+    }
+}
+
+impl From<String> for SidebarNotice {
+    fn from(text: String) -> Self {
+        SharedString::from(text).into()
+    }
+}
+
+impl From<&str> for SidebarNotice {
+    fn from(text: &str) -> Self {
+        SharedString::from(text.to_owned()).into()
+    }
+}
+
 pub struct Shell {
     voice: voice::VoiceUi,
     state: Entity<AppState>,
@@ -1971,8 +2004,8 @@ pub struct Shell {
     /// failures and connectivity degradation produce one attention sound.
     attention_sound_gate: crate::sound::AttentionSoundGate,
     user_menu: popover::Popup<()>,
-    /// Inline sidebar error strip (mutation failures); click dismisses.
-    sidebar_notice: Option<SharedString>,
+    /// Inline action feedback; only failures use the danger palette.
+    sidebar_notice: Option<SidebarNotice>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -7917,7 +7950,7 @@ impl Shell {
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
-            // Inline mutation-failure notice.
+            // Quiet successful actions and explicit mutation failures.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
                     div()
@@ -7928,15 +7961,23 @@ impl Shell {
                         .py(px(4.0))
                         .rounded(px(Theme::CONTROL_RADIUS))
                         .border_1()
-                        .border_color(theme.danger)
+                        .border_color(if notice.failed {
+                            theme.danger
+                        } else {
+                            theme.border
+                        })
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                        .text_color(if notice.failed {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        })
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
+                        .child(notice.text),
                 )
             })
             .child(
@@ -8737,6 +8778,11 @@ impl Shell {
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let details_id = chat_id.clone();
+            let fork_id = chat_id.clone();
+            let can_transfer = self
+                .state
+                .read(cx)
+                .chat_host_supports(&chat_id, zeron_proto::capabilities::THREAD_TRANSFERS_V1);
             let lifecycle = self
                 .state
                 .read(cx)
@@ -8861,6 +8907,22 @@ impl Shell {
                             )
                             .child(SharedString::from("Thread details")),
                     )
+                    .when(can_transfer, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-fork-{chat_id}"))
+                                .id("chat-menu-fork")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_chat_menu(cx);
+                                    this.fork_conversation(fork_id.clone(), None, cx);
+                                }))
+                                .child(
+                                    icon(icons::ARROW_TURN_UP_RIGHT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Fork conversation")),
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
@@ -15294,6 +15356,30 @@ impl Shell {
     pub fn fixture_appshots_transcript_start(&self, cx: &mut Context<Self>) {
         self.transcript
             .update(cx, |t, cx| t.fixture_appshots_start(cx));
+    }
+}
+
+/// Native renderer verification; never injects global mouse/keyboard events.
+#[cfg(feature = "orchestration-fixture")]
+impl Shell {
+    pub fn fixture_orchestration_open(&mut self, chat: String, cx: &mut Context<Self>) {
+        self.open_chat(chat, cx);
+        self.open_details_panel(cx);
+    }
+
+    pub fn fixture_orchestration_fork(&mut self, chat: String, cx: &mut Context<Self>) {
+        self.fork_conversation(chat, None, cx);
+    }
+
+    pub fn fixture_orchestration_merge(&mut self, chat: String, cx: &mut Context<Self>) {
+        let actions = self.live_details_actions(chat);
+        (actions.merge_back)(self, (), cx);
+    }
+
+    pub fn fixture_orchestration_transcript_start(&self, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.fixture_appshots_start(cx);
+        });
     }
 }
 

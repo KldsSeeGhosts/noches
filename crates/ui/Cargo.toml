@@ -13,6 +13,7 @@ browser-fixture = []
 webkit-browser = []
 windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
+orchestration-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
 [[example]]
@@ -42,6 +43,10 @@ required-features = ["windows-render-fixture"]
 [[example]]
 name = "appshots-fixture"
 required-features = ["appshots-fixture"]
+
+[[example]]
+name = "orchestration-fixture"
+required-features = ["orchestration-fixture"]
 
 [[example]]
 name = "new-project-fixture"

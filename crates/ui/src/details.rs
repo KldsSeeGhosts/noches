@@ -38,6 +38,35 @@ pub struct DetailsModel {
     pub pull_requests: Vec<PullRequestLink>,
     pub automations: Vec<Automation>,
     pub checkpoints: Vec<Checkpoint>,
+    pub lineage: Vec<ConversationRelation>,
+    pub transfers: Vec<ContextTransferRow>,
+    pub transfers_supported: bool,
+    pub transfer_busy: bool,
+    pub fork_run_id: Option<String>,
+    pub merge_run_id: Option<String>,
+    pub merge_target: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConversationRelation {
+    pub chat_id: String,
+    pub title: String,
+    pub label: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContextTransferRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub detail: String,
+    pub source_chat_id: Option<String>,
+    pub providers: Option<String>,
+    pub failed: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -125,12 +154,29 @@ pub struct Checkpoint {
     pub summary: String,
     pub additions: u32,
     pub deletions: u32,
+    #[serde(default)]
+    pub forkable: bool,
 }
 
 /// Env var naming a JSON file of `{chatTitle: DetailsModel}` for headed QA.
 pub const FIXTURE_ENV: &str = "NOCHES_DETAILS_FIXTURE";
 
 impl DetailsModel {
+    fn can_fork(&self) -> bool {
+        self.transfers_supported && !self.transfer_busy && self.fork_run_id.is_some()
+    }
+
+    fn can_merge_back(&self) -> bool {
+        self.transfers_supported
+            && !self.transfer_busy
+            && self.merge_run_id.is_some()
+            && self.merge_target.as_ref().is_some_and(|target| {
+                self.lineage
+                    .iter()
+                    .any(|r| &r.chat_id == target && r.available)
+            })
+    }
+
     pub fn for_chat(state: &AppState, chat_id: &str) -> Self {
         let chat = state.chats.iter().find(|chat| chat.id == chat_id);
         let fixture = chat
@@ -141,6 +187,24 @@ impl DetailsModel {
         }
         let mut model = Self::default();
         if let Some(chat) = chat {
+            model.transfers_supported =
+                state.chat_host_supports(chat_id, zeron_proto::capabilities::THREAD_TRANSFERS_V1);
+            model.transfer_busy = state.details.transfer_busy(chat_id);
+            model.lineage = crate::delegation::related_rows(&state.delegation, chat_id, |id| {
+                state
+                    .chats
+                    .iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.title.clone())
+            })
+            .into_iter()
+            .map(|r| ConversationRelation {
+                available: state.chats.iter().any(|c| c.id == r.chat_id),
+                chat_id: r.chat_id,
+                title: r.title.to_string(),
+                label: r.relation.label().into(),
+            })
+            .collect();
             if let Some(space) = chat
                 .space_id
                 .as_ref()
@@ -211,6 +275,22 @@ impl DetailsModel {
         {
             crate::details_data::apply_snapshot(&mut model, row);
         }
+        if let Some(parent) = &model.merge_target
+            && !model.lineage.iter().any(|r| &r.chat_id == parent)
+        {
+            let chat = state.chats.iter().find(|c| &c.id == parent);
+            model.lineage.insert(
+                0,
+                ConversationRelation {
+                    chat_id: parent.clone(),
+                    title: chat
+                        .and_then(|c| c.title.clone())
+                        .unwrap_or_else(|| "Parent thread".into()),
+                    label: "Forked from".into(),
+                    available: chat.is_some(),
+                },
+            );
+        }
         model
     }
 }
@@ -228,6 +308,11 @@ type ShellAction<T> = Rc<dyn Fn(&mut Shell, T, &mut Context<Shell>)>;
 /// What the panel's controls do. The shell wires each to an engine call.
 #[derive(Clone)]
 pub struct DetailsActions {
+    pub open_thread: ShellAction<String>,
+    pub fork_thread: ShellAction<Option<String>>,
+    pub merge_back: ShellAction<()>,
+    pub toggle_lineage: ShellAction<()>,
+    pub toggle_transfers: ShellAction<()>,
     pub open_url: ShellAction<String>,
     pub toggle_watch: ShellAction<(String, bool)>,
     pub link_pull_request: ShellAction<()>,
@@ -247,6 +332,8 @@ pub struct DetailsActions {
 #[derive(Clone, Debug, Default)]
 pub struct DetailsUi {
     pub checkpoints_expanded: bool,
+    pub lineage_expanded: bool,
+    pub transfers_expanded: bool,
 }
 
 pub fn details_panel_body(
@@ -261,6 +348,12 @@ pub fn details_panel_body(
 ) -> AnyElement {
     let mut sections: Vec<AnyElement> =
         vec![workspace_section(chat_id, model, now, theme, actions, cx)];
+    if model.transfers_supported || !model.lineage.is_empty() {
+        sections.push(lineage_section(chat_id, model, ui, theme, actions, cx));
+    }
+    if !model.transfers.is_empty() {
+        sections.push(transfers_section(chat_id, model, ui, theme, actions, cx));
+    }
     sections.push(version_control_section(chat_id, model, theme, actions, cx));
     if !model.automations.is_empty() {
         sections.push(automations_section(chat_id, model, now, theme, actions, cx));
@@ -389,6 +482,268 @@ fn icon_action(
         .tooltip(crate::tooltip::text(tooltip))
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(icon(glyph).size(px(14.0)).text_color(theme.text_muted))
+}
+
+fn lineage_section(
+    chat_id: &str,
+    model: &DetailsModel,
+    ui: &DetailsUi,
+    theme: &Theme,
+    actions: &DetailsActions,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    let fork = actions.fork_thread.clone();
+    let can_fork = model.can_fork();
+    let mut body = section("Lineage", vec![], theme);
+    if model.transfers_supported {
+        body = body.child(
+            row(
+                format!("details-{chat_id}-fork").into(),
+                Some(icons::GIT_BRANCH),
+                theme,
+            )
+            .role(gpui::Role::Button)
+            .aria_label("Fork conversation")
+            .when(can_fork, |el| hover_row(el, theme))
+            .when(!can_fork, |el| el.opacity(0.45))
+            .tooltip(crate::tooltip::text(if model.transfer_busy {
+                "Creating context transfer…"
+            } else if can_fork {
+                "Explore from the latest finished turn without changing this conversation"
+            } else {
+                "Complete a turn before forking this conversation"
+            }))
+            .child(label(if model.transfer_busy {
+                "Preparing conversation…"
+            } else {
+                "Fork conversation"
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if can_fork {
+                    fork(this, None, cx);
+                }
+            })),
+        );
+    }
+    let shown = if ui.lineage_expanded {
+        model.lineage.len()
+    } else {
+        model.lineage.len().min(6)
+    };
+    let mut relationships = div()
+        .id(SharedString::from(format!(
+            "details-{chat_id}-lineage-list"
+        )))
+        .max_h(px(216.0))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+    for relation in model.lineage.iter().take(shown) {
+        let open = actions.open_thread.clone();
+        let target = relation.chat_id.clone();
+        let available = relation.available;
+        let is_parent = model.merge_target.as_deref() == Some(&relation.chat_id);
+        let can_merge = is_parent && model.can_merge_back();
+        let merge = actions.merge_back.clone();
+        relationships = relationships.child(
+            hover_row(
+                row(
+                    format!("details-{chat_id}-relation-{}", relation.chat_id).into(),
+                    Some(if is_parent {
+                        icons::ARROW_LEFT
+                    } else {
+                        icons::GIT_BRANCH
+                    }),
+                    theme,
+                ),
+                theme,
+            )
+            .role(gpui::Role::Button)
+            .aria_label(format!("Open {} {}", relation.label, relation.title))
+            .when(!available, |el| el.opacity(0.45))
+            .tooltip(crate::tooltip::text(if available {
+                "Open related conversation"
+            } else {
+                "This conversation is unavailable"
+            }))
+            .child(label(relation.title.clone()))
+            .child(mono(relation.label.clone(), theme.text_faint, theme))
+            .when(is_parent && model.transfers_supported, |el| {
+                el.child(
+                    icon_action(
+                        format!("details-{chat_id}-merge-back").into(),
+                        icons::ARROW_TURN_UP_RIGHT,
+                        "Merge conversation context back (does not merge files)",
+                        theme,
+                    )
+                    .when(!can_merge, |el| el.opacity(0.35))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if can_merge {
+                            merge(this, (), cx);
+                        }
+                    })),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if available {
+                    open(this, target.clone(), cx);
+                }
+            })),
+        );
+    }
+    body = body.child(relationships);
+    if model.lineage.len() > 6 {
+        let toggle = actions.toggle_lineage.clone();
+        body = body.child(
+            hover_row(
+                row(
+                    format!("details-{chat_id}-lineage-more").into(),
+                    None,
+                    theme,
+                ),
+                theme,
+            )
+            .child(label(if ui.lineage_expanded {
+                "Show fewer".into()
+            } else {
+                format!("Show all · {}", model.lineage.len())
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| toggle(this, (), cx))),
+        );
+    }
+    body.into_any_element()
+}
+
+fn transfers_section(
+    chat_id: &str,
+    model: &DetailsModel,
+    ui: &DetailsUi,
+    theme: &Theme,
+    actions: &DetailsActions,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    let shown = if ui.transfers_expanded {
+        model.transfers.len()
+    } else {
+        model.transfers.len().min(5)
+    };
+    let mut body = section("Context transfers", vec![], theme);
+    let mut history = div()
+        .id(SharedString::from(format!(
+            "details-{chat_id}-transfer-list"
+        )))
+        .max_h(px(288.0))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+    for transfer in model.transfers.iter().take(shown) {
+        let open = actions.open_thread.clone();
+        let target = transfer.source_chat_id.clone();
+        let tooltip = transfer.error.clone().unwrap_or_else(|| {
+            if transfer.status == "Prepared" {
+                "Context is prepared; agent acceptance has not been confirmed.".into()
+            } else if transfer.status == "Pending" {
+                "Context resolves when the target conversation starts its next message.".into()
+            } else {
+                transfer.detail.clone()
+            }
+        });
+        history = history.child(
+            div()
+                .id(SharedString::from(format!(
+                    "details-{chat_id}-transfer-{}",
+                    transfer.id
+                )))
+                .w_full()
+                .min_h(px(48.0))
+                .px(px(ROW_PAD_X))
+                .py(px(6.0))
+                .rounded(px(ROW_RADIUS))
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .when(target.is_some(), |el| {
+                    el.cursor_pointer().hover(|el| el.bg(theme.wash(0.075)))
+                })
+                .tooltip(crate::tooltip::text(tooltip))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            icon(if transfer.failed {
+                                icons::DANGER_TRIANGLE
+                            } else {
+                                icons::ARROW_TURN_UP_RIGHT
+                            })
+                            .size(px(14.0))
+                            .text_color(if transfer.failed {
+                                theme.danger
+                            } else {
+                                theme.text_muted
+                            }),
+                        )
+                        .child(
+                            label(transfer.title.clone())
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(mono(
+                            transfer.status.clone(),
+                            if transfer.failed {
+                                theme.danger
+                            } else {
+                                theme.text_faint
+                            },
+                            theme,
+                        )),
+                )
+                .child(
+                    div().pl(px(22.0)).child(
+                        mono(transfer.detail.clone(), theme.text_faint, theme)
+                            .min_w_0()
+                            .truncate(),
+                    ),
+                )
+                .when_some(transfer.providers.clone(), |el, providers| {
+                    el.child(
+                        div().pl(px(22.0)).child(
+                            mono(providers, theme.text_faint, theme)
+                                .min_w_0()
+                                .truncate(),
+                        ),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(target) = &target {
+                        open(this, target.clone(), cx);
+                    }
+                })),
+        );
+    }
+    body = body.child(history);
+    if model.transfers.len() > 5 {
+        let toggle = actions.toggle_transfers.clone();
+        body = body.child(
+            hover_row(
+                row(
+                    format!("details-{chat_id}-transfer-more").into(),
+                    None,
+                    theme,
+                ),
+                theme,
+            )
+            .child(label(if ui.transfers_expanded {
+                "Show fewer".into()
+            } else {
+                format!("Show all · {}", model.transfers.len())
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| toggle(this, (), cx))),
+        );
+    }
+    body.into_any_element()
 }
 
 fn workspace_section(
@@ -877,6 +1232,9 @@ fn checkpoints_section(
         .take(shown)
         .map(|checkpoint| {
             let restore = actions.restore_checkpoint.clone();
+            let fork = actions.fork_thread.clone();
+            let fork_id = checkpoint.id.clone();
+            let can_fork = model.transfers_supported && !model.transfer_busy && checkpoint.forkable;
             let id = checkpoint.id.clone();
             let local = checkpoint.at.with_timezone(&chrono::Local);
             let stamp = if now.signed_duration_since(checkpoint.at).num_hours() < 20 {
@@ -905,6 +1263,22 @@ fn checkpoints_section(
                                 theme.diff_del,
                                 theme,
                             )),
+                    )
+                })
+                .when(can_fork, |el| {
+                    el.child(
+                        icon_action(
+                            format!("details-{chat_id}-cp-{}-fork", checkpoint.id).into(),
+                            icons::GIT_BRANCH,
+                            "Fork conversation from this checkpoint",
+                            theme,
+                        )
+                        .opacity(0.0)
+                        .group_hover(group.clone(), |el| el.opacity(1.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            fork(this, Some(fork_id.clone()), cx);
+                        })),
                     )
                 })
                 .child(
@@ -979,5 +1353,32 @@ mod tests {
             relative_future(now - chrono::Duration::hours(5), now),
             "in <1m"
         );
+    }
+
+    #[test]
+    fn transfer_actions_need_host_capability_finished_run_and_available_parent() {
+        let mut model = DetailsModel::default();
+        assert!(!model.can_fork());
+        model.fork_run_id = Some("run".into());
+        model.merge_run_id = Some("child-run".into());
+        model.merge_target = Some("parent".into());
+        assert!(!model.can_fork());
+        model.transfers_supported = true;
+        assert!(model.can_fork());
+        assert!(!model.can_merge_back());
+        model.lineage.push(ConversationRelation {
+            chat_id: "parent".into(),
+            available: true,
+            ..Default::default()
+        });
+        assert!(model.can_merge_back());
+        model.transfer_busy = true;
+        assert!(!model.can_fork());
+        assert!(!model.can_merge_back());
+        model.transfer_busy = false;
+        model.lineage[0].available = false;
+        assert!(!model.can_merge_back());
+        model.merge_run_id = None;
+        assert!(!model.can_merge_back());
     }
 }

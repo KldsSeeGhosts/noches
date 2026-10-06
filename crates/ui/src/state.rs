@@ -2722,6 +2722,9 @@ impl AppState {
     ) {
         if let Some(id) = &chat_id {
             self.focus_chat_sync(id, cx);
+            if self.chat_host_supports(id, zeron_proto::capabilities::THREAD_TRANSFERS_V1) {
+                self.refresh_details(id, false, cx);
+            }
         }
         self.nudge_delegation();
         if self.selected_chat == chat_id {
@@ -6010,7 +6013,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "appshots-fixture")]
+#[cfg(any(feature = "appshots-fixture", feature = "orchestration-fixture"))]
 impl AppState {
     /// Keep fixture documents deterministic while using the real attachment RPC.
     pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {
