@@ -5,6 +5,21 @@ use zeron_proto::orchestration_mcp::T3ThreadOrganizeInputAction;
 use crate::state::EngineHandle;
 
 impl EngineHandle {
+    pub async fn mutate_queued_run(
+        &self,
+        request: zeron_proto::MutateQueuedRunParams,
+    ) -> Result<zeron_proto::MutateQueuedRunResult, String> {
+        let value = self
+            .client()
+            .call(
+                zeron_rpc::methods::MUTATE_QUEUED_RUN,
+                serde_json::to_value(request).map_err(|e| e.to_string())?,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
     pub async fn queue_state(&self, chat_id: &str) -> Result<Option<QueueUiState>, String> {
         let value = self
             .client()

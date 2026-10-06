@@ -542,6 +542,56 @@ pub struct TranscriptSnapshot {
     pub replay_baseline: Arc<zeron_doc::TranscriptBaseline>,
 }
 
+#[derive(Clone, Default, Serialize)]
+pub struct QueueSnapshot {
+    pub items: Vec<QueuedMessage>,
+    pub canonical: Option<zeron_proto::QueueUiState>,
+}
+
+impl PartialEq for QueueSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+            && match (&self.canonical, &other.canonical) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    // Transcript token publications advance the SQL sequence, but
+                    // do not change queue controls. Do not repaint the composer
+                    // merely because unrelated conversation content grew.
+                a.schema_version == b.schema_version
+                    && a.thread_id == b.thread_id
+                        && a.queue == b.queue
+                        && a.pending_questions == b.pending_questions
+                        && a.lifecycle == b.lifecycle
+                        && a.active_run_id == b.active_run_id
+                        && a.can_promote_to_steer == b.can_promote_to_steer
+                }
+                _ => false,
+            }
+    }
+}
+
+#[cfg(test)]
+mod queue_snapshot_tests {
+    #[test]
+    fn unrelated_projection_sequences_do_not_repaint_queue_controls() {
+        let first = super::QueueSnapshot {
+            canonical: Some(zeron_proto::QueueUiState {
+                schema_version: 1, thread_id: "chat".into(), version: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut next = first.clone();
+        next.canonical.as_mut().unwrap().version = 100;
+        assert!(first == next);
+        next.canonical.as_mut().unwrap().active_run_id = Some("active".into());
+        assert!(first != next);
+        next = first.clone();
+        next.canonical.as_mut().unwrap().can_promote_to_steer = true;
+        assert!(first != next);
+    }
+}
+
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
 pub struct ChatDocHandle {
     chat_id: String,
@@ -556,6 +606,8 @@ pub struct ChatDocHandle {
     /// of short rows — so unlike the transcript mirror it publishes on every
     /// change without a dirty flag.
     queue_tx: watch::Sender<Vec<QueuedMessage>>,
+    /// Additive desktop view. Only watched queues expand the queue projection.
+    canonical_queue_tx: watch::Sender<QueueSnapshot>,
     /// Serializes everything that TAKES from the queue. Both the doc-change
     /// task and the turn-end status watcher call `drain_queue`, and nothing
     /// keeps those two apart: without this they interleave across the
@@ -661,6 +713,7 @@ impl ChatDocHandle {
     fn sync_protected(&self) -> bool {
         self.messages_tx.receiver_count() > 0
             || self.queue_tx.receiver_count() > 0
+            || self.canonical_queue_tx.receiver_count() > 0
             || self.writers.load(Ordering::Acquire) > 0
     }
 
@@ -724,6 +777,13 @@ impl ChatDocHandle {
         rx
     }
 
+    pub fn watch_canonical_queue(&self) -> watch::Receiver<QueueSnapshot> {
+        self.touch();
+        let rx = self.canonical_queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
     /// V2 mutations and the legacy drainer share this owner lane. Callers must
     /// keep the guard through source commit and the Loro intent patch.
     pub(crate) async fn orchestration_queue_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -737,6 +797,20 @@ impl ChatDocHandle {
     fn publish_queue(&self) {
         match self.doc.read_queue() {
             Ok(items) => {
+                if self.canonical_queue_tx.receiver_count() > 0 {
+                    let snapshot = QueueSnapshot {
+                        items: items.clone(),
+                        canonical: self.doc.orchestration_queue_state(),
+                    };
+                    self.canonical_queue_tx.send_if_modified(|slot| {
+                        if *slot == snapshot {
+                            false
+                        } else {
+                            *slot = snapshot;
+                            true
+                        }
+                    });
+                }
                 self.queue_tx.send_if_modified(|slot| {
                     if *slot == items {
                         false
@@ -1576,6 +1650,7 @@ impl DocHost {
         // appended after the handle exists retain the normal automatic drain.
         let recovered_queue_pending = !initial_queue.is_empty();
         let (queue_tx, _) = watch::channel(initial_queue);
+        let (canonical_queue_tx, _) = watch::channel(QueueSnapshot::default());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -1585,6 +1660,7 @@ impl DocHost {
             transcript_import: Mutex::default(),
             transcript_history,
             queue_tx,
+            canonical_queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
@@ -3061,7 +3137,10 @@ impl DocHost {
         if handle.publication_failed.load(Ordering::Acquire) {
             return true;
         }
-        if handle.messages_tx.receiver_count() > 0 || handle.queue_tx.receiver_count() > 0 {
+        if handle.messages_tx.receiver_count() > 0
+            || handle.queue_tx.receiver_count() > 0
+            || handle.canonical_queue_tx.receiver_count() > 0
+        {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -3314,7 +3393,10 @@ impl DocHost {
         let mut waiting = 0usize;
         let mut oldest = 0i64;
         for h in handles.values() {
-            if h.messages_tx.receiver_count() > 0 || h.queue_tx.receiver_count() > 0 {
+            if h.messages_tx.receiver_count() > 0
+                || h.queue_tx.receiver_count() > 0
+                || h.canonical_queue_tx.receiver_count() > 0
+            {
                 reasons["views"] = (reasons["views"].as_u64().unwrap() + 1).into();
             }
             if h.writers.load(Ordering::Acquire) > 0 {

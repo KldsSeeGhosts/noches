@@ -905,6 +905,8 @@ pub struct AppState {
     /// Independent of `selected_chat`: a pane keeps reading its own queue
     /// while another chat is selected.
     pane_queues: HashMap<String, Vec<zeron_doc::QueuedMessage>>,
+    /// Passive SQL queue snapshots keyed by thread, never CRDT intents.
+    pub(crate) canonical_queues: HashMap<String, zeron_proto::QueueUiState>,
     /// One queue watch task per fixed pane chat (single-flight per key;
     /// dropping the task cancels the engine-side watch).
     pane_queue_tasks: HashMap<String, Task<()>>,
@@ -1034,6 +1036,7 @@ impl AppState {
             delegation_nudge,
             delegation_nudge_rx: Some(delegation_nudge_rx),
             pane_queues: HashMap::new(),
+            canonical_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
             terminal_panels: HashMap::new(),
             auto_selected: false,
@@ -1284,6 +1287,8 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        self.canonical_queues
+            .retain(|id, _| self.chats.iter().any(|chat| &chat.id == id));
         self.chats_synced = true;
         self.apply_lifecycle_fixture();
         // A new child chat or a parent's publication arrives as a chat row.
@@ -2231,7 +2236,6 @@ impl AppState {
         }
     }
 
-
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         // O(1): the index is rebuilt wherever `sessions` is replaced, and the
         // field is private so no caller can bypass that.
@@ -2433,6 +2437,7 @@ impl AppState {
         self.local_device_id = None;
         self.update = None;
         self.pane_queues.clear();
+        self.canonical_queues.clear();
         self.pane_queue_tasks.clear();
         cx.notify();
     }
@@ -2934,6 +2939,23 @@ impl AppState {
         }
         if let Some(queue) = self.pane_queues.get_mut(chat_id) {
             f(queue);
+        }
+    }
+
+    pub(crate) fn apply_canonical_queue(
+        &mut self,
+        chat_id: &str,
+        snapshot: Option<zeron_proto::QueueUiState>,
+    ) {
+        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.thread_id == chat_id) else {
+            return;
+        };
+        if self
+            .canonical_queues
+            .get(chat_id)
+            .is_none_or(|old| old.version <= snapshot.version)
+        {
+            self.canonical_queues.insert(chat_id.to_owned(), snapshot);
         }
     }
 
@@ -3446,11 +3468,16 @@ fn spawn_queue_watch(
     struct QueueFrame {
         #[serde(default)]
         items: Vec<zeron_doc::QueuedMessage>,
+        #[serde(default)]
+        canonical: Option<zeron_proto::QueueUiState>,
     }
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
-            let params = serde_json::json!({ "chatId": chat_id });
+            let params = serde_json::json!({
+                "chatId": chat_id,
+                "includeCanonical": handle.engine_info().supports(zeron_proto::capabilities::CANONICAL_QUEUE_V1),
+            });
             let mut rx = match handle
                 .client()
                 .subscribe_checked(methods::WATCH_QUEUE, params)
@@ -3478,6 +3505,7 @@ fn spawn_queue_watch(
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                         state.queue = frame.items;
+                        state.apply_canonical_queue(&chat_id, frame.canonical);
                         cx.notify();
                     }
                 });
@@ -3505,11 +3533,16 @@ fn spawn_pane_queue_watch(
     struct QueueFrame {
         #[serde(default)]
         items: Vec<zeron_doc::QueuedMessage>,
+        #[serde(default)]
+        canonical: Option<zeron_proto::QueueUiState>,
     }
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
-            let params = serde_json::json!({ "chatId": chat_id });
+            let params = serde_json::json!({
+                "chatId": chat_id,
+                "includeCanonical": handle.engine_info().supports(zeron_proto::capabilities::CANONICAL_QUEUE_V1),
+            });
             let mut rx = match handle
                 .client()
                 .subscribe_checked(methods::WATCH_QUEUE, params)
@@ -3537,6 +3570,7 @@ fn spawn_pane_queue_watch(
                     // A stale pump racing a refresh finds no key.
                     if let Some(queue) = state.pane_queues.get_mut(&chat_id) {
                         *queue = frame.items;
+                        state.apply_canonical_queue(&chat_id, frame.canonical);
                         cx.notify();
                     }
                 });
@@ -6018,5 +6052,18 @@ impl AppState {
     /// Keep fixture documents deterministic while using the real attachment RPC.
     pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {
         self.engine = Some(engine);
+    }
+}
+
+#[cfg(feature = "orchestration-fixture")]
+impl AppState {
+    /// Use the production subscription/reducer for active composer and sidebar
+    /// status; static fixture rows must not pretend a held provider is idle.
+    pub fn fixture_watch_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = self.engine.clone() {
+            self.watch_tasks.push(spawn_watch(
+                cx, engine, methods::WATCH_SESSIONS, AppState::apply_sessions,
+            ));
+        }
     }
 }

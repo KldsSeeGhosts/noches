@@ -45,6 +45,8 @@ pub mod methods {
     pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
     pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
     pub const GET_QUEUE_STATE: &str = "GetQueueState";
+    /// Owner-only user authority over canonical queued runs (never an agent scope).
+    pub const MUTATE_QUEUED_RUN: &str = "MutateQueuedRun";
     pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
     pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";

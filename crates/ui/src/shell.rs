@@ -15367,6 +15367,31 @@ impl Shell {
         self.open_details_panel(cx);
     }
 
+    pub fn fixture_queue_rows(&self, cx: &Context<Self>) -> Vec<zeron_doc::QueuedMessage> {
+        let composer = self.composer.read(cx);
+        Composer::target_queue_rows(&composer.target, self.state.read(cx))
+    }
+
+    pub fn fixture_queue_edit(&self, id: String, text: String, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.begin_queue_edit(id, cx);
+            assert!(composer.canonical_queue_edit.is_some(), "fixture must edit a real SQL-only row");
+            composer.input.update(cx, |input, cx| input.set_text(text, cx));
+        });
+    }
+
+    pub fn fixture_queue_save(&self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| { assert!(composer.commit_queue_edit(cx)); });
+    }
+
+    pub fn fixture_queue_remove(&self, id: String, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| composer.remove_queued(id, cx));
+    }
+
+    pub fn fixture_queue_move(&self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| composer.move_queued(from, to, cx));
+    }
+
     pub fn fixture_orchestration_fork(&mut self, chat: String, cx: &mut Context<Self>) {
         self.fork_conversation(chat, None, cx);
     }

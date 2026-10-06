@@ -747,6 +747,14 @@ async fn loro_queue_has_one_drainer_and_cancelled_intents_do_not_resurrect() {
 async fn successful_promotion_preserves_attachments_and_only_enqueues_steering() {
     let f = Fixture::new();
     let active = f.start_target().await;
+    assert!(super::can_promote_to_steer(
+        &f.service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap()
+    ));
     let queued = f.sync("steering").await;
     let mut intents = f
         .service

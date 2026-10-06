@@ -44,11 +44,16 @@ pub enum SettleSource {
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct QueueUiState {
+    /// Zero denotes an older publisher without document provenance.
+    pub schema_version: u32,
     pub thread_id: String,
     pub version: i64,
     pub queue: Vec<QueueUiEntry>,
     pub pending_questions: Vec<PendingQuestionUi>,
     pub lifecycle: ChatLifecycle,
+    pub active_run_id: Option<String>,
+    /// A passive hint only. The owner rechecks the exact run/attempt/turn.
+    pub can_promote_to_steer: bool,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,6 +67,48 @@ pub struct QueueUiEntry {
     pub held: bool,
     pub delivery_gate: Option<serde_json::Value>,
     pub automatic: bool,
+    /// Loro rows keep their edit leases and attachment transport. Other rows
+    /// are presentation-only; clients must never insert them into the document.
+    pub document_backed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MutateQueuedRunParams {
+    pub chat_id: String,
+    pub queued_run_id: String,
+    pub client_request_id: String,
+    pub action: QueuedRunAction,
+    #[serde(default)]
+    pub target_device_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum QueuedRunAction {
+    /// Text-only edit: attachments and context remain on the original message.
+    Edit {
+        text: String,
+        expected_text: String,
+    },
+    Cancel,
+    Reorder {
+        before_run_id: Option<String>,
+    },
+    PromoteToSteer {
+        target_run_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MutateQueuedRunResult {
+    pub sequence: i64,
+    pub refusal: Option<String>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +122,27 @@ pub struct PendingQuestionUi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_queue_snapshots_do_not_claim_document_provenance_or_steering() {
+        let state: super::QueueUiState = serde_json::from_str(r#"{"threadId":"old","queue":[{"messageId":"m","text":"work"}]}"#).unwrap();
+        assert_eq!(state.schema_version, 0);
+        assert!(!state.can_promote_to_steer);
+        assert!(state.active_run_id.is_none());
+    }
+
+    #[test]
+    fn canonical_text_edits_require_the_original_text_and_stable_identity() {
+        let value = serde_json::json!({"chatId":"thread","queuedRunId":"run",
+            "clientRequestId":"stable", "action":{"type":"edit","text":"new"}});
+        assert!(serde_json::from_value::<super::MutateQueuedRunParams>(value.clone()).is_err());
+        let mut value = value;
+        value["action"]["expectedText"] = serde_json::json!("old");
+        let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
+        assert_eq!(request.action, super::QueuedRunAction::Edit {
+            text: "new".into(), expected_text: "old".into(),
+        });
+    }
+
     #[test]
     fn old_lifecycle_loads_with_defaults() {
         let value: super::ChatLifecycle = serde_json::from_str("{}").unwrap();

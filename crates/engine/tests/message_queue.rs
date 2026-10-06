@@ -30,6 +30,400 @@ use zeron_proto::{
 
 const CHAT: &str = "chat-queue";
 
+async fn canonical_input(core: &EngineCore, key: &str) -> String {
+    canonical_input_with_attachments(core, key, vec![]).await
+}
+
+async fn canonical_input_with_attachments(
+    core: &EngineCore,
+    key: &str,
+    attachments: Vec<serde_json::Value>,
+) -> String {
+    use zeron_engine::orchestration::thread_service::ThreadSendRequest;
+    use zeron_proto::orchestration::{OrchestrationV2Actor, OrchestrationV2CreationSource};
+    let thread = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    core.orchestration_host
+        .as_ref()
+        .unwrap()
+        .threads
+        .send_to_thread(ThreadSendRequest {
+            project_id: thread.thread.project_id,
+            thread_id: CHAT.into(),
+            command_id: format!("canonical:{key}").into(),
+            message_id: format!("message:{key}").into(),
+            scheduled_task_id: None,
+            sender_thread_id: None,
+            text: key.into(),
+            attachments,
+            model_selection: None,
+            mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Queue,
+            created_by: OrchestrationV2Actor::Agent,
+            creation_source: OrchestrationV2CreationSource::Mcp,
+        })
+        .await
+        .unwrap()
+        .run_id
+        .0
+}
+
+async fn canonical_frame(
+    rx: &mut zeron_rpc::RpcSubscription,
+    predicate: impl Fn(&zeron_proto::QueueUiState) -> bool,
+) -> zeron_proto::QueueUiState {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let value = rx.recv().await.expect("queue watch remains open");
+            if let Ok(queue) =
+                serde_json::from_value::<zeron_proto::QueueUiState>(value["canonical"].clone())
+                && predicate(&queue)
+            {
+                return queue;
+            }
+        }
+    })
+    .await
+    .expect("canonical queue snapshot must arrive without polling")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_canonical_queue_is_live_editable_idempotent_and_owner_authoritative() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut legacy = client
+        .subscribe_checked(methods::WATCH_QUEUE, json!({"chatId":CHAT}))
+        .await
+        .unwrap();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        legacy.recv().await.unwrap().get("canonical").is_none(),
+        "old watch contracts are unchanged"
+    );
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let attachments = vec![
+        json!({"type":"image","id":"upload","name":"diagram.png","mimeType":"image/png","sizeBytes":12}),
+    ];
+    let run =
+        canonical_input_with_attachments(&core, "agent queued work", attachments.clone()).await;
+    let state = canonical_frame(&mut watch, |queue| {
+        queue.queue.iter().any(|entry| entry.queued_run_id == run)
+    })
+    .await;
+    assert!(
+        !state
+            .queue
+            .iter()
+            .find(|entry| entry.queued_run_id == run)
+            .unwrap()
+            .document_backed
+    );
+    assert!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_queue()
+            .unwrap()
+            .is_empty(),
+        "SQL-only work is not inserted into Loro"
+    );
+    let edit = json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":"edit-identity",
+        "action":{"type":"edit","text":"edited agent work","expectedText":"agent queued work"}});
+    let first = client
+        .call(methods::MUTATE_QUEUED_RUN, edit.clone())
+        .await
+        .unwrap();
+    assert!(first["refusal"].is_null(), "{first}");
+    let sequence = core.orchestration.store.projection_frontier().unwrap();
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, edit.clone())
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        core.orchestration.store.projection_frontier().unwrap(),
+        sequence,
+        "response-loss retry emits no second edit"
+    );
+    let mut collision = edit.clone();
+    collision["action"]["text"] = json!("different payload");
+    assert!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, collision)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("identity")
+    );
+    let mut stale = edit;
+    stale["clientRequestId"] = json!("stale-editor");
+    stale["action"]["text"] = json!("overwrite");
+    let refusal = client
+        .call(methods::MUTATE_QUEUED_RUN, stale)
+        .await
+        .unwrap();
+    assert!(refusal["refusal"].as_str().unwrap().contains("changed"));
+    let updated = canonical_frame(&mut watch, |queue| {
+        queue
+            .queue
+            .iter()
+            .any(|entry| entry.text == "edited agent work")
+    })
+    .await;
+    assert_eq!(
+        updated
+            .queue
+            .iter()
+            .find(|entry| entry.queued_run_id == run)
+            .unwrap()
+            .attachments,
+        attachments
+    );
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let message = projection.records["message"]
+        .iter()
+        .find(|message| message["id"] == "message:agent queued work")
+        .unwrap();
+    assert_eq!(
+        message["createdBy"], "agent",
+        "user edits must preserve original provenance"
+    );
+    assert_eq!(message["creationSource"], "mcp");
+    let cancel = json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":"cancel-identity","action":{"type":"cancel"}});
+    let first = client
+        .call(methods::MUTATE_QUEUED_RUN, cancel.clone())
+        .await
+        .unwrap();
+    assert!(first["refusal"].is_null());
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, cancel)
+            .await
+            .unwrap(),
+        first
+    );
+    canonical_frame(&mut watch, |queue| {
+        !queue.queue.iter().any(|entry| entry.queued_run_id == run)
+    })
+    .await;
+    core.workspace
+        .create_chat("replica", None, Some("foreign-owner"), None, None)
+        .unwrap();
+    assert!(client.call(methods::MUTATE_QUEUED_RUN,
+        json!({"chatId":"replica","queuedRunId":run,"clientRequestId":"foreign","action":{"type":"cancel"}})).await.is_err());
+    assert!(
+        core.orchestration
+            .store
+            .thread(&"replica".into())
+            .unwrap()
+            .is_none()
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_mixed_queue_reorder_preserves_intents_and_edit_leases() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let sql = canonical_input(&core, "SQL work").await;
+    let a = core
+        .doc_host
+        .queue_message(CHAT, "typed a", vec![])
+        .unwrap();
+    let b = core
+        .doc_host
+        .queue_message(CHAT, "typed b", vec![])
+        .unwrap();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let snapshot = canonical_frame(&mut watch, |queue| queue.queue.len() == 3).await;
+    let ra = snapshot
+        .queue
+        .iter()
+        .find(|entry| entry.message_id == a)
+        .unwrap()
+        .queued_run_id
+        .clone();
+    let rb = snapshot
+        .queue
+        .iter()
+        .find(|entry| entry.message_id == b)
+        .unwrap()
+        .queued_run_id
+        .clone();
+    for (key, run, before) in [("b-before-sql", &rb, &sql), ("sql-before-a", &sql, &ra)] {
+        let result = client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,"queuedRunId":run,
+            "clientRequestId":key,"action":{"type":"reorder","beforeRunId":before}}),
+            )
+            .await
+            .unwrap();
+        assert!(result["refusal"].is_null(), "{result}");
+    }
+    assert_eq!(
+        queue_texts(&core),
+        ["typed b", "typed a"],
+        "SQL-only positions never corrupt Loro order"
+    );
+    let lease = client.call(methods::BEGIN_QUEUED_MESSAGE_EDIT,
+        json!({"chatId":CHAT,"id":a,"editorDeviceId":core.device_id,"editorInstanceId":"lease-test"})).await.unwrap();
+    assert_eq!(lease["outcome"], "acquired");
+    assert!(
+        client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,"queuedRunId":ra,"clientRequestId":"bypass-lease",
+        "action":{"type":"edit","text":"unsafe","expectedText":"typed a"}})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("protected")
+    );
+    assert_eq!(queue_texts(&core), ["typed b", "typed a"]);
+    let stale = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            json!({"chatId":CHAT,"queuedRunId":sql,"clientRequestId":"wrong-active",
+        "action":{"type":"promoteToSteer","targetRunId":"stale-run"}}),
+        )
+        .await
+        .unwrap();
+    assert!(stale["refusal"].is_string());
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "refused steering never starts or interrupts a provider"
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_canonical_promotion_targets_the_running_attempt_without_restart() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let queued = canonical_input(&core, "queued steering").await;
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let snapshot = canonical_frame(&mut watch, |queue| queue.can_promote_to_steer).await;
+    let active = snapshot.active_run_id.unwrap();
+    let request = json!({"chatId":CHAT,"queuedRunId":queued,"clientRequestId":"promote-identity",
+        "action":{"type":"promoteToSteer","targetRunId":active}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, request.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, request)
+            .await
+            .unwrap(),
+        reply
+    );
+    canonical_frame(&mut watch, |queue| queue.queue.is_empty()).await;
+    wait_for(
+        || {
+            user_messages(&core)
+                .iter()
+                .any(|text| text == "queued steering")
+        },
+        "steering effect delivery",
+    )
+    .await;
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "promotion never starts a second provider"
+    );
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection
+            .runs
+            .iter()
+            .find(|run| run.id.0 == queued)
+            .unwrap()
+            .status,
+        zeron_proto::orchestration::OrchestrationV2RunStatus::Cancelled
+    );
+    assert_eq!(
+        projection
+            .runs
+            .iter()
+            .find(|run| run.id.0 == active)
+            .unwrap()
+            .status,
+        zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// A turn that does not end until the test says so, so "the agent is busy" is
 /// a state the test controls rather than races.
 struct HeldHarness {

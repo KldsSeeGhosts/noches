@@ -1,12 +1,12 @@
 //! The pending-message queue, docked above the composer.
 //!
-//! Everything you typed while the agent was busy, in the order it will be sent.
-//! The rows live on the session doc ([`zeron_doc::QueuedMessage`]), so the phone
-//! shows the same queue and either device can reorder it.
+//! Typed intents and canonical agent/automation work, in delivery order. Typed
+//! rows live on the session doc; SQL-only rows are a passive projection, never
+//! synthetic intents. Every mutation is routed to its actual authority.
 //!
-//! Each row exposes a `Send now` control that interrupts the active response.
-//! Editing moves the message into the composer while its leased row reserves
-//! its position.
+//! Typed rows retain `Send now` and their host edit leases. Canonical work can
+//! steer a compatible active attempt; text edits preserve attachments/context
+//! and retain the draft if another editor or automatic drain wins the race.
 
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
@@ -69,17 +69,66 @@ const QUEUE_ICON_SIZE: f32 = 13.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePrimaryAction {
     SendNow,
+    Steer,
 }
 
 impl QueuePrimaryAction {
     fn tooltip(self) -> &'static str {
         match self {
             Self::SendNow => "Send now (interrupt)",
+            Self::Steer => "Steer active response",
         }
     }
 }
 
-/// All providers use Send now. Only host support and edit/review gates
+/// Unlike a document lease, this edit cannot stop an automatic drain. The
+/// owner uses the exact run and original text; a lost race retains the draft.
+pub(crate) struct CanonicalQueueEdit {
+    run_id: String,
+    base_text: String,
+    request: Option<(String, String)>,
+    attachment_count: usize,
+}
+
+/// Merge only for presentation. Never resurrect a consumed Loro intent from
+/// a delayed SQL publication, and never write SQL-only messages into Loro.
+fn queue_rows_for_display(
+    document: &[QueuedMessage],
+    canonical: Option<&zeron_proto::QueueUiState>,
+) -> Vec<QueuedMessage> {
+    let Some(canonical) = canonical.filter(|queue| queue.schema_version == 1) else {
+        return document.to_vec();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for entry in &canonical.queue {
+        seen.insert(entry.message_id.as_str());
+        if entry.automatic {
+            continue;
+        }
+        if let Some(row) = document.iter().find(|row| row.id == entry.message_id) {
+            rows.push(row.clone());
+        } else if !entry.document_backed {
+            let mut row = QueuedMessage::new(&entry.message_id, &entry.text, "");
+            row.attachments = entry.attachment_paths.clone();
+            row.hold_for_turn_end = entry.held;
+            row.delivery_gate = entry
+                .delivery_gate
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok());
+            rows.push(row);
+        }
+    }
+    rows.extend(
+        document
+            .iter()
+            .filter(|row| !seen.contains(row.id.as_str()))
+            .cloned(),
+    );
+    rows
+}
+
+/// Typed document rows use Send now. Only host support and edit/review gates
 /// determine whether the action is available.
 fn available_queue_primary_action(
     delivery_blocked: bool,
@@ -129,6 +178,7 @@ fn queue_drag_offsets(ix: usize, from: usize, prev_over: usize, over: usize) -> 
 pub struct QueueDragPayload {
     chat: String,
     from: usize,
+    message_id: String,
 }
 
 /// Where the dragged row would land, including the previous slot needed to
@@ -282,6 +332,37 @@ impl Composer {
         }
     }
 
+    pub(crate) fn target_queue_rows(target: &ChatTarget, state: &AppState) -> Vec<QueuedMessage> {
+        queue_rows_for_display(
+            Self::target_queue(target, state),
+            target
+                .chat_id(state)
+                .and_then(|id| state.canonical_queues.get(id)),
+        )
+    }
+
+    fn canonical_queue_entry<'a>(
+        &self,
+        id: &str,
+        state: &'a AppState,
+    ) -> Option<&'a zeron_proto::QueueUiEntry> {
+        let chat = self.target.chat_id(state)?;
+        state
+            .canonical_queues
+            .get(chat)
+            .filter(|queue| queue.schema_version == 1)?
+            .queue
+            .iter()
+            .find(|entry| {
+                entry.message_id == id
+                    && !entry.document_backed
+                    && !entry.automatic
+                    && !Self::target_queue(&self.target, state)
+                        .iter()
+                        .any(|row| row.id == id)
+            })
+    }
+
     /// The queue panel, or `None` when nothing is waiting. Like the composer,
     /// it is one frosted surface; rows use spacing and hover wash rather than
     /// nesting raised cards inside it.
@@ -304,7 +385,7 @@ impl Composer {
                 zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
             );
             (
-                Self::target_queue(&self.target, state).to_vec(),
+                Self::target_queue_rows(&self.target, state),
                 chat_id,
                 host_supports_actions,
             )
@@ -373,7 +454,16 @@ impl Composer {
                         .map(|d| d.over)
                         .unwrap_or(payload.from);
                     this.queue_drag = None;
-                    this.move_queued(payload.from, to, cx);
+                    let state = this.state.read(cx);
+                    if this.target.chat_id(state) != Some(drop_chat.as_str()) {
+                        return;
+                    }
+                    let from = Self::target_queue_rows(&this.target, state)
+                        .iter()
+                        .position(|row| row.id == payload.message_id);
+                    if let Some(from) = from {
+                        this.move_queued(from, to, cx);
+                    }
                 },
             ))
             .on_mouse_up_out(
@@ -403,6 +493,10 @@ impl Composer {
         let key = SharedString::from(format!("queue-{}", item.id));
         let being_edited = editing.as_deref() == Some(item.id.as_str());
         let being_removed = self.queue_removing.contains(&item.id);
+        let state = self.state.read(cx);
+        let canonical = self.canonical_queue_entry(&item.id, state).cloned();
+        let canonical_supported =
+            state.chat_host_supports(chat_id, zeron_proto::capabilities::CANONICAL_QUEUE_V1);
         let delivery_blocked = item.delivery_gate.is_some();
         let interaction_blocked = delivery_blocked || being_removed;
         let text = match &item.delivery_gate {
@@ -421,7 +515,7 @@ impl Composer {
             "edit",
             "Edit",
             icons::PEN,
-            !being_removed,
+            !being_removed && (canonical.is_none() || canonical_supported),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
@@ -432,20 +526,33 @@ impl Composer {
             &key,
             "drop",
             if being_removed {
-                "Removing…"
+                "Updating…"
             } else {
                 "Remove"
             },
             icons::TRASH_BIN_MINIMALISTIC,
-            !being_removed,
+            !being_removed && (canonical.is_none() || canonical_supported),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.remove_queued(drop_id.clone(), cx);
             }),
         );
-        let resolved_primary =
-            available_queue_primary_action(interaction_blocked, host_supports_actions);
-        let primary_action = resolved_primary.unwrap_or(QueuePrimaryAction::SendNow);
+        let resolved_primary = if canonical.is_some() {
+            (!interaction_blocked
+                && canonical_supported
+                && state
+                    .canonical_queues
+                    .get(chat_id)
+                    .is_some_and(|queue| queue.can_promote_to_steer))
+            .then_some(QueuePrimaryAction::Steer)
+        } else {
+            available_queue_primary_action(interaction_blocked, host_supports_actions)
+        };
+        let primary_action = resolved_primary.unwrap_or(if canonical.is_some() {
+            QueuePrimaryAction::Steer
+        } else {
+            QueuePrimaryAction::SendNow
+        });
         let primary_id = item.id.clone();
         let primary = self.queue_primary_action_button(
             &key,
@@ -533,6 +640,7 @@ impl Composer {
                     QueueDragPayload {
                         chat: drag_chat,
                         from: ix,
+                        message_id: item.id.clone(),
                     },
                     move |_payload, _point, _, cx| {
                         cx.stop_propagation();
@@ -545,7 +653,15 @@ impl Composer {
             // from the editing state.
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .when(!being_edited, |el| {
-                let labels = queue_attachment_labels(&item.text, &item.attachments);
+                let mut labels = queue_attachment_labels(&item.text, &item.attachments);
+                if let Some(entry) = canonical {
+                    labels.extend(entry.attachments.iter().map(|attachment| {
+                        attachment["name"]
+                            .as_str()
+                            .unwrap_or("Attachment")
+                            .to_owned()
+                    }));
+                }
                 let summary = if labels.len() > 1 {
                     format!("{} attachments · {}", labels.len(), labels.join(" · "))
                 } else {
@@ -619,9 +735,16 @@ impl Composer {
                         .text_size(px(QUEUE_TEXT_SIZE))
                         .text_color(theme.text_muted)
                         .child(if self.queue_edit_finishing {
-                            "Saving…"
+                            SharedString::from("Saving…")
+                        } else if let Some(edit) = &self.canonical_queue_edit
+                            && edit.attachment_count > 0
+                        {
+                            SharedString::from(format!(
+                                "Editing text · {} attachments kept",
+                                edit.attachment_count
+                            ))
                         } else {
-                            "Editing in composer"
+                            SharedString::from("Editing in composer")
                         }),
                 )
             })
@@ -1027,7 +1150,12 @@ impl Composer {
                     .text_color(theme.text_muted)
                     .into_any_element()
             } else {
-                div().child("Send now").into_any_element()
+                div()
+                    .child(match action {
+                        QueuePrimaryAction::SendNow => "Send now",
+                        QueuePrimaryAction::Steer => "Steer",
+                    })
+                    .into_any_element()
             })
             .into_any_element()
     }
@@ -1069,6 +1197,52 @@ impl Composer {
             cx.notify();
             return;
         }
+        let state = self.state.read(cx);
+        let rows = Self::target_queue_rows(&self.target, state);
+        let canonical = self
+            .target
+            .chat_id(state)
+            .and_then(|id| state.canonical_queues.get(id))
+            .filter(|queue| queue.schema_version == 1);
+        if canonical.is_some_and(|queue| {
+            queue
+                .queue
+                .iter()
+                .any(|entry| !entry.automatic && !entry.document_backed)
+        }) {
+            let Some(queue) = canonical else { return };
+            let Some(row) = rows.get(from) else { return };
+            let Some(run) = queue.queue.iter().find(|entry| entry.message_id == row.id) else {
+                self.failure = Some("The queue is still syncing; try reordering again".into());
+                cx.notify();
+                return;
+            };
+            let run_id = run.queued_run_id.clone();
+            let mut order = rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+            order.remove(from);
+            let before = order.get(to.min(order.len())).copied();
+            let before_run_id = match before {
+                None => None,
+                Some(id) => {
+                    let Some(entry) = queue.queue.iter().find(|entry| entry.message_id == id)
+                    else {
+                        self.failure =
+                            Some("The queue is still syncing; try reordering again".into());
+                        cx.notify();
+                        return;
+                    };
+                    Some(entry.queued_run_id.clone())
+                }
+            };
+            let message_id = row.id.clone();
+            self.canonical_queue_action(
+                message_id,
+                run_id,
+                zeron_proto::QueuedRunAction::Reorder { before_run_id },
+                cx,
+            );
+            return;
+        }
         let (id, chat_id) = {
             let state = self.state.read(cx);
             let Some(id) = Self::target_queue(&self.target, state)
@@ -1103,6 +1277,18 @@ impl Composer {
     /// until the host acknowledges winning the race against automatic drain.
     pub(crate) fn remove_queued(&mut self, id: String, cx: &mut Context<Self>) {
         if self.queue_removing.contains(&id) {
+            return;
+        }
+        if let Some(entry) = self
+            .canonical_queue_entry(&id, self.state.read(cx))
+            .cloned()
+        {
+            self.canonical_queue_action(
+                id,
+                entry.queued_run_id,
+                zeron_proto::QueuedRunAction::Cancel,
+                cx,
+            );
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1229,14 +1415,44 @@ impl Composer {
     ) {
         match action {
             QueuePrimaryAction::SendNow => self.send_queued_now(id, cx),
+            QueuePrimaryAction::Steer => {
+                let state = self.state.read(cx);
+                let Some(entry) = self.canonical_queue_entry(&id, state) else {
+                    return;
+                };
+                let Some(target_run_id) = self
+                    .target
+                    .chat_id(state)
+                    .and_then(|id| state.canonical_queues.get(id))
+                    .filter(|queue| queue.can_promote_to_steer)
+                    .and_then(|queue| queue.active_run_id.clone())
+                else {
+                    return;
+                };
+                let run_id = entry.queued_run_id.clone();
+                self.canonical_queue_action(
+                    id,
+                    run_id,
+                    zeron_proto::QueuedRunAction::PromoteToSteer { target_run_id },
+                    cx,
+                );
+            }
         }
     }
 
-    /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
-    /// the most recently queued row: Send now, interrupting the current response.
-    /// An edit/review gate or an old chat host makes it a no-op.
+    /// Cmd/Ctrl+Enter activates the most recent row's advertised action:
+    /// interrupt for typed intents, or exact-attempt steering for canonical work.
+    /// Unsupported capabilities and edit/review gates remain a no-op.
     pub(crate) fn activate_latest_queued(&mut self, cx: &mut Context<Self>) {
         if self.editing_queued.is_some() {
+            return;
+        }
+        let state = self.state.read(cx);
+        if let Some(row) = Self::target_queue_rows(&self.target, state).last()
+            && self.canonical_queue_entry(&row.id, state).is_some()
+        {
+            let id = row.id.clone();
+            self.activate_queued_primary(id, QueuePrimaryAction::Steer, cx);
             return;
         }
         let (id, delivery_blocked, host_supports_actions) = {
@@ -1270,6 +1486,13 @@ impl Composer {
             || self.editing_queued.is_some()
             || !self.can_edit_queue_in_composer()
         {
+            return;
+        }
+        if let Some(entry) = self
+            .canonical_queue_entry(&id, self.state.read(cx))
+            .cloned()
+        {
+            self.begin_canonical_queue_edit(id, entry, cx);
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1457,10 +1680,17 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
-        if self.input.update(cx, |input, cx| input.finish_dictation(true, cx)) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
             return true;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        if self.canonical_queue_edit.is_some() {
+            self.finish_canonical_queue_edit(text, cx);
+            return true;
+        }
         if text.is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
             self.finish_queue_edit("discard", None, cx);
         } else {
@@ -1475,6 +1705,12 @@ impl Composer {
             return false;
         }
         self.input.update(cx, |input, _| input.cancel_dictation());
+        if self.canonical_queue_edit.is_some() {
+            if !self.queue_edit_finishing {
+                self.clear_queue_edit_local(cx);
+            }
+            return true;
+        }
         self.finish_queue_edit("cancel", None, cx);
         true
     }
@@ -1487,6 +1723,7 @@ impl Composer {
     fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
         self.input.update(cx, |input, _| input.cancel_dictation());
         self.editing_queued = None;
+        self.canonical_queue_edit = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
         self.queue_edit_chat_id = None;
@@ -1691,6 +1928,176 @@ impl Composer {
         .detach();
     }
 
+    fn begin_canonical_queue_edit(
+        &mut self,
+        id: String,
+        entry: zeron_proto::QueueUiEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let Some(chat) = self.target.chat(state) else {
+            return;
+        };
+        if !state.chat_host_supports(&chat.id, zeron_proto::capabilities::CANONICAL_QUEUE_V1) {
+            self.failure = Some("Update the chat host to manage queued runs".into());
+            cx.notify();
+            return;
+        }
+        self.queue_edit_chat_id = Some(chat.id.clone());
+        self.queue_edit_host_device_id = Some(chat.device_id.clone());
+        self.editing_queued = Some(id);
+        self.canonical_queue_edit = Some(CanonicalQueueEdit {
+            run_id: entry.queued_run_id,
+            base_text: entry.text.clone(),
+            request: None,
+            attachment_count: entry.attachments.len() + entry.attachment_paths.len(),
+        });
+        self.queue_edit_draft = Some((
+            self.input.read(cx).text().to_string(),
+            self.attachments
+                .remove(&self.current_key)
+                .unwrap_or_default(),
+            self.appshots.remove(&self.current_key).unwrap_or_default(),
+        ));
+        self.queue_drag = None;
+        self.focus_pending = true;
+        self.input
+            .update(cx, |input, cx| input.set_text(entry.text, cx));
+        cx.notify();
+    }
+
+    fn finish_canonical_queue_edit(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.queue_edit_finishing {
+            return;
+        }
+        if text.trim().is_empty() {
+            self.failure =
+                Some("Enter a message, or cancel the edit and remove it from the queue".into());
+            cx.notify();
+            return;
+        }
+        if !self.staged().is_empty() || !self.staged_appshots().is_empty() {
+            self.failure = Some("This edit changes text only; the queued attachments are kept. Remove the new attachments to save.".into());
+            cx.notify();
+            return;
+        }
+        let (Some(chat_id), Some(host), Some(edit), Some(engine)) = (
+            self.queue_edit_chat_id.clone(),
+            self.queue_edit_host_device_id.clone(),
+            self.canonical_queue_edit.as_mut(),
+            self.state.read(cx).engine().cloned(),
+        ) else {
+            return;
+        };
+        if edit
+            .request
+            .as_ref()
+            .is_none_or(|(previous, _)| *previous != text)
+        {
+            edit.request = Some((text.clone(), uuid::Uuid::new_v4().to_string()));
+        }
+        let request = zeron_proto::MutateQueuedRunParams {
+            chat_id,
+            queued_run_id: edit.run_id.clone(),
+            client_request_id: edit.request.as_ref().unwrap().1.clone(),
+            target_device_id: Some(host),
+            action: zeron_proto::QueuedRunAction::Edit {
+                text,
+                expected_text: edit.base_text.clone(),
+            },
+        };
+        self.queue_edit_finishing = true;
+        self.input.update(cx, |input, cx| {
+            input.read_only = true;
+            cx.notify();
+        });
+        cx.notify();
+        self.queue_edit_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.mutate_queued_run(request).await;
+            this.update(cx, |composer, cx| {
+                composer.queue_edit_finishing = false;
+                composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
+                match result {
+                    Ok(reply) if reply.refusal.is_none() => {
+                        composer.clear_queue_edit_local(cx);
+                    }
+                    Ok(reply) => {
+                        composer.failure = Some(format!("{} Your edit is still in the composer.", reply.refusal.unwrap()).into());
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "canonical queue edit failed");
+                        composer.failure = Some("Couldn't reach the chat host; your edit is still in the composer. Save again to retry.".into());
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }));
+    }
+
+    fn canonical_queue_action(
+        &mut self,
+        message_id: String,
+        run_id: String,
+        action: zeron_proto::QueuedRunAction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.queue_removing.contains(&message_id) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let (Some(chat), Some(engine)) = (self.target.chat(state), state.engine().cloned()) else {
+            return;
+        };
+        if !state.chat_host_supports(&chat.id, zeron_proto::capabilities::CANONICAL_QUEUE_V1) {
+            self.failure = Some("Update the chat host to manage queued runs".into());
+            cx.notify();
+            return;
+        }
+        let chat_id = chat.id.clone();
+        let request = zeron_proto::MutateQueuedRunParams {
+            chat_id: chat_id.clone(),
+            queued_run_id: run_id,
+            client_request_id: uuid::Uuid::new_v4().to_string(),
+            target_device_id: Some(chat.device_id.clone()),
+            action,
+        };
+        self.queue_removing.insert(message_id.clone());
+        self.queue_drag = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // One safe retry of the exact identity covers after-commit response
+            // loss. Never retarget or mint another steering command.
+            let result = match engine.mutate_queued_run(request.clone()).await {
+                Err(_) => engine.mutate_queued_run(request).await,
+                result => result,
+            };
+            this.update(cx, |composer, cx| {
+                composer.queue_removing.remove(&message_id);
+                let failure = match result {
+                    Ok(reply) => reply.refusal,
+                    Err(error) => {
+                        tracing::warn!(%error, "canonical queue action failed");
+                        Some(
+                            "Couldn't update the queue; reconnect to the chat host and try again"
+                                .into(),
+                        )
+                    }
+                };
+                if let Some(failure) = failure
+                    && composer.target.chat_id(composer.state.read(cx)) == Some(chat_id.as_str())
+                {
+                    composer.failure = Some(failure.into());
+                }
+                composer
+                    .state
+                    .update(cx, |state, cx| state.refresh_chat_queue(&chat_id, cx));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Fire one queue mutation at the chat's doc host.
     fn queue_rpc(
         &mut self,
@@ -1821,6 +2228,121 @@ mod tests {
         queue_drop_index, queue_latest_shortcut_visible, queue_mutation_acknowledged,
         queue_visible_text, visible_queue_rows,
     };
+
+    #[test]
+    fn canonical_rows_are_ordered_deduplicated_and_never_resurrect_consumed_intents() {
+        use zeron_doc::QueuedMessage;
+        use zeron_proto::{QueueUiEntry, QueueUiState};
+        let entry = |id: &str, document_backed, automatic| QueueUiEntry {
+            queued_run_id: format!("run:{id}"),
+            message_id: id.into(),
+            text: format!("canonical {id}"),
+            document_backed,
+            automatic,
+            ..Default::default()
+        };
+        let canonical = QueueUiState {
+            schema_version: 1,
+            queue: vec![
+                entry("completion", false, true),
+                entry("agent", false, false),
+                entry("typed", true, false),
+                entry("consumed", true, false),
+            ],
+            ..Default::default()
+        };
+        let doc = vec![
+            QueuedMessage::new("typed", "new local edit", "device"),
+            QueuedMessage::new("not-admitted-yet", "pending", "device"),
+        ];
+        let rows = super::queue_rows_for_display(&doc, Some(&canonical));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["agent", "typed", "not-admitted-yet"]
+        );
+        assert_eq!(rows[1].text, "new local edit");
+        assert_eq!(doc.len(), 2, "synthetic rows never become intents");
+        assert_eq!(
+            super::queue_rows_for_display(&doc, None),
+            doc,
+            "old hosts retain the legacy path"
+        );
+    }
+
+    #[test]
+    fn canonical_queue_snapshots_are_thread_scoped_and_sequence_fenced() {
+        use zeron_proto::QueueUiState;
+        let mut state = crate::state::AppState::new();
+        let snapshot = |id: &str, version| QueueUiState {
+            thread_id: id.into(),
+            version,
+            ..Default::default()
+        };
+        state.apply_canonical_queue("pane", Some(snapshot("pane", 9)));
+        state.apply_canonical_queue("pane", Some(snapshot("pane", 3)));
+        state.apply_canonical_queue("pane", Some(snapshot("other", 20)));
+        state.apply_canonical_queue("selected", Some(snapshot("selected", 11)));
+        assert_eq!(state.canonical_queues["pane"].version, 9);
+        assert_eq!(state.canonical_queues["selected"].version, 11);
+        state.apply_canonical_queue("pane", None);
+        assert_eq!(state.canonical_queues["pane"].version, 9);
+    }
+
+    #[gpui::test]
+    fn draining_a_canonical_edit_retains_both_drafts(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let state = cx.new(|_| {
+            let mut state = crate::state::AppState::new();
+            state.selected_chat = Some("source".into());
+            state.canonical_queues.insert(
+                "source".into(),
+                zeron_proto::QueueUiState {
+                    schema_version: 1,
+                    thread_id: "source".into(),
+                    queue: vec![zeron_proto::QueueUiEntry {
+                        message_id: "queued".into(),
+                        queued_run_id: "queued-run".into(),
+                        text: "original work".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            state
+        });
+        let composer = cx.new(|cx| super::Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.editing_queued = Some("queued".into());
+            composer.canonical_queue_edit = Some(super::CanonicalQueueEdit {
+                run_id: "queued-run".into(),
+                base_text: "original work".into(),
+                request: None,
+                attachment_count: 0,
+            });
+            composer.queue_edit_draft = Some(("previous draft".into(), vec![], vec![]));
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("unsaved edit", cx));
+        });
+        state.update(cx, |state, cx| {
+            state
+                .canonical_queues
+                .get_mut("source")
+                .unwrap()
+                .queue
+                .clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, cx| {
+            assert!(composer.editing_queued.is_none());
+            assert!(composer.canonical_queue_edit.is_none());
+            assert_eq!(
+                composer.input.read(cx).text(),
+                "previous draft\n\nunsaved edit"
+            );
+        });
+    }
 
     #[test]
     fn queue_preview_work_follows_the_visible_rows() {

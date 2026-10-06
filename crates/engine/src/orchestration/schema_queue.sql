@@ -22,3 +22,9 @@ CREATE TABLE IF NOT EXISTS orchestration_queue_patches (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS orchestration_queue_patches_thread
     ON orchestration_queue_patches(thread_id,sequence);
+-- Reserve user request identities before dispatch. A lost response/restart can
+-- retry the exact command, but cannot silently change its target or content.
+CREATE TABLE IF NOT EXISTS orchestration_queue_user_requests (
+    command_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+) STRICT;

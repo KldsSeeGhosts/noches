@@ -179,6 +179,13 @@ fn queue_mutation(
             if automatic(&message) {
                 return Err(refuse("Automatic completion deliveries cannot be edited."));
             }
+            if let Some(expected) = op.input["expectedText"].as_str()
+                && message["text"].as_str() != Some(expected)
+            {
+                return Err(refuse(
+                    "This queued message changed; your edit was not applied.",
+                ));
+            }
             message["text"] = json!(text);
             message["updatedAt"] = json!(iso(now)?);
             plan.emit(command, "message.updated", &message, now)?;
@@ -273,14 +280,14 @@ fn queue_mutation(
     }
 }
 
-fn steer(
-    plan: &mut Plan,
-    command: &Command,
-    p: &ThreadProjection,
+fn steering_target<'a>(
+    p: &'a ThreadProjection,
     target: &str,
     message: &Value,
-    now: i64,
-) -> Result<()> {
+) -> Result<(&'a OrchestrationV2Run, &'a str, &'a Value)> {
+    if p.thread.archived_at.is_some() {
+        return Err(refuse("Thread is not active."));
+    }
     let run = p
         .runs
         .iter()
@@ -335,6 +342,18 @@ fn steer(
                 && t["status"] == "running"
         })
         .ok_or_else(|| refuse("No running provider turn found for active run."))?;
+    Ok((run, session_id, turn))
+}
+
+fn steer(
+    plan: &mut Plan,
+    command: &Command,
+    p: &ThreadProjection,
+    target: &str,
+    message: &Value,
+    now: i64,
+) -> Result<()> {
+    let (run, session_id, turn) = steering_target(p, target, message)?;
     let mut message = message.clone();
     message["runId"] = json!(run.id);
     message["nodeId"] = json!(run.root_node_id);
@@ -362,6 +381,15 @@ fn steer(
         message_id: MessageId(message["id"].as_str().unwrap().into()),
     });
     Ok(())
+}
+
+/// Use the actual steering planner for the passive UI hint, so provider,
+/// maintenance and attempt/turn fences cannot drift from the mutation path.
+pub(crate) fn can_promote_to_steer(p: &ThreadProjection) -> bool {
+    let Some(run) = task::active_run(p) else {
+        return false;
+    };
+    steering_target(p, &run.id.0, &json!({"text":"message"})).is_ok()
 }
 
 fn respond(

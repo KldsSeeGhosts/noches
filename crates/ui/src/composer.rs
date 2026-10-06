@@ -4201,6 +4201,7 @@ pub struct Composer {
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
+    pub(crate) canonical_queue_edit: Option<crate::queue::CanonicalQueueEdit>,
     /// Host-issued generation protecting `editing_queued` from automatic
     /// delivery. The text buffer is kept until Finish receives an ACK.
     pub(crate) queue_edit_lease_id: Option<String>,
@@ -4575,6 +4576,7 @@ impl Composer {
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
+            canonical_queue_edit: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
             queue_edit_chat_id: None,
@@ -4959,6 +4961,11 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         if self.queue_edit_finishing {
+            return;
+        }
+        if self.canonical_queue_edit.is_some() {
+            self.failure = Some("This queue edit changes text only; the original attachments are kept".into());
+            cx.notify();
             return;
         }
         let key = self.current_key.clone();
@@ -5443,6 +5450,11 @@ impl Composer {
     /// Paperclip: the native image picker (the original's hidden
     /// `<input type=file accept=image/* multiple>`).
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
+        if self.canonical_queue_edit.is_some() {
+            self.failure = Some("This queue edit changes text only; the original attachments are kept".into());
+            cx.notify();
+            return;
+        }
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -6172,7 +6184,7 @@ impl Composer {
             // `target_queue` is this composer's own projection - selected or
             // pane-fixed - so removal markers verify against its rows without
             // involving the selection.
-            let queue = Self::target_queue(&self.target, state);
+            let queue = Self::target_queue_rows(&self.target, state);
             self.queue_removing
                 .retain(|id| queue.iter().any(|item| item.id == *id));
         }
@@ -6189,7 +6201,7 @@ impl Composer {
                 self.target.key(s),
                 pending_input_request(self.target.transcript(s)),
                 editing_id.as_ref().is_none_or(|id| {
-                    Self::target_queue(&self.target, s)
+                    Self::target_queue_rows(&self.target, s)
                         .iter()
                         .any(|item| item.id == *id)
                 }),

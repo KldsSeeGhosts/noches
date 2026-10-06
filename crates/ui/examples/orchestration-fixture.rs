@@ -3,7 +3,10 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
+use futures::{
+    StreamExt as _,
+    stream::{self, BoxStream},
+};
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
 use serde_json::json;
 use zeron_engine::{EngineCore, HarnessRegistry};
@@ -52,6 +55,29 @@ impl Harness for FixtureHarness {
         _: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let native = uuid::Uuid::new_v4().to_string();
+        if request
+            .prompt
+            .ends_with("Hold this response while I arrange the queue.")
+        {
+            return Ok(stream::iter([
+                Ok(AgentEvent::SessionStarted {
+                    instance_id: None,
+                    session_id: native,
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    cwd: request.cwd,
+                    tools: vec![],
+                    assistant_message_id: uuid::Uuid::new_v4().to_string(),
+                }),
+                Ok(AgentEvent::TextDelta {
+                    text:
+                        "Working on the current request. Queued instructions remain editable below."
+                            .into(),
+                }),
+            ])
+            .chain(stream::pending())
+            .boxed());
+        }
         let text = if request
             .prompt
             .ends_with("Check the retry boundary in this fork.")
@@ -125,6 +151,37 @@ async fn send(core: &EngineCore, chat: &str, key: &str, text: &str) -> anyhow::R
         }
     })
     .await?;
+    Ok(())
+}
+
+async fn queued_intake(
+    core: &EngineCore,
+    key: &str,
+    text: &str,
+    mode: T3ThreadSendInputMode,
+) -> anyhow::Result<()> {
+    core.orchestration_host
+        .as_ref()
+        .unwrap()
+        .threads
+        .send_to_thread(
+            zeron_engine::orchestration::thread_service::ThreadSendRequest {
+                project_id: "fixture-project".into(),
+                thread_id: "fixture-queue".into(),
+                command_id: key.into(),
+                message_id: format!("message:{key}").into(),
+                scheduled_task_id: None,
+                sender_thread_id: None,
+                text: text.into(),
+                attachments: vec![],
+                model_selection: None,
+                mode,
+                created_by: OrchestrationV2Actor::Agent,
+                creation_source: OrchestrationV2CreationSource::Mcp,
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     Ok(())
 }
 
@@ -218,6 +275,12 @@ fn main() -> anyhow::Result<()> {
         })).await?;
         core.workspace.rename_chat("fixture-parent", "Review orchestration boundaries")?;
         core.workspace.set_chat_branch("fixture-parent", "main")?;
+        client.call(methods::MUTATE, json!({
+            "op":"createChat", "chatId":"fixture-queue", "spaceId":"fixture-project", "cwd":checkout,
+            "config":{"harness":"mock", "model":"mock-1", "reasoning":null, "sandbox":"workspace-write",
+                "runtimeMode":"full-access", "interactionMode":"default"}
+        })).await?;
+        core.workspace.rename_chat("fixture-queue", "Arrange queued work")?;
         send(&core, "fixture-parent", "initial", "Review how conversation forks and agent handoffs preserve context.").await
     })?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -276,6 +339,7 @@ fn main() -> anyhow::Result<()> {
             state.spaces_synced = true;
             state
         });
+        state.update(cx, |state, cx| state.fixture_watch_sessions(cx));
         let window = cx.open_window(WindowOptions {
             window_background: theme::Theme::of(cx).window_background_appearance(),
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -336,12 +400,48 @@ fn main() -> anyhow::Result<()> {
                 window.update(cx, |_, window, _| window.resize(size(px(960.), px(720.))))?;
                 pause(cx, 400).await;
                 capture(window.into(), cx, &output, &format!("merge-back-{mode}-960"))?;
+                let queue_core = renderer_core.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    queued_intake(&queue_core, "active-queue", "Hold this response while I arrange the queue.", T3ThreadSendInputMode::Auto).await
+                }).await??;
+                pause(cx, 800).await;
+                let queue_core = renderer_core.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    queued_intake(&queue_core, "agent-queue", "Review the handoff acceptance receipt.", T3ThreadSendInputMode::Queue).await?;
+                    queue_core.doc_host.queue_message("fixture-queue", "Typed follow-up: verify the retry boundary.", vec![])?;
+                    queued_intake(&queue_core, "automation-queue", "Summarize the remaining orchestration gaps.", T3ThreadSendInputMode::Queue).await
+                }).await??;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_open("fixture-queue".into(), cx))?;
+                pause(cx, 1200).await;
+                let rows = window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?;
+                anyhow::ensure!(rows.len() == 3, "The unified native tray did not receive all three queue rows");
+                capture(window.into(), cx, &output, &format!("unified-queue-{mode}-960"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_queue_edit(
+                    "message:agent-queue".into(), "Review the accepted native handoff and its coverage.".into(), cx))?;
+                pause(cx, 300).await;
+                capture(window.into(), cx, &output, &format!("queue-edit-{mode}-960"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_queue_save(cx))?;
+                pause(cx, 1000).await;
+                let rows = window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?;
+                anyhow::ensure!(rows.iter().any(|row| row.text == "Review the accepted native handoff and its coverage."), "The native composer edit was not accepted by SQL");
+                let from = rows.iter().position(|row| row.id == "message:automation-queue").unwrap();
+                window.update(cx, |shell, _, cx| shell.fixture_queue_move(from, 0, cx))?;
+                pause(cx, 800).await;
+                let rows = window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?;
+                anyhow::ensure!(rows[0].id == "message:automation-queue", "Canonical reorder did not reach the native tray");
+                window.update(cx, |shell, _, cx| shell.fixture_queue_remove("message:automation-queue".into(), cx))?;
+                pause(cx, 800).await;
+                let rows = window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?;
+                anyhow::ensure!(rows.len() == 2 && rows.iter().all(|row| row.id != "message:automation-queue"), "Canonical cancellation did not reach the tray");
+                anyhow::ensure!(renderer_core.doc_host.open("fixture-queue")?.doc().read_queue()?.len() == 1, "Synthetic rows leaked into Loro");
+                capture(window.into(), cx, &output, &format!("queue-managed-{mode}-960"))?;
                 anyhow::ensure!(std::fs::read_to_string(checkout.join("README.md"))? == "# Fixture checkout\n",
                     "A conversation transfer changed working files");
                 std::fs::write(output.join(format!("result-{mode}.txt")),
                     format!("PASS ({mode}): production UI fork/merge handlers and RPCs; idle fork; \
                         inherited lineage/text; continued fork; context-only merge; native GPUI \
-                        regular/narrow render. Mock provider only; no live-provider or physical-device claims.\n"))?;
+                        regular/narrow render; live mixed document/canonical queue; composer text edit; \
+                        reorder and cancel through production handlers. Mock provider only; no live-provider or physical-device claims.\n"))?;
                 Ok(())
             }.await;
             if let Err(error) = run {
