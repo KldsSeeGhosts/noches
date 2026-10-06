@@ -191,6 +191,40 @@ are not solved merely because these benchmarks improve.
 
 ## Reproduction
 
+### CI portability follow-up
+
+The first [Windows engine job for PR #46](https://github.com/KldsSeeGhosts/noches/actions/runs/37539231148/job/112527850783)
+failed eight tests. All eight failures, including their assertion values and
+errors, were already present in the preceding
+[dev Windows engine job](https://github.com/KldsSeeGhosts/noches/actions/runs/37259096658/job/111602305767).
+The follow-up is limited to fixture portability and a checkout rule:
+
+- Keep the exact-hash MCP instruction file LF on every checkout. The pinned
+  length and SHA-256 assertions remain unchanged.
+- Set `core.autocrlf=false` only in the temporary checkpoint/launch repositories,
+  preserving exact restored-byte assertions without changing the user's Git
+  configuration or production restore policy.
+- Use local file URLs for clone fixture sources so canonical Windows paths are
+  not mistaken for SSH hostnames, and compare canonical checkout identity
+  instead of Git's path spelling. Detached checkouts remain excluded.
+- Use `cmd.exe` on Windows and `/bin/sh` on Unix in the terminal-idleness fixture;
+  retain the live-terminal pull refusal and explicit terminal close.
+
+An isolated global `core.autocrlf=true` configuration reproduced all three
+Git-induced CRLF failures with the pre-follow-up macOS test executable. A
+checkout probe with the new attribute rule retained the exact 5,521-byte prompt
+and original SHA-256. After the fixture fixes, the full macOS engine library
+suite and selected auth/login integration targets passed under that same global
+setting: **637 library + 19 integration tests**, zero failures, four existing
+ignored library tests. All eight previously failing test names passed locally;
+the Windows-only `codex_catalog` target has no macOS tests.
+
+Native Windows path/ConPTY execution and the unrelated
+Linux browser window-discovery failure still require hosted CI verification;
+these fixture fixes are not additional performance measurements.
+
+### Performance reproduction
+
 Build both revisions before any timing run; do not compile or profile
 concurrently. Use fresh output directories, isolated profiles, and immutable
 binary copies. The microbenchmarks need the same fixture-only additions in the

@@ -1231,11 +1231,12 @@ async fn open_terminal_is_not_an_idle_checkout() {
     let f = Fixture::new().await;
     let policy = f.remote().await;
     f.service.set_pull_policy(policy).await.unwrap();
+    let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
     let terminal = f
         .service
         .0
         .terminals
-        .open_with_shell(f.repo.to_str().unwrap(), 80, 24, Some("/bin/sh"))
+        .open_with_shell(f.repo.to_str().unwrap(), 80, 24, Some(shell))
         .unwrap();
     assert_eq!(
         f.service
