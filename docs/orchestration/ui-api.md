@@ -78,12 +78,17 @@ They are passive: no result acknowledgement, provider start, or cancellation.
   models/options/readiness. `ListModels` and `ListCommands` accept `{instanceId}`;
   `{harness}` selects only that driver's canonical compatibility identity.
 
-`CancelDelegatedTask {chatId, taskId}` is the one UI write: the signed-in user's
+`CancelDelegatedTask {chatId, taskId}` is the delegation-specific UI write: the signed-in user's
 Stop of an app-owned task of parent `chatId`. It is `task_cancel` under the
 parent chat's authority (no provider session), resolves on acceptance
 (`{"taskId", "status":"cancel_requested"}`) and never acknowledges a result. A
 settled task replies with its terminal status and disposes completion delivery,
 exactly like the MCP tool.
+
+Owner-routed user `ForkThread` and `MergeThreadBack` use the same transactional
+transfer planner as MCP, with separate user authority and stable retry keys.
+Their contracts and passive inherited-history presentation are documented in
+[transfer-api.md](transfer-api.md).
 
 `GetOrchestrationState` shape:
 
