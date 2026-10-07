@@ -25,6 +25,7 @@ use zeron_proto::{
 };
 
 use super::launch::{self, PiSettings, Resume};
+use super::lifecycle::{self, Leaf};
 use super::rpc::PiRpc;
 use super::{Spawned, catalog, normalize};
 use crate::mcp::SessionMcpContext;
@@ -733,9 +734,9 @@ impl Runner {
             .request(json!({"type": "get_commands"}), QUICK_TIMEOUT)
             .await
             .unwrap_or(Value::Null);
-        let baseline = rpc
-            .request(json!({"type": "get_entries"}), QUICK_TIMEOUT)
-            .await;
+        // The baseline cursor comes from the session file: a listing from Pi
+        // would serialise the whole (possibly huge) session before the prompt.
+        let baseline = leaf_of(&session_file).await;
         let slug = model.as_ref().and_then(catalog::slug);
         Ok(Started {
             session_file,
@@ -746,13 +747,11 @@ impl Runner {
             window: model.as_ref().and_then(catalog::context_window),
             skills: skill_names(&commands),
             commands: commands_from(&commands),
-            leaf: baseline
-                .as_ref()
-                .ok()
-                .and_then(|data| data.get("leafId"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            leaf_trusted: baseline.is_ok(),
+            leaf: match &baseline {
+                Leaf::Entry(id) => Some(id.clone()),
+                Leaf::Empty | Leaf::Unknown => None,
+            },
+            leaf_trusted: baseline != Leaf::Unknown,
         })
     }
 
@@ -1502,37 +1501,36 @@ impl Runner {
     /// provider turn's native ref: the point `fork` re-roots before.
     async fn emit_native_reference(&mut self) {
         let was_trusted = self.leaf_trusted;
-        let mut record = json!({"type": "get_entries"});
-        if let (true, Some(cursor)) = (was_trusted, &self.leaf_cursor) {
-            record["since"] = Value::String(cursor.clone());
-        }
-        let mut data = self.rpc.request(record, TREE_TIMEOUT).await;
-        if data.is_err() && was_trusted {
-            // The cursor no longer matches: resync from a full listing, and
-            // skip this turn's ref rather than point rollback too far back.
-            self.leaf_trusted = false;
-            data = self
-                .rpc
-                .request(json!({"type": "get_entries"}), TREE_TIMEOUT)
-                .await;
-        }
-        let turn_id = match &data {
-            Ok(data) => {
+        let mut turn_id = None;
+        let mut synced = false;
+        if was_trusted {
+            let mut record = json!({"type": "get_entries"});
+            if let Some(cursor) = &self.leaf_cursor {
+                record["since"] = Value::String(cursor.clone());
+            }
+            // Bounded by this turn: the cursor is where the previous one ended
+            // (and an unset cursor means the session was empty).
+            if let Ok(data) = self.rpc.request(record, TREE_TIMEOUT).await {
                 self.leaf_cursor = data
                     .get("leafId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let first_user = was_trusted
-                    .then(|| first_user_entry(data))
-                    .flatten();
-                self.leaf_trusted = true;
-                first_user
+                turn_id = first_user_entry(&data);
+                synced = true;
             }
-            Err(_) => {
-                self.leaf_trusted = false;
-                None
-            }
-        };
+        }
+        if !synced {
+            // The cursor was unknown or no longer matches (a Pi extension
+            // rewrote the tree): resync from the file, never from a full
+            // listing, and skip this turn's ref rather than point a fork too
+            // far back.
+            let leaf = leaf_of(&self.session_file).await;
+            self.leaf_trusted = leaf != Leaf::Unknown;
+            self.leaf_cursor = match leaf {
+                Leaf::Entry(id) => Some(id),
+                Leaf::Empty | Leaf::Unknown => None,
+            };
+        }
         let _ = self
             .emit(AgentEvent::NativeReference {
                 thread_id: self.session_file.clone(),
@@ -1540,6 +1538,14 @@ impl Runner {
             })
             .await;
     }
+}
+
+/// The session file's current leaf, read off the async workers.
+async fn leaf_of(session_file: &str) -> Leaf {
+    let path = PathBuf::from(session_file);
+    tokio::task::spawn_blocking(move || lifecycle::session_leaf(&path))
+        .await
+        .unwrap_or(Leaf::Unknown)
 }
 
 fn first_user_entry(data: &Value) -> Option<String> {

@@ -643,6 +643,72 @@ async fn resume_continues_the_stored_session_and_a_vanished_one_starts_fresh() {
     assert_ne!(done(&fresh).2, Some(session.as_str()));
 }
 
+/// A multi-megabyte session in Pi's file format, ending on an assistant entry.
+fn seed_large_session(env: &Env) -> (String, String) {
+    let file = env.sessions().join("2026-01-01T00-00-00-000Z_seeded.jsonl");
+    std::fs::create_dir_all(env.sessions()).unwrap();
+    let filler = "x".repeat(128 * 1024);
+    let mut text = format!(
+        "{}\n",
+        json!({"type": "session", "version": 3, "id": "seeded", "cwd": env.cwd()})
+    );
+    let mut parent = Value::Null;
+    let mut last = String::new();
+    for n in 1..=40 {
+        let id = format!("e{n:05}");
+        let role = if n % 2 == 1 { "user" } else { "assistant" };
+        text.push_str(&format!(
+            "{}\n",
+            json!({"type": "message", "id": id, "parentId": parent,
+                "message": {"role": role, "content": [{"type": "text", "text": filler}]}})
+        ));
+        parent = json!(id);
+        last = id;
+    }
+    std::fs::write(&file, text).unwrap();
+    (file.display().to_string(), last)
+}
+
+#[tokio::test]
+async fn a_huge_session_never_needs_a_full_entry_listing_and_stays_forkable() {
+    // This fake never answers `get_entries` without a cursor, like a Pi whose
+    // reply to a huge session exceeds the framer's cap.
+    let env = Env::new().with("FAKE_PI_NO_FULL_ENTRIES", "1");
+    let (session, last) = seed_large_session(&env);
+    let mut req = request(&env, "again");
+    req.resume = Some(session.clone());
+    let (controls, _h) = default_controls();
+    let harness = env.harness();
+    let started = std::time::Instant::now();
+    let mut stream = start(&harness, req, controls).await;
+    let events = until_done(&mut stream, 1).await;
+    assert!(started.elapsed() < Duration::from_secs(4), "run start/finish waited on a listing");
+    assert_eq!(done(&events).0, &DoneStatus::Completed);
+    assert_eq!(done(&events).2, Some(session.as_str()));
+
+    // Every listing used the locally derived cursor.
+    let listings = env.commands("get_entries");
+    assert!(!listings.is_empty());
+    assert!(listings.iter().all(|c| c["since"] == last.as_str()), "{listings:?}");
+
+    // The turn still gets its native ref (its own user entry), so native fork
+    // keeps working on the big chat.
+    let entries = entry_ids(Path::new(&session));
+    let user = &entries[entries.len() - 2];
+    assert_eq!(user.1, "user");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::NativeReference { turn_id: Some(turn), .. } if *turn == user.0
+    )));
+    std::fs::create_dir_all(env.path("fork-cwd")).unwrap();
+    assert!(
+        harness
+            .can_fork_now(&fork_request(&env, &session, Some(&user.0), None))
+            .await
+            .unwrap()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Steering receipts
 // ---------------------------------------------------------------------------

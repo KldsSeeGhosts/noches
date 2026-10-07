@@ -462,6 +462,8 @@ def handle(cmd):
         respond(cid, kind)
     elif kind == "get_entries":
         since = cmd.get("since")
+        if since is None and os.environ.get("FAKE_PI_NO_FULL_ENTRIES"):
+            return  # a session too big to serialise: the reply never arrives
         window = entries
         if since is not None:
             ids = [e["id"] for e in entries]

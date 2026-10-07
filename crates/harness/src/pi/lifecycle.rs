@@ -61,6 +61,71 @@ pub(super) fn is_user_entry(session: &Path, id: &str) -> bool {
     }
 }
 
+/// What the end of a session file says about its current leaf.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Leaf {
+    /// No entry has been written yet (a missing file or a header only).
+    Empty,
+    /// The id of the last complete entry: Pi's `leafId` after loading the file.
+    Entry(String),
+    /// The tail could not be read or holds an entry larger than the read cap.
+    Unknown,
+}
+
+const TAIL_START: u64 = 1 << 16;
+const TAIL_CAP: u64 = 1 << 24;
+
+/// The last complete entry of a session file, found by reading backwards from
+/// its end. Sessions run to hundreds of MB, and Pi's `get_entries` without a
+/// cursor would serialise all of them (and exceed the framer's cap), so the
+/// baseline cursor for `get_entries since` comes from the file instead. Pi
+/// loads the last non-header entry as its leaf, which this mirrors.
+pub(super) fn session_leaf(session: &Path) -> Leaf {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = match std::fs::File::open(session) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Leaf::Empty,
+        Err(_) => return Leaf::Unknown,
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Leaf::Unknown;
+    };
+    let mut window = TAIL_START;
+    loop {
+        let from = len.saturating_sub(window);
+        let mut buffer = Vec::with_capacity((len - from) as usize);
+        if file.seek(SeekFrom::Start(from)).is_err()
+            || (&mut file).take(len - from).read_to_end(&mut buffer).is_err()
+        {
+            return Leaf::Unknown;
+        }
+        let mut lines = buffer.split(|b| *b == b'\n').collect::<Vec<_>>();
+        // A window that starts mid-file begins inside some line.
+        if from > 0 {
+            lines.remove(0);
+        }
+        for line in lines.into_iter().rev() {
+            // A torn trailing write is not a complete entry.
+            let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if entry.get("type").and_then(Value::as_str) == Some("session") {
+                return Leaf::Empty;
+            }
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                return Leaf::Entry(id.to_owned());
+            }
+        }
+        if from == 0 {
+            return Leaf::Empty;
+        }
+        if window >= TAIL_CAP {
+            return Leaf::Unknown;
+        }
+        window = (window * 4).min(TAIL_CAP);
+    }
+}
+
 impl PiHarness {
     /// Why this boundary cannot fork natively, or the validated parts.
     fn fork_plan<'a>(
@@ -241,6 +306,60 @@ mod tests {
         assert!(!is_user_entry(&file, ""));
         assert!(!is_user_entry(&file, "u1\",\"x"));
         assert!(!is_user_entry(&dir.path().join("gone.jsonl"), "u1"));
+    }
+
+    #[test]
+    fn the_leaf_is_the_last_complete_entry_read_from_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = session(dir.path());
+        assert_eq!(session_leaf(&file), Leaf::Entry("u2".into()));
+        // A torn trailing write is skipped.
+        let torn = dir.path().join("torn.jsonl");
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\n{\"type\":\"message\",\"id\":\"u3\",\"mess");
+        std::fs::write(&torn, text).unwrap();
+        assert_eq!(session_leaf(&torn), Leaf::Entry("u2".into()));
+        // A header alone, an empty file and a missing file are all empty sessions.
+        let header = dir.path().join("header.jsonl");
+        std::fs::write(&header, "{\"type\":\"session\",\"id\":\"s\"}\n").unwrap();
+        assert_eq!(session_leaf(&header), Leaf::Empty);
+        std::fs::write(dir.path().join("empty.jsonl"), "").unwrap();
+        assert_eq!(session_leaf(&dir.path().join("empty.jsonl")), Leaf::Empty);
+        assert_eq!(session_leaf(&dir.path().join("gone.jsonl")), Leaf::Empty);
+    }
+
+    #[test]
+    fn the_leaf_of_a_huge_session_does_not_need_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.jsonl");
+        let filler = "x".repeat(1 << 20);
+        let mut text = String::from("{\"type\":\"session\",\"id\":\"s\"}\n");
+        for n in 0..24 {
+            text.push_str(&format!(
+                "{{\"type\":\"message\",\"id\":\"m{n}\",\"message\":{{\"role\":\"user\",\"content\":\"{filler}\"}}}}\n"
+            ));
+        }
+        std::fs::write(&big, &text).unwrap();
+        assert_eq!(session_leaf(&big), Leaf::Entry("m23".into()));
+        // The last entry alone is larger than the first window.
+        let tail = dir.path().join("tail.jsonl");
+        let single = format!(
+            "{{\"type\":\"session\",\"id\":\"s\"}}\n{{\"type\":\"message\",\"id\":\"only\",\"message\":\"{}\"}}\n",
+            "y".repeat(3 << 16)
+        );
+        std::fs::write(&tail, single).unwrap();
+        assert_eq!(session_leaf(&tail), Leaf::Entry("only".into()));
+        // Beyond the read cap the leaf is unknown, never guessed.
+        let huge = dir.path().join("huge.jsonl");
+        std::fs::write(
+            &huge,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"s\"}}\n{{\"id\":\"z\",\"pad\":\"{}\"}}\n",
+                "z".repeat(TAIL_CAP as usize + 10)
+            ),
+        )
+        .unwrap();
+        assert_eq!(session_leaf(&huge), Leaf::Unknown);
     }
 
     fn request(source: &Path, turn: Option<&str>, next: Option<&str>) -> NativeForkRequest {
