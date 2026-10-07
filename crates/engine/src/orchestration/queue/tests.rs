@@ -1677,7 +1677,8 @@ async fn promotion_hint_follows_the_complete_selection_and_transition_policy() {
         ("codex", ("mock", "mock-2"), true, false, Some(ActiveSteering), true, false),
         ("codex", ("mock", "mock-2"), false, true, Some(InterruptRestart), false, false),
         ("codex", ("mock", "mock-2"), false, false, None, false, false),
-        ("mock", ("mock", "mock-2"), true, true, None, false, true),
+        // A same-instance change the adapter cannot absorb is a new generation.
+        ("mock", ("mock", "mock-2"), true, true, Some(InterruptRestartWithHandoff), false, false),
         ("mock", ("mock", "mock-2"), true, false, None, false, true),
         ("codex", ("other", "other-1"), true, true, Some(InterruptRestartWithHandoff), false, false),
         ("codex", ("other", "other-1"), true, false, None, false, true),
@@ -1936,6 +1937,94 @@ async fn cross_instance_promotion_rebinds_the_replacement_attempt_and_fences_the
         .unwrap();
     assert_eq!(json!(rebuilt.runs), json!(after.runs));
     let replay = promote(&f, "promote-cross", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn same_instance_handoff_change_restarts_on_a_new_generation_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    // The test adapter cannot switch models inside a native session.
+    set_driver(&f, "mock");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue on the next model").await;
+    save_selection(&f, "mock", "mock-2");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let old_attempt = before.runs[0].active_attempt_id.clone().unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart_with_handoff",
+        "expectedSelection":selection("mock","mock-2"),
+        "resolvedSelection":selection("mock","mock-2"),"targetDriver":"mock"});
+    // The non-handoff click for the same change is a stale action, not a restart.
+    let stale = promote(
+        &f,
+        "promote-stale",
+        json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart",
+            "expectedSelection":selection("mock","mock-2"),
+            "resolvedSelection":selection("mock","mock-2"),"targetDriver":"mock"}),
+    )
+    .await;
+    assert_eq!(stale.status, ReceiptStatus::Rejected);
+    let first = promote(&f, "promote-same", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs.len(), before.runs.len(), "one logical run");
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-2");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    let generation = run.provider_thread_id.clone().unwrap();
+    assert_eq!(
+        generation.0, "provider-thread:app:target:mock:1:attempt:2",
+        "a handoff on the same instance is a new generation, never the old one"
+    );
+    let old = after.attempts.iter().find(|a| a.id == old_attempt).unwrap();
+    assert_eq!(old.status, OrchestrationV2RunAttemptStatus::Superseded);
+    assert_eq!(
+        old.provider_thread_id,
+        active.provider_thread_id.clone().unwrap()
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-same")
+        .unwrap();
+    assert!(
+        matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, interrupted_attempt_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref() && interrupted_attempt_id == &old_attempt)
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    let replay = promote(&f, "promote-same", input).await;
     assert_eq!(replay.result_sequence, first.result_sequence);
     assert_eq!(
         f.service.kernel.store.effects().unwrap().len(),

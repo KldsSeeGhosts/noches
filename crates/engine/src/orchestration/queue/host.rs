@@ -25,6 +25,38 @@ impl crate::orchestration::task::DelegationCatalog for LiveCatalog {
     }
 }
 
+/// Validate a selection against the live catalog (exact model id, option
+/// values, provider availability) and name the driver that would own it.
+pub(crate) async fn resolve_selection(
+    registry: &HarnessRegistry,
+    thread: &zeron_proto::orchestration::OrchestrationV2AppThread,
+    wanted: &zeron_proto::provider_instance::ModelSelection,
+) -> Result<crate::orchestration::task::ResolvedTarget, String> {
+    use crate::orchestration::task::{CatalogTargets, DelegationTargets};
+    let options = match &wanted.options {
+        zeron_proto::orchestration::Optional::Present(options) => Some(
+            serde_json::from_value(serde_json::to_value(options).map_err(|e| e.to_string())?)
+                .map_err(|_| "The saved model options are invalid.".to_string())?,
+        ),
+        _ => None,
+    };
+    let target = zeron_proto::orchestration_mcp::DelegateTaskInputTarget {
+        provider_instance_id: zeron_proto::orchestration::Optional::Present(
+            wanted.instance_id.0.clone(),
+        ),
+        driver_kind: Default::default(),
+        model: zeron_proto::orchestration::Optional::Present(wanted.model.to_string()),
+        options: options
+            .map(zeron_proto::orchestration::Optional::Present)
+            .unwrap_or_default(),
+    };
+    let catalog = LiveCatalog(registry.provider_instances.snapshot(registry));
+    CatalogTargets(Arc::new(catalog))
+        .resolve(thread, Some(&target))
+        .await
+        .map_err(|error| error.message)
+}
+
 pub struct HostQueue {
     pub domain: Arc<QueueDomain>,
     pub docs: DocHost,
@@ -41,7 +73,6 @@ impl HostQueue {
         p: &crate::orchestration::projection::ThreadProjection,
         input: &mut Value,
     ) -> Result<(), String> {
-        use crate::orchestration::task::{CatalogTargets, DelegationTargets};
         let Some(run) = p
             .runs
             .iter()
@@ -53,28 +84,7 @@ impl HostQueue {
         if *wanted == run.model_selection {
             return Ok(());
         }
-        let options = match &wanted.options {
-            zeron_proto::orchestration::Optional::Present(options) => Some(
-                serde_json::from_value(serde_json::to_value(options).map_err(|e| e.to_string())?)
-                    .map_err(|_| "The saved model options are invalid.".to_string())?,
-            ),
-            _ => None,
-        };
-        let target = zeron_proto::orchestration_mcp::DelegateTaskInputTarget {
-            provider_instance_id: zeron_proto::orchestration::Optional::Present(
-                wanted.instance_id.0.clone(),
-            ),
-            driver_kind: Default::default(),
-            model: zeron_proto::orchestration::Optional::Present(wanted.model.to_string()),
-            options: options
-                .map(zeron_proto::orchestration::Optional::Present)
-                .unwrap_or_default(),
-        };
-        let catalog = LiveCatalog(self.registry.provider_instances.snapshot(&self.registry));
-        let resolved = CatalogTargets(Arc::new(catalog))
-            .resolve(&p.thread, Some(&target))
-            .await
-            .map_err(|error| error.message)?;
+        let resolved = resolve_selection(&self.registry, &p.thread, wanted).await?;
         // The saved selection is the trusted value; the catalog only vouches
         // for it and names the driver that will own the new generation.
         input["resolvedSelection"] = json!(wanted);

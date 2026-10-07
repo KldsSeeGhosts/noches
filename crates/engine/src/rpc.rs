@@ -2664,7 +2664,29 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
+                let selection = match &p {
+                    MutateParams::SetChatConfig { chat_id, config } => {
+                        Some((chat_id.clone(), config.clone()))
+                    }
+                    _ => None,
+                };
                 self.mutate(p)?;
+                // The chat row is the LWW record; the thread's saved selection
+                // follows it so a mid-run composer change drives the queue's
+                // promotion mode. One kernel command, and none when unchanged.
+                if let Some((chat_id, config)) = selection
+                    && self.doc_host.is_host(&chat_id)
+                    && let Some(service) = &self.delegation
+                    && let Err(error) = crate::orchestration::selection_sync::mirror_chat_config(
+                        &service.kernel,
+                        &self.registry,
+                        &chat_id,
+                        &config,
+                    )
+                    .await
+                {
+                    tracing::warn!(chat = %chat_id, %error, "composer selection was not mirrored to the thread");
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {

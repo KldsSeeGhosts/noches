@@ -412,13 +412,19 @@ impl RunnerBridge {
                 .unwrap_or_default(),
         )
         .await?;
-        // A user-reset conversation is rebuilt from portable history, never from
-        // the engine-remembered native session of the generation it left.
-        if request.resume.is_none()
-            && super::queue::session_control::fresh_after_reset(&projection, &run)
-        {
-            self.sessions.forget_native_resume(&effect.thread_id.0);
-        }
+        // The planner, not engine memory, owns native continuity: a generation
+        // it rebuilt from portable history must not silently resume whatever
+        // session the engine remembers for this chat.
+        let native = if super::transfer::delivery::fresh_native_start(
+            &self.kernel,
+            &effect.thread_id,
+            &run,
+            request.resume.as_deref(),
+        )? {
+            crate::sessions::NativeIntent::Fresh
+        } else {
+            crate::sessions::NativeIntent::Legacy
+        };
         if let Err(error) = (super::checkpoint::FileCheckpointService {
             kernel: self.kernel.clone(),
         })
@@ -461,6 +467,7 @@ impl RunnerBridge {
                 harness.id(),
                 request,
                 Some(run.user_message_id.0.clone()),
+                native,
             )
             .await
         {

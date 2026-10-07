@@ -589,6 +589,39 @@ fn restart_origin<'a>(
     Some((first, attempts(first.attempt_ordinal - 1)?))
 }
 
+/// Whether a started run is a generation the planner rebuilt from portable
+/// context (provider handoff to this run, or a user reset), rather than one
+/// continuing an accepted native session. Only then may the engine be told
+/// not to resume whatever it remembers for the chat; a run with no positive
+/// evidence (for example the first canonical turn of an adopted chat) keeps
+/// the engine's own continuity.
+pub(crate) fn fresh_native_start(
+    kernel: &Kernel,
+    thread: &ThreadId,
+    run: &OrchestrationV2Run,
+    resume: Option<&str>,
+) -> Result<bool> {
+    if resume.is_some() {
+        return Ok(false);
+    }
+    let projection = kernel
+        .store
+        .thread(thread)?
+        .ok_or_else(|| Error::Invariant("Run thread missing after preparation.".into()))?;
+    if super::super::queue::session_control::fresh_after_reset(&projection, run) {
+        return Ok(true);
+    }
+    let to = run.provider_thread_id.as_ref().map(|id| id.0.as_str());
+    let handoffs = kernel.store.thread_transfers(thread)?;
+    Ok(handoffs.iter().any(|t| {
+        t["type"] == "provider_handoff"
+            && t["targetRunId"] == run.id.0
+            && super::super::task::records(&projection, "context-handoff")
+                .iter()
+                .any(|h| h["transferId"] == t["id"] && h["toProviderThreadId"].as_str() == to)
+    }))
+}
+
 /// Delegated-completion and notification runs are automatic deliveries; they
 /// never consume context the user is waiting to send (a pending merge-back).
 fn automatic_run(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {

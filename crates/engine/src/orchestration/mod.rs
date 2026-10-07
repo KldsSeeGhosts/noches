@@ -26,6 +26,7 @@ pub mod queue_service;
 pub mod recovery;
 pub mod runner;
 pub mod scheduler;
+pub(crate) mod selection_sync;
 pub mod service;
 pub(crate) mod steering;
 pub(crate) mod stop_all;
