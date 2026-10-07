@@ -32,6 +32,16 @@ IDs to the previously audited `bfec2387` versions. This is a service freshness
 check, not a claim that all newer upstream UI/device/settings changes have been
 implemented or verified.
 
+The subsequent settled-root Stop follow-up reads current
+[`Orchestrator`](https://github.com/pingdotgg/t3code/blob/365aa87982a4d81cc8e0c085e8d1a40ca7daecdc/apps/server/src/orchestration-v2/Orchestrator.ts)
+(`dispatchRunInterrupt`, `dispatchBackgroundWorkSettle`, `settleBackgroundWork`)
+and
+[`orchestrationV2PendingBackgroundWork`](https://github.com/pingdotgg/t3code/blob/365aa87982a4d81cc8e0c085e8d1a40ca7daecdc/packages/shared/src/orchestrationV2PendingBackgroundWork.ts).
+Stop covers native work after foreground completion and bounds settlement by
+the stopped run's ordinal. Persistent monitors and rolled-back items are excluded.
+Noches adapts this to its one-physical-runtime-per-app-thread model; it does not
+claim T3's simultaneous multiple-provider-process architecture.
+
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
 context transfer and file checkpoint. Correctness depends on their ownership
@@ -62,6 +72,7 @@ it is not alone evidence that a feature works in either application.
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
 | Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering and capability-fenced active steering. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Interrupt/restart promotion and queued merge-back remain gaps. |
+| Stop after foreground completion | Current `Orchestrator` background settlement and shared pending-work selector | **Added:** completed-root background Stop through user composer/Escape→durable command→canonical admission→exact runtime teardown→bounded settlement. Completed reply/attempt/timestamps survive; later work, app-owned tasks and persistent monitors are not terminated. Background-only queue-watch changes now reach the composer. |
 | Scheduler | server scheduler and launch/intake dispatch | `scheduler`, Settings Automations: persistent claims, recurring/manual/webhook work, bound/unbound dispatch, restart/deduplication. Existing. |
 | PR association and settlement | `PullRequestWatchReactor`, `PullRequestSyncReactor`, `ThreadSettlementService` | `pull_requests`, `git_actions`, Details/lifecycle: authenticated linking, stable watch receipts, wake/settlement fences. Some environment/project settlement policy UI remains incomplete. |
 | Checkpoints | `CheckpointService`, `CheckpointRollbackService` | files-only checkpoint preview/checksum/HEAD/ownership/backup safety. No conversation rewind; sparse/submodule support is explicitly refused. |
@@ -232,8 +243,26 @@ is not an acceptable substitute.
   ingestion a bounded grace period, then performs any synthetic settlement in
   a transaction that rechecks the admission and physical-process fence.
   A late observer cannot terminalize the superseding restart attempt. These
-  checks do not implement Stop on an already-completed root that still owns
-  background work.
+  checks are also used by completed-root background Stop. Cleanup holds the
+  runtime map empty across its synchronous transaction, excluding even an
+  unbound ordinary-session replacement.
+- Background waiting and Stop share one selector for provider rosters, native
+  subagents and active command/dynamic-tool/native-subagent items. A queued run
+  cannot steal the target; a new foreground run does. Settlement clears only
+  work through the stopped ordinal after exact process retirement, including
+  older dead-provider rosters. Independent app-owned tasks and persistent
+  monitors retain their own authority. A separate background-stop result
+  fences delayed native child observations without rewriting a completed reply.
+- Ordinary composer Stop now uses host authority and its durable session-command
+  identity rather than an unqualified legacy runtime lookup. It does not need
+  an active agent credential. Early questions and actual output before session
+  metadata retain exact-process cancellation without fabricated native session,
+  turn or acceptance data. Queue pause survives terminality and edit completion;
+  only an explicit successful send thaws it.
+- `backgroundRunId` is an additive passive queue hint, not an active foreground
+  run or a new replicated execution authority. The empty composer and opt-in
+  Escape path offer Stop; a new draft still sends a new turn. The queue watch
+  compares background changes while ignoring unrelated sequence-only churn.
 - Delegated completion steering uses the live canonical run/attempt/root/process
   fence and adapter acknowledgement, not a chat-only mailbox lookup. The
   delegated mailbox retains its prior retry/recovery policy; complete durable
@@ -272,9 +301,10 @@ is not an acceptable substitute.
 7. Older builds stored false acceptance at session initialization. Existing
    provider-turn/delivery rows cannot retrospectively prove provider submission;
    no speculative migration or historical duplicate replay is performed.
-8. Stop on already-settled roots with remaining native background work,
-   complete attachment cleanup and the relationship-panel app-owned subagent
-   Stop interaction require further parity verification. Ordinary/managed
+8. Complete attachment cleanup and the relationship-panel app-owned subagent
+   Stop interaction require further parity verification. Completed-root native
+   background Stop is implemented; simultaneous live provider processes and
+   T3's whole-thread/app-owned-child bulk Stop are not claimed. Ordinary/managed
    interruption and restart now pin their physical process and atomically fence
    terminal repair; delegated steering pins its live process, but its complete
    receipt/uncertainty policy remains a gap.
@@ -282,9 +312,9 @@ is not an acceptable substitute.
 ## Verification
 
 The task uses an isolated worktree and build target; the other performance
-worktree and the main checkout's untracked files are untouched. Final full
-library/integration checks use serial execution where noted below; queue
-repeats and the broader session-sync gate also pass with default parallelism.
+worktree and the main checkout's untracked files are untouched. The final
+library/integration batches and separate queue repeat use default test
+parallelism. Older serial verification is not substituted for those results.
 
 The feature branch deliberately merges `dev` at `14ce2955`, including the
 existing performance PRs #46 and #48; neither separate worktree was modified.
@@ -296,16 +326,21 @@ host epoch and legacy succeeded effects, and verifies that performance indexes,
 steering tables and control targets coexist without speculative legacy markers.
 The final checks below run the actual combined production source, not the
 previous PR merge ref or the earlier standalone feature revision.
-Production source is committed at `337371ed`; the subsequent audit/evidence
-refresh does not change production code. Fresh logs are retained locally under
-`/tmp/noches-parity-final.aSdcwl`, and native artifacts under
-`/tmp/noches-parity-native-final.Gwqi01`.
+Production source, including completed-root background Stop, is committed at
+`4d6feeca`; the subsequent audit/evidence refresh does not change production
+code. Fresh test/build logs are retained locally under
+`/tmp/noches-background-stop.B8hsyE`, and separate dark/light native launches
+under `/tmp/noches-background-stop-visual.Z66nvd`. Both launches produced their
+mode-specific PASS files, and all four background-ready/stopped screenshots
+were visually inspected. The earlier `337371ed` batch and its logs under
+`/tmp/noches-parity-final.aSdcwl` remain historical evidence, not coverage of
+these new changes.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 671 passed, 0 failed, 4 ignored |
-| Selected engine integration suites | 96 passed, 0 failed, 3 ignored |
-| Desktop library, including pane/sidebar regressions | 1,515 passed, 0 failed, 2 ignored |
+| Engine library | 675 passed, 0 failed, 4 ignored |
+| Selected engine integration suites | 97 passed, 0 failed, 3 ignored |
+| Desktop library, including pane/sidebar regressions | 1,516 passed, 0 failed, 2 ignored |
 | Doc/proto/RPC libraries and integration suites | 244 passed, 0 failed, 2 ignored |
 | Full harness library, integrations and doctest | 435 passed, 0 failed, 12 ignored |
 | Production `zeron` desktop build (`--locked`) | Passed |
@@ -317,7 +352,7 @@ The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
 `restart_resume`, `message_queue`, `queue_lifecycle_rpc`,
 `scheduler_bootstrap`, `codex_subagents`, `e2e`, `turn_quiesce` and
-`self_continued_quiesce`. These checks total 2,961 distinct
+`self_continued_quiesce`. These checks total 2,967 distinct
 passing tests. Focused transfer coverage is included in the engine library
 count, not counted a second time. The session-sync gate supplies additional
 coverage; its overlapping engine/restart/child tests are not added to this total.
@@ -337,10 +372,10 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   acceptance, and distinguish untold retry from accepted interrupted history.
 - A→B→A with/without restart, changed model/options/checkout, legacy history,
   accepted-current-run replay and native delivery receipt cases pass.
-- All 35 message-queue tests pass, including shared native session with
+- All 36 message-queue tests pass, including shared native session with
   coherent run/attempt/root binding and changed-selection reconstruction.
-  The final combined source also passes all 35 with default
-  parallelism, separately from the full serial engine batch.
+  The final combined source also passes all 36 in a separate default-parallel
+  repeat; that repeat is not added to the distinct-test total.
 - Exact control regressions cover current-process interruption, changed
   run/attempt/root/provider/process and unbound-target refusal, missing-runtime
   handling, durable restart admission across rebuild and cancellation/replacement
@@ -349,6 +384,15 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   parked idle; delayed production Stop preserves both replacements. Ordinary
   production Stop releases ingestion and terminalizes its exact run; restart
   supersedes the old attempt, starts its replacement and preserves one logical run.
+- Completed-background Stop tests cover live parked and already-dead native
+  processes, revoked agent credentials, unchanged completed canonical and
+  ordinary Loro replies/attempts/timestamps, held edited queues and an explicit
+  next send. Kernel tests bound cleanup to the stopped ordinal, preserve
+  persistent monitors/app-owned tasks/later work, clear dead-provider rosters,
+  reject cancelled/replaced/superseded cleanup, exclude rolled-back/no-work
+  roots, and fence late native child observations. The queue snapshot equality
+  regression checks both appearance and clearance of background-only state;
+  sequence-only changes still suppress repaint.
 - Canonical steering regressions cover exact session/attempt/root/message/
   provider-ordinal/process fences, including replacement of a process with
   the same logical attempt; refused Stop/failure/cancelled-target follow-up;
@@ -402,6 +446,11 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   The disconnect action then uses the production Shell/RPC path and waits for
   actual runtime disappearance, attachment removal and cleared UI retry/busy
   state while the transcript remains visible.
+- The completed-background native fixture finishes its foreground reply while
+  its exact mock provider process remains alive. The real composer Stop action
+  travels through the durable user command, kernel and runtime teardown; it
+  waits for native-child interruption and cleared background UI state. Both
+  themes retain the completed reply and change Stop back to Send.
 
 Reproduce from this checkout with Cargo available on `PATH`:
 
@@ -412,10 +461,10 @@ cargo test -p zeron-engine --lib \
   --test message_queue --test queue_lifecycle_rpc --test scheduler_bootstrap \
   --test codex_subagents --test e2e --test turn_quiesce \
   --test self_continued_quiesce \
-  --locked -- --test-threads=1
-cargo test -p zeron-ui --lib --locked -- --test-threads=1
+  --locked
+cargo test -p zeron-ui --lib --locked
 cargo test -p zeron-proto -p zeron-rpc -p zeron-doc --locked
-cargo test -p zeron-harness --locked -- --test-threads=1
+cargo test -p zeron-harness --locked
 cargo test -p zeron-engine --test message_queue --locked
 python3 scripts/ci/run-session-sync.py
 cargo build -p zeron --locked
@@ -432,8 +481,9 @@ cargo run -p zeron-ui --example orchestration-fixture \
 ```
 
 The fixture writes per-mode PASS files and PNGs; it does not inject global
-keyboard/mouse events or invoke installed agents. Separate launches initialize
-the appearance before opening the window. Exploratory in-process theme
+keyboard/mouse events or invoke installed agents. Check the actual assertions
+and mode-specific PASS file, not just process exit status. Separate launches
+initialize the appearance before opening the window. Exploratory in-process theme
 switching exposed `RefCell already borrowed` in the unchanged GPUI macOS
 `on_appearance_changed` callback (`window.rs:1650`) during synchronous
 `NSApplication.setAppearance`; that theme-transition warning is not fixed by
@@ -454,7 +504,8 @@ differences. A broader changed-file check also reports existing differences in
 mixed/prior-feature files (`codex_subagents.rs`, `thread_lifecycle.rs`, composer,
 shell and state), including incoming performance hunks. The latest
 steering/control Rust files and native fixture pass scoped `rustfmt --check`
-with child-module traversal disabled. No unrelated formatting is included.
+with child-module traversal disabled, including the new background module.
+No unrelated formatting is included.
 
 Ignored live-provider/edge/tailnet/private-snapshot and optional comparative
 profiling tests are not passes. Child-process reruns of an already-counted
@@ -491,8 +542,13 @@ CI on the last published root-acceptance/mailbox revision `3f6c7ff0` has also
 completed successfully for every executed job, including the Mac/Windows UI,
 harness/engine/packaging, session-sync, networking, layout, policy and browser
 checks. Windows native GUI and iOS were skipped. Those results do not cover
-the later canonical-steering/process-fence source verified locally above;
-new-head CI remains required after pushing it.
+the later canonical-steering/process-fence source verified locally above.
+
+CI on `c9213c52` also completed successfully for every executed job, including
+Mac/UI/browser, Windows UI/harness/engine/packaging, session-sync, networking,
+layout and policy. Windows native GUI and iOS were skipped, not passes.
+This confirms the previously published combined source, not the new
+completed-background Stop follow-up; new-head CI remains required after push.
 
 The byte-pinned MCP instruction fixture retains its narrowly scoped LF checkout
 rule; the SHA/length tests are unchanged. These CI results do not prove a later
@@ -501,6 +557,11 @@ An isolated checkout-index probe with `core.autocrlf=true` retains the exact
 pinned instruction SHA on this Mac; it is not a Windows runtime test.
 
 ### Native rendering evidence
+
+The following fork/queue/disconnect captures are from the earlier combined
+source at `337371ed`. Fresh completed-background Stop captures from `4d6feeca`
+are included below; the separate new runs also pass the earlier workflow
+assertions.
 
 Idle fork: inherited text, visible boundary, parent navigation and neutral
 success feedback; no provider has started.
@@ -543,3 +604,22 @@ After production teardown, the action is gone and the composer is idle.
 Conversation text remains; the neutral notice describes the accepted request.
 
 ![Disconnected session with retained history in light appearance](evidence/t3-parity-2026-10-06/disconnected-light.png)
+
+Completed foreground reply with native background work still running: the
+empty composer offers Stop without pretending the foreground run is active.
+Typing a new draft still selects Send, not Queue.
+
+![Completed reply with background Stop in dark appearance](evidence/t3-parity-2026-10-07/background-stop-ready-dark.png)
+
+After the production Stop workflow, the same completed reply remains and the
+composer returns to Send. Cleanup ends native work, not the foreground result
+or independently owned delegated tasks.
+
+![Retained completed reply after background Stop in dark appearance](evidence/t3-parity-2026-10-07/background-stopped-dark.png)
+
+The separate light launch verifies the same available-then-cleared control
+without in-process appearance switching.
+
+![Completed reply with background Stop in light appearance](evidence/t3-parity-2026-10-07/background-stop-ready-light.png)
+
+![Retained completed reply after background Stop in light appearance](evidence/t3-parity-2026-10-07/background-stopped-light.png)
