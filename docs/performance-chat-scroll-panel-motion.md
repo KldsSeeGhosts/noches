@@ -121,7 +121,15 @@ This PR does not change that production path. Light/dark fresh-process
 verification passed separately with no runtime errors. Settled transcript,
 left-collapsed and right-open native endpoint readbacks were inspected in both
 appearances; these are GPUI image readbacks, not OS screenshots or transition
-recordings. Real mouse/trackpad QA through Computer Use is **pending app-access
-approval**, so this is a draft PR, not a claim that every reported stall has
-been eliminated. Linux and Windows native behavior and Mac split-view manual
-input have not been verified locally.
+recordings.
+
+The connected Computer Use tool now works without changing macOS permissions.
+A dark-appearance desktop smoke check used OS-level scroll actions in both
+directions, Cmd+B for the left sidebar, and the visible right-sidebar toggle.
+Updated OS screenshots confirm transcript movement and both panels' open/closed
+endpoints. The stale terminal-only tool connection was stopped without accepting
+its approval request. This is a smoke check, not an exact scroll-displacement,
+continuous animation recording, physical trackpad momentum or input-to-display
+measurement. Those checks and Mac split-view manual input remain unverified,
+so the PR remains draft; this is not a claim that every reported stall has been
+eliminated. Linux and Windows native behavior have not been verified locally.

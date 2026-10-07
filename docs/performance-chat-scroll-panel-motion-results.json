@@ -137,8 +137,27 @@
     "runtime_errors_both": false,
     "passed": ["wheel cancels rail", "streaming preserves ownership", "interrupted panel reversal", "reduced and instant snaps"],
     "endpoint_readbacks_inspected": ["settled transcript", "left collapsed", "right open"],
-    "physical_input": "pending Computer Use app-access approval",
+    "physical_input": "See connected_desktop_smoke below; hardware trackpad latency/momentum remains unverified",
     "unverified": ["Linux native", "Windows native", "macOS split-view manual input"],
     "known_preexisting": "Live macOS theme switching re-enters GPUI via synchronous AppKit appearance callback and logs an App borrow warning; fresh-process appearance runs avoid that path."
+  },
+  "connected_desktop_smoke": {
+    "transport": "connected node_repl + @oai/sky; not a terminal-only MCP connection",
+    "binary_sha256": "9de76692b8b282ae435c7a94e4984cae63c69d13782f205b92d2351baf39941c",
+    "appearance": "dark",
+    "profile": "temporary generated history, no installed app data",
+    "macos_permissions_changed": false,
+    "observed": [
+      "OS-level scroll actions updated the transcript in both directions",
+      "Cmd+B closed and reopened the left sidebar",
+      "Visible right-sidebar control opened and closed the right sidebar",
+      "OS endpoint screenshots inspected after actions"
+    ],
+    "not_verified": [
+      "exact scroll displacement",
+      "continuous visual animation recording",
+      "physical trackpad momentum or latency",
+      "split-view manual input"
+    ]
   }
 }
