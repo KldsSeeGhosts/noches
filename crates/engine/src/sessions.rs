@@ -4379,6 +4379,19 @@ mod tests {
             matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "replacement mailbox must remain untouched"
         );
+        let entries = core
+            .sessions
+            .doc_handle("canonical-target")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.id != "stale-message" && e.id != "stale-process-message"),
+            "a rejected steer must not leave a transcript row"
+        );
         // A process replacement may even reuse the canonical attempt/root.
         // Only its private incarnation differs.
         replacement = original.clone();
