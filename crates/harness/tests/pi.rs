@@ -641,6 +641,25 @@ async fn resume_continues_the_stored_session_and_a_vanished_one_starts_fresh() {
     assert!(!launch["argv"].as_array().unwrap().iter().any(|a| a == "--session"));
     assert!(!gone.exists());
     assert_ne!(done(&fresh).2, Some(session.as_str()));
+    // The chat is told it lost its earlier context instead of silently
+    // continuing blank.
+    assert!(
+        fresh.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message } if message.contains("no longer available")
+        )),
+        "{fresh:?}"
+    );
+    assert!(!resumed.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+
+    // Planning can tell beforehand: a vanished or foreign file is not
+    // resumable, so the engine routes the next run to portable context.
+    let harness = env.harness();
+    assert!(harness.can_resume_now(&session, &env.cwd()).await.unwrap());
+    assert!(!harness.can_resume_now(&gone.display().to_string(), &env.cwd()).await.unwrap());
+    let foreign = env.path("outside.jsonl");
+    std::fs::write(&foreign, "{}\n").unwrap();
+    assert!(!harness.can_resume_now(&foreign.display().to_string(), &env.cwd()).await.unwrap());
 }
 
 /// A multi-megabyte session in Pi's file format, ending on an assistant entry.

@@ -196,6 +196,16 @@ impl PiHarness {
         Ok(())
     }
 
+    /// Every directory this instance keeps sessions in for runs in `cwd`.
+    fn session_roots_for(&self, cwd: &str) -> Result<Vec<PathBuf>, HarnessError> {
+        let user_args = self.user_args()?;
+        let cwd = PathBuf::from(cwd);
+        let env = &self.launch.environment;
+        let agent_dir = launch::agent_dir(env);
+        let settings = launch::PiSettings::read(&agent_dir, &cwd);
+        Ok(launch::session_roots(&user_args, env, &settings, &agent_dir, &cwd))
+    }
+
     /// A configured `pi --mode rpc` child. `cwd` is the working directory the
     /// session runs in; `extra` are Noches `-e` extensions and session args.
     fn command(&self, exe: &Path, cwd: Option<&str>, args: &[String]) -> Command {
@@ -442,7 +452,13 @@ impl Harness for PiHarness {
         let agent_dir = launch::agent_dir(env);
         let settings = launch::PiSettings::read(&agent_dir, &cwd);
         let roots = launch::session_roots(&user_args, env, &settings, &agent_dir, &cwd);
-        let resume = launch::resolve_resume(request.resume.as_deref(), &roots);
+        let wanted = request.resume.clone();
+        // The session store walk is blocking file I/O.
+        let resume = tokio::task::spawn_blocking(move || {
+            launch::resolve_resume(wanted.as_deref(), &roots, Some(&launch::acp_session_map()))
+        })
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
 
         let extensions = session::Extensions::provision(&controls, policy.runtime)?;
         let mut args = Vec::new();

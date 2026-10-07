@@ -424,17 +424,56 @@ fn looks_like_path(value: &str) -> bool {
     value.contains('/') || value.contains('\\') || value.ends_with(".jsonl")
 }
 
+/// Whether `path` is inside one of Pi's session directories. A resume or fork
+/// id comes from synced state, so it must not name an arbitrary readable file.
+pub(crate) fn within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| path.starts_with(root))
+}
+
+/// pi-acp (the adapter this driver replaced) recorded every session's file next
+/// to its id; legacy ids resolve through it before the session store is walked.
+pub(crate) fn acp_session_map() -> PathBuf {
+    crate::executable::home_or_current_dir()
+        .join(".pi")
+        .join("pi-acp")
+        .join("session-map.json")
+}
+
+fn mapped_session_file(map: &Path, id: &str) -> Option<PathBuf> {
+    const MAX_MAP_BYTES: u64 = 16 << 20;
+    if std::fs::metadata(map).ok()?.len() > MAX_MAP_BYTES {
+        return None;
+    }
+    let map: serde_json::Value = serde_json::from_slice(&std::fs::read(map).ok()?).ok()?;
+    let file = map.pointer("/sessions")?.get(id)?.get("sessionFile")?.as_str()?;
+    Some(PathBuf::from(file))
+}
+
 /// Native ids are session file paths; legacy ids stored by the old ACP adapter
-/// are Pi session UUIDs and are resolved through the session store.
-pub(crate) fn resolve_resume(resume: Option<&str>, roots: &[PathBuf]) -> Resume {
+/// are Pi session UUIDs and are resolved through its session map, then the
+/// session store. Only files under Pi's session roots are ever resumed.
+pub(crate) fn resolve_resume(
+    resume: Option<&str>,
+    roots: &[PathBuf],
+    acp_map: Option<&Path>,
+) -> Resume {
     let Some(resume) = resume.filter(|value| !value.is_empty()) else {
         return Resume::Fresh;
     };
     let found = if looks_like_path(resume) {
         let path = PathBuf::from(resume);
-        path.is_file().then_some(path)
+        (path.is_file() && within_roots(&path, roots)).then_some(path)
     } else {
-        find_session_file(roots, resume)
+        acp_map
+            .and_then(|map| mapped_session_file(map, resume))
+            .filter(|path| path.is_file() && within_roots(path, roots))
+            .or_else(|| find_session_file(roots, resume))
     };
     found.map_or(Resume::Missing, Resume::File)
 }
@@ -644,24 +683,86 @@ mod tests {
         std::fs::write(&flat, "{}\n").unwrap();
         let roots = vec![root];
 
-        assert_eq!(resolve_resume(None, &roots), Resume::Fresh);
-        assert_eq!(resolve_resume(Some(""), &roots), Resume::Fresh);
+        assert_eq!(resolve_resume(None, &roots, None), Resume::Fresh);
+        assert_eq!(resolve_resume(Some(""), &roots, None), Resume::Fresh);
         assert_eq!(
-            resolve_resume(Some(file.to_str().unwrap()), &roots),
+            resolve_resume(Some(file.to_str().unwrap()), &roots, None),
             Resume::File(file.clone())
         );
-        assert_eq!(resolve_resume(Some(id), &roots), Resume::File(file));
+        assert_eq!(resolve_resume(Some(id), &roots, None), Resume::File(file));
         assert_eq!(
-            resolve_resume(Some("aaaa-bbbb"), &roots),
+            resolve_resume(Some("aaaa-bbbb"), &roots, None),
             Resume::File(flat)
         );
         // A vanished file must not be handed to `--session` (it would create
         // a new session at that path).
         let gone = dir.path().join("gone.jsonl");
-        assert_eq!(resolve_resume(Some(gone.to_str().unwrap()), &roots), Resume::Missing);
-        assert_eq!(resolve_resume(Some("deadbeef"), &roots), Resume::Missing);
+        assert_eq!(resolve_resume(Some(gone.to_str().unwrap()), &roots, None), Resume::Missing);
+        assert_eq!(resolve_resume(Some("deadbeef"), &roots, None), Resume::Missing);
         // Ids that are not hex cannot walk the store.
         assert_eq!(find_session_file(&roots, "../../etc"), None);
+    }
+
+    #[test]
+    fn only_files_under_the_session_roots_are_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("a_aaaa.jsonl");
+        let outside = dir.path().join("elsewhere.jsonl");
+        std::fs::write(&inside, "{}\n").unwrap();
+        std::fs::write(&outside, "{}\n").unwrap();
+        let roots = vec![root.clone()];
+        assert_eq!(
+            resolve_resume(Some(inside.to_str().unwrap()), &roots, None),
+            Resume::File(inside.clone())
+        );
+        assert_eq!(
+            resolve_resume(Some(outside.to_str().unwrap()), &roots, None),
+            Resume::Missing
+        );
+        // `..` cannot climb out of a root.
+        let climbing = root.join("..").join("elsewhere.jsonl");
+        assert_eq!(
+            resolve_resume(Some(climbing.to_str().unwrap()), &roots, None),
+            Resume::Missing
+        );
+        assert!(!within_roots(&outside, &[dir.path().join("missing-root")]));
+    }
+
+    #[test]
+    fn legacy_ids_prefer_pi_acps_recorded_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The session lives somewhere the store walk would never find by name.
+        let root = dir.path().join("sessions");
+        let moved = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&moved).unwrap();
+        let file = moved.join("2026-10-07T13-41-15-958Z_01a11698-d036.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let map = dir.path().join("session-map.json");
+        std::fs::write(
+            &map,
+            serde_json::json!({"version": 1, "sessions": {"01a11698-d036": {
+                "sessionId": "01a11698-d036", "sessionFile": file,
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let roots = vec![root];
+        assert_eq!(resolve_resume(Some("01a11698-d036"), &roots, None), Resume::Missing);
+        assert_eq!(
+            resolve_resume(Some("01a11698-d036"), &roots, Some(&map)),
+            Resume::File(file)
+        );
+        // A map entry pointing outside Pi's session roots is ignored.
+        let stray = dir.path().join("stray.jsonl");
+        std::fs::write(&stray, "{}\n").unwrap();
+        std::fs::write(
+            &map,
+            serde_json::json!({"sessions": {"ffff": {"sessionFile": stray}}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(resolve_resume(Some("ffff"), &roots, Some(&map)), Resume::Missing);
     }
 
     #[test]

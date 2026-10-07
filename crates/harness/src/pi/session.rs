@@ -612,7 +612,8 @@ impl Runner {
             }
         };
         let commands = self.adopt(started);
-        if matches!(self.resume, Resume::Missing) {
+        let lost_session = matches!(self.resume, Resume::Missing);
+        if lost_session {
             tracing::warn!(
                 target: "zeron_harness::pi",
                 "stored Pi session is gone; starting a new session"
@@ -629,6 +630,18 @@ impl Runner {
                 assistant_message_id: self.assistant_message_id.clone(),
             })
             .await
+        {
+            self.child.shutdown(self.kill_grace).await;
+            return;
+        }
+        if lost_session
+            && !self
+                .emit(AgentEvent::Error {
+                    message: "The earlier Pi session is no longer available on this device, so \
+                              this chat continues in a new Pi session without its earlier context."
+                        .into(),
+                })
+                .await
         {
             self.child.shutdown(self.kill_grace).await;
             return;

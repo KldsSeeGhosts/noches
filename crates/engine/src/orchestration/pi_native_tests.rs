@@ -246,6 +246,33 @@ async fn pi_turns_record_the_session_file_and_user_entry_refs_and_resume_it() {
 }
 
 #[tokio::test]
+async fn a_vanished_pi_session_continues_from_portable_context_not_a_blank_chat() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = setup(root.path()).await;
+    let first = fixture.send("source", "remember the zebra").await;
+    let session = native_thread(&fixture.core, "source", &first);
+    // The session file is gone (another device, a cleaned store).
+    std::fs::remove_file(&session).unwrap();
+
+    let second = fixture.send("source", "what did I ask").await;
+    // The run did not resume the dead path, and the new Pi session was given
+    // the earlier conversation as portable context with the new message last.
+    let launches: Vec<_> = fixture
+        .log()
+        .into_iter()
+        .filter(|r| r["kind"] == "start" && r["argv"][0] == "--mode")
+        .filter(|r| r["argv"].as_array().unwrap().iter().all(|a| a != "--no-session"))
+        .collect();
+    assert_eq!(launches.len(), 2);
+    assert!(launches[1]["argv"].as_array().unwrap().iter().all(|a| a != "--session"));
+    let prompt = fixture.prompts().pop().unwrap();
+    assert!(prompt.contains("remember the zebra"), "{prompt}");
+    assert!(prompt.ends_with("what did I ask"), "{prompt}");
+    assert_ne!(native_thread(&fixture.core, "source", &second), session);
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_native_pi_fork_carries_only_the_turns_up_to_the_selected_one() {
     let root = tempfile::tempdir().unwrap();
     let fixture = setup(root.path()).await;

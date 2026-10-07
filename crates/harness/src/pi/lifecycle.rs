@@ -130,6 +130,7 @@ impl PiHarness {
     /// Why this boundary cannot fork natively, or the validated parts.
     fn fork_plan<'a>(
         request: &'a NativeForkRequest,
+        roots: &[PathBuf],
     ) -> Result<(PathBuf, Option<&'a str>), String> {
         if request.source_turn_id.as_deref().is_none_or(str::is_empty) {
             return Err(
@@ -139,8 +140,12 @@ impl PiHarness {
         if request.rollback_turns.is_some() {
             return Err("Pi cannot trim a head fork by turn count.".into());
         }
+        if request.cwd.is_empty() {
+            // `--fork` re-homes the copy to the process cwd; never the app's own.
+            return Err("A Pi fork needs a destination working directory.".into());
+        }
         let source = PathBuf::from(&request.source_thread_id);
-        if !source.is_file() {
+        if !source.is_file() || !launch::within_roots(&source, roots) {
             return Err("The source Pi session file is not available on this device.".into());
         }
         let cut = request.source_next_turn_id.as_deref().filter(|id| !id.is_empty());
@@ -174,8 +179,9 @@ impl SessionLifecycle for PiHarness {
             interaction_mode: request.interaction_mode,
             mcp: request.mcp.clone(),
         };
+        let roots = self.session_roots_for(&request.cwd)?;
         // File scans of large transcripts stay off the async workers.
-        tokio::task::spawn_blocking(move || Self::fork_plan(&request_copy).is_ok())
+        tokio::task::spawn_blocking(move || Self::fork_plan(&request_copy, &roots).is_ok())
             .await
             .map_err(|e| HarnessError::Protocol(e.to_string()))
             .and_then(|plannable| {
@@ -184,8 +190,22 @@ impl SessionLifecycle for PiHarness {
             })
     }
 
+    async fn can_resume_now(&self, native_thread_id: &str, cwd: &str) -> Result<bool, HarnessError> {
+        let roots = self.session_roots_for(cwd)?;
+        let wanted = native_thread_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            !matches!(
+                launch::resolve_resume(Some(&wanted), &roots, Some(&launch::acp_session_map())),
+                launch::Resume::Missing
+            )
+        })
+        .await
+        .map_err(|e| HarnessError::Protocol(e.to_string()))
+    }
+
     async fn fork_thread(&self, request: NativeForkRequest) -> Result<String, HarnessError> {
-        let (source, cut) = Self::fork_plan(&request).map_err(HarnessError::Protocol)?;
+        let roots = self.session_roots_for(&request.cwd)?;
+        let (source, cut) = Self::fork_plan(&request, &roots).map_err(HarnessError::Protocol)?;
         let exe = self.resolve_executable()?;
         self.check_version(&exe).await?;
         let mut args = launch::without_extensions_and_tools(&self.user_args()?);
@@ -368,7 +388,7 @@ mod tests {
             source_turn_id: turn.map(str::to_owned),
             source_next_turn_id: next.map(str::to_owned),
             rollback_turns: None,
-            cwd: String::new(),
+            cwd: "dest".into(),
             model: String::new(),
             runtime_mode: Default::default(),
             interaction_mode: Default::default(),
@@ -380,23 +400,31 @@ mod tests {
     fn the_fork_boundary_must_be_provable_before_anything_runs() {
         let dir = tempfile::tempdir().unwrap();
         let file = session(dir.path());
+        let roots = [dir.path().to_path_buf()];
         // Head fork of a known turn, and a cut before the next turn's entry.
-        assert_eq!(PiHarness::fork_plan(&request(&file, Some("u1"), None)).unwrap().1, None);
+        assert_eq!(PiHarness::fork_plan(&request(&file, Some("u1"), None), &roots).unwrap().1, None);
         assert_eq!(
-            PiHarness::fork_plan(&request(&file, Some("u1"), Some("u2"))).unwrap().1,
+            PiHarness::fork_plan(&request(&file, Some("u1"), Some("u2")), &roots).unwrap().1,
             Some("u2")
         );
         // Never fork a moving head with an unknown boundary.
-        assert!(PiHarness::fork_plan(&request(&file, None, None))
+        assert!(PiHarness::fork_plan(&request(&file, None, None), &roots)
             .unwrap_err()
             .contains("native turn reference"));
         // The next turn's entry must be a user message of THIS session.
-        assert!(PiHarness::fork_plan(&request(&file, Some("u1"), Some("a1"))).is_err());
-        assert!(PiHarness::fork_plan(&request(&file, Some("u1"), Some("nope"))).is_err());
+        assert!(PiHarness::fork_plan(&request(&file, Some("u1"), Some("a1")), &roots).is_err());
+        assert!(PiHarness::fork_plan(&request(&file, Some("u1"), Some("nope")), &roots).is_err());
         // Legacy ACP ids and vanished files fall back to portable context.
-        assert!(PiHarness::fork_plan(&request(Path::new("01a11698-d036"), Some("u1"), None)).is_err());
+        assert!(PiHarness::fork_plan(&request(Path::new("01a11698-d036"), Some("u1"), None), &roots).is_err());
         let mut counted = request(&file, Some("u1"), None);
         counted.rollback_turns = Some(2);
-        assert!(PiHarness::fork_plan(&counted).is_err());
+        // A fork with no destination would re-home into the app's own cwd.
+        let mut homeless = request(&file, Some("u1"), None);
+        homeless.cwd = String::new();
+        assert!(PiHarness::fork_plan(&homeless, &roots).unwrap_err().contains("working directory"));
+        // Only Pi's own session files can be forked.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(PiHarness::fork_plan(&request(&file, Some("u1"), None), &[elsewhere.path().to_path_buf()]).is_err());
+        assert!(PiHarness::fork_plan(&counted, &roots).is_err());
     }
 }

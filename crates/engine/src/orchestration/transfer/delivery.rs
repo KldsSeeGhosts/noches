@@ -673,7 +673,22 @@ pub async fn prepare_run(
         .collect();
     let mut handoffs = vec![];
     let mut durable_transfers = vec![];
-    let target_native = resumable_native(kernel, &projection, run, &request.cwd)?;
+    let mut target_native = resumable_native(kernel, &projection, run, &request.cwd)?;
+    // A native thread the harness can no longer resume (a vanished session
+    // file) is as good as none: the planner rebuilds the conversation from
+    // portable context rather than letting the run start a blank session.
+    if let (Some(native), Some(lifecycle)) = (&target_native, harness.session_lifecycle())
+        && !lifecycle
+            .can_resume_now(native, &request.cwd)
+            .await
+            .map_err(|e| Error::Invariant(e.to_string()))?
+    {
+        tracing::warn!(
+            thread = %thread.0,
+            "native session {native} is no longer available; continuing from portable context"
+        );
+        target_native = None;
+    }
     let target_provider = provider_for_run(&projection, run).unwrap_or(Value::Null);
     if request.resume.is_none()
         || target_native.is_some()
