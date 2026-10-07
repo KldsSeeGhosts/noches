@@ -190,15 +190,26 @@ it exactly once (`prepare_run`); an automatic delivery leaves it pending, and a
 cancelled queued run never consumed it.
 
 Native hooks implemented: Codex `thread/fork` at `lastTurnId`; OpenCode 1.x
-`messageID` and 2.x `before` cut boundaries. Missing source/later cursors use
-portable context instead of copying an unstable head. Mocked protocol tests are
+`messageID` and 2.x `before` cut boundaries; Claude's lazy fork (below). Missing
+source/later cursors use portable context instead of copying an unstable head.
+
+Claude has no standalone fork primitive, so `fork_thread` only mints a deferred
+native id (`claude-fork:v1:<child>:<parent>:<assistant uuid>`) and starts no
+process. The child's first run expands it to `--resume <parent> --fork-session
+--session-id <child> --resume-session-at <uuid>`; the host-chosen child id makes
+a start that dies before `init` retry the same fork, and once the child's
+transcript exists the token resolves to a plain `--resume <child>`. Turn refs
+are the last top-level assistant frame uuid of each successful turn. Before any
+fork is recorded as in flight, `SessionLifecycle::can_fork_now` must confirm the
+uuid is in the parent's local transcript recorded in the child's working
+directory; otherwise (head with no ref, legacy turn, other directory, parent
+gone) delivery uses portable context. Verified against fake-CLI fixtures and CLI
+2.1.292 flag parsing only, not a live model turn. Mocked protocol tests are
 not live installed-provider verification.
 
 Remaining parity work, not claimed complete:
 
-- Claude/Pi/negotiated ACP native fork hooks (Claude's `--fork-session` writes no
-  session until a turn runs and the adapter exposes no turn refs; ACP
-  `session/fork` is head-only); lifecycle operations are not inferred from native
+- Pi/negotiated ACP native fork hooks (ACP `session/fork` is head-only); lifecycle operations are not inferred from native
   resume support. Codex cursor-less (legacy) source turns do fork natively: head
   fork, then paginated `thread/revert` of the counted settled later turns,
   refused (portable fallback or uncertain fork) when a later turn is live or the

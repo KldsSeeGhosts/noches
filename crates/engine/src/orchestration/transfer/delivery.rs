@@ -882,18 +882,46 @@ pub async fn prepare_run(
             && (next_run.is_none() || next_turn.is_some()))
             || (!transfer["sourcePoint"]["providerTurnRef"]["nativeId"].is_string()
                 && legacy_rollback.is_some());
-        if transfer["type"] == "fork"
+        let fork_request = (transfer["type"] == "fork"
             && stable_native_boundary
             && native_fork_eligible(
                 &transfer,
                 source_run,
                 &run.provider_instance_id,
                 capabilities,
-            )
-        {
-            let lifecycle = harness
-                .session_lifecycle()
-                .ok_or_else(|| Error::Invariant("Native fork adapter unavailable.".into()))?;
+            ))
+        .then(|| NativeForkRequest {
+            source_thread_id: transfer["sourcePoint"]["providerThreadRef"]["nativeId"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
+            source_turn_id: transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
+                .as_str()
+                .map(str::to_owned),
+            source_next_turn_id: next_turn,
+            rollback_turns: legacy_rollback,
+            cwd: request.cwd.clone(),
+            model: run.model_selection.model.clone(),
+            runtime_mode: request.runtime_mode,
+            interaction_mode: request.interaction_mode,
+            mcp: mcp.clone(),
+        });
+        // A definite "cannot fork this boundary" routes to portable context
+        // before anything is recorded as in flight.
+        let native_fork = match fork_request {
+            Some(fork_request) => {
+                let lifecycle = harness
+                    .session_lifecycle()
+                    .ok_or_else(|| Error::Invariant("Native fork adapter unavailable.".into()))?;
+                lifecycle
+                    .can_fork_now(&fork_request)
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?
+                    .then_some((lifecycle, fork_request))
+            }
+            None => None,
+        };
+        if let Some((lifecycle, fork_request)) = native_fork {
             kernel.store.write(|tx| {
                 let marker = json!({"status":"fork_pending","targetRunId":run.id});
                 tx.execute("INSERT INTO orchestration_transfer_delivery(transfer_id,target_run_id,status,payload_json) VALUES(?1,?2,'fork_pending',?3)",
@@ -901,22 +929,7 @@ pub async fn prepare_run(
                 Ok(())
             })?;
             let native = lifecycle
-                .fork_thread(NativeForkRequest {
-                    source_thread_id: transfer["sourcePoint"]["providerThreadRef"]["nativeId"]
-                        .as_str()
-                        .unwrap_or("")
-                        .into(),
-                    source_turn_id: transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
-                        .as_str()
-                        .map(str::to_owned),
-                    source_next_turn_id: next_turn,
-                    rollback_turns: legacy_rollback,
-                    cwd: request.cwd.clone(),
-                    model: run.model_selection.model.clone(),
-                    runtime_mode: request.runtime_mode,
-                    interaction_mode: request.interaction_mode,
-                    mcp: mcp.clone(),
-                })
+                .fork_thread(fork_request)
                 .await
                 .map_err(|e| Error::Invariant(e.to_string()))?;
             transfer["resolution"] = json!({"strategy":"native_fork","providerThreadRef":{

@@ -227,7 +227,9 @@ fn handoff_budget_uses_the_catalog_declared_window_before_any_telemetry() {
 }
 
 /// Records the native fork request; accepts a counted legacy boundary.
+/// `refuse` is a definite pre-flight "cannot fork this boundary".
 struct RollbackForkHarness {
+    refuse: bool,
     seen: std::sync::Mutex<Vec<(Option<String>, Option<usize>)>>,
 }
 #[async_trait::async_trait]
@@ -276,6 +278,12 @@ impl zeron_harness::session_lifecycle::SessionLifecycle for RollbackForkHarness 
     }
     fn supports_fork_rollback(&self) -> bool {
         true
+    }
+    async fn can_fork_now(
+        &self,
+        _: &zeron_harness::session_lifecycle::NativeForkRequest,
+    ) -> std::result::Result<bool, zeron_harness::HarnessError> {
+        Ok(!self.refuse)
     }
     async fn fork_thread(
         &self,
@@ -342,6 +350,7 @@ async fn legacy_cursorless_fork_counts_settled_later_turns_and_refuses_a_live_he
             .unwrap();
         let run = start(&kernel, "legacy-child", "legacy-input").await;
         let harness = RollbackForkHarness {
+            refuse: false,
             seen: Default::default(),
         };
         let caps = crate::orchestration::assembly::capabilities(&harness);
@@ -366,6 +375,95 @@ async fn legacy_cursorless_fork_counts_settled_later_turns_and_refuses_a_live_he
             assert_eq!(seen, vec![(None, Some(2))]);
             assert_eq!(transfer["resolution"]["strategy"], "native_fork");
             assert_eq!(input.resume.as_deref(), Some("legacy-native-fork"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_definite_preflight_refusal_uses_portable_context_without_an_in_flight_fork() {
+    for refuse in [false, true] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (db, kernel, source) = fixture(cwd.path());
+        let mut turn = legacy_turn("source-turn", "attempt:source", 1, "completed");
+        turn["nativeTurnRef"] =
+            json!({"driver":"claude","nativeId":"assistant-uuid","strength":"strong"});
+        kernel
+            .store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orchestration_projection_records(thread_id,kind,id,payload_json,last_sequence)
+                     VALUES('source','provider-turn','source-turn',?1,1)",
+                    [turn.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        kernel
+            .transfer_command(
+                &"source".into(),
+                "fork:preflight".into(),
+                TransferOperation::Fork {
+                    target: "preflight-child".into(),
+                    source: SourcePoint::Run { run_id: source.id },
+                    title: None,
+                },
+            )
+            .await
+            .unwrap();
+        let run = start(&kernel, "preflight-child", "preflight-input").await;
+        let harness = RollbackForkHarness {
+            refuse,
+            seen: Default::default(),
+        };
+        let caps = crate::orchestration::assembly::capabilities(&harness);
+        let mut input = request(cwd.path());
+        prepare_run(
+            &kernel,
+            &run.thread_id,
+            &run,
+            &mut input,
+            &harness,
+            &caps,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        // A retry after the same refusal (or a restart) stays portable too: a
+        // refusal never leaves a marker that would read as an uncertain fork.
+        let reopened = Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+        let mut retry = request(cwd.path());
+        prepare_run(
+            &reopened,
+            &run.thread_id,
+            &run,
+            &mut retry,
+            &harness,
+            &caps,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let transfer = &reopened.store.thread_transfers(&run.thread_id).unwrap()[0];
+        let forks = harness.seen.lock().unwrap().len();
+        if refuse {
+            assert_eq!(forks, 0);
+            assert_eq!(transfer["resolution"]["strategy"], "portable_context");
+            assert!(input.resume.is_none() && retry.resume.is_none());
+            let markers: i64 = reopened
+                .store
+                .read(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_transfer_delivery WHERE status='fork_pending'",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(markers, 0);
+        } else {
+            assert_eq!(forks, 1);
+            assert_eq!(transfer["resolution"]["strategy"], "native_fork");
+            assert_eq!(input.resume, retry.resume);
         }
     }
 }
