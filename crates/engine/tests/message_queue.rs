@@ -950,6 +950,24 @@ where
     }
 }
 
+/// Occurrence-counted write injection needs a quiet store: the first turn's
+/// settlement commits can otherwise land after injection on a slow runner.
+async fn settled_store(core: &EngineCore) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = core.orchestration.store.projection_frontier().unwrap();
+    let mut quiet = 0;
+    while quiet < 10 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for a quiet orchestration store"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let frontier = core.orchestration.store.projection_frontier().unwrap();
+        quiet = if frontier == last { quiet + 1 } else { 0 };
+        last = frontier;
+    }
+}
+
 fn queue_texts(core: &EngineCore) -> Vec<String> {
     core.doc_host
         .open(CHAT)
@@ -1642,6 +1660,7 @@ async fn delayed_disconnect_survives_response_loss_rebuild_and_does_not_stop_an_
         .unwrap();
     let sessions = attached_sessions(&core).await;
     core.orchestration_host.as_ref().unwrap().shutdown().await;
+    settled_store(&core).await;
     let request = DisconnectThreadSessionParams {
         chat_id: CHAT.into(),
         client_request_id: "after-commit-loss".into(),
