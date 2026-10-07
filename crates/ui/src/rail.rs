@@ -412,6 +412,7 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
+        let build_started = crate::perf_trace::enabled().then(Instant::now);
         let (entries, echoes) = {
             let state = self.state_entity().read(cx);
             (state.transcript.clone(), state.pending_echoes().to_vec())
@@ -428,6 +429,9 @@ impl Transcript {
                 Some((tick, row))
             })
             .collect();
+        if let Some(started) = build_started {
+            crate::perf_trace::rail_build(started.elapsed());
+        }
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
         if pairs.len() < 2 {

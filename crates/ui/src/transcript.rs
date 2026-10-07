@@ -6369,6 +6369,7 @@ impl Transcript {
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        crate::perf_trace::row_render();
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
@@ -7644,6 +7645,31 @@ impl Transcript {
                 )
             })
             .into_any_element()
+    }
+}
+
+#[cfg(feature = "ui-response-fixture")]
+impl Transcript {
+    pub fn fixture_response_position(&self) -> serde_json::Value {
+        let top = self.list.logical_scroll_top();
+        serde_json::json!({
+            "row": top.item_ix,
+            "offset": f32::from(top.offset_in_item),
+            "distance": self.distance_from_bottom(),
+            "rows": self.rows.len(),
+            "pinned": self.pinned,
+            "jump": self.show_jump_button,
+            "navigation": self.scroll_anim.is_some(),
+        })
+    }
+
+    pub fn fixture_response_seek(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        self.stop_automatic_scrolling();
+        self.list.scroll_to(ListOffset {
+            item_ix: ((self.rows.len().saturating_sub(1) as f32) * fraction) as usize,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
     }
 }
 

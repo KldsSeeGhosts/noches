@@ -5,7 +5,7 @@ use std::{cell::RefCell, collections::HashMap, sync::OnceLock, time::Duration};
 
 use gpui::{App, EntityId};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct Counters {
     pub transcript_renders: u64,
     pub transcript_cache_hits: u64,
@@ -13,6 +13,9 @@ pub(crate) struct Counters {
     pub subagent_scans: u64,
     pub subagent_cache_hits: u64,
     pub highlight_hash_bytes: u64,
+    pub rail_builds: u64,
+    pub rail_build_us: u64,
+    pub row_renders: u64,
 }
 
 thread_local! {
@@ -74,6 +77,22 @@ pub(crate) fn highlight_hash(bytes: usize) {
 
 pub(crate) fn snapshot() -> Counters {
     COUNTERS.with(|c| *c.borrow())
+}
+
+pub(crate) fn row_render() {
+    if counting() {
+        COUNTERS.with(|c| c.borrow_mut().row_renders += 1);
+    }
+}
+
+pub(crate) fn rail_build(elapsed: Duration) {
+    if counting() {
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.rail_builds += 1;
+            c.rail_build_us += elapsed.as_micros() as u64;
+        });
+    }
 }
 
 pub(crate) fn init(cx: &mut App) {
