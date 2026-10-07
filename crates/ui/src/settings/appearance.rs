@@ -289,7 +289,7 @@ impl AppearancePage {
     }
 
     /// Panel animation duration: a short ladder over the 0-400ms range the
-    /// motion catalog accepts. Off is the default (T3's).
+    /// motion catalog accepts. The authored 200ms timing is the default.
     fn render_panel_animation(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         const STEPS: [(u16, &str); 5] = [
             (0, "Off"),
@@ -324,14 +324,14 @@ impl AppearancePage {
                             ),
                     ),
             )
-            .when(current != 0, |row| {
+            .when(current != crate::motion::PANEL_ANIMATION_DEFAULT_MS, |row| {
                 row.child(widgets::reset_button(theme, "panel-animation-reset", cx.entity_id()).on_click(
                     cx.listener(|_, _, _, cx| {
-                        crate::motion::set_panel_animation_ms(0);
+                        crate::motion::set_panel_animation_ms(crate::motion::PANEL_ANIMATION_DEFAULT_MS);
                         crate::settings::update(
                             crate::settings::SavePolicy::Immediate,
                             cx,
-                            |settings| settings.panel_animation_ms = 0,
+                            |settings| settings.panel_animation_ms = crate::motion::PANEL_ANIMATION_DEFAULT_MS,
                         );
                         cx.notify();
                     }),

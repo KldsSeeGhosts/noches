@@ -38,11 +38,14 @@ fn capture(
     output: &std::path::Path,
     name: &str,
 ) -> anyhow::Result<()> {
+    eprintln!("native capture begin: {name}");
     window.update(cx, |_, w, _| {
         w.render_to_image()?
             .save(output.join(format!("{name}.png")))?;
         anyhow::Ok(())
-    })?
+    })??;
+    eprintln!("native capture end: {name}");
+    Ok(())
 }
 
 fn history(turns: usize) -> Vec<zeron_doc::SessionMessageEntry> {
@@ -206,20 +209,30 @@ fn main() -> anyhow::Result<()> {
                         pause(cx, 20).await;
                         anyhow::ensure!(!transcript.read_with(cx, |t, _| t.fixture_response_position())["pinned"].as_bool().unwrap(), "background streaming stole scroll ownership");
                     }
-                    for mode in [appearance::AppearanceMode::Dark, appearance::AppearanceMode::Light] {
+                    // Keep readbacks outside input sustain and active width
+                    // transitions; intermediate geometry comes from replay.
+                    pause(cx, 1200).await;
+                    // Boot each appearance in a separate process. Live
+                    // set_mode calls setAppearance: while App is borrowed,
+                    // and the existing synchronous AppKit callback re-enters
+                    // AsyncApp::update_window (which correctly refuses it).
+                    for mode in [if light {appearance::AppearanceMode::Light} else {appearance::AppearanceMode::Dark}] {
                         let label = if mode == appearance::AppearanceMode::Dark {"dark"} else {"light"};
-                        cx.update(|cx| appearance::set_mode(mode, cx));
                         pause(cx, 300).await;
                         capture(window, cx, &output, &format!("settled-{label}"))?;
                         for right in [false, true] {
                             let side = if right {"right"} else {"left"};
                             window.update(cx, |s, _, cx| s.fixture_response_toggle(right, cx))?;
                             pause(cx, 40).await;
-                            capture(window, cx, &output, &format!("{side}-mid-{label}"))?;
                             let (before, from) = window.update(cx, |s, _, cx| s.fixture_response_reverse(right, cx))?;
                             anyhow::ensure!((before - from).abs() < 1., "{side} panel reversal jumped: {before} -> {from}");
                             pause(cx, 400).await;
                             capture(window, cx, &output, &format!("{side}-restored-{label}"))?;
+                            window.update(cx, |s, _, cx| s.fixture_response_toggle(right, cx))?;
+                            pause(cx, 400).await;
+                            capture(window, cx, &output, &format!("{side}-changed-{label}"))?;
+                            window.update(cx, |s, _, cx| s.fixture_response_toggle(right, cx))?;
+                            pause(cx, 400).await;
                         }
                     }
                     for (ms, reduced) in [(200, true), (0, false)] {
@@ -237,7 +250,7 @@ fn main() -> anyhow::Result<()> {
                             pause(cx, 32).await;
                         }
                     }
-                    eprintln!("native verification: wheel cancels rail; streaming preserves ownership; interrupted panels; dark/light captures; reduced/instant snaps: PASS");
+                    eprintln!("native verification: wheel cancels rail; streaming preserves ownership; interrupted panels; appearance captures; reduced/instant snaps: PASS");
                 }
                 drop(temp);
                 Ok(())
