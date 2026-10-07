@@ -5,12 +5,39 @@ use zeron_proto::orchestration::ThreadId;
 use zeron_proto::transfer::ThreadTransferState;
 use zeron_rpc::{RpcError, RpcReply, methods};
 
+/// The Details preview shows only the most recent text messages, so the wire
+/// state carries just those (delivery reads `inherited_items` in full).
+const PREVIEW_MESSAGES: usize = 100;
+const PREVIEW_CHARS: usize = 10_000;
+
+fn preview_items(items: Vec<Value>) -> Vec<Value> {
+    let mut messages: Vec<Value> = items
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("user_message" | "assistant_message")
+            ) && item["text"].as_str().is_some_and(|text| !text.is_empty())
+        })
+        .collect();
+    messages.drain(..messages.len().saturating_sub(PREVIEW_MESSAGES));
+    for item in &mut messages {
+        // One char past the limit, so the client can still tell it was cut.
+        if let Some(text) = item["text"].as_str()
+            && text.chars().count() > PREVIEW_CHARS + 1
+        {
+            item["text"] = json!(text.chars().take(PREVIEW_CHARS + 1).collect::<String>());
+        }
+    }
+    messages
+}
+
 impl Store {
     pub fn transfer_ui_state(&self, id: &ThreadId) -> Result<ThreadTransferState> {
         let projection = self
             .thread(id)?
             .ok_or_else(|| Error::Invariant("The thread was not found.".into()))?;
-        let inherited = super::transfer::inherited_items(self, &projection)?;
+        let inherited = preview_items(super::transfer::inherited_items(self, &projection)?);
         let transfers = self.thread_transfers(id)?;
         // A transfer is visible on both ends, but its acceptance receipt lives
         // on the target. Source Details must not label delivered child history
@@ -330,5 +357,33 @@ pub(crate) async fn rpc(
             )
         }
         _ => unreachable!("transfer RPC route"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_details_preview_carries_only_recent_capped_text_messages() {
+        let mut items = vec![json!({"type":"reasoning","text":"private"})];
+        for n in 0..150 {
+            items.push(json!({"type":"user_message","id":format!("m{n}"),"text":format!("hello {n}")}));
+            items.push(json!({"type":"tool_call","id":format!("t{n}"),"text":"ls"}));
+        }
+        items.push(json!({"type":"assistant_message","id":"empty","text":""}));
+        items.push(json!({"type":"assistant_message","id":"huge","text":"x".repeat(50_000)}));
+        let preview = preview_items(items);
+        assert_eq!(preview.len(), PREVIEW_MESSAGES);
+        assert!(
+            preview
+                .iter()
+                .all(|i| matches!(i["type"].as_str(), Some("user_message" | "assistant_message")))
+        );
+        assert_eq!(preview[0]["id"], "m51");
+        let huge = preview.last().unwrap();
+        assert_eq!(huge["id"], "huge");
+        // One past the client's own 10k cut, so it still shows "shortened".
+        assert_eq!(huge["text"].as_str().unwrap().chars().count(), PREVIEW_CHARS + 1);
     }
 }
