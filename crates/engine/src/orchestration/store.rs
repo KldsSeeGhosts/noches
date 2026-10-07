@@ -716,6 +716,12 @@ mod migration_tests {
                     [index as i64 + 1],
                 )?;
             }
+            // The dev copy of migration 6 predates the user-request tables; they
+            // exist here only because `MIGRATIONS` was edited in place.
+            conn.execute_batch(
+                "DROP TABLE orchestration_queue_user_requests;
+                 DROP TABLE orchestration_session_user_requests;",
+            )?;
             conn.execute("INSERT INTO orchestration_host VALUES(1,'host',4)", [])?;
             conn.execute(
                 "INSERT INTO orchestration_effect_outbox
@@ -778,6 +784,17 @@ mod migration_tests {
                     )?,
                     5,
                     "performance indexes and new steering tables must coexist"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE name IN ('orchestration_queue_user_requests',
+                                        'orchestration_session_user_requests')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    2,
+                    "opening a dev v7 database must recreate the request-identity tables"
                 );
                 assert_eq!(
                     conn.query_row(

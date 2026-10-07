@@ -215,18 +215,7 @@ impl QueueDomain {
             .kernel
             .store
             .write(|conn| {
-                let previous: Option<String> = conn.query_row(
-                "SELECT payload_json FROM orchestration_session_user_requests WHERE command_id=?1",
-                [&id.0], |row| row.get(0),
-            ).optional()?;
-                if let Some(previous) = previous {
-                    return Ok(previous == payload);
-                }
-                conn.execute(
-                    "INSERT INTO orchestration_session_user_requests VALUES(?1,?2)",
-                    rusqlite::params![id.0, payload],
-                )?;
-                Ok(true)
+                super::reserve_request(conn, super::SESSION_USER_REQUESTS, &id.0, &payload)
             })
             .map_err(fail)?;
         if !same {

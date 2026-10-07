@@ -246,7 +246,6 @@ impl HostQueue {
         &self,
         request: zeron_proto::MutateQueuedRunParams,
     ) -> Result<zeron_proto::MutateQueuedRunResult, ToolError> {
-        use rusqlite::OptionalExtension;
         use zeron_proto::QueuedRunAction;
         use zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode as Code;
 
@@ -320,18 +319,7 @@ impl HostQueue {
             .kernel
             .store
             .write(|conn| {
-                let previous: Option<String> = conn.query_row(
-                "SELECT payload_json FROM orchestration_queue_user_requests WHERE command_id=?1",
-                [&id.0], |row| row.get(0),
-            ).optional()?;
-                if let Some(previous) = previous {
-                    return Ok(previous == payload);
-                }
-                conn.execute(
-                    "INSERT INTO orchestration_queue_user_requests VALUES(?1,?2)",
-                    rusqlite::params![id.0, payload],
-                )?;
-                Ok(true)
+                super::reserve_request(conn, super::QUEUE_USER_REQUESTS, &id.0, &payload)
             })
             .map_err(|_| unavailable())?;
         if !same {
