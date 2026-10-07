@@ -260,27 +260,71 @@ pub(super) fn plan_reset(
     Ok(())
 }
 
+/// A run cancelled while still queued: it never reached the provider, so it
+/// proves nothing about the conversation it was bound to.
+pub(crate) fn never_started(run: &zeron_proto::orchestration::OrchestrationV2Run) -> bool {
+    run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Cancelled
+        && run.started_at.is_none()
+}
+
 /// True for a run that begins a new provider-thread generation after a user
-/// reset: it is bound to a closed conversation, or is the first run on a fresh
-/// one while a closed conversation exists. Later runs resume that generation.
+/// reset: it is bound to a closed conversation, or is bound to a fresh one that
+/// has not yet established its own native conversation while a closed sibling
+/// exists. Later runs resume that generation once it has.
 pub(crate) fn fresh_after_reset(
     p: &ThreadProjection,
     run: &zeron_proto::orchestration::OrchestrationV2Run,
 ) -> bool {
-    let threads = task::records(p, "provider-thread");
     let closed = |thread: &Value| thread["status"] == "closed";
+    let Some(own) = task::records(p, "provider-thread").iter().find(|thread| {
+        Some(thread["id"].as_str().unwrap_or(""))
+            == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+    }) else {
+        return false;
+    };
+    closed(own) || fresh_generation(p, run)
+}
+
+/// The fresh generation a reset created, until a turn on it is accepted. Keyed
+/// on the generation's own evidence, never on whether an earlier run shares it:
+/// a cancelled or startup-failed first run must not turn the next start back
+/// into a resume of the closed conversation.
+pub(crate) fn fresh_generation(
+    p: &ThreadProjection,
+    run: &zeron_proto::orchestration::OrchestrationV2Run,
+) -> bool {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::{Completed, Waiting};
+    let threads = task::records(p, "provider-thread");
     let Some(own) = threads.iter().find(|thread| {
         Some(thread["id"].as_str().unwrap_or(""))
             == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
     }) else {
         return false;
     };
-    closed(own)
-        || (threads.iter().any(closed)
-            && !p.runs.iter().any(|earlier| {
-                earlier.ordinal < run.ordinal
-                    && earlier.provider_thread_id == run.provider_thread_id
-            }))
+    if own["status"] == "closed"
+        || !threads.iter().any(|sibling| {
+            sibling["status"] == "closed"
+                && sibling["id"] != own["id"]
+                && sibling["providerInstanceId"] == own["providerInstanceId"]
+        })
+    {
+        return false;
+    }
+    let native = own["nativeThreadRef"]["nativeId"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+        || own["providerSessionId"].as_str().is_some_and(|id| !id.is_empty());
+    let accepted = p.runs.iter().any(|earlier| {
+        earlier.id != run.id
+            && earlier.ordinal < run.ordinal
+            && earlier.provider_thread_id == run.provider_thread_id
+            && !never_started(earlier)
+            && (matches!(earlier.status, Completed | Waiting)
+                || p.attempts.iter().any(|attempt| {
+                    attempt.run_id == earlier.id && attempt.native_thread_id.as_ref().is_some()
+                }))
+    });
+    !native && !accepted
 }
 
 pub(super) fn target_still_disconnected(p: &ThreadProjection, request: &EffectRequest) -> bool {

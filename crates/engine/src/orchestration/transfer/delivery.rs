@@ -686,7 +686,11 @@ pub async fn prepare_run(
     let earlier = projection
         .runs
         .iter()
-        .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
+        .filter(|r| {
+            r.ordinal < run.ordinal
+                && super::forkable(&r.status)
+                && !super::super::queue::session_control::never_started(r)
+        })
         .max_by_key(|r| r.ordinal);
     // A restart that moved the run onto another generation hands off from the
     // run itself, partial output included. Otherwise the previous finished run
@@ -700,6 +704,9 @@ pub async fn prepare_run(
                 || (previous.provider_thread_id != run.provider_thread_id
                     && provider_for_run(&projection, previous)
                         .is_some_and(|p| p["status"] == "closed"))
+                // The fresh generation has no accepted native conversation yet
+                // (its first run was cancelled or failed before one existed).
+                || super::super::queue::session_control::fresh_generation(&projection, run)
                 || selection_transition(
                     target_provider["driver"].as_str().unwrap_or_default(),
                     &previous.model_selection,

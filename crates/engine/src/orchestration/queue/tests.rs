@@ -106,6 +106,8 @@ async fn reset_generation_predicate_marks_only_the_first_run_after_a_closed_conv
     let mut generation = closed.clone();
     generation["id"] = json!("fresh-generation");
     generation["status"] = json!("not_loaded");
+    generation["nativeThreadRef"] = serde_json::Value::Null;
+    generation["providerSessionId"] = serde_json::Value::Null;
     rows.retain(|row| row["id"] != provider.0);
     rows.push(closed);
     rows.push(generation);
@@ -115,6 +117,8 @@ async fn reset_generation_predicate_marks_only_the_first_run_after_a_closed_conv
         &p.runs[index]
     ));
     // ...the first turn on its replacement is rebuilt, a later one resumes it.
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::{Cancelled, Completed, Failed};
+    fresh.status = Completed;
     p.runs.push(fresh.clone());
     assert!(super::session_control::fresh_after_reset(&p, &fresh));
     let mut later = fresh.clone();
@@ -122,6 +126,30 @@ async fn reset_generation_predicate_marks_only_the_first_run_after_a_closed_conv
     later.ordinal += 1;
     p.runs.push(later.clone());
     assert!(!super::session_control::fresh_after_reset(&p, &later));
+    // A first run cancelled before it started, or one that failed before any
+    // native session existed, proves nothing: the next start is still fresh.
+    for (status, started) in [(Cancelled, false), (Failed, true), (Cancelled, true)] {
+        let mut q = p.clone();
+        let first = q.runs.iter_mut().find(|r| r.id == fresh.id).unwrap();
+        first.status = status.clone();
+        first.started_at = started.then(|| "2026-01-01T00:00:00.000Z".to_string());
+        assert!(
+            super::session_control::fresh_after_reset(&q, &later),
+            "{status:?} started={started}"
+        );
+        // ...until a native session is accepted on the fresh generation.
+        q.records
+            .get_mut("provider-thread")
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == "fresh-generation")
+            .unwrap()["nativeThreadRef"] =
+            json!({"driver":"mock","nativeId":"native","strength":"strong"});
+        assert!(
+            !super::session_control::fresh_after_reset(&q, &later),
+            "{status:?}: an accepted native identity continues the generation"
+        );
+    }
 }
 
 #[tokio::test]

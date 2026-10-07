@@ -4104,6 +4104,184 @@ async fn forced_reset_starts_a_fresh_generation_with_portable_history_and_is_rep
     core.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_first_run_after_reset_does_not_turn_the_next_start_back_into_a_resume() {
+    use zeron_proto::transfer::{ResetThreadSessionParams, StopThreadWorkParams};
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening question", vec![])
+        .unwrap();
+    attached_sessions(&core).await;
+    for text in ["first after reset", "second after reset"] {
+        core.doc_host.queue_message(CHAT, text, vec![]).unwrap();
+    }
+    // Stop freezes the queue; the two rows stay queued across the reset.
+    client
+        .stop_thread_work(
+            StopThreadWorkParams {
+                chat_id: CHAT.into(),
+                client_request_id: "stop-before-reset".into(),
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the stopped turn to settle",
+    )
+    .await;
+    let observed = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .latest_started_run_id;
+    let live = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .attached_provider_sessions;
+    let reset = client
+        .reset_thread_session(
+            ResetThreadSessionParams {
+                chat_id: CHAT.into(),
+                client_request_id: "reset-then-cancel".into(),
+                observed_run_id: observed,
+                provider_sessions: live,
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    assert!(reset.refusal.is_none(), "{:?}", reset.refusal);
+    wait_for(|| !core.sessions.has_live_runtime(CHAT), "reset teardown").await;
+    // The first row never reaches a provider; the second is the first to start.
+    let rows = core.doc_host.open(CHAT).unwrap().doc().read_queue().unwrap();
+    assert_eq!(rows.len(), 2, "{:?}", queue_texts(&core));
+    core.doc_host
+        .remove_queued_message(CHAT, &rows[0].id)
+        .await
+        .unwrap();
+    assert!(
+        core.doc_host
+            .send_queued_now(CHAT, &rows[1].id)
+            .await
+            .unwrap()
+    );
+    wait_for(
+        || prompts.lock().unwrap().len() == 2,
+        "the run after the cancelled one",
+    )
+    .await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(
+            requests[1].resume, None,
+            "a cancelled queued run must not hide the reset"
+        );
+        assert!(
+            requests[1].prompt.contains("opening question")
+                && requests[1].prompt.contains("second after reset"),
+            "{}",
+            requests[1].prompt
+        );
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_first_run_after_reset_does_not_turn_the_next_start_back_into_a_resume() {
+    use zeron_proto::transfer::{ResetThreadSessionParams, StopThreadWorkParams};
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening question", vec![])
+        .unwrap();
+    attached_sessions(&core).await;
+    for text in ["first after reset", "second after reset"] {
+        core.doc_host.queue_message(CHAT, text, vec![]).unwrap();
+    }
+    // Stop freezes the queue; the two rows stay queued across the reset.
+    client
+        .stop_thread_work(
+            StopThreadWorkParams {
+                chat_id: CHAT.into(),
+                client_request_id: "stop-before-reset".into(),
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the stopped turn to settle",
+    )
+    .await;
+    let observed = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .latest_started_run_id;
+    let live = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .attached_provider_sessions;
+    let reset = client
+        .reset_thread_session(
+            ResetThreadSessionParams {
+                chat_id: CHAT.into(),
+                client_request_id: "reset-then-cancel".into(),
+                observed_run_id: observed,
+                provider_sessions: live,
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    assert!(reset.refusal.is_none(), "{:?}", reset.refusal);
+    wait_for(|| !core.sessions.has_live_runtime(CHAT), "reset teardown").await;
+    // The first row never reaches a provider; the second is the first to start.
+    let rows = core.doc_host.open(CHAT).unwrap().doc().read_queue().unwrap();
+    assert_eq!(rows.len(), 2, "{:?}", queue_texts(&core));
+    core.doc_host
+        .remove_queued_message(CHAT, &rows[0].id)
+        .await
+        .unwrap();
+    assert!(
+        core.doc_host
+            .send_queued_now(CHAT, &rows[1].id)
+            .await
+            .unwrap()
+    );
+    wait_for(
+        || prompts.lock().unwrap().len() == 2,
+        "the run after the cancelled one",
+    )
+    .await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(
+            requests[1].resume, None,
+            "a cancelled queued run must not hide the reset"
+        );
+        assert!(
+            requests[1].prompt.contains("opening question")
+                && requests[1].prompt.contains("second after reset"),
+            "{}",
+            requests[1].prompt
+        );
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 fn composer_config(harness: HarnessId, model: &str) -> zeron_proto::ChatConfig {
     zeron_proto::ChatConfig {
         instance_id: None,
