@@ -85,6 +85,18 @@ parent chat's authority (no provider session), resolves on acceptance
 settled task replies with its terminal status and disposes completion delivery,
 exactly like the MCP tool.
 
+`CancelDelegatedTask`, `StopThreadWork` and `ResetThreadSession` are owner-routed
+(`targetDeviceId`) like the other lifecycle writes.
+`StopThreadWork {chatId, clientRequestId}` stops the thread's interruptible run (or
+completed-root native background work) and every non-terminal app-owned child task
+beneath it, recursively; the target set is frozen under the request id and a replay
+repeats it. It answers `{sequence, stoppedRuns, skipped, refusal}`; a child thread
+refuses it (stop the task from its owner). `ResetThreadSession {chatId,
+clientRequestId, observedRunId, providerSessions}` closes the thread's provider
+conversations so the next turn is rebuilt from bounded portable history; it is refused
+while a run is active, for a stale `observedRunId` (`latestStartedRunId` of
+`GetThreadTransferState`) or attachment set, and when no conversation exists.
+
 Owner-routed user `ForkThread` and `MergeThreadBack` use the same transactional
 transfer planner as MCP, with separate user authority and stable retry keys.
 Their contracts and passive inherited-history presentation are documented in

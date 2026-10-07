@@ -33,8 +33,10 @@ it is not alone evidence that a feature works in either application.
 | Native vs app-owned agents | `SubagentProjection`, provider event ingest, client-runtime subagent selectors | `delegation`, `subagents`, `agents`, composer/sidebar: observational native children and app-owned tasks retain separate authority and share presentation. Existing. |
 | Thread launch/workspace binding | `ThreadLaunchService`, `ThreadManagementService` | `launch`, `worktree`, `thread_service`: explicit root/existing/new-worktree preparation, durable setup admission; existing with adapter gaps below. |
 | Lazy fork and merge-back | [ThreadForkService](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/server/src/orchestration-v2/ThreadForkService.ts) | **Added:** owner-routed user RPCs, pinned source, stable request identity, immediate inherited chat config, no eager provider start. Direct-parent merge prepares context; it is not a Git merge. |
-| Thread relationships | [ThreadRelationshipsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/ThreadRelationshipsControl.tsx) | **Added:** Details lineage, parent/fork navigation, bounded scroll regions, fork/checkpoint actions, merge-back action and sidebar fork shortcut. Existing Agents panel continues to own delegated-task controls. |
+| Thread relationships | [ThreadRelationshipsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/ThreadRelationshipsControl.tsx) | **Added:** Details lineage, parent/fork navigation, bounded scroll regions, fork/checkpoint actions, merge-back action and sidebar fork shortcut. Existing Agents panel continues to own delegated-task controls. Lineage rows in Details and the Agents panel are keyboard-reachable (Tab, up/down, Enter/Space), skip unavailable threads and show T3's hover arrow. Status icon/label per row and the hover card remain gaps. |
 | Disconnect agent session | `ThreadRelationshipsControl.stopSession`, client-runtime `stopThreadSession`, `Orchestrator.dispatchProviderSessionDetach`, `ProviderSessionManager` | **Added:** passive attachment revisions, owner-routed user RPC, atomic detach plan and durable exact-run teardown. Conversation/native history and app-owned child threads are preserved. Reattachment, changed attempts/generations and active or idle replacement runtimes fence delayed effects. |
+| Whole-thread and child Stop | `Orchestrator.dispatchRunInterrupt` (per run, `holdQueue`), client-runtime `interruptThreadTurn`, `DelegatedTaskService` cancel; T3 pins no bulk Stop at this commit | **Added (Noches-specific):** `StopThreadWork` (owner-routed, capability `thread-work-stop-v1`) freezes the thread's interruptible run/settled background work and every non-terminal app-owned child task, recursively, leaves first, under one stable request identity (`orchestration/stop_all.rs`). Each step is an ordinary kernel command (`TaskOperation::Cancel` / `ThreadOperation::Interrupt`) with derived identity, so it inherits exact run/attempt/root/process fences and control admission; a target that settled or was replaced is skipped, never retargeted, and a replay repeats only the first frozen set. Ownership is the parent's own task record, so forks, native children and other threads' tasks are never reached. Completed replies, persistent monitors and unrelated threads are untouched. The relationship-panel Stop (`CancelDelegatedTask`) was verified end to end against a live child runtime and fixed to be owner-routed. UI: Agents panel Active header **Stop all**; composer Stop/Escape are unchanged. |
+| Forced session reconstruction | `ThreadRelationshipsControl` Disconnect only; T3 has no reset | **Added (Noches-specific):** Details **Reset agent session** (`ResetThreadSession`, capability `provider-session-reset-v1`) closes the provider conversations a started run used, tears down attached sessions as Disconnect does, and rebinds queued runs to one fresh generation. The next turn starts a new provider-thread generation with full bounded portable history and never rides the engine-remembered native session. Refused while a run is active, for a stale observed run or attachment set, and with nothing to reset; stable identity makes a retry repeat the same request. History, runs and the app conversation are kept (distinct from Disconnect, which keeps native history). |
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
 | Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering, capability-fenced active steering and same-selection interrupt/restart promotion. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Provider/model promotion transitions and queued merge-back remain gaps. |
@@ -256,12 +258,26 @@ is not an acceptable substitute.
   fixture now issues a real scoped MCP credential before dispatch rather than
   relying on an unbound ordinary runtime.
 
+## Simultaneous provider processes
+
+Noches keeps one physical provider runtime per **app thread**, keyed by thread
+id in the sessions map; an app-owned delegated child is its own app thread, so
+a parent, its children and their descendants already run concurrently as
+separate processes (the delegation tests start several). Whole-thread Stop
+therefore needs no multi-runtime-per-thread model: each target is stopped
+through its own thread's exact runtime, and native subagents live inside their
+provider process and are covered by that thread's own Stop. Changing the model
+would only matter for several live provider processes *within one thread*
+(for example a user-selected second harness alongside the first); nothing in
+the delegation, queue or Stop paths needs that, so it is deliberately not
+attempted here.
+
 ## Remaining gaps
 
 Tracked in issue #49 (provider/model transitions during queue promotion,
 queued merge-back consumption, native Claude/Pi/ACP fork and receipts, full
-inherited tool/media history, whole-thread Stop, context-window/compact policy,
-and live-provider and non-Mac verification). Older builds stored false
+inherited tool/media history, context-window/compact policy, and live-provider
+and non-Mac verification). Older builds stored false
 acceptance at session initialization; those rows cannot retrospectively prove
 provider submission, so no speculative migration or historical replay is done.
 
