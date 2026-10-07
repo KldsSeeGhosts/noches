@@ -422,6 +422,9 @@ pub(crate) async fn execute(
     if expected.runtime_id.is_none() {
         return Ok(EffectOutcome::Failed);
     }
+    // The adapter ACK can take seconds; Stop and event ingestion need this lane.
+    // `steer_canonical` fences on the exact admitted runtime under its own lock.
+    drop(guards);
     let outcome = bridge
         .sessions
         .steer_canonical(&effect.thread_id.0, &expected, &text, message_id.0.clone())
@@ -429,6 +432,11 @@ pub(crate) async fn execute(
         .map_err(|e| super::Error::Invariant(e.to_string()))?;
     match outcome {
         CanonicalSteerOutcome::Accepted => {
+            let _guards = bridge
+                .kernel
+                .locks
+                .acquire([effect.thread_id.clone()])
+                .await;
             let p = bridge.kernel.store.thread(&effect.thread_id)?.unwrap();
             match bridge
                 .kernel
@@ -447,7 +455,6 @@ pub(crate) async fn execute(
             // The adapter can reject while the exact target completes. Let
             // provider observation commit before rechecking in the follow-up
             // planner; never reinterpret failure/Stop/missing runtime as Done.
-            drop(guards);
             if allow_follow_up {
                 tokio::task::yield_now().await;
                 let current = bridge.kernel.store.thread(&effect.thread_id)?.unwrap();

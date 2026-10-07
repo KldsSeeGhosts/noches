@@ -791,6 +791,9 @@ struct HeldHarness {
     park_after_done: bool,
     native_background: bool,
     steering_receipt: Arc<Mutex<Option<bool>>>,
+    /// Keep each steer's ACK sender alive and unanswered (a hung adapter),
+    /// instead of dropping it, which reads as an immediate uncertain result.
+    held_receipts: Arc<Mutex<Option<Vec<tokio::sync::oneshot::Sender<bool>>>>>,
 }
 
 impl HeldHarness {
@@ -815,6 +818,7 @@ impl HeldHarness {
                 park_after_done: false,
                 native_background: false,
                 steering_receipt: Arc::new(Mutex::new(Some(true))),
+                held_receipts: Arc::new(Mutex::new(None)),
             }),
             prompts,
         )
@@ -864,6 +868,7 @@ impl Harness for HeldHarness {
         }
         let mut steering = controls.steering;
         let steering_receipt = self.steering_receipt.clone();
+        let held_receipts = self.held_receipts.clone();
         let mut opening = vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
@@ -901,10 +906,12 @@ impl Harness for HeldHarness {
                     }
                     steer = steering.recv() => {
                         if let Some(mut steer) = steer {
-                            if let Some(receipt) = steer.notification_acceptance.take()
-                                && let Some(accepted) = *steering_receipt.lock().unwrap()
-                            {
-                                let _ = receipt.send(accepted);
+                            if let Some(receipt) = steer.notification_acceptance.take() {
+                                if let Some(held) = held_receipts.lock().unwrap().as_mut() {
+                                    held.push(receipt);
+                                } else if let Some(accepted) = *steering_receipt.lock().unwrap() {
+                                    let _ = receipt.send(accepted);
+                                }
                             }
                         } else {
                             return Ok(AgentEvent::Done {
@@ -1126,6 +1133,81 @@ async fn canonical_stop_releases_ingestion_lane_and_terminalizes_the_exact_run()
     )
     .await;
     assert!(!core.sessions.has_live_runtime(CHAT));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_steer_ack_does_not_hold_the_thread_lane_against_stop() {
+    use zeron_engine::orchestration::effects::{EffectRequest, EffectStatus};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    let (core, harness, _) = setup(SteeringMode::StepBoundary).await;
+    *harness.held_receipts.lock().unwrap() = Some(vec![]);
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .queue_ui_state(&CHAT.into())
+                .is_ok_and(|state| state.can_promote_to_steer)
+        },
+        "running, steerable canonical turn",
+    )
+    .await;
+    let run_id = core
+        .orchestration
+        .store
+        .queue_ui_state(&CHAT.into())
+        .unwrap()
+        .active_run_id
+        .unwrap();
+    canonical_message(
+        &core,
+        "unanswered-steer",
+        vec![],
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+    )
+    .await;
+    let effect = core.orchestration.store.effects().unwrap().into_iter().find(|effect| matches!(&effect.request,
+        EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == "message:unanswered-steer")).unwrap();
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .effect(&effect.id)
+                .unwrap()
+                .is_some_and(|effect| effect.status == EffectStatus::Running)
+        },
+        "steer effect waiting on its adapter ACK",
+    )
+    .await;
+    wait_for(
+        || harness.held_receipts.lock().unwrap().as_ref().is_some_and(|held| !held.is_empty()),
+        "adapter holding the steer ACK",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The steer ACK wait is 10s; Stop must not queue behind it.
+    let stop = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        core.orchestration.dispatch(
+            &Command {
+                id: "stop-during-steer".into(),
+                thread_id: CHAT.into(),
+                operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                    run_id: run_id.into(),
+                    reason: None,
+                })),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        ),
+    )
+    .await
+    .expect("Stop waited behind the steer ACK")
+    .unwrap();
+    assert_eq!(stop.status, ReceiptStatus::Accepted);
     core.shutdown().await;
 }
 

@@ -648,9 +648,9 @@ impl SessionsEngine {
         Ok(target)
     }
 
-    /// The caller holds the owning thread's kernel lane. Pin the private live
-    /// runtime under its map lock as well: a stale canonical projection must
-    /// never steer an ordinary-session replacement or a newer attempt.
+    /// Pin the private live runtime under its map lock: a stale canonical
+    /// projection must never steer an ordinary-session replacement or a newer
+    /// attempt. The caller must not hold the kernel lane across the ACK wait.
     pub(crate) async fn steer_canonical(
         &self,
         chat_id: &str,
@@ -660,19 +660,31 @@ impl SessionsEngine {
     ) -> Result<CanonicalSteerOutcome, EngineError> {
         let _admission = self.admit_work()?;
         let handle = self.doc_handle(chat_id)?;
+        let admissible = |run: &RunHandle, statuses: &HashMap<String, Session>| {
+            run.canonical_target.as_ref() == Some(expected)
+                && run.steerable
+                && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
+                && statuses
+                    .get(chat_id)
+                    .is_some_and(|s| s.status == SessionStatus::Working)
+        };
+        // Check before the transcript write so a rejected steer leaves no row.
+        {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            if !runs.get(chat_id).is_some_and(|run| admissible(run, &statuses)) {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            }
+        }
         handle.write_user_message(&message_id, prompt, now_ms())?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
         {
             let statuses = lock(&self.inner.statuses);
             let runs = lock(&self.inner.runs);
-            let Some(run) = runs.get(chat_id).filter(|run| {
-                run.canonical_target.as_ref() == Some(expected)
-                    && run.steerable
-                    && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
-                    && statuses
-                        .get(chat_id)
-                        .is_some_and(|s| s.status == SessionStatus::Working)
-            }) else {
+            let Some(run) = runs
+                .get(chat_id)
+                .filter(|run| admissible(run, &statuses))
+            else {
                 return Ok(CanonicalSteerOutcome::Rejected);
             };
             if run
