@@ -173,11 +173,20 @@ projection, including this run's partial output, under a per-generation
 `provider-handoff:{run}:attempt:{n}` identity. The host validates the saved
 selection through the live provider catalog and freezes it into the command, so
 a replay never consults a changed catalog. Teardown stays fenced to the old
-exact provider/process. A same-instance change that needs a handoff is refused
-for restart (sessions would auto-resume the instance's native session); it
-applies at the next turn. The thread's saved selection is the authority, so the
-desktop composer's chat config must be mirrored into it (today only the next
-admission or `thread.model-selection.set` does) before this mode appears mid-run.
+exact provider/process. A same-instance change the adapter cannot absorb (for
+example a model change on `pi`, `grok` or an unlisted driver) takes the same
+handoff restart as a cross-instance one: a new provider-thread generation, a
+per-attempt `provider-handoff:{run}:attempt:{n}` identity, and a start the
+sessions engine is told is **fresh** (`NativeIntent::Fresh`), so it never
+resumes the native session the engine still remembers for the chat.
+The thread's saved selection is the authority. The desktop composer's
+`SetChatConfig` mirrors into it on the owning host
+(`selection_sync::mirror_chat_config`): one catalog-validated
+`thread.model-selection.set` / `provider.switch` command, none when the
+selection is unchanged, and it never interrupts or restarts a running turn. A
+config the live catalog rejects is not mirrored (the chat row stays LWW and the
+next admission re-validates). A config written on another device reaches the
+thread at its next admission; it is not mirrored while a turn runs.
 The native typed-row **Send now** still uses its existing document command/edit
 lease path; this is not a claim that every typed-row interaction uses canonical
 promotion. Context metadata is retained, but full native rendering of every
