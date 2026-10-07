@@ -357,6 +357,9 @@ impl Harness for OpencodeHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::TurnBoundary
     }
+    fn confirms_steered_inputs(&self) -> bool {
+        true
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         REASONING_LEVELS
     }
@@ -1440,6 +1443,9 @@ struct PendingSpawn {
 }
 
 struct TurnState {
+    /// The app input associated with this exact prompt POST, if it came from
+    /// the mailbox. Retained across the detached HTTP response's lifetime.
+    message_id: Option<String>,
     /// Detached HTTP results belong only to this exact submitted input. A
     /// blocking command can acknowledge after its SSE turn already settled.
     submission_id: uuid::Uuid,
@@ -1474,6 +1480,7 @@ struct TurnState {
 impl TurnState {
     fn begin(stall: Option<Duration>) -> Self {
         Self {
+            message_id: None,
             submission_id: uuid::Uuid::new_v4(),
             active: true,
             idle_ready: false,
@@ -1750,7 +1757,7 @@ async fn run_session(session: Session) {
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    let mut queued_steers: VecDeque<crate::SteerMessage> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupt_requested = false;
     let mut pending_usage: Option<AgentEvent> = None;
@@ -1796,14 +1803,15 @@ async fn run_session(session: Session) {
                 }).await {
                     break $label;
                 }
-                let next_turn = TurnState::begin(stall);
+                let mut next_turn = TurnState::begin(stall);
+                next_turn.message_id = steer.message_id;
                 match post_prompt(
                     &server,
                     &bus_tx,
                     &session_id,
                     dir,
                     &commands,
-                    &steer,
+                    &steer.prompt,
                     TurnSpec {
                         submission_id: next_turn.submission_id,
                         model: model.as_ref(),
@@ -1910,7 +1918,7 @@ async fn run_session(session: Session) {
                 match steer {
                     Some(steer) => {
                         if turn.active {
-                            queued_steers.push_back(steer.prompt);
+                            queued_steers.push_back(steer);
                         } else {
                             // Between turns (shouldn't happen — the engine
                             // steers live runs — but deliver, don't drop).
@@ -1919,7 +1927,8 @@ async fn run_session(session: Session) {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
                             }).await;
-                            let next_turn = TurnState::begin(stall);
+                            let mut next_turn = TurnState::begin(stall);
+                            next_turn.message_id = steer.message_id;
                             if post_prompt(
                                 &server,
                                 &bus_tx,
@@ -1999,7 +2008,10 @@ async fn run_session(session: Session) {
                 match msg {
                     BusMsg::PromptAck(submission_id) => {
                         if turn.accept_submission(submission_id) {
-                            let _ = send(&event_tx, AgentEvent::InputAccepted).await;
+                            let _ = send(
+                                &event_tx,
+                                crate::input_accepted_event(turn.message_id.clone()),
+                            ).await;
                         }
                     }
                     BusMsg::CommandFailed { submission_id, .. }

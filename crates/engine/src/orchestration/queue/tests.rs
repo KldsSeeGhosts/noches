@@ -586,6 +586,143 @@ async fn nonresumable_question_is_readable_but_cannot_be_answered() {
 }
 
 #[tokio::test]
+async fn pre_attachment_runtime_requests_do_not_brick_observation_or_invent_authority() {
+    use crate::orchestration::task::TaskOperation;
+    use zeron_proto::{AgentEvent, DoneStatus, HarnessId, PermissionRequest, UserInputQuestion};
+
+    for approval in [false, true] {
+        for attach in [false, true] {
+            let f = Fixture::new();
+            let thread = &f.caller.thread_id;
+            let p = f.service.kernel.store.thread(thread).unwrap().unwrap();
+            let run = &p.runs[0];
+            let capabilities: Value = serde_json::from_str::<Value>(include_str!(
+                "../../../../proto/tests/t3_oracle/fixtures/serde-cases.json"
+            ))
+            .unwrap()["OrchestrationV2ProviderCapabilities"][0]
+                .clone();
+            let mut permission = PermissionRequest::standard("Exec", "cargo test", true);
+            permission.id = "early".into();
+            let incoming = if approval {
+                AgentEvent::PermissionRequested {
+                    request: permission,
+                }
+            } else {
+                AgentEvent::InputRequested {
+                    request_id: "early".into(),
+                    questions: vec![UserInputQuestion {
+                        id: "q".into(),
+                        header: "Question".into(),
+                        question: "Proceed?".into(),
+                        options: vec!["yes".into()],
+                        multi_select: false,
+                    }],
+                }
+            };
+            for (index, event) in [
+                Some(incoming),
+                attach.then(|| AgentEvent::SessionStarted {
+                    instance_id: None,
+                    session_id: "real-native".into(),
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/fixture".into(),
+                    assistant_message_id: "assistant".into(),
+                }),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some(event) = event else { continue };
+                f.service
+                    .kernel
+                    .task_command(
+                        thread,
+                        CommandId(format!("early-event:{index}")),
+                        TaskOperation::RunnerEvent {
+                            run_id: run.id.clone(),
+                            attempt_id: run.active_attempt_id.clone().unwrap(),
+                            event,
+                            capabilities: Some(Box::new(
+                                serde_json::from_value(capabilities.clone()).unwrap(),
+                            )),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let current = f.service.kernel.store.thread(thread).unwrap().unwrap();
+                let request = &current.records["runtime-request"][0];
+                if index == 0 {
+                    assert_eq!(current.runs[0].status, OrchestrationV2RunStatus::Waiting);
+                    assert_eq!(
+                        request["responseCapability"]["type"], "not_resumable",
+                        "a callback with no native binding cannot manufacture live authority"
+                    );
+                    assert!(current.records["provider-session"].is_empty());
+                } else if index == 1 {
+                    assert_eq!(current.runs[0].status, OrchestrationV2RunStatus::Waiting);
+                    assert_eq!(request["responseCapability"]["type"], "live");
+                    assert_eq!(
+                        request["responseCapability"]["providerSessionId"],
+                        current.records["provider-session"][0]["id"]
+                    );
+                } else {
+                    assert_eq!(
+                        current.runs[0].status,
+                        OrchestrationV2RunStatus::Interrupted
+                    );
+                    assert_eq!(request["status"], "expired");
+                }
+                assert!(
+                    current.records["provider-turn"].is_empty(),
+                    "a callback, attachment or interruption is not root-input acceptance"
+                );
+                assert!(current.attempts[0].provider_turn_id.is_none());
+            }
+            // A stale late attachment cannot make an expired request live.
+            let receipt = f
+                .service
+                .kernel
+                .task_command(
+                    thread,
+                    CommandId("late-attachment".into()),
+                    TaskOperation::RunnerEvent {
+                        run_id: run.id.clone(),
+                        attempt_id: run.active_attempt_id.clone().unwrap(),
+                        event: AgentEvent::SessionStarted {
+                            instance_id: None,
+                            session_id: "stale-native".into(),
+                            harness: HarnessId::Mock,
+                            model: "mock-1".into(),
+                            tools: vec![],
+                            cwd: "/fixture".into(),
+                            assistant_message_id: "late-assistant".into(),
+                        },
+                        capabilities: Some(Box::new(
+                            serde_json::from_value(capabilities.clone()).unwrap(),
+                        )),
+                    },
+                )
+                .await;
+            receipt.unwrap();
+            let current = f.service.kernel.store.thread(thread).unwrap().unwrap();
+            assert_eq!(current.records["runtime-request"][0]["status"], "expired");
+            assert_eq!(
+                current.runs[0].status,
+                OrchestrationV2RunStatus::Interrupted
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn live_question_dispatch_and_runtime_projection_preserve_capability() {
     let f = Fixture::new();
     let p = f

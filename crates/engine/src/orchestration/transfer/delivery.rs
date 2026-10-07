@@ -74,10 +74,20 @@ pub(crate) fn local_items(projection: &ThreadProjection, ordinal: i64) -> Vec<Va
         let Some(run) = message["runId"].as_str().and_then(|id| runs.get(id)) else {
             continue;
         };
-        if items
-            .iter()
-            .any(|i| i["messageId"] == message["id"] || i["id"] == message["id"])
+        if let Some(item) = items
+            .iter_mut()
+            .find(|i| i["messageId"] == message["id"] || i["id"] == message["id"])
         {
+            // Ordinary admission can adopt the Loro user entry before the
+            // provider accepts it. Its imported item must retain its stable ID,
+            // but the canonical message now owns a logical run. Without that
+            // association, retry filtering silently drops the untold root input.
+            // This is history attribution, not a native acceptance receipt.
+            if item["runId"].is_null() {
+                item["runId"] = json!(run.id);
+                item["nodeId"] = message["nodeId"].clone();
+                item["providerThreadId"] = json!(run.provider_thread_id);
+            }
             continue;
         }
         items.push(json!({"id":message["id"],"type":if message["role"] == "user" {"user_message"} else {"assistant_message"},

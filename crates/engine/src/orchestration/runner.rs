@@ -961,6 +961,7 @@ impl EffectExecutor for RunnerBridge {
 fn accepted_input(event: &AgentEvent) -> bool {
     match event {
         AgentEvent::InputAccepted
+        | AgentEvent::InputAcceptedFor { .. }
         | AgentEvent::UserMessage { .. }
         | AgentEvent::GeneratedImage { .. }
         | AgentEvent::ToolCall { .. }
@@ -980,6 +981,7 @@ fn accepted_input(event: &AgentEvent) -> bool {
 /// submitted. Persistent drivers reuse this seam at a confirmed warm boundary.
 #[allow(clippy::too_many_arguments)]
 fn attach_session(
+    projection: &ThreadProjection,
     command: &Command,
     plan: &mut Plan,
     run: &mut serde_json::Value,
@@ -1005,9 +1007,22 @@ fn attach_session(
     provider["status"] = json!("active");
     provider["updatedAt"] = json!(iso(now)?);
     attempt["nativeThreadId"] = json!(native);
+    super::queue::runtime::session_attached(
+        projection,
+        command,
+        plan,
+        &RunId(run["id"].as_str().unwrap().into()),
+        &session_id,
+        now,
+    )?;
     for row in [run, attempt, node] {
-        row["startedAt"] = json!(iso(now)?);
-        row["status"] = json!("running");
+        if row["startedAt"].is_null() {
+            row["startedAt"] = json!(iso(now)?);
+        }
+        // Late metadata is not an answer to an outstanding question/approval.
+        if row["status"] != "waiting" {
+            row["status"] = json!("running");
+        }
     }
     plan.emit(command, "provider-thread.updated", provider, now)?;
     Ok(())
@@ -1069,7 +1084,12 @@ pub(crate) fn plan_event(
     let mut turn = records(projection,"provider-turn").iter().find(|t| t["id"] == turn_id).cloned()
         .unwrap_or(json!({"id":turn_id,"providerThreadId":provider["id"],"nodeId":node["id"],
         "runAttemptId":attempt_id,"nativeTurnRef":null,"ordinal":run["ordinal"],"status":"running","startedAt":iso(now)?,"completedAt":null}));
-    if accepted_input(event) && attempt["providerTurnId"].is_null() {
+    let accepts_root = accepted_input(event)
+        && match event {
+            AgentEvent::InputAcceptedFor { message_id } => run["userMessageId"] == *message_id,
+            _ => true,
+        };
+    if accepts_root && attempt["providerTurnId"].is_null() {
         let native = match event {
             AgentEvent::NativeReference { thread_id, .. } => Some(thread_id.clone()),
             AgentEvent::Done {
@@ -1085,6 +1105,7 @@ pub(crate) fn plan_event(
             && let Some(native) = &native
         {
             attach_session(
+                projection,
                 command,
                 plan,
                 &mut run,
@@ -1147,6 +1168,9 @@ pub(crate) fn plan_event(
                     item
                 }
             };
+            item["runId"] = run["id"].clone();
+            item["nodeId"] = node["id"].clone();
+            item["providerThreadId"] = provider["id"].clone();
             item["providerTurnId"] = json!(turn_id);
             plan.emit(command, "turn-item.updated", &item, now)?;
         }
@@ -1155,7 +1179,10 @@ pub(crate) fn plan_event(
         plan.emit(command, "node.updated", &node, now)?;
     }
     match event {
-        AgentEvent::InputAccepted | AgentEvent::Steered { .. } | AgentEvent::UserMessage { .. } => {
+        AgentEvent::InputAccepted
+        | AgentEvent::InputAcceptedFor { .. }
+        | AgentEvent::Steered { .. }
+        | AgentEvent::UserMessage { .. } => {
             return Ok(());
         }
         AgentEvent::ContextUsage { tokens, window } => {
@@ -1224,6 +1251,7 @@ pub(crate) fn plan_event(
             let capabilities = capabilities
                 .ok_or_else(|| Error::Invariant("Live provider capabilities missing.".into()))?;
             attach_session(
+                projection,
                 command,
                 plan,
                 &mut run,

@@ -427,6 +427,13 @@ pub enum AgentEvent {
     /// Host-only acknowledgement that the provider accepted the submitted
     /// input. Creating/resuming a native session alone does not establish this.
     InputAccepted,
+    /// Host-only acknowledgement for one identified mailbox submission. A
+    /// receipt for another message must not accept the current root input or
+    /// retire the next steer merely because it arrived first.
+    #[serde(rename_all = "camelCase")]
+    InputAcceptedFor {
+        message_id: String,
+    },
     /// Host-only durable native conversation boundary, not a visible message.
     #[serde(rename_all = "camelCase")]
     NativeReference {
@@ -588,6 +595,15 @@ mod tests {
         let accepted = AgentEvent::InputAccepted;
         let wire = serde_json::to_string(&accepted).unwrap();
         assert_eq!(wire, r#"{"type":"inputAccepted"}"#);
+        assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), accepted);
+        let accepted = AgentEvent::InputAcceptedFor {
+            message_id: "submitted-message".into(),
+        };
+        let wire = serde_json::to_string(&accepted).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"type":"inputAcceptedFor","messageId":"submitted-message"}"#
+        );
         assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), accepted);
         let ev = AgentEvent::ToolCall {
             id: "t1".into(),

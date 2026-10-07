@@ -437,7 +437,37 @@ async fn warm_assignment_acceptance_attaches_and_settles_without_another_session
             .is_none(),
         "a local steering boundary is not provider acceptance"
     );
-    observe(&kernel, &next, zeron_proto::AgentEvent::InputAccepted).await;
+    observe(
+        &kernel,
+        &next,
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: known.user_message_id.0.clone(),
+        },
+    )
+    .await;
+    let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+    assert!(
+        p.attempts
+            .iter()
+            .find(|a| Some(&a.id) == next.active_attempt_id.as_ref())
+            .unwrap()
+            .provider_turn_id
+            .as_ref()
+            .is_none(),
+        "an acknowledgement of an older message cannot accept the next root input"
+    );
+    assert!(
+        p.records["context-handoff"][0]["delivery"].is_null()
+            || p.records["context-handoff"][0]["delivery"]["status"] == "pending"
+    );
+    observe(
+        &kernel,
+        &next,
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: next.user_message_id.0.clone(),
+        },
+    )
+    .await;
     let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
     let attempt = p
         .attempts
@@ -1415,6 +1445,100 @@ async fn imported_runless_history_survives_portable_handoffs_without_duplicate_c
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn adopted_user_item_keeps_identity_and_unaccepted_root_retry_history() {
+    for accepted in [false, true] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_db, kernel, _) = fixture(cwd.path());
+        let mut thread = kernel
+            .store
+            .thread(&"source".into())
+            .unwrap()
+            .unwrap()
+            .thread;
+        thread.history_origin = Optional::Present(OrchestrationV2ThreadHistoryOrigin::V1Import);
+        kernel
+            .dispatch(
+                &Command {
+                    id: "adopted-history-marker".into(),
+                    thread_id: thread.id.clone(),
+                    operation: Operation::SessionBinding(Box::new(thread)),
+                },
+                crate::now_ms(),
+            )
+            .await
+            .unwrap();
+        let text = "Adopted user input must not silently disappear from retry history.";
+        let run = start_text(&kernel, "source", "adopted-input", text).await;
+        let now = crate::now_ms();
+        let time = crate::orchestration::event::iso(now).unwrap();
+        let item = json!({"id":"adopted-item","threadId":"source","runId":null,
+            "nodeId":null,"providerThreadId":null,"providerTurnId":null,
+            "nativeItemRef":null,"parentItemId":null,"type":"user_message",
+            "status":"completed","ordinal":0,"title":null,
+            "startedAt":time,"completedAt":time,"updatedAt":time,
+            "createdBy":"user","creationSource":"server","messageId":"adopted-input",
+            "inputIntent":"turn_start","text":text,"attachments":[]});
+        kernel
+            .store
+            .write(|tx| {
+                kernel.store.append_event(
+                    tx,
+                    None,
+                    crate::orchestration::event::make(
+                        "adopted-item-event".into(),
+                        &run.thread_id,
+                        "turn-item.updated",
+                        &item,
+                        now,
+                    )?,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        observe(&kernel, &run, session_started(cwd.path(), "adopted-native")).await;
+        let p = kernel.store.thread(&run.thread_id).unwrap().unwrap();
+        let history = local_items(&p, run.ordinal);
+        let attributed: Vec<_> = history
+            .iter()
+            .filter(|i| i["messageId"] == "adopted-input")
+            .collect();
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0]["id"], "adopted-item");
+        assert_eq!(attributed[0]["runId"], run.id.0);
+        assert!(attributed[0]["providerTurnId"].is_null());
+        assert!(
+            p.records["provider-turn"].is_empty(),
+            "history attribution must not manufacture provider acceptance"
+        );
+        if accepted {
+            observe(&kernel, &run, zeron_proto::AgentEvent::InputAccepted).await;
+            let p = kernel.store.thread(&run.thread_id).unwrap().unwrap();
+            let bound = p.records["turn-item"]
+                .iter()
+                .find(|i| i["id"] == "adopted-item")
+                .unwrap();
+            assert_eq!(bound["runId"], run.id.0);
+            assert_eq!(bound["nodeId"], run.root_node_id.as_ref().unwrap().0);
+            assert_eq!(
+                bound["providerThreadId"],
+                run.provider_thread_id.as_ref().unwrap().0
+            );
+            assert!(bound["providerTurnId"].is_string());
+            assert_eq!(bound["ordinal"], 0);
+        }
+        observe(&kernel, &run, done(zeron_proto::DoneStatus::Interrupted)).await;
+        let next = start(&kernel, "source", "after-adopted-input").await;
+        let mut input = request(cwd.path());
+        prepare(&kernel, &next, &mut input).await.unwrap();
+        assert_eq!(input.prompt.contains(text), !accepted);
+        if !accepted {
+            assert_eq!(input.prompt.matches(text).count(), 1);
+            assert!(input.prompt.contains("item=adopted-item"));
+        }
+    }
 }
 
 #[tokio::test]

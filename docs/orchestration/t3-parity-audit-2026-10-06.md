@@ -5,12 +5,19 @@ Noches baseline: `dev` at `d0e08ba2`. This is an original Rust/GPUI adaptation,
 not a replacement of Noches with T3's TypeScript/Electron stack.
 
 Latest freshness check: compared T3 `main` at
-[`d021f57b`](https://github.com/pingdotgg/t3code/tree/d021f57bf3a500e419e800c3eb957568bed8f713)
+[`bfec2387`](https://github.com/pingdotgg/t3code/tree/bfec2387b8102975c84690f99be0f5f834fd0cbe)
 with the pinned reference. `ProviderTurnStartService`, `ContextHandoffDelivery`
 and the fork/transfer services are unchanged. The newer adapter/session-manager
 interruption cleanup, per-turn busy identity and app-owned subagent Stop control
 were inspected; equivalent full current-upstream parity is not claimed.
 The earlier comparison at `8ddf200e` predated those changes.
+The three additional commits after `d021f57b` change diff/file rendering
+dependencies and deleted-cloud-tunnel recovery, not the audited orchestration
+services.
+The next four commits through `bfec2387` change device fold controls, lineage
+card density, Markdown anchors and Pi discovered-model provider identity.
+They do not change these audited orchestration services; complete equivalent
+device, lineage and native Pi behavior remains unverified.
 
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
@@ -132,6 +139,31 @@ is not an acceptable substitute.
   projection rebuild; fork/switch context and accepted native coverage suppress
   duplicate items. Historical attachments/private reasoning/native tools are
   not re-executed. A successfully accepted failed turn is not replayed.
+- Codex and OpenCode preserve the original mailbox message ID through native
+  submission, queued boundary delivery and Codex's new-turn fallback. Their
+  host-only `InputAcceptedFor` acknowledges that exact message only after its
+  successful RPC/POST; local `Steered` cannot retire its recovery entry.
+  Duplicate, unrelated and uncorrelated receipts cannot consume another input.
+  A receipt from a replaced runtime is not published, and an older message's
+  receipt cannot bind the next canonical root or settle its context. Ordinary
+  provider failure redelivers only unacknowledged mailbox inputs with their
+  original transcript identity. This is not a claim of restart-durable
+  per-message steering reconciliation or equivalent receipts for every adapter.
+- An engine question/approval callback may precede native-session metadata.
+  Such a request is projected as not resumable, never as a live capability with
+  a null/fabricated session ID. A later real attachment upgrades only pending
+  requests owned by that exact run, preserves the waiting state, and cannot
+  reopen an expired request. Without an attachment, interruption still expires
+  the request and terminalizes the canonical run; the next send stays usable.
+  Question/approval callbacks and session readiness do not establish root input
+  acceptance. The former null capability killed the observer and stranded the
+  run in Starting despite an aborted transcript entry.
+- Imported ordinary user items keep their original ID and position while
+  portable history attributes them to the canonical message's logical run.
+  Untold-input retry filtering therefore cannot drop an adopted user message
+  just because its transcript item was imported before admission. This does
+  not manufacture provider acceptance: native turn binding is written only
+  at a real acceptance boundary, and accepted interrupted inputs are not replayed.
 - First-response acceptance and assistant/error materialization share a planned
   item-ordinal allocator. Newly emitted items in the same transaction contribute
   to the next ordinal, preserving user-before-assistant pagination and preventing
@@ -153,9 +185,11 @@ is not an acceptable substitute.
 3. Canonical queue edits are text-only (existing attachment metadata is shown and
    preserved, not replaced). Native active-steering promotion is implemented;
    interrupt/restart promotion and queued merge-back consumption remain unsupported.
-   The legacy active-steer ledger still retires at a local transcript boundary;
-   per-steered-input native acknowledgement/rejection recovery is a separate gap
-   from the verified root-turn acceptance and missed-start recovery here.
+   Codex/OpenCode mailbox recovery now retires only at an exact native input
+   receipt. Other legacy adapters retain boundary-based retirement.
+   Restart-durable per-steered-input recovery, native acknowledgement of every
+   canonical steering effect and complete rejection/late-follow-up fencing
+   remain gaps distinct from verified root-turn recovery and this host ledger.
 4. Live catalog context-window lookup, cross-account native continuation,
    `/compact` handoff deferral, conversation rollback and driver-authorized
    cross-checkout native continuation.
@@ -188,8 +222,8 @@ of this later acceptance/retry follow-up combined with the performance changes.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 643 passed, 0 failed, 2 ignored |
-| Selected engine integration suites | 57 passed, 0 failed, 1 ignored |
+| Engine library | 645 passed, 0 failed, 2 ignored |
+| Selected engine integration suites | 92 passed, 0 failed, 3 ignored |
 | Desktop library, including pane/sidebar regressions | 1,506 passed, 0 failed, 1 ignored |
 | Doc/proto/RPC libraries and integration suites | 244 passed, 0 failed, 2 ignored |
 | Full harness library, integrations and doctest | 433 passed, 0 failed, 12 ignored |
@@ -200,16 +234,32 @@ of this later acceptance/retry follow-up combined with the performance changes.
 
 The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
-`restart_resume`, `message_queue`, `queue_lifecycle_rpc` and
-`scheduler_bootstrap` and `codex_subagents`. These checks total 2,883 distinct
+`restart_resume`, `message_queue`, `queue_lifecycle_rpc`,
+`scheduler_bootstrap`, `codex_subagents`, `e2e`, `turn_quiesce` and
+`self_continued_quiesce`. These checks total 2,920 distinct
 passing tests. Focused transfer coverage is included in the engine library
 count, not counted a second time. The session-sync gate supplies additional
 coverage; its overlapping engine/restart/child tests are not added to this total.
 
+- The full engine end-to-end suite passes all 29 non-ignored tests. A rejected
+  local steer boundary redelivers the same message ID only without a native
+  receipt; an exact receipt suppresses replay even if the provider then fails.
+  Duplicate/unrelated/unit acknowledgements cannot retire another mailbox
+  input or publish premature completion. The interrupted-question fixture
+  intentionally emits no attachment/acceptance metadata, verifies canonical
+  interruption/request expiry, and completes its next input with the untold
+  user history preserved.
+- Early question/approval projection tests cover absence/later arrival of
+  attachment metadata, preserved waiting, non-fabricated live authority,
+  request expiry and refused late reattachment. Adopted-input tests preserve
+  the imported item identity/position, bind its canonical run at actual
+  acceptance, and distinguish untold retry from accepted interrupted history.
 - A→B→A with/without restart, changed model/options/checkout, legacy history,
   accepted-current-run replay and native delivery receipt cases pass.
 - All 31 message-queue tests pass, including shared native session with
   coherent run/attempt/root binding and changed-selection reconstruction.
+  The final correlated-receipt source also passes all 31 with default
+  parallelism, separately from the full serial engine batch.
 - Production disconnect tests cover active teardown, preserved native history
   on the next input, no dependency on an unexpired agent MCP credential, stable
   response-loss retries, request collisions, foreign ownership and delayed
@@ -255,7 +305,8 @@ cargo test -p zeron-engine --lib \
   --test thread_transfers_rpc --test orchestration_bootstrap \
   --test orchestration_mcp --test registry_adoption --test restart_resume \
   --test message_queue --test queue_lifecycle_rpc --test scheduler_bootstrap \
-  --test codex_subagents \
+  --test codex_subagents --test e2e --test turn_quiesce \
+  --test self_continued_quiesce \
   --locked -- --test-threads=1
 cargo test -p zeron-ui --lib --locked -- --test-threads=1
 cargo test -p zeron-proto -p zeron-rpc -p zeron-doc --locked
@@ -285,6 +336,10 @@ this PR. The final separate-mode transfer runs emit no such error. A readiness
 probe also emits an incomplete WebSocket-handshake warning before successful
 IPC attachment. Existing compiler/Objective-C/linker warnings remain.
 
+Whole-workspace `cargo fmt --all --check` reports pre-existing formatting
+differences in untouched files. Task-owned Rust files use scoped `rustfmt`
+with child-module traversal disabled; no unrelated formatting is included.
+
 Ignored live-provider/edge/tailnet/private-snapshot tests are not passes.
 Current installed-provider, remote-device and non-Mac verification has not
 been performed. No release or integration-branch mutation is part of this task.
@@ -304,7 +359,15 @@ then proved that the queue patch was saved but a later transcript change made
 the whole-document cleanliness check fail. The command-generation watermark
 fix passes that regression and a real SQLite write-failure guard. Four
 consecutive default-parallel local queue runs now pass all 31 tests. New-head
-Linux CI remains required; the older job is not claimed green.
+Linux CI for `005ad0a6` subsequently passed; the older failed job is not claimed
+green. This is evidence for that published revision, not the later correlated
+steering/request-lifecycle follow-up.
+
+CI on `005ad0a6` completed successfully for all executed jobs, including
+[Linux Cursor compatibility](https://github.com/KldsSeeGhosts/noches/actions/runs/37556764316/job/112584859842),
+Mac UI/browser/frame recovery, Windows UI/harness/engine/packaging,
+session-sync, networking, layout and policy. Windows native GUI and iOS were
+skipped. A new-head run remains required for the later changes in this audit.
 
 The byte-pinned MCP instruction fixture retains its narrowly scoped LF checkout
 rule; the SHA/length tests are unchanged. These CI results do not prove a later

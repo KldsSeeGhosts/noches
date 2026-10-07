@@ -406,7 +406,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
     steer
         .send(SteerMessage {
             prompt: "redirect please".into(),
-            message_id: None,
+            message_id: Some("direct-steer-message".into()),
             notification_acceptance: None,
         })
         .await
@@ -428,6 +428,9 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
         .expect("Steered emitted: {events:?}");
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "direct-steer-message".into(),
+    }));
 
     // The fake only emits this delta after verifying expectedTurnId + text.
     assert!(events.contains(&AgentEvent::TextDelta {
@@ -458,6 +461,9 @@ async fn notification_steer_receipts_native_acceptance() {
         .unwrap();
     let events = run_to_end(&harness(), request("scenario:steer"), controls).await;
     assert!(response.await.unwrap());
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "stable-completion-message".into(),
+    }));
     assert!(
         events
             .iter()
@@ -488,6 +494,7 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
             .unwrap()
             .unwrap();
         assert!(!matches!(event, AgentEvent::Steered { .. }));
+        assert!(!matches!(event, AgentEvent::InputAcceptedFor { .. }));
         if matches!(event, AgentEvent::Done { .. }) {
             break;
         }
@@ -510,12 +517,23 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     steer
         .send(SteerMessage {
             prompt: "redirect please".into(),
-            message_id: None,
+            message_id: Some("fallback-steer-message".into()),
             notification_acceptance: None,
         })
         .await
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer-race"), controls).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event
+                == AgentEvent::InputAcceptedFor {
+                    message_id: "fallback-steer-message".into(),
+                })
+            .count(),
+        1,
+        "native fallback must acknowledge the original message exactly once"
+    );
 
     // Two turns: the raced one completes, then the fallback carries the steer.
     let dones: Vec<_> = events

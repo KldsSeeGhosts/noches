@@ -214,6 +214,15 @@ pub struct SteerMessage {
     pub notification_acceptance: Option<oneshot::Sender<bool>>,
 }
 
+/// An uncorrelated legacy submission can confirm a root input, but cannot
+/// retire an arbitrary message from the host's steering recovery ledger.
+pub(crate) fn input_accepted_event(message_id: Option<String>) -> AgentEvent {
+    match message_id {
+        Some(message_id) => AgentEvent::InputAcceptedFor { message_id },
+        None => AgentEvent::InputAccepted,
+    }
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     /// Host-local MCP servers, credentials, and session instructions. Never
@@ -287,6 +296,14 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// This adapter preserves mailbox message identity through its native
+    /// submission/fallback paths and emits InputAcceptedFor only after native
+    /// acceptance. Its local Steered boundary cannot retire a pending input.
+    /// Legacy adapters retain boundary-based recovery until they implement
+    /// this explicit contract.
+    fn confirms_steered_inputs(&self) -> bool {
+        false
+    }
     fn session_lifecycle(&self) -> Option<&dyn session_lifecycle::SessionLifecycle> {
         None
     }

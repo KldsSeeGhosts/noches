@@ -508,6 +508,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::InputAccepted
+        | AgentEvent::InputAcceptedFor { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::NativeReference { .. }
         | AgentEvent::ContextUsage { .. }
@@ -719,6 +720,12 @@ mod tests {
     fn input_acceptance_is_host_only_not_a_transcript_part() {
         let mut parts = vec![];
         super::fold_event_into_parts(&mut parts, &zeron_proto::AgentEvent::InputAccepted);
+        super::fold_event_into_parts(
+            &mut parts,
+            &zeron_proto::AgentEvent::InputAcceptedFor {
+                message_id: "input".into(),
+            },
+        );
         assert!(parts.is_empty());
     }
 

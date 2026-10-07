@@ -211,6 +211,7 @@ struct RunHandle {
     canonical_run_id: Option<zeron_proto::orchestration::RunId>,
     steerable: bool,
     steering_mode: zeron_proto::SteeringMode,
+    confirms_steered_inputs: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Shared handle to the live run's computer-use bridge (Pi only). The run
@@ -228,8 +229,9 @@ struct RunHandle {
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
     pending_permissions: PendingPermissions,
-    /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
-    /// event — the at-least-once ledger. A run can die with accepted steers
+    /// Steers accepted into the mailbox but not yet confirmed by the adapter's
+    /// input receipt (or a legacy `Steered` boundary) — the at-least-once ledger.
+    /// A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
     /// discarding queued boundary steers): the run task drains this at exit
     /// and re-dispatches each entry as a fresh turn, so an accepted message
@@ -1198,6 +1200,7 @@ impl SessionsEngine {
                 canonical_run_id,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
+                confirms_steered_inputs: harness.confirms_steered_inputs(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 cua_bridge: cua_bridge.clone(),
@@ -2889,6 +2892,26 @@ async fn drive_run(
             *instance_id = run_instance.clone();
         }
 
+        // A provider receipt identifies the submitted input, not whichever
+        // steer happens to be first today. Handle it even while parked without
+        // waking the turn or changing transcript boundaries. A stale/duplicate
+        // receipt cannot consume a different pending message.
+        if let AgentEvent::InputAcceptedFor { message_id } = &event {
+            let live = {
+                let runs = lock(&inner.runs);
+                if let Some(handle) = runs.get(&chat_id).filter(|handle| handle.run_id == run_id) {
+                    lock(&handle.routed_steers).retain(|steer| &steer.message_id != message_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if live {
+                inner.publish(&chat_id, &event);
+            }
+            continue;
+        }
+
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
         // into the subagent's own doc, and the parent keeps only the spawn
@@ -3325,11 +3348,12 @@ async fn drive_run(
             // steer boundary restarts it (matches the parked-resume path and
             // the composer's optimistic overlay, which already reads 0:00).
             inner.set_status(&chat_id, SessionStatus::Working, true);
-            // The boundary confirms delivery of the oldest accepted steer —
-            // retire its at-least-once ledger entry.
+            // Legacy adapters expose only this boundary. Receipt-capable
+            // adapters retain the input until its exact native acknowledgement;
+            // an OpenCode local boundary precedes the HTTP response.
             if let Some(h) = lock(&inner.runs)
                 .get(&chat_id)
-                .filter(|h| h.run_id == run_id)
+                .filter(|h| h.run_id == run_id && !h.confirms_steered_inputs)
             {
                 lock(&h.routed_steers).pop_front();
             }
@@ -3540,7 +3564,7 @@ async fn drive_run(
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
-        // Steered boundary (idle-reaper race, a mid-turn error discarding
+        // native acknowledgement (idle-reaper race, a mid-turn error discarding
         // queued boundary steers, a parked child death). Their user entries
         // are already in the transcript — a message that shows as sent must
         // never silently not run. Re-dispatch each as a fresh turn

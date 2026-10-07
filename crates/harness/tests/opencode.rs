@@ -349,7 +349,10 @@ async fn next_event(
 ) -> AgentEvent {
     loop {
         let event = next_wire_event(stream).await;
-        if event != AgentEvent::InputAccepted {
+        if !matches!(
+            event,
+            AgentEvent::InputAccepted | AgentEvent::InputAcceptedFor { .. }
+        ) {
             return event;
         }
     }
@@ -460,7 +463,7 @@ async fn rejected_warm_submission_does_not_acknowledge_the_steering_boundary() {
     steer
         .send(SteerMessage {
             prompt: "rejected follow-up".into(),
-            message_id: None,
+            message_id: Some("rejected-warm-message".into()),
             notification_acceptance: None,
         })
         .await
@@ -475,7 +478,10 @@ async fn rejected_warm_submission_does_not_acknowledge_the_steering_boundary() {
             .any(|e| matches!(e, AgentEvent::Steered { .. }))
     );
     assert!(
-        !events.contains(&AgentEvent::InputAccepted),
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::InputAccepted | AgentEvent::InputAcceptedFor { .. }
+        )),
         "the local steer is not a POST acceptance"
     );
     assert!(matches!(
@@ -695,7 +701,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
         .send(SteerMessage {
             notification_acceptance: None,
             prompt: "also do this".into(),
-            message_id: None,
+            message_id: Some("queued-steer-message".into()),
         })
         .await
         .unwrap();
@@ -711,6 +717,13 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
     // The steer went out as a second prompt on the SAME session.
     let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
     assert_eq!(prompts[1]["parts"][0]["text"], "also do this");
+    assert_eq!(
+        next_wire_event(&mut stream).await,
+        AgentEvent::InputAcceptedFor {
+            message_id: "queued-steer-message".into(),
+        },
+        "the successful prompt POST must acknowledge the queued message, not the previous input"
+    );
 
     // Turn 2 settles normally.
     assistant_message(&fake, "ses_test", "msg_2");

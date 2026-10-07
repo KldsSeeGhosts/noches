@@ -1998,7 +1998,14 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
             controls: RunControls,
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
-            if request.prompt == "second run" {
+            if request.prompt != "ask and block" {
+                assert!(
+                    request.prompt.starts_with("Context handoff")
+                        && request.prompt.contains("\nask and block\n")
+                        && request.prompt.ends_with("\n\nsecond run"),
+                    "the next input must retain untold root history without treating it as a fresh request: {}",
+                    request.prompt
+                );
                 // The post-interrupt turn: completes immediately.
                 tokio::spawn(async move {
                     let _ = tx
@@ -2099,6 +2106,24 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
             )
         })
     }));
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs[0].status
+                        == zeron_proto::orchestration::OrchestrationV2RunStatus::Interrupted
+                        && p.attempts[0].provider_turn_id.is_none()
+                        && p.records["runtime-request"]
+                            .iter()
+                            .all(|r| r["status"] == "expired")
+                })
+        },
+        "canonical interrupted run without false input acceptance",
+    )
+    .await;
 
     // And the session is usable: the next run completes.
     queue_as_viewer(
@@ -2111,6 +2136,11 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     );
     wait_for(
         || {
+            if let Some((SessionCommandStatus::Rejected, resolution)) =
+                command_status(&core, "cmd-run-second")
+            {
+                panic!("second run was rejected: {resolution:?}");
+            }
             entries_now(&core).iter().any(|e| {
                 e.status == Some(MessageStatus::Complete)
                     && e.parts.iter().any(
@@ -2121,6 +2151,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
         "second run to complete",
     )
     .await;
+    core.shutdown().await;
 }
 
 /// Regression (the "nothing happened after I answered" bug): a harness that
@@ -2994,6 +3025,7 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
 async fn pending_steer_handoff_does_not_publish_a_completion() {
     struct ControlledHarness(
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+        bool,
     );
     #[async_trait]
     impl Harness for ControlledHarness {
@@ -3008,6 +3040,9 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
         }
         fn steering_mode(&self) -> SteeringMode {
             SteeringMode::StepBoundary
+        }
+        fn confirms_steered_inputs(&self) -> bool {
+            self.1
         }
         fn reasoning_levels(&self) -> &[ReasoningLevel] {
             &[ReasoningLevel::Medium]
@@ -3030,12 +3065,17 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
             )
         }
     }
-    for routed_dispatch in [false, true] {
+    for (routed_dispatch, confirms_inputs) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
         let core = assemble(
             dir.path(),
-            Arc::new(ControlledHarness(std::sync::Mutex::new(Some(rx)))),
+            Arc::new(ControlledHarness(
+                std::sync::Mutex::new(Some(rx)),
+                confirms_inputs,
+            )),
         );
         let handle = core.doc_host.open(CHAT).unwrap();
         queue_as_viewer(
@@ -3071,6 +3111,15 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
                 zeron_engine::sessions::SteerOutcome::Accepted
             );
         }
+        if confirms_inputs {
+            assert_eq!(
+                core.sessions
+                    .steer(CHAT, "second redirect", Some("second-steer".into()))
+                    .await
+                    .unwrap(),
+                zeron_engine::sessions::SteerOutcome::Accepted
+            );
+        }
         tx.send(done(DoneStatus::Completed)).unwrap();
         wait_for(
             || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
@@ -3089,6 +3138,56 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
             next_assistant_message_id: Some("a-steered".into()),
         })
         .unwrap();
+        if confirms_inputs {
+            tx.send(AgentEvent::InputAcceptedFor {
+                message_id: "user-steer".into(),
+            })
+            .unwrap();
+            tx.send(AgentEvent::InputAcceptedFor {
+                message_id: "user-steer".into(),
+            })
+            .unwrap();
+            tx.send(AgentEvent::InputAcceptedFor {
+                message_id: "unrelated-message".into(),
+            })
+            .unwrap();
+            tx.send(AgentEvent::InputAccepted).unwrap();
+            tx.send(AgentEvent::TextDelta {
+                text: "first redirect answered".into(),
+            })
+            .unwrap();
+            tx.send(done(DoneStatus::Completed)).unwrap();
+            wait_for(
+                || {
+                    core.sessions.session_status(CHAT).map(|s| s.status)
+                        == Some(SessionStatus::Idle)
+                },
+                "unconfirmed second input",
+            )
+            .await;
+            assert_eq!(
+                core.sessions
+                    .session_status(CHAT)
+                    .unwrap()
+                    .last_completed_turn,
+                None,
+                "a boundary, duplicate, unrelated or uncorrelated ACK cannot retire the other input"
+            );
+            tx.send(AgentEvent::Steered {
+                assistant_message_id: Some("a-steered".into()),
+                next_assistant_message_id: Some("a-confirmed".into()),
+            })
+            .unwrap();
+            tx.send(AgentEvent::InputAcceptedFor {
+                message_id: "second-steer".into(),
+            })
+            .unwrap();
+        }
+        let completed_id = if confirms_inputs {
+            "a-confirmed"
+        } else {
+            "a-steered"
+        };
         tx.send(AgentEvent::TextDelta {
             text: "redirected response".into(),
         })
@@ -3100,7 +3199,7 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
                     .session_status(CHAT)
                     .and_then(|s| s.last_completed_turn)
                     .as_deref()
-                    == Some("a-steered")
+                    == Some(completed_id)
             },
             "real completion",
         )
@@ -3122,7 +3221,155 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
                 .unwrap()
                 .last_completed_turn
                 .as_deref(),
-            Some("a-steered")
+            Some(completed_id)
+        );
+        core.shutdown().await;
+    }
+}
+
+/// A local assignment boundary can precede native rejection. Keep its input
+/// recoverable until a receipt names that message; accepted inputs must not
+/// be replayed merely because their provider later fails.
+#[tokio::test]
+async fn native_steer_receipt_not_local_boundary_controls_failure_redelivery() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ReceiptHarness {
+        calls: Arc<AtomicUsize>,
+        accepted: bool,
+    }
+    #[async_trait]
+    impl Harness for ReceiptHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Native receipt fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn confirms_steered_inputs(&self) -> bool {
+            true
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            mut controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let accepted = self.accepted;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                tx.send(mock_script()[0].clone()).unwrap();
+                tx.send(AgentEvent::InputAccepted).unwrap();
+                if call == 0 {
+                    tx.send(AgentEvent::TextDelta {
+                        text: "Opening response.".into(),
+                    })
+                    .unwrap();
+                    tx.send(done(DoneStatus::Completed)).unwrap();
+                    let input = controls.steering.recv().await.unwrap();
+                    tx.send(AgentEvent::Steered {
+                        assistant_message_id: Some("a-1".into()),
+                        next_assistant_message_id: Some("a-rejected".into()),
+                    })
+                    .unwrap();
+                    if accepted {
+                        tx.send(AgentEvent::InputAcceptedFor {
+                            message_id: input.message_id.unwrap(),
+                        })
+                        .unwrap();
+                    }
+                    tx.send(done(DoneStatus::Errored)).unwrap();
+                } else {
+                    assert_eq!(call, 1, "rejection must not create an unbounded retry loop");
+                    assert_eq!(request.prompt, "Recover this precise input.");
+                    tx.send(AgentEvent::TextDelta {
+                        text: "Recovered input.".into(),
+                    })
+                    .unwrap();
+                    tx.send(done(DoneStatus::Completed)).unwrap();
+                }
+            });
+            Ok(
+                futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|event| event.map(Ok)))
+                    .boxed(),
+            )
+        }
+    }
+    for accepted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = assemble(
+            dir.path(),
+            Arc::new(ReceiptHarness {
+                calls: calls.clone(),
+                accepted,
+            }),
+        );
+        let handle = core.doc_host.open(CHAT).unwrap();
+        core.sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Mock,
+                run_request("opening"),
+                Some("opening-input".into()),
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+            "opening parked turn",
+        )
+        .await;
+        assert_eq!(
+            core.sessions
+                .steer(
+                    CHAT,
+                    "Recover this precise input.",
+                    Some("recoverable-input".into())
+                )
+                .await
+                .unwrap(),
+            zeron_engine::sessions::SteerOutcome::Accepted,
+        );
+        wait_for(
+            || {
+                if accepted {
+                    !core.sessions.has_live_runtime(CHAT)
+                } else {
+                    calls.load(Ordering::SeqCst) == 2
+                        && entries(&core)
+                            .iter()
+                            .any(|entry| entry.id == "recoverable-input")
+                        && core.sessions.session_status(CHAT).map(|s| s.status)
+                            == Some(SessionStatus::Idle)
+                }
+            },
+            "native acknowledgement or exact-input recovery",
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), if accepted { 1 } else { 2 });
+        assert_eq!(
+            handle
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User && entry.id == "recoverable-input")
+                .count(),
+            1,
+            "redelivery must retain the original input identity, not duplicate its transcript row"
         );
         core.shutdown().await;
     }
