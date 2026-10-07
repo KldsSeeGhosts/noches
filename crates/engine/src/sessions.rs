@@ -282,6 +282,8 @@ struct Inner {
     /// chat_id → fence serializing run registration against a retired-runtime
     /// settlement, so that commit never holds the global `runs` map.
     run_fences: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Fired whenever a run leaves or replaces its `runs` entry.
+    run_retired: tokio::sync::Notify,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -352,6 +354,7 @@ impl SessionsEngine {
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 run_fences: Mutex::new(HashMap::new()),
+                run_retired: tokio::sync::Notify::new(),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -1345,6 +1348,7 @@ impl SessionsEngine {
             },
         );
         drop(registering);
+        self.inner.run_retired.notify_waiters();
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -1545,12 +1549,7 @@ impl SessionsEngine {
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
-        for _ in 0..500 {
-            if !self.is_live(chat_id, &run_id) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        self.wait_until_not_live(chat_id, &run_id).await;
         Ok(true)
     }
 
@@ -1578,13 +1577,25 @@ impl SessionsEngine {
     }
 
     pub(crate) async fn await_runtime_retirement(&self, chat_id: &str, runtime_id: &str) -> bool {
-        for _ in 0..500 {
-            if !self.is_live(chat_id, runtime_id) {
+        self.wait_until_not_live(chat_id, runtime_id).await
+    }
+
+    /// Wait (5s, as the former 500x10ms poll) for a run to leave `runs`,
+    /// woken by `remove_run`/registration rather than a timer.
+    async fn wait_until_not_live(&self, chat_id: &str, run_id: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retired = self.inner.run_retired.notified();
+            tokio::pin!(retired);
+            // Register before checking so a retirement between the two is seen.
+            retired.as_mut().enable();
+            if !self.is_live(chat_id, run_id) {
                 return true;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if tokio::time::timeout_at(deadline, retired).await.is_err() {
+                return !self.is_live(chat_id, run_id);
+            }
         }
-        !self.is_live(chat_id, runtime_id)
     }
 
     /// Removing/replacing a configured instance retires only its live scope.
@@ -2285,6 +2296,8 @@ impl Inner {
             if let Some(handle) = runs.remove(chat_id) {
                 expire_permissions(&handle.pending_permissions, &handle.engine_tx);
             }
+            drop(runs);
+            self.run_retired.notify_waiters();
         }
     }
 }

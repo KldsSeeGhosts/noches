@@ -332,8 +332,12 @@ pub(crate) async fn execute(
         return Ok(EffectOutcome::Succeeded);
     }
     if had_runtime && !matches!(effect.request, EffectRequest::ProviderTurnRestart { .. }) {
+        // Wake on each committed write instead of re-reading the projection
+        // on a timer; the native terminal event arrives as one.
+        let mut commits = bridge.kernel.store.subscribe_writes();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
+        loop {
+            commits.mark_unchanged();
             if bridge
                 .kernel
                 .store
@@ -347,7 +351,12 @@ pub(crate) async fn execute(
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if tokio::time::timeout_at(deadline, commits.changed())
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     }
     // Process replacement can race the bounded wait. Neither synthetic
