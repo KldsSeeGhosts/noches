@@ -1192,11 +1192,7 @@ impl SessionsEngine {
                 }
             }
             if let Some(reasoning) = request.reasoning {
-                let option_id = match harness_id {
-                    HarnessId::ClaudeCode => "effort",
-                    HarnessId::Pi => "thinking",
-                    _ => "reasoningEffort",
-                };
+                let option_id = crate::provider_instances::reasoning_option_key(harness_id);
                 inherited_options
                     .entry(option_id)
                     .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));

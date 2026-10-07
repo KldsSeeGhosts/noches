@@ -706,6 +706,28 @@ pub fn legacy_instance_id(id: HarnessId) -> ProviderInstanceId {
     ProviderInstanceId(legacy_driver(id).0)
 }
 
+/// The saved option id that carries a harness's reasoning level.
+pub(crate) fn reasoning_option_key(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "effort",
+        HarnessId::Pi => "thinking",
+        _ => "reasoningEffort",
+    }
+}
+
+/// A selection's options as the id → value map `ChatConfig::model_options` uses.
+pub(crate) fn selection_options(
+    selection: &zeron_proto::provider_instance::ModelSelection,
+) -> serde_json::Map<String, serde_json::Value> {
+    selection
+        .options
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| Some((o.id.to_string(), serde_json::to_value(&o.value).ok()?)))
+        .collect()
+}
+
 pub fn legacy_driver(id: HarnessId) -> ProviderDriverKind {
     let id = match id {
         HarnessId::ClaudeCode => "claudeAgent".to_owned(),
@@ -727,11 +749,7 @@ fn from_legacy_model(harness: HarnessId, model: Model) -> CatalogModel {
     }).collect();
     let mut legacy_reasoning_option = None;
     if !model.reasoning_levels.is_empty() {
-        let id = match harness {
-            HarnessId::ClaudeCode => "effort",
-            HarnessId::Pi => "thinking",
-            _ => "reasoningEffort",
-        };
+        let id = reasoning_option_key(harness);
         if !options.iter().any(|descriptor| match descriptor {
             ProviderOptionDescriptor::Select(d) => d.id == id,
             ProviderOptionDescriptor::Boolean(d) => d.id == id,
@@ -849,6 +867,22 @@ fn to_legacy_model(model: CatalogModel) -> Model {
 mod tests {
     use super::*;
     use zeron_harness::mock::MockHarness;
+
+    #[test]
+    fn reasoning_key_and_selection_options_share_one_mapping() {
+        assert_eq!(reasoning_option_key(HarnessId::ClaudeCode), "effort");
+        assert_eq!(reasoning_option_key(HarnessId::Pi), "thinking");
+        assert_eq!(reasoning_option_key(HarnessId::Codex), "reasoningEffort");
+        let selection: zeron_proto::provider_instance::ModelSelection = serde_json::from_value(
+            json!({"instanceId":"codex","model":"m","options":[
+                {"id":"reasoningEffort","value":"high"},{"id":"fast","value":true}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(selection_options(&selection)),
+            json!({"reasoningEffort":"high","fast":true})
+        );
+    }
 
     #[test]
     fn installed_cpa_metadata_preserves_exact_ids_options_and_discards_templates() {

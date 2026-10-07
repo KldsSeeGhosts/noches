@@ -91,11 +91,7 @@ impl RegistryAdmission {
             }
         }
         if let Some(reasoning) = config.and_then(|c| c.reasoning) {
-            let key = match harness {
-                zeron_proto::HarnessId::ClaudeCode => "effort",
-                zeron_proto::HarnessId::Pi => "thinking",
-                _ => "reasoningEffort",
-            };
+            let key = crate::provider_instances::reasoning_option_key(harness);
             options.entry(key).or_insert(json!(reasoning));
         }
         let selection = zeron_proto::orchestration::normalize_contract(

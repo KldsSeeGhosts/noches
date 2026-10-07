@@ -774,18 +774,8 @@ pub(crate) fn materialize_thread(
             .map(|c| c.harness)
     });
     let config = harness.map(|harness| {
-        let selection = json!(thread.model_selection);
-        let options: serde_json::Map<_, _> = selection["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|o| Some((o["id"].as_str()?.to_owned(), o["value"].clone())))
-            .collect();
-        let reasoning_key = match harness {
-            zeron_proto::HarnessId::ClaudeCode => "effort",
-            zeron_proto::HarnessId::Pi => "thinking",
-            _ => "reasoningEffort",
-        };
+        let options = crate::provider_instances::selection_options(&thread.model_selection);
+        let reasoning_key = crate::provider_instances::reasoning_option_key(harness);
         zeron_proto::ChatConfig {
             instance_id: Some(thread.provider_instance_id.clone()),
             harness,

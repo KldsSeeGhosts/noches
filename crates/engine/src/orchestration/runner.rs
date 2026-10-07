@@ -296,20 +296,8 @@ impl RunnerBridge {
                     .flatten()
                     .map(|s| s.id)
             });
-        let options_value = serde_json::to_value(&run.model_selection)?;
-        let mut options = serde_json::Map::new();
-        if let Some(selections) = options_value["options"].as_array() {
-            for selection in selections {
-                if let Some(id) = selection["id"].as_str() {
-                    options.insert(id.into(), selection["value"].clone());
-                }
-            }
-        }
-        let reasoning_key = match harness.id() {
-            zeron_proto::HarnessId::ClaudeCode => "effort",
-            zeron_proto::HarnessId::Pi => "thinking",
-            _ => "reasoningEffort",
-        };
+        let options = crate::provider_instances::selection_options(&run.model_selection);
+        let reasoning_key = crate::provider_instances::reasoning_option_key(harness.id());
         let reasoning = options
             .get(reasoning_key)
             .filter(|value| value.is_string())
