@@ -129,7 +129,10 @@ impl RunnerBridge {
         })?;
         for thread in threads {
             let thread = ThreadId(thread);
-            let projection = self.kernel.store.thread(&thread)?.unwrap();
+            // Threads whose chat another device hosts are recovered there.
+            let Some(projection) = self.kernel.store.thread(&thread)? else {
+                continue;
+            };
             for run in &projection.runs {
                 let delivery = super::mailbox::cohort(run)["delivery"].clone();
                 if delivery.is_null() {
@@ -599,7 +602,7 @@ impl RunnerBridge {
                 // Native background observations may arrive after root Done.
                 // Keep the receiver until another app run takes ownership.
             }
-            let current = self.kernel.store.thread(&thread)?.unwrap();
+            let current = self.kernel.store.executing_thread(&thread)?;
             if native_progress {
                 self.kernel.reconcile_ancestors(&thread).await?;
             }
@@ -628,7 +631,7 @@ impl RunnerBridge {
     }
 
     pub(crate) async fn settle(&self, thread: &ThreadId, run: &OrchestrationV2Run) -> Result<()> {
-        let projection = self.kernel.store.thread(thread)?.unwrap();
+        let projection = self.kernel.store.executing_thread(thread)?;
         if let Some(message) = records(&projection, "message")
             .iter()
             .find(|message| message["id"] == run.user_message_id.0)
@@ -732,7 +735,7 @@ impl RunnerBridge {
                     message_id: message_id.clone(),
                     action: DeliveryAction::Queue,
                 };
-                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                let projection = self.kernel.store.executing_thread(&effect.thread_id)?;
                 if current_delivery(&projection, &input).is_none() {
                     return Ok(EffectOutcome::Succeeded);
                 }
@@ -749,17 +752,21 @@ impl RunnerBridge {
                         "steer",
                     )
                     .await?;
-                    let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
+                    let projection = self.kernel.store.executing_thread(&effect.thread_id)?;
                     if current_delivery(&projection, &input).is_none() {
                         return Ok(EffectOutcome::Succeeded);
                     }
-                    let text = records(&projection, "message")
+                    let Some(text) = records(&projection, "message")
                         .iter()
                         .find(|message| message["id"] == message_id.0)
-                        .unwrap()["text"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned();
+                        .and_then(|message| message["text"].as_str())
+                        .map(str::to_owned)
+                    else {
+                        return Err(Error::Invariant(format!(
+                            "steered delivery message missing: {}",
+                            message_id.0
+                        )));
+                    };
                     let Some(run) = super::task::active_run(&projection) else {
                         return Ok(EffectOutcome::Succeeded);
                     };

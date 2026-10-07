@@ -33,7 +33,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("!inputs.skip-compatibility", ui["jobs"]["compatibility"]["if"])
         self.assertIn("vendor/**", ui["on"]["pull_request"]["paths"])
         self.assertEqual(set(ui["jobs"]), {
-            "changes", "compatibility", "session-sync-regressions", "ui-tests",
+            "changes", "compatibility", "session-sync-regressions", "engine-integration",
+            "macos-engine-integration", "ui-tests",
             "app-tests", "macos-ui", "macos-browser", "macos-frame-recovery",
             "linux-browser", "chromium-browser", "ios-tests",
         })
@@ -131,6 +132,19 @@ class WorkflowTests(unittest.TestCase):
                              "${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}")
             self.assertIn("github.event_name", job["concurrency"]["group"],
                           "Manual validation must not share a cancellable push group")
+
+    def test_every_engine_integration_target_runs_on_linux_and_macos(self):
+        jobs = workflow("ui-tests.yml")["jobs"]
+        command = "cargo test --locked --no-fail-fast -p zeron-engine --tests"
+        for name, runner in (("engine-integration", "ubuntu-24.04"),
+                             ("macos-engine-integration", "macos-latest")):
+            job = jobs[name]
+            self.assertEqual(job["runs-on"], runner)
+            self.assertIn("needs.changes.outputs.native == 'true'", job["if"])
+            self.assertIn(command, [step.get("run") for step in job["steps"]])
+        # Only the paid macOS leg skips fork PRs; Linux always validates them.
+        self.assertIn("head.repo.full_name == github.repository", jobs["macos-engine-integration"]["if"])
+        self.assertNotIn("head.repo.full_name", jobs["engine-integration"]["if"])
 
     def test_sync_gate_and_cache_warming_remain_explicit(self):
         ui = workflow("ui-tests.yml")

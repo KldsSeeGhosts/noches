@@ -25,3 +25,7 @@ pub const TERMINAL_OUTPUT_BATCH_MS: u64 = 12;
 pub const COMMAND_DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Current session doc schema version (`meta.schemaVersion`).
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
+/// Title an orchestration thread carries before a real name exists. It is a
+/// display placeholder, never a chat name: mirroring it into the chat row would
+/// make the automatic titler treat the chat as already named.
+pub const UNTITLED_THREAD_TITLE: &str = "Conversation";

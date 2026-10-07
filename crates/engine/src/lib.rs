@@ -623,8 +623,11 @@ impl EngineCore {
         self.doc_host.flush_all();
         self.workspace.shutdown();
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
-        // actually be freed once the last handle drops.
+        // actually be freed once the last handle drops. The MCP toolkit's
+        // injected orchestration services (queue host, kernel facades) pin the
+        // doc host through the sessions-owned server, so they go too.
         self.sessions.clear_doc_host();
+        self.sessions.mcp_server().toolkit.clear_services();
     }
 }
 

@@ -254,6 +254,15 @@ impl Store {
         self.read(|conn| projection::read_thread(conn, id))
     }
 
+    /// The projection of a thread this engine is already executing. Unlike
+    /// [`Self::thread`] this ignores registry admission: re-homing a chat
+    /// mid-run must not hide the run from the host that is still observing and
+    /// settling it.
+    pub(crate) fn executing_thread(&self, id: &ThreadId) -> Result<ThreadProjection> {
+        self.stored_thread(id)?
+            .ok_or_else(|| Error::Invariant(format!("thread projection missing: {}", id.0)))
+    }
+
     pub(crate) fn install_admission(&self, admission: super::adoption::RegistryAdmission) {
         let _ = self.admission.set(admission);
     }

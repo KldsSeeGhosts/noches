@@ -86,6 +86,47 @@ fn thread_lifecycle_map_syncs_separately_and_live_attention_cannot_be_hidden() {
     );
 }
 
+#[test]
+fn first_summary_does_not_overwrite_the_chat_archive_flag_but_changes_do() {
+    let mut doc = RegistryDoc::new("host");
+    doc.upsert_chat(&chat("thread", "host")).unwrap();
+    doc.set_chat_archived("thread", false).unwrap();
+    let mut summary = json!({"id":"thread","title":"T","archivedAt":"1970-01-01T00:00:00.001Z",
+        "lastVisitedAt":null,"hostId":"host","hostEpoch":1,"version":1});
+    doc.set_chat_orchestration("thread", summary.clone()).unwrap();
+    assert!(!doc.chat("thread").unwrap().unwrap().archived);
+    summary["archivedAt"] = json!(null);
+    summary["version"] = json!(2);
+    doc.set_chat_archived("thread", true).unwrap();
+    doc.set_chat_orchestration("thread", summary.clone()).unwrap();
+    assert!(!doc.chat("thread").unwrap().unwrap().archived);
+    summary["archivedAt"] = json!("1970-01-01T00:00:00.002Z");
+    summary["version"] = json!(3);
+    doc.set_chat_orchestration("thread", summary).unwrap();
+    assert!(doc.chat("thread").unwrap().unwrap().archived);
+}
+
+#[test]
+fn untitled_thread_placeholder_is_not_mirrored_into_the_chat_title() {
+    let mut doc = RegistryDoc::new("host");
+    let mut untitled = chat("thread", "host");
+    untitled.title = None;
+    doc.upsert_chat(&untitled).unwrap();
+    let mut summary = json!({"id":"thread","title":UNTITLED_THREAD_TITLE,"archivedAt":null,
+        "lastVisitedAt":null,"hostId":"host","hostEpoch":1,"version":1});
+    doc.set_chat_orchestration("thread", summary.clone())
+        .unwrap();
+    assert_eq!(doc.chat("thread").unwrap().unwrap().title, None);
+    // A real name still mirrors, and so does a later rename of the thread.
+    summary["title"] = json!("Fix Login Flow");
+    summary["version"] = json!(2);
+    doc.set_chat_orchestration("thread", summary).unwrap();
+    assert_eq!(
+        doc.chat("thread").unwrap().unwrap().title.as_deref(),
+        Some("Fix Login Flow")
+    );
+}
+
 fn hlc(ms: i64) -> String {
     encode_hlc(ms, 0, "dev-a")
 }

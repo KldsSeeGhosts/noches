@@ -53,6 +53,10 @@ impl Harness for ScriptedHarness {
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
     }
+    async fn authenticated(&self) -> Result<Option<bool>, HarnessError> {
+        // The fixture never uses this machine's credentials.
+        Ok(Some(true))
+    }
     async fn run(
         &self,
         _request: RunRequest,
@@ -114,6 +118,17 @@ fn registry() -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
+    // The catalog migration lists Mock only for a mock-only rig; both scripted
+    // harnesses must be runnable here, whatever this host has installed.
+    std::fs::write(
+        dir.join("provider-instances.json"),
+        serde_json::json!({
+            "mock": {"driver": "mock", "displayName": "Scripted", "enabled": true},
+            "cursor": {"driver": "cursor", "displayName": "Scripted", "enabled": true},
+        })
+        .to_string(),
+    )
+    .expect("seed provider instances");
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
 }
 
