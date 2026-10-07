@@ -186,6 +186,18 @@ fn saved_target(conn: &Connection, id: &str) -> Result<Option<ControlTarget>> {
         .transpose()
 }
 
+/// True when admission recorded a row but could not freeze a target.
+fn target_unresolved(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT target_json IS NULL FROM orchestration_control_targets WHERE effect_id=?1",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// The final logical repair is checked in its write transaction, not between
 /// a preflight read and an independently admitted synthetic terminal event.
 pub(crate) fn plan_settlement(
@@ -253,19 +265,28 @@ pub(crate) async fn execute(
         .locks
         .acquire([effect.thread_id.clone()])
         .await;
-    let saved = bridge.kernel.store.read(|conn| {
+    let (saved, unresolved) = bridge.kernel.store.read(|conn| {
         if super::effects::get(conn, &effect.id)?.is_none_or(|e| {
             !matches!(
                 e.status,
                 super::effects::EffectStatus::Pending | super::effects::EffectStatus::Running
             )
         }) {
-            return Ok(None);
+            return Ok((None, false));
         }
-        saved_target(conn, &effect.id)
+        Ok((
+            saved_target(conn, &effect.id)?,
+            target_unresolved(conn, &effect.id)?,
+        ))
     })?;
-    // Legacy or unbound controls cannot acquire authority over a new process.
+    // Legacy rows (no targets row) cannot acquire authority over a new process.
+    // An admitted row with no frozen target means the planner and `target()`
+    // disagreed: nothing will be stopped, so never report that as success.
     let Some(saved) = saved else {
+        if unresolved {
+            tracing::warn!(effect = %effect.id, request = ?effect.request, "control effect was admitted without a resolvable target");
+            return Ok(EffectOutcome::Failed);
+        }
         return Ok(EffectOutcome::Succeeded);
     };
     let Some(p) = bridge.kernel.store.thread(&effect.thread_id)? else {

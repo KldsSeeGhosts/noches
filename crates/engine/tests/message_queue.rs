@@ -1337,6 +1337,77 @@ async fn delayed_stop_with_stale_sql_cannot_cancel_an_active_or_idle_replacement
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_admitted_without_a_frozen_target_fails_but_a_legacy_row_still_succeeds() {
+    use zeron_engine::orchestration::effects::{EffectExecutor, EffectOutcome, EffectRequest};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    for legacy in [false, true] {
+        let (harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        core.doc_host
+            .queue_message(CHAT, "original", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        core.orchestration_host.as_ref().unwrap().shutdown().await;
+        let receipt = core
+            .orchestration
+            .dispatch(
+                &Command {
+                    id: "untargeted-stop".into(),
+                    thread_id: CHAT.into(),
+                    operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                        run_id: original.runs[0].id.clone(),
+                        reason: None,
+                    })),
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let effect = core
+            .orchestration
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        let diagnostic_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+        diagnostic_store.with_connection(|conn| {
+            let sql = if legacy {
+                "DELETE FROM orchestration_control_targets WHERE effect_id=?1"
+            } else {
+                "UPDATE orchestration_control_targets SET target_json=NULL WHERE effect_id=?1"
+            };
+            assert_eq!(conn.execute(sql, [&effect.id]).unwrap(), 1);
+        });
+        let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+        assert_eq!(
+            bridge
+                .execute(&effect, tokio_util::sync::CancellationToken::new())
+                .await,
+            if legacy {
+                EffectOutcome::Succeeded
+            } else {
+                EffectOutcome::Failed
+            },
+            "legacy={legacy}"
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_restart_replaces_only_the_interrupted_attempt_and_keeps_one_run() {
     use zeron_proto::orchestration::{OrchestrationV2RunAttemptStatus, OrchestrationV2RunStatus};
     let (core, harness, _) = setup(SteeringMode::TurnBoundary).await;
