@@ -242,3 +242,77 @@ No headed visual, Windows, iOS, reverse-direction Claude→Codex live run, or
 remote-host MCP forwarding is claimed. The exact live failure and full
 validation results are documented here and in `ui-api.md`; P4–P8 tools remain
 the sibling workstreams' explicit unavailable routes.
+
+# Wave 3 live scenarios (macOS, 2026-10-07)
+
+`scripts/orchestration-live-scenarios.py` boots one headless `zeron` per
+scenario on a scratch data directory (never a real Noches profile) and drives
+the same RPC surface as the desktop: `Mutate` (`createChat`, `setChatConfig`),
+`QueueCommand` (run), `QueueMessage` + `MutateQueuedRun` (promote to
+steer/restart), `ForkThread`, `StopThreadWork`, `ResetThreadSession`,
+`UploadChunk`/`UploadCommit`. Each scenario prints one `PASS|FAIL|UNSUPPORTED|SKIP`
+line and writes `evidence/<n>.json`. The engine copies installed CLI logins into
+`data/agent-accounts/` of its scratch profile; the driver deletes that directory
+on shutdown, so retained evidence never holds credentials.
+
+Authorized, cheap models only (all via the owner's CPA proxy): `claude-haiku-4-5`
+(`claudeAgent`), `gpt-6-luna` and `gemini-3.8-flash` (`codex`, medium effort).
+Provider turns are capped by `--max-turns` (default 60).
+
+```sh
+LINUX_TARGET=w3-live /Volumes/DevDrive/AiStack/noches-t3-program/linux-test.sh <worktree> build -p zeron
+python3 scripts/orchestration-live-scenarios.py \
+  --binary /Volumes/DevDrive/AiStack/noches-wt/targets/w3-live/debug/zeron \
+  [--only 1,2,...] [--stop-parent claude|codex] [--reset-pause SECONDS]
+```
+
+## Results
+
+Evidence: `…/noches-t3-program/w3/live-scratch/<run>/evidence/<n>.json` (not committed).
+
+| # | Scenario | Providers | Result | Run |
+|---|----------|-----------|--------|-----|
+| 1 | Steer mid-tool and right after the last tool result: one user message, one native receipt, one acceptance row, no redispatch | Haiku | PASS | run1b |
+| 2 | Lazy native fork (turn-1 checkpoint vs head): child session id equals the host-minted `claude-fork:v1` id, parent session file byte-identical, turn-1 fork knows `X` only, head fork `X` and `Y` | Haiku | PASS¹ | run2a |
+| 3 | Effort `medium→high` then model `gpt-6-luna→gemini-3.8-flash`: same native thread, no handoff/transfer, Codex's own `turn_context` records each model/effort | luna, gemini | PASS | run3a |
+| 4 | Queue promotion to interrupt/restart after a model change: restart on the same native thread with the new model, second queued row untouched, `sleep` child released, one app-server | luna → gemini | PASS | run4b |
+| 5 | A→B→A: B gets a portable `full_thread_summary`, A resumes its own session with a `delta_since_target_last_seen` handoff and recalls a fact told only to B | Haiku ↔ luna | PASS | run5d |
+| 6 | Multimodal steer: solid-red PNG into a running turn, delivered natively once, answer `red` | luna; Haiku | PASS | run6b |
+| 7 | Codex fork at a turn boundary (native `thread/fork`, child rollout names the parent); installed app-server uses `historyMode: paginated` and `thread/fork` + `thread/turns/list` + `thread/revert` leave exactly the first of two turns | luna | PASS | run7a |
+| 8 | Stop all: parent + delegated Haiku child both stopped (`stoppedRuns: 2`), no `sleep` survives, queued message stays queued | Haiku parent, Haiku child | PASS² | run8c |
+| 9 | Reset agent session: new native session without `--resume`, portable context in the new session's prompt | Haiku | PASS³ | run9b, run9c |
+
+¹ Run2a predates the fork-token assertions added afterwards; they were replayed
+read-only against run2a's own SQL/journal data (child id = token child id; token
+turn = the parent's `nativeReference` for turn 1 / head) but not re-run live.
+² `--stop-parent codex` (gpt-6-luna) is an environment limitation: luna calls
+`tool_search`, which the CPA route answers `unsupported call`, so it can never
+discover the deferred `delegate_task` MCP tool (run8a). The Stop-all contract is
+provider independent and was verified with a Claude parent.
+³ Run9a (immediate send after Reset, before the fix) failed; see below.
+
+## Findings
+
+* **Bug fixed: a message sent while a stopped/reset session was still exiting
+  was accepted and then lost.** Reset (and Stop, and Disconnect) cancel a parked
+  session handle that stays registered until its process exits; warm dispatch
+  still routed the next prompt into that dying mailbox, so the user message
+  appeared in the transcript and its run ended `interrupted` with no answer
+  (run9a: Reset returned at 14:01:12.283, the next run was dispatched 100 ms
+  later and was interrupted 2.2 s after). `SessionsEngine::dispatch` now treats a
+  handle whose interrupt was requested as mid-teardown, waits for retirement and
+  starts a fresh run. Regression:
+  `restart_resume::a_send_during_a_requested_teardown_starts_a_fresh_run`
+  (fails without the fix); live confirmation run9c (`--reset-pause 0`).
+* **Observation (not changed): idle gap after a steer that lands after the final
+  text.** A steer sent right after the last tool result can arrive after Claude
+  has already written its answer; the CLI answers it as a trailing turn. The
+  thread is delivered exactly once and answered (`GAMMA` then `GAMMA DELTA`), but
+  between the first `done` and the trailing answer (≈0.9–1.1 s in
+  scenario 1's state samples) `GetQueueState` reports no active run and
+  `workState: result_available`.
+* **Environment, not product:** `codex` retried `Connection failed` against
+  `127.0.0.1:8317` for minutes once (run5b); the same scenario passed on re-run.
+  Driver races fixed along the way: `run()` now returns only after the host
+  accepted the dispatch (a provider switch can take ~2.6 s), upload ids are
+  `[A-Za-z0-9_-]`.
