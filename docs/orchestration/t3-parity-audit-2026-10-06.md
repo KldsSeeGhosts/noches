@@ -276,8 +276,13 @@ attempted here.
 
 ## Remaining gaps
 
-Tracked in issue #49 (native Pi/ACP fork, full inherited tool/media
-history, and live-provider and non-Mac verification). Older builds stored false
+Still open after #49: native Pi/negotiated-ACP fork and exact input receipts
+(ACP `session/fork` is unstable and head-only; those adapters keep boundary
+retirement), loaded-process history injection, driver-authorized cross-account
+and cross-checkout native continuation, conversation rollback, provider
+clone/setup progress edges, project/environment PR-settlement settings,
+sparse/submodule checkpoints, catalog context windows beyond Claude, and
+live-provider, remote multi-device and non-Mac verification. Older builds stored false
 acceptance at session initialization; those rows cannot retrospectively prove
 provider submission, so no speculative migration or historical replay is done.
 
