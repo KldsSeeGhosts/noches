@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use zeron_proto::orchestration::*;
 use zeron_proto::orchestration_mcp::*;
-use zeron_proto::provider_instance::{ModelSelection, ProviderDriverKind};
+use zeron_proto::provider_instance::{ModelSelection, ProviderDriverKind, ProviderInstanceId};
 use zeron_proto::{AgentEvent, InteractionMode, RuntimeMode};
 
 use super::command::{Command, ExecutionSeed, Operation, Plan, run_terminal};
@@ -598,6 +598,41 @@ pub(crate) fn selection_transition(
     }
 }
 
+/// The earlier run whose provider generation a run on `instance` can continue.
+/// Only the instance's own earlier, non-rolled-back runs qualify, and only when
+/// the selection change rides the existing native session (see
+/// `selection_transition`); anything else needs a new generation.
+pub(crate) fn reusable_generation<'a>(
+    projection: &'a ThreadProjection,
+    instance: &ProviderInstanceId,
+    target: &ModelSelection,
+    ordinal: i64,
+    driver: &str,
+) -> Option<(&'a OrchestrationV2Run, &'a Value)> {
+    let (run, provider) = projection
+        .runs
+        .iter()
+        .rev()
+        .filter(|run| {
+            run.ordinal < ordinal
+                && &run.provider_instance_id == instance
+                && run.status != OrchestrationV2RunStatus::RolledBack
+        })
+        .find_map(|run| {
+            let id = run.provider_thread_id.as_ref()?;
+            let provider = records(projection, "provider-thread").iter().find(|p| {
+                p["id"] == id.0
+                    && p["providerInstanceId"] == instance.0
+                    && p["driver"] == driver
+                    && !matches!(p["status"].as_str(), Some("closed" | "archived" | "error"))
+            })?;
+            Some((run, provider))
+        })?;
+    (selection_transition(driver, &run.model_selection, target)
+        == SelectionTransition::ApplyOnNextTurn)
+        .then_some((run, provider))
+}
+
 /// Keep the provider's native identity, context usage, fork provenance and
 /// handoff coverage across turns. Old single-handle records are reusable only
 /// when their recorded instance/driver actually agrees with the selected run.
@@ -613,29 +648,13 @@ pub(crate) fn execution_seed_for(
     now: i64,
 ) -> Result<ExecutionSeed> {
     let mut seed = execution_seed(thread, ordinal, message_id, status, driver, now)?;
-    let previous = projection
-        .runs
-        .iter()
-        .rev()
-        .filter(|run| {
-            run.ordinal < ordinal
-                && run.provider_instance_id == thread.provider_instance_id
-                && run.status != OrchestrationV2RunStatus::RolledBack
-        })
-        .find_map(|run| {
-            let id = run.provider_thread_id.as_ref()?;
-            let provider = records(projection, "provider-thread").iter().find(|p| {
-                p["id"] == id.0
-                    && p["providerInstanceId"] == thread.provider_instance_id.0
-                    && p["driver"] == driver
-                    && !matches!(p["status"].as_str(), Some("closed" | "archived" | "error"))
-            })?;
-            Some((run, provider))
-        });
-    if let Some((run, provider)) = previous
-        && selection_transition(driver, &run.model_selection, &thread.model_selection)
-            == SelectionTransition::ApplyOnNextTurn
-    {
+    if let Some((_, provider)) = reusable_generation(
+        projection,
+        &thread.provider_instance_id,
+        &thread.model_selection,
+        ordinal,
+        driver,
+    ) {
         seed.provider_thread = serde_json::from_value(provider.clone())?;
         seed.run.provider_thread_id = Some(seed.provider_thread.id.clone());
         seed.attempt.provider_thread_id = seed.provider_thread.id.clone();
@@ -1035,7 +1054,6 @@ pub(crate) fn plan(
                 super::transfer::ensure_start_allowed(
                     &super::transfer::transfers(conn, &command.thread_id)?,
                     &command.thread_id,
-                    true,
                 )?;
             }
             super::continuation::drain(&authority, command, &mut plan, now)?
@@ -1056,7 +1074,6 @@ pub(crate) fn plan(
             super::transfer::ensure_start_allowed(
                 &super::transfer::transfers(conn, &command.thread_id)?,
                 &command.thread_id,
-                false,
             )?;
             if active_run(&projection).is_some()
                 || projection.thread.archived_at.is_some()

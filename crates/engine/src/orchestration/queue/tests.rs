@@ -1620,6 +1620,517 @@ async fn queued_promotion_restarts_one_logical_run_with_original_message_and_exa
     );
 }
 
+/// Save the next-turn selection on the thread, as `thread.model-selection.set`
+/// or `provider.switch` would.
+fn save_selection(f: &Fixture, instance: &str, model: &str) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut thread = json!(p.thread);
+    thread["providerInstanceId"] = json!(instance);
+    thread["modelSelection"] = json!({"instanceId":instance,"model":model});
+    f.seed("target", "thread.provider-switched", thread);
+}
+
+fn set_driver(f: &Fixture, driver: &str) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = task::records(&p, "provider-thread")[0].clone();
+    provider["driver"] = json!(driver);
+    f.seed("target", "provider-thread.updated", provider);
+}
+
+fn selection(instance: &str, model: &str) -> Value {
+    json!({"instanceId":instance,"model":model})
+}
+
+async fn promote(f: &Fixture, id: &str, input: Value) -> super::super::CommandReceipt {
+    f.service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input,
+            id.into(),
+            NOW,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn promotion_hint_follows_the_complete_selection_and_transition_policy() {
+    use zeron_proto::QueuePromotionMode::*;
+    // (driver, saved selection, active, interrupt+restart, mode, deferred, blocked)
+    let cases = [
+        ("codex", ("mock", "mock-1"), true, true, Some(ActiveSteering), false, false),
+        ("codex", ("mock", "mock-2"), true, true, Some(InterruptRestart), false, false),
+        ("codex", ("mock", "mock-2"), true, false, Some(ActiveSteering), true, false),
+        ("codex", ("mock", "mock-2"), false, true, Some(InterruptRestart), false, false),
+        ("codex", ("mock", "mock-2"), false, false, None, false, false),
+        ("mock", ("mock", "mock-2"), true, true, Some(InterruptRestartWithHandoff), false, false),
+        ("mock", ("mock", "mock-2"), true, false, None, false, true),
+        ("codex", ("other", "other-1"), true, true, Some(InterruptRestartWithHandoff), false, false),
+        ("codex", ("other", "other-1"), true, false, None, false, true),
+    ];
+    for (driver, (instance, model), active, restart, mode, deferred, blocked) in cases {
+        let f = Fixture::new();
+        f.start_target().await;
+        set_driver(&f, driver);
+        set_promotion_capabilities(&f, active, restart, restart);
+        f.sync("direction").await;
+        save_selection(&f, instance, model);
+        let hint = f
+            .service
+            .kernel
+            .store
+            .queue_ui_state(&"target".into())
+            .unwrap();
+        let label = format!("{driver} {instance}/{model} active={active} restart={restart}");
+        assert_eq!(hint.promotion_mode, mode, "{label}");
+        assert_eq!(hint.promotion_selection_deferred, deferred, "{label}");
+        assert_eq!(hint.promotion_blocked.is_some(), blocked, "{label}");
+        let changed = model != "mock-1";
+        assert_eq!(
+            hint.promotion_selection.is_some(),
+            changed && mode.is_some(),
+            "{label}: the displayed selection is echoed only when it matters"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_instance_model_change_restarts_the_native_generation_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("switch models now").await;
+    save_selection(&f, "mock", "mock-2");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart","expectedSelection":selection("mock","mock-2"),
+        "resolvedSelection":selection("mock","mock-2"),"targetDriver":"codex"});
+    let first = promote(&f, "promote-model", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-2");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    assert_eq!(
+        run.provider_thread_id, active.provider_thread_id,
+        "an absorbed model change keeps the native generation"
+    );
+    let attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(attempt.attempt_ordinal, 2);
+    assert_eq!(attempt.provider_thread_id, active.provider_thread_id.clone().unwrap());
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-model")
+        .unwrap();
+    assert!(matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref()));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(
+        saved["runtime"]["attempt_id"],
+        json!(active.active_attempt_id)
+    );
+    assert_eq!(saved["replacement_attempt_id"], json!(attempt.id));
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let replay = promote(&f, "promote-model", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn cross_instance_promotion_rebinds_the_replacement_attempt_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue on the other provider").await;
+    save_selection(&f, "other", "other-1");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let old_attempt = before.runs[0].active_attempt_id.clone().unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart_with_handoff",
+        "expectedSelection":selection("other","other-1"),
+        "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"});
+    let first = promote(&f, "promote-cross", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs.len(), before.runs.len(), "one logical run");
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.provider_instance_id.0, "other");
+    assert_eq!(run.model_selection.model.to_string(), "other-1");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    assert_eq!(run.status, OrchestrationV2RunStatus::Starting);
+    let generation = run.provider_thread_id.clone().unwrap();
+    assert_ne!(Some(&generation), active.provider_thread_id.as_ref());
+    assert_eq!(
+        generation.0,
+        "provider-thread:app:target:other:1:attempt:2",
+        "a per-attempt generation never collides with the original"
+    );
+    let provider = task::records(&after, "provider-thread")
+        .iter()
+        .find(|p| p["id"] == generation.0)
+        .unwrap()
+        .clone();
+    assert_eq!(provider["driver"], "claudeAgent");
+    assert_eq!(provider["providerInstanceId"], "other");
+    assert!(provider["nativeThreadRef"].is_null());
+    assert_eq!(provider["lastRunOrdinal"], run.ordinal);
+    let attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(attempt.provider_instance_id.0, "other");
+    assert_eq!(attempt.provider_thread_id, generation);
+    assert!(
+        json!(attempt)["nativeThreadId"].is_null(),
+        "the new generation never inherits the old native identity"
+    );
+    let old = after.attempts.iter().find(|a| a.id == old_attempt).unwrap();
+    assert_eq!(old.status, OrchestrationV2RunAttemptStatus::Superseded);
+    assert_eq!(old.provider_thread_id, active.provider_thread_id.clone().unwrap());
+    assert_eq!(old.provider_instance_id.0, "mock");
+    let root = after
+        .nodes
+        .iter()
+        .find(|n| Some(&n.id) == run.root_node_id.as_ref())
+        .unwrap();
+    assert_eq!(root.provider_thread_id.as_ref(), Some(&generation));
+    // Teardown names the OLD exact provider/process, independent of the binding.
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-cross")
+        .unwrap();
+    assert!(matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, interrupted_attempt_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref() && interrupted_attempt_id == &old_attempt));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: Option<String> = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw.expect("a frozen target"))?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(saved["runtime"]["attempt_id"], json!(old_attempt));
+    assert_eq!(
+        saved["runtime"]["provider_thread_id"],
+        json!(active.provider_thread_id)
+    );
+    assert_eq!(saved["replacement_attempt_id"], json!(attempt.id));
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let rebuilt = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(json!(rebuilt.runs), json!(after.runs));
+    let replay = promote(&f, "promote-cross", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn stopping_during_a_cross_instance_restart_cancels_it_and_binds_nothing_late() {
+    use crate::orchestration::effects::{EffectRequest, EffectStatus};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue elsewhere").await;
+    save_selection(&f, "other", "other-1");
+    let receipt = promote(
+        &f,
+        "promote-then-stop",
+        json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart_with_handoff",
+            "expectedSelection":selection("other","other-1"),
+            "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"}),
+    )
+    .await;
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{:?}", receipt.error);
+    let restarting = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = restarting.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.status, OrchestrationV2RunStatus::Starting);
+    let stop = f
+        .service
+        .kernel
+        .store
+        .dispatch(
+            &Command {
+                id: "stop-mid-restart".into(),
+                thread_id: "target".into(),
+                operation: Operation::Thread(Box::new(
+                    crate::orchestration::threads::planner::ThreadOperation::Interrupt {
+                        run_id: active.id.clone(),
+                        reason: None,
+                    },
+                )),
+            },
+            NOW + 1,
+        )
+        .unwrap();
+    assert_eq!(stop.status, ReceiptStatus::Accepted, "{:?}", stop.error);
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.command_id.0 == "promote-then-stop")
+        .unwrap();
+    assert!(matches!(effect.request, EffectRequest::ProviderTurnRestart { .. }));
+    assert_eq!(
+        effect.status,
+        EffectStatus::Cancelled,
+        "the pending replacement start cannot outlive the stop"
+    );
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert!(crate::orchestration::command::run_terminal(&run.status));
+    assert_eq!(
+        run.provider_instance_id.0, "other",
+        "the binding stays exact for the records that already name it"
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+}
+
+#[tokio::test]
+async fn selection_promotion_refuses_stale_unresolved_and_mismatched_requests_atomically() {
+    for fence in [
+        "stale-selection",
+        "missing-selection",
+        "unresolved-instance",
+        "resolution-for-another-selection",
+        "steer-click",
+        "no-interrupt-for-handoff",
+    ] {
+        let f = Fixture::new();
+        let active = f.start_target().await;
+        set_driver(&f, "codex");
+        set_promotion_capabilities(&f, true, fence != "no-interrupt-for-handoff", fence != "no-interrupt-for-handoff");
+        let queued = f.sync("direction").await;
+        save_selection(&f, "other", "other-1");
+        let mut input = json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart_with_handoff",
+            "expectedSelection":selection("other","other-1"),
+            "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"});
+        match fence {
+            "stale-selection" => input["expectedSelection"] = selection("other", "other-2"),
+            "missing-selection" => input["expectedSelection"] = Value::Null,
+            "unresolved-instance" => {
+                input["resolvedSelection"] = Value::Null;
+                input["targetDriver"] = Value::Null;
+            }
+            "resolution-for-another-selection" => {
+                input["resolvedSelection"] = selection("other", "other-2")
+            }
+            "steer-click" => input["expectedExecution"] = json!("active_steering"),
+            _ => {}
+        }
+        let frontier = f.service.kernel.store.projection_frontier().unwrap();
+        let receipt = promote(&f, &format!("refused-{fence}"), input).await;
+        assert_eq!(receipt.status, ReceiptStatus::Rejected, "{fence}");
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            frontier,
+            "{fence}: a refusal writes nothing"
+        );
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+            OrchestrationV2RunStatus::Queued,
+            "{fence}"
+        );
+        let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+        assert_eq!(run.provider_instance_id.0, "mock", "{fence}");
+        assert_eq!(run.active_attempt_id, active.active_attempt_id, "{fence}");
+    }
+}
+
+#[tokio::test]
+async fn a_selection_that_waits_for_the_next_turn_steers_without_moving_the_run() {
+    use crate::orchestration::effects::EffectRequest;
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, false, false);
+    let queued = f.sync("steer on the old model").await;
+    save_selection(&f, "mock", "mock-2");
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"active_steering","expectedSelection":selection("mock","mock-2")});
+    // Both the displayed selection and the mode are fenced.
+    let mut stale = input.clone();
+    stale["expectedSelection"] = selection("mock", "mock-3");
+    assert_eq!(
+        promote(&f, "waiting-stale", stale).await.status,
+        ReceiptStatus::Rejected
+    );
+    let mut unsure = input.clone();
+    unsure["expectedSelection"] = Value::Null;
+    assert_eq!(
+        promote(&f, "waiting-unreviewed", unsure).await.status,
+        ReceiptStatus::Rejected,
+        "the user must have been shown that the selection waits"
+    );
+    let receipt = promote(&f, "waiting-ok", input).await;
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{:?}", receipt.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-1");
+    assert_eq!(run.active_attempt_id, active.active_attempt_id);
+    assert_eq!(
+        after.thread.model_selection.model.to_string(),
+        "mock-2",
+        "the saved selection stays for the next turn"
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    assert!(effects.iter().any(
+        |e| e.command_id.0 == "waiting-ok" && matches!(e.request, EffectRequest::ProviderTurnSteer { .. })
+    ));
+    assert!(!effects.iter().any(
+        |e| e.command_id.0 == "waiting-ok" && matches!(e.request, EffectRequest::ProviderTurnRestart { .. })
+    ));
+}
+
 #[tokio::test]
 async fn restart_promotion_refuses_stale_modes_capabilities_bindings_and_maintenance_atomically() {
     for fence in [

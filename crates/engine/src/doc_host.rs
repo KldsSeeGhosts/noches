@@ -566,6 +566,9 @@ impl PartialEq for QueueSnapshot {
                         && a.background_run_id == b.background_run_id
                         && a.can_promote_to_steer == b.can_promote_to_steer
                         && a.promotion_mode == b.promotion_mode
+                        && a.promotion_selection == b.promotion_selection
+                        && a.promotion_selection_deferred == b.promotion_selection_deferred
+                        && a.promotion_blocked == b.promotion_blocked
                 }
                 _ => false,
             }

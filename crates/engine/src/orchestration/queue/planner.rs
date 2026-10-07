@@ -7,6 +7,7 @@ use crate::orchestration::command::{Command, Plan};
 use crate::orchestration::effects::{EffectRequest, TitleKind};
 use crate::orchestration::event::iso;
 use crate::orchestration::projection::{self, ThreadProjection};
+use crate::orchestration::threads::planner::Rebind;
 use crate::orchestration::{Error, Result, task};
 
 fn refuse(message: impl Into<String>) -> Error {
@@ -284,16 +285,41 @@ fn queue_mutation(
                 return Err(refuse("Queued run is missing message or execution state."));
             }
             let target = op.input["targetRunId"].as_str().unwrap_or("");
-            let (_, _, _, mode) = steering_target(p, target, message)?;
+            let resolution = Resolution::from_input(&op.input)?;
+            let promotion = steering_target(p, target, message, resolution.as_ref(), true)?;
+            // The mode the user reviewed covers the whole selection decision:
+            // a stale Steer click can never become a restart, nor a restart
+            // retarget a different instance/model than the one displayed.
             if let Some(expected) = op.input["expectedExecution"].as_str()
-                && serde_json::to_value(mode)?.as_str() != Some(expected)
+                && serde_json::to_value(promotion.mode)?.as_str() != Some(expected)
             {
                 return Err(refuse(
                     "The queue delivery mode changed; review the action before sending.",
                 ));
             }
+            let selection_dependent = promotion.rebind.is_some() || promotion.deferred;
+            match op.input.get("expectedSelection").filter(|v| !v.is_null()) {
+                Some(expected) => {
+                    let expected: zeron_proto::provider_instance::ModelSelection =
+                        serde_json::from_value(expected.clone())
+                            .map_err(|_| refuse("The reviewed selection is invalid."))?;
+                    if expected != p.thread.model_selection {
+                        return Err(refuse(
+                            "The thread's model selection changed; review the action before sending.",
+                        ));
+                    }
+                }
+                // Desktop user authority must name what it reviewed; an agent
+                // caller acts on the saved selection it was told about.
+                None if selection_dependent && op.caller.is_none() => {
+                    return Err(refuse(
+                        "The thread's model selection changed; review the action before sending.",
+                    ));
+                }
+                None => {}
+            }
             cancel(plan, command, p, run, now)?;
-            steer(plan, command, p, target, message, now)?;
+            steer(plan, command, p, target, message, resolution.as_ref(), now)?;
             plan.queue_patch = Some(json!({"action":"cancel","messageId":run.user_message_id}));
             Ok(())
         }
@@ -301,16 +327,50 @@ fn queue_mutation(
     }
 }
 
+/// The host's catalog resolution of the thread's saved selection, frozen into
+/// the command so a replay never re-reads a catalog that has since changed.
+#[derive(Debug, Clone)]
+struct Resolution {
+    selection: zeron_proto::provider_instance::ModelSelection,
+    driver: String,
+}
+
+impl Resolution {
+    fn from_input(input: &Value) -> Result<Option<Self>> {
+        let Some(selection) = input.get("resolvedSelection").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            selection: serde_json::from_value(selection.clone())
+                .map_err(|_| refuse("The resolved selection is invalid."))?,
+            driver: input["targetDriver"]
+                .as_str()
+                .filter(|d| !d.is_empty())
+                .ok_or_else(|| refuse("The resolved selection has no driver."))?
+                .to_owned(),
+        }))
+    }
+}
+
+struct Promotion<'a> {
+    run: &'a OrchestrationV2Run,
+    session_id: &'a str,
+    turn: &'a Value,
+    mode: zeron_proto::QueuePromotionMode,
+    /// Set when the restart also moves the run to the saved selection.
+    rebind: Option<Rebind>,
+    /// Active steering keeps the live selection; the saved one waits.
+    deferred: bool,
+}
+
 fn steering_target<'a>(
     p: &'a ThreadProjection,
     target: &str,
     message: &Value,
-) -> Result<(
-    &'a OrchestrationV2Run,
-    &'a str,
-    &'a Value,
-    zeron_proto::QueuePromotionMode,
-)> {
+    resolution: Option<&Resolution>,
+    strict: bool,
+) -> Result<Promotion<'a>> {
+    use crate::orchestration::task::{SelectionTransition, selection_transition};
     use zeron_proto::QueuePromotionMode;
     if p.thread.archived_at.is_some() {
         return Err(refuse("Thread is not active."));
@@ -323,11 +383,9 @@ fn steering_target<'a>(
     if run.status != OrchestrationV2RunStatus::Running || run.root_node_id.is_none() {
         return Err(refuse("Target run cannot be steered."));
     }
-    // TODO(merge-threads): negotiate provider-owned selection transitions with
-    // that slice's steering policy. Never silently steer the old instance
-    // when the saved next-turn selection requires a provider handoff.
-    if p.thread.provider_instance_id != run.provider_instance_id {
-        return Err(refuse("Provider handoff is required before steering."));
+    let wanted = &p.thread.model_selection;
+    if p.thread.provider_instance_id != wanted.instance_id {
+        return Err(refuse("The thread's saved selection is inconsistent."));
     }
     let target_message = records(p, "message")
         .iter()
@@ -360,19 +418,83 @@ fn steering_target<'a>(
         .find(|s| s["id"] == session_id && s["providerInstanceId"] == run.provider_instance_id.0)
         .ok_or_else(|| refuse("Provider session is not active."))?;
     let caps = &session["capabilities"]["turns"];
-    let mode = if caps["supportsActiveSteering"] == true {
-        QueuePromotionMode::ActiveSteering
-    } else if caps["supportsInterrupt"] == true
-        && caps["supportsSteeringByInterruptRestart"] == true
-    {
-        if p.thread.model_selection != run.model_selection {
-            return Err(refuse(
-                "A model selection handoff is required before restart.",
-            ));
+    let can_steer = caps["supportsActiveSteering"] == true;
+    let can_restart =
+        caps["supportsInterrupt"] == true && caps["supportsSteeringByInterruptRestart"] == true;
+    let changed = *wanted != run.model_selection;
+    let mut rebind = None;
+    let mut deferred = false;
+    let mode = if !changed {
+        if can_steer {
+            QueuePromotionMode::ActiveSteering
+        } else if can_restart {
+            QueuePromotionMode::InterruptRestart
+        } else {
+            return Err(refuse("Provider cannot steer or interrupt/restart."));
         }
-        QueuePromotionMode::InterruptRestart
     } else {
-        return Err(refuse("Provider cannot steer or interrupt/restart."));
+        // The driver that owns the *target* selection decides whether it rides
+        // the live native session. A different instance never does.
+        let same_instance = wanted.instance_id == run.provider_instance_id;
+        let run_driver = provider["driver"].as_str().unwrap_or_default();
+        let transition = if same_instance {
+            selection_transition(run_driver, &run.model_selection, wanted)
+        } else {
+            SelectionTransition::CreateWithHandoff
+        };
+        let mode = match transition {
+            SelectionTransition::ApplyOnNextTurn if can_restart => {
+                QueuePromotionMode::InterruptRestart
+            }
+            // T3: the selection waits for the next turn rather than silently
+            // steering into a stale one *and* losing it.
+            SelectionTransition::ApplyOnNextTurn if can_steer => {
+                deferred = true;
+                QueuePromotionMode::ActiveSteering
+            }
+            SelectionTransition::ApplyOnNextTurn => {
+                return Err(refuse("Provider cannot steer or interrupt/restart."));
+            }
+            SelectionTransition::CreateWithHandoff if can_restart => {
+                QueuePromotionMode::InterruptRestartWithHandoff
+            }
+            SelectionTransition::CreateWithHandoff => {
+                return Err(refuse(
+                    "This model selection needs a provider handoff, and the running provider cannot be interrupted and restarted. Send it after the current run.",
+                ));
+            }
+        };
+        if mode != QueuePromotionMode::ActiveSteering {
+            let driver = if same_instance {
+                run_driver.to_owned()
+            } else if let Some(resolution) = resolution {
+                resolution.driver.clone()
+            } else if strict {
+                return Err(refuse(
+                    "The target provider was not resolved by the host catalog.",
+                ));
+            } else {
+                String::new()
+            };
+            if let Some(resolution) = resolution
+                && resolution.selection != *wanted
+            {
+                return Err(refuse(
+                    "The thread's model selection changed; review the action before sending.",
+                ));
+            }
+            if strict && resolution.is_none() {
+                return Err(refuse(
+                    "The target selection was not resolved by the host catalog.",
+                ));
+            }
+            rebind = Some(Rebind {
+                selection: wanted.clone(),
+                driver,
+                transition,
+            });
+        }
+        mode
     };
     let turn = records(p, "provider-turn")
         .iter()
@@ -401,7 +523,14 @@ fn steering_target<'a>(
     {
         return Err(refuse("The active attempt/provider binding changed."));
     }
-    Ok((run, session_id, turn, mode))
+    Ok(Promotion {
+        run,
+        session_id,
+        turn,
+        mode,
+        rebind,
+        deferred,
+    })
 }
 
 fn steer(
@@ -410,15 +539,23 @@ fn steer(
     p: &ThreadProjection,
     target: &str,
     message: &Value,
+    resolution: Option<&Resolution>,
     now: i64,
 ) -> Result<()> {
-    let (run, session_id, turn, mode) = steering_target(p, target, message)?;
+    let Promotion {
+        run,
+        session_id,
+        turn,
+        mode,
+        rebind,
+        ..
+    } = steering_target(p, target, message, resolution, true)?;
     let message_id = message["id"]
         .as_str()
         .ok_or_else(|| Error::Invariant("Promoted message has no id.".into()))?
         .to_owned();
     let restarted;
-    let run = if mode == zeron_proto::QueuePromotionMode::InterruptRestart {
+    let run = if mode != zeron_proto::QueuePromotionMode::ActiveSteering {
         restarted = crate::orchestration::threads::planner::restart_attempt(
             p,
             command,
@@ -427,6 +564,7 @@ fn steer(
             session_id,
             turn,
             &MessageId(message_id.clone()),
+            rebind.as_ref(),
             now,
         )?;
         &restarted
@@ -471,15 +609,49 @@ fn steer(
     Ok(())
 }
 
-/// Use the actual steering planner for the passive UI hint, so provider,
-/// maintenance and attempt/turn fences cannot drift from the mutation path.
-pub(crate) fn promotion_mode(p: &ThreadProjection) -> Option<zeron_proto::QueuePromotionMode> {
-    let run = task::active_run(p)?;
-    steering_target(p, &run.id.0, &json!({"text":"message"}))
-        .ok()
-        .map(|(_, _, _, mode)| mode)
+/// Passive UI hint computed by the same steering planner as the mutation
+/// path, so provider, maintenance, selection and attempt/turn fences cannot
+/// drift. The host-only catalog resolution is the one thing it cannot see.
+pub(crate) struct PromotionHint {
+    pub mode: Option<zeron_proto::QueuePromotionMode>,
+    pub selection: Option<zeron_proto::provider_instance::ModelSelection>,
+    pub deferred: bool,
+    pub blocked: Option<String>,
 }
 
+pub(crate) fn promotion_hint(p: &ThreadProjection) -> PromotionHint {
+    let none = |blocked| PromotionHint {
+        mode: None,
+        selection: None,
+        deferred: false,
+        blocked,
+    };
+    let Some(run) = task::active_run(p) else {
+        return none(None);
+    };
+    match steering_target(p, &run.id.0, &json!({"text":"message"}), None, false) {
+        Ok(promotion) => PromotionHint {
+            mode: Some(promotion.mode),
+            selection: (promotion.rebind.is_some() || promotion.deferred)
+                .then(|| p.thread.model_selection.clone()),
+            deferred: promotion.deferred,
+            blocked: None,
+        },
+        // Only a refusal that is about the selection explains a disabled
+        // action; the rest (not running yet, maintenance, ...) stay silent.
+        Err(Error::Invariant(message)) if message.contains("provider handoff") => {
+            none(Some(message))
+        }
+        Err(_) => none(None),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn promotion_mode(p: &ThreadProjection) -> Option<zeron_proto::QueuePromotionMode> {
+    promotion_hint(p).mode
+}
+
+#[cfg(test)]
 pub(crate) fn can_promote_to_steer(p: &ThreadProjection) -> bool {
     promotion_mode(p) == Some(zeron_proto::QueuePromotionMode::ActiveSteering)
 }
@@ -582,9 +754,18 @@ fn respond(
             .iter()
             .rev()
             .find(|r| r.status == OrchestrationV2RunStatus::Running)
-            && steer(&mut Plan::default(), command, p, &run.id.0, &message, now).is_ok()
+            && steer(
+                &mut Plan::default(),
+                command,
+                p,
+                &run.id.0,
+                &message,
+                None,
+                now,
+            )
+            .is_ok()
         {
-            steer(plan, command, p, &run.id.0, &message, now)?;
+            steer(plan, command, p, &run.id.0, &message, None, now)?;
             return Ok(());
         }
         enqueue_answer(plan, command, p, &id, &message, now)?;

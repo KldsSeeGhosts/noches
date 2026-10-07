@@ -555,6 +555,49 @@ impl HandoffDelivery for EngineDelivery<'_> {
     }
 }
 
+/// A selection-changing restart replaces the provider generation inside one
+/// logical run. Returns the attempt that first ran on the current generation
+/// and the interrupted attempt just before it (a different generation), or None
+/// when the run has stayed on its original generation.
+fn restart_origin<'a>(
+    projection: &'a ThreadProjection,
+    run: &OrchestrationV2Run,
+) -> Option<(&'a OrchestrationV2RunAttempt, &'a OrchestrationV2RunAttempt)> {
+    let attempts = |ordinal: i64| {
+        projection
+            .attempts
+            .iter()
+            .find(|a| a.run_id == run.id && a.attempt_ordinal == ordinal)
+    };
+    let current = projection
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref() && a.run_id == run.id)?;
+    let mut first = current;
+    while first.attempt_ordinal > 1
+        && first.reason == OrchestrationV2RunAttemptReason::SteeringRestart
+        && let Some(previous) = attempts(first.attempt_ordinal - 1)
+        && previous.provider_thread_id == first.provider_thread_id
+    {
+        first = previous;
+    }
+    if first.attempt_ordinal == 1
+        || first.reason != OrchestrationV2RunAttemptReason::SteeringRestart
+    {
+        return None;
+    }
+    Some((first, attempts(first.attempt_ordinal - 1)?))
+}
+
+/// Delegated-completion and notification runs are automatic deliveries; they
+/// never consume context the user is waiting to send (a pending merge-back).
+fn automatic_run(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {
+    super::super::task::records(projection, "message")
+        .iter()
+        .find(|m| m["id"] == run.user_message_id.0)
+        .is_some_and(|m| m.get("delegatedCompletion").is_some() || m.get("notification").is_some())
+}
+
 /// Normal start integration. `request.prompt` retains current input verbatim;
 /// imported context is prepended only to native input, not historical transcript.
 pub async fn prepare_run(
@@ -577,16 +620,22 @@ pub async fn prepare_run(
         ));
     }
     let all = kernel.store.thread_transfers(thread)?;
-    super::ensure_start_allowed(&all, thread, false)?;
-    let needs_full_switch = all.iter().any(|t| {
-        t["type"] == "merge_back" && t["status"] == "pending" && t["targetThreadId"] == thread.0
-    });
+    super::ensure_start_allowed(&all, thread)?;
+    // Queued runs may be admitted while a merge-back waits. The first
+    // non-automatic run to actually start consumes it; a cancelled queued run
+    // never reaches here, and an automatic delivery leaves it pending.
+    let automatic = automatic_run(&projection, run);
+    let claims_pending =
+        |t: &Value| t["status"] == "pending" && !(automatic && t["type"] == "merge_back");
+    let needs_full_switch = all
+        .iter()
+        .any(|t| t["type"] == "merge_back" && claims_pending(t) && t["targetThreadId"] == thread.0);
     let relevant: Vec<_> = all
         .into_iter()
         .filter(|t| {
             t["targetThreadId"] == thread.0
                 && matches!(t["type"].as_str(), Some("fork" | "merge_back"))
-                && (t["status"] == "pending" || t["targetRunId"] == run.id.0)
+                && (claims_pending(t) || t["targetRunId"] == run.id.0)
         })
         .collect();
     let mut handoffs = vec![];
@@ -600,27 +649,58 @@ pub async fn prepare_run(
     {
         request.resume = target_native.clone();
     }
-    if let Some(previous) = projection
+    let restart = restart_origin(&projection, run);
+    let earlier = projection
         .runs
         .iter()
         .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
-        .max_by_key(|r| r.ordinal)
-        && (previous.provider_instance_id != run.provider_instance_id
-            // A user reset closed the previous conversation: rebuild fully.
-            || (previous.provider_thread_id != run.provider_thread_id
-                && provider_for_run(&projection, previous)
-                    .is_some_and(|p| p["status"] == "closed"))
-            || selection_transition(
-                target_provider["driver"].as_str().unwrap_or_default(),
-                &previous.model_selection,
-                &run.model_selection,
-            ) == SelectionTransition::CreateWithHandoff
-            || (provider_for_run(&projection, run)
-                .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
-                && target_native.is_none()
-                && request.resume.is_none()))
-    {
-        let id = format!("provider-handoff:{}", encode_component(&run.id.0));
+        .max_by_key(|r| r.ordinal);
+    // A restart that moved the run onto another generation hands off from the
+    // run itself, partial output included. Otherwise the previous finished run
+    // is the source, and only when the selection cannot ride the native session.
+    let source = if restart.is_some() {
+        Some(run)
+    } else {
+        earlier.filter(|previous| {
+            previous.provider_instance_id != run.provider_instance_id
+                // A user reset closed the previous conversation: rebuild fully.
+                || (previous.provider_thread_id != run.provider_thread_id
+                    && provider_for_run(&projection, previous)
+                        .is_some_and(|p| p["status"] == "closed"))
+                || selection_transition(
+                    target_provider["driver"].as_str().unwrap_or_default(),
+                    &previous.model_selection,
+                    &run.model_selection,
+                ) == SelectionTransition::CreateWithHandoff
+                || (provider_for_run(&projection, run)
+                    .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
+                    && target_native.is_none()
+                    && request.resume.is_none())
+        })
+    };
+    if let Some(previous) = source {
+        // One transfer per provider generation of a run, never per run: the
+        // earlier attempt's handoff belongs to the generation it fed.
+        let (id, command_id) = match restart {
+            Some((first, _)) => (
+                format!(
+                    "provider-handoff:{}:attempt:{}",
+                    encode_component(&run.id.0),
+                    first.attempt_ordinal
+                ),
+                format!(
+                    "provider-handoff:{}:attempt:{}",
+                    run.id.0, first.attempt_ordinal
+                ),
+            ),
+            None => (
+                format!("provider-handoff:{}", encode_component(&run.id.0)),
+                format!("provider-handoff:{}", run.id.0),
+            ),
+        };
+        let source_instance = restart
+            .map(|(_, interrupted)| interrupted.provider_instance_id.clone())
+            .unwrap_or_else(|| previous.provider_instance_id.clone());
         let existing = kernel
             .store
             .thread_transfers(thread)?
@@ -662,6 +742,12 @@ pub async fn prepare_run(
                     .map(|r| r.ordinal >= from)
                     .unwrap_or(seen.is_none() && i["runId"].is_null())
             });
+            if restart.is_some() {
+                // The prompt being delivered is the run's current input, not history.
+                items.retain(|i| {
+                    i["messageId"] != run.user_message_id.0 && i["id"] != run.user_message_id.0
+                });
+            }
             if seen.is_none() {
                 items.splice(0..0, super::inherited_items(&kernel.store, &projection)?);
             }
@@ -683,13 +769,13 @@ pub async fn prepare_run(
                 "createdByProviderInstanceId":null,"createdAt":now,"updatedAt":now});
             let transfer = json!({"id":id,"type":"provider_handoff","sourceThreadId":thread,"targetThreadId":thread,
                 "sourcePoint":super::canonical_point(&projection,previous),"basePoint":seen.map(|r| super::canonical_point(&projection,r)),
-                "sourceProviderInstanceId":previous.provider_instance_id,"targetProviderInstanceId":run.provider_instance_id,
+                "sourceProviderInstanceId":source_instance,"targetProviderInstanceId":run.provider_instance_id,
                 "targetRunId":run.id,"status":"consumed","resolution":{"strategy":if seen.is_none() {"portable_context"} else {"delta_context"},"contextHandoffId":handoff_id},
                 "createdBy":"system","error":null,"createdAt":now,"updatedAt":now,"consumedAt":now});
             let receipt = kernel
                 .transfer_command(
                     thread,
-                    CommandId(format!("provider-handoff:{}", run.id.0)),
+                    CommandId(command_id),
                     super::TransferOperation::CreateHandoff {
                         transfer: Box::new(transfer.clone()),
                         handoff: Box::new(handoff.clone()),
@@ -913,6 +999,15 @@ pub async fn prepare_run(
             .into_iter()
             .find(|t| t["id"] == handoff["transferId"])
         {
+            // A provider handoff fed the generation it was prepared for. After a
+            // restart onto another generation the run's own handoff covers the
+            // history again; re-injecting the earlier one would duplicate it.
+            if transfer["type"] == "provider_handoff"
+                && handoff["toProviderThreadId"].as_str()
+                    != run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+            {
+                continue;
+            }
             handoffs.push(handoff.clone());
             durable_transfers.push(transfer);
         }

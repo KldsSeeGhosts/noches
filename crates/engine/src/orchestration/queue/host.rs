@@ -11,6 +11,20 @@ use crate::orchestration::queue_service::QueueService;
 use crate::orchestration::service::{CallerScope, ToolError};
 use crate::{DocHost, HarnessRegistry};
 
+/// The live configured-instance catalog, joined with availability, as the
+/// composer and capabilities tool see it.
+struct LiveCatalog(Vec<crate::provider_instances::ProviderInstance>);
+
+#[async_trait]
+impl crate::orchestration::task::DelegationCatalog for LiveCatalog {
+    async fn providers(
+        &self,
+    ) -> Result<Vec<zeron_proto::provider_instance::OrchestratorMcpProviderCapability>, ToolError>
+    {
+        Ok(self.0.iter().map(|p| p.capability()).collect())
+    }
+}
+
 pub struct HostQueue {
     pub domain: Arc<QueueDomain>,
     pub docs: DocHost,
@@ -18,6 +32,56 @@ pub struct HostQueue {
 }
 
 impl HostQueue {
+    /// Validate the thread's saved selection through the trusted live catalog
+    /// when promoting it would move the running run onto a different one, and
+    /// freeze the result (exact custom model id/options plus the target driver)
+    /// into the command input. Replays use the receipt, never a fresh catalog.
+    async fn resolve_promotion(
+        &self,
+        p: &crate::orchestration::projection::ThreadProjection,
+        input: &mut Value,
+    ) -> Result<(), String> {
+        use crate::orchestration::task::{CatalogTargets, DelegationTargets};
+        let Some(run) = p
+            .runs
+            .iter()
+            .find(|r| Some(r.id.0.as_str()) == input["targetRunId"].as_str())
+        else {
+            return Ok(());
+        };
+        let wanted = &p.thread.model_selection;
+        if *wanted == run.model_selection {
+            return Ok(());
+        }
+        let options = match &wanted.options {
+            zeron_proto::orchestration::Optional::Present(options) => Some(
+                serde_json::from_value(serde_json::to_value(options).map_err(|e| e.to_string())?)
+                    .map_err(|_| "The saved model options are invalid.".to_string())?,
+            ),
+            _ => None,
+        };
+        let target = zeron_proto::orchestration_mcp::DelegateTaskInputTarget {
+            provider_instance_id: zeron_proto::orchestration::Optional::Present(
+                wanted.instance_id.0.clone(),
+            ),
+            driver_kind: Default::default(),
+            model: zeron_proto::orchestration::Optional::Present(wanted.model.to_string()),
+            options: options
+                .map(zeron_proto::orchestration::Optional::Present)
+                .unwrap_or_default(),
+        };
+        let catalog = LiveCatalog(self.registry.provider_instances.snapshot(&self.registry));
+        let resolved = CatalogTargets(Arc::new(catalog))
+            .resolve(&p.thread, Some(&target))
+            .await
+            .map_err(|error| error.message)?;
+        // The saved selection is the trusted value; the catalog only vouches
+        // for it and names the driver that will own the new generation.
+        input["resolvedSelection"] = json!(wanted);
+        input["targetDriver"] = json!(resolved.driver.0);
+        Ok(())
+    }
+
     /// The runtime can be briefly idle between admitted restart attempts.
     /// That gap does not authorize draining another document-owned input.
     pub(crate) fn has_starting_turn(&self, chat: &str) -> super::super::Result<bool> {
@@ -296,13 +360,23 @@ impl HostQueue {
             QueuedRunAction::Reorder { before_run_id } => {
                 ("t3_queue_reorder", json!({"beforeRunId":before_run_id}))
             }
-            QueuedRunAction::PromoteToSteer { target_run_id } => (
+            QueuedRunAction::PromoteToSteer {
+                target_run_id,
+                expected_selection,
+            } => (
                 "t3_queue_promote_to_steer",
-                json!({"targetRunId":target_run_id,"expectedExecution":"active_steering"}),
+                json!({"targetRunId":target_run_id,"expectedExecution":"active_steering",
+                    "expectedSelection":expected_selection}),
             ),
-            QueuedRunAction::PromoteToRestart { target_run_id } => (
+            QueuedRunAction::PromoteToRestart {
+                target_run_id,
+                handoff,
+                expected_selection,
+            } => (
                 "t3_queue_promote_to_steer",
-                json!({"targetRunId":target_run_id,"expectedExecution":"interrupt_restart"}),
+                json!({"targetRunId":target_run_id,
+                    "expectedExecution":if *handoff {"interrupt_restart_with_handoff"} else {"interrupt_restart"},
+                    "expectedSelection":expected_selection}),
             ),
         };
         input["threadId"] = json!(request.chat_id);
@@ -359,6 +433,16 @@ impl HostQueue {
                 ));
             }
         }
+        // After the identity is reserved from the caller's content: a replay
+        // resolves to its stored receipt and must not depend on today's catalog.
+        if !replay && name == "t3_queue_promote_to_steer" {
+            if let Err(refusal) = self.resolve_promotion(&current, &mut input).await {
+                return Ok(zeron_proto::MutateQueuedRunResult {
+                    sequence: current.through_sequence,
+                    refusal: Some(refusal),
+                });
+            }
+        }
         let receipt = self
             .domain
             .mutate(None, thread.clone(), name, input, id, crate::now_ms())
@@ -412,6 +496,15 @@ impl QueueService for HostQueue {
             {
                 return Err(unavailable());
             }
+        }
+        let mut input = input;
+        if name == "t3_queue_promote_to_steer"
+            && let Err(message) = self.resolve_promotion(&target, &mut input).await
+        {
+            return Err(ToolError::new(
+                zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode::ModelUnavailable,
+                message,
+            ));
         }
         let result = self.domain.call(caller, name, input).await?;
         self.apply_patches(&target.thread.id, &handle)?;

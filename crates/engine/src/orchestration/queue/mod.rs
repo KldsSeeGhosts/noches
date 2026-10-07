@@ -55,8 +55,10 @@ pub(crate) fn reserve_request(
     Ok(true)
 }
 
-pub(crate) use planner::{can_promote_to_steer, promotion_mode};
 pub(crate) use planner::plan;
+pub(crate) use planner::promotion_hint;
+#[cfg(test)]
+pub(crate) use planner::can_promote_to_steer;
 
 #[derive(Clone)]
 pub struct QueueCommand {

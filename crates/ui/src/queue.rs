@@ -72,6 +72,8 @@ enum QueuePrimaryAction {
     SendNow,
     Steer,
     Restart,
+    /// The saved selection needs a new provider generation seeded with context.
+    RestartWithHandoff,
 }
 
 impl QueuePrimaryAction {
@@ -80,7 +82,39 @@ impl QueuePrimaryAction {
             Self::SendNow => "Send now (interrupt)",
             Self::Steer => "Steer active response",
             Self::Restart => "Send now (interrupt and restart)",
+            Self::RestartWithHandoff => "Send now (restart with handoff)",
         }
+    }
+}
+
+/// The row action's tooltip, naming the selection it will run on and why it is
+/// unavailable. The host decides all of it; this only words the hint.
+fn primary_tooltip(
+    action: QueuePrimaryAction,
+    enabled: bool,
+    queue: Option<&zeron_proto::QueueUiState>,
+) -> String {
+    let model = queue
+        .and_then(|queue| queue.promotion_selection.as_ref())
+        .map(|selection| selection.model.to_string());
+    if !enabled {
+        return queue
+            .and_then(|queue| queue.promotion_blocked.clone())
+            .unwrap_or_else(|| "Waiting for provider capabilities".into());
+    }
+    match (action, model) {
+        (QueuePrimaryAction::Steer, Some(_))
+            if queue.is_some_and(|queue| queue.promotion_selection_deferred) =>
+        {
+            "Steer active response (the new model applies next turn)".into()
+        }
+        (QueuePrimaryAction::Restart, Some(model)) => {
+            format!("Send now on {model} (interrupt and restart)")
+        }
+        (QueuePrimaryAction::RestartWithHandoff, Some(model)) => {
+            format!("Send now on {model} (restart with handoff)")
+        }
+        (action, _) => action.tooltip().into(),
     }
 }
 
@@ -89,6 +123,9 @@ fn canonical_primary_action(queue: &zeron_proto::QueueUiState) -> Option<QueuePr
     match queue.promotion_mode {
         Some(QueuePromotionMode::ActiveSteering) => Some(QueuePrimaryAction::Steer),
         Some(QueuePromotionMode::InterruptRestart) => Some(QueuePrimaryAction::Restart),
+        Some(QueuePromotionMode::InterruptRestartWithHandoff) => {
+            Some(QueuePrimaryAction::RestartWithHandoff)
+        }
         None if queue.can_promote_to_steer => Some(QueuePrimaryAction::Steer),
         None => None,
     }
@@ -626,9 +663,15 @@ impl Composer {
             QueuePrimaryAction::SendNow
         });
         let primary_id = item.id.clone();
+        let primary_tooltip = primary_tooltip(
+            primary_action,
+            resolved_primary.is_some(),
+            state.canonical_queues.get(chat_id),
+        );
         let primary = self.queue_primary_action_button(
             &key,
             primary_action,
+            primary_tooltip,
             resolved_primary.is_some(),
             queue_latest_shortcut_visible(
                 ix,
@@ -1163,22 +1206,18 @@ impl Composer {
         &self,
         key: &SharedString,
         action: QueuePrimaryAction,
+        tooltip: String,
         enabled: bool,
         show_shortcut: bool,
         theme: &Theme,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
-        let tooltip = if enabled {
-            action.tooltip()
-        } else {
-            "Waiting for provider capabilities"
-        };
         let accent = theme.accent;
         let compact = self.queue_preview_limit() == 1;
         div()
             .id(SharedString::from(format!("{key}-primary")))
             .role(gpui::Role::Button)
-            .aria_label(tooltip)
+            .aria_label(tooltip.clone())
             // Both labels occupy the same slot; modifier previews never move
             // the message text, thumbnails, or adjacent actions.
             .w(px(if compact { 28.0 } else { 72.0 }))
@@ -1224,7 +1263,9 @@ impl Composer {
             } else {
                 div()
                     .child(match action {
-                        QueuePrimaryAction::SendNow | QueuePrimaryAction::Restart => "Send now",
+                        QueuePrimaryAction::SendNow
+                        | QueuePrimaryAction::Restart
+                        | QueuePrimaryAction::RestartWithHandoff => "Send now",
                         QueuePrimaryAction::Steer => "Steer",
                     })
                     .into_any_element()
@@ -1492,28 +1533,39 @@ impl Composer {
     ) {
         match action {
             QueuePrimaryAction::SendNow => self.send_queued_now(id, cx),
-            QueuePrimaryAction::Steer | QueuePrimaryAction::Restart => {
+            QueuePrimaryAction::Steer
+            | QueuePrimaryAction::Restart
+            | QueuePrimaryAction::RestartWithHandoff => {
                 let state = self.state.read(cx);
                 let Some(entry) = self.canonical_queue_entry(&id, state) else {
                     return;
                 };
-                let Some(target_run_id) = self
+                let Some((target_run_id, expected_selection)) = self
                     .target
                     .chat_id(state)
                     .and_then(|id| state.canonical_queues.get(id))
                     .filter(|queue| canonical_primary_action(queue) == Some(action))
-                    .and_then(|queue| queue.active_run_id.clone())
+                    .and_then(|queue| {
+                        Some((queue.active_run_id.clone()?, queue.promotion_selection.clone()))
+                    })
                 else {
                     return;
                 };
                 let run_id = entry.queued_run_id.clone();
+                // The host refuses if the selection or mode shown here moved.
                 self.canonical_queue_action(
                     id,
                     run_id,
-                    if action == QueuePrimaryAction::Restart {
-                        zeron_proto::QueuedRunAction::PromoteToRestart { target_run_id }
-                    } else {
-                        zeron_proto::QueuedRunAction::PromoteToSteer { target_run_id }
+                    match action {
+                        QueuePrimaryAction::Steer => zeron_proto::QueuedRunAction::PromoteToSteer {
+                            target_run_id,
+                            expected_selection,
+                        },
+                        _ => zeron_proto::QueuedRunAction::PromoteToRestart {
+                            target_run_id,
+                            handoff: action == QueuePrimaryAction::RestartWithHandoff,
+                            expected_selection,
+                        },
                     },
                     cx,
                 );
@@ -2334,7 +2386,7 @@ mod tests {
 
     use super::{
         PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
-        canonical_primary_action, latest_queued_message, one_line, queue_action_needs_host,
+        canonical_primary_action, latest_queued_message, one_line, primary_tooltip, queue_action_needs_host,
         queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible,
         queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
@@ -2599,6 +2651,47 @@ mod tests {
         );
         queue.promotion_mode = None;
         assert_eq!(canonical_primary_action(&queue), None);
+    }
+
+    #[test]
+    fn primary_tooltip_names_the_selection_the_host_will_run_and_why_it_is_unavailable() {
+        use zeron_proto::{QueuePromotionMode, QueueUiState};
+        let mut queue = QueueUiState::default();
+        queue.promotion_mode = Some(QueuePromotionMode::InterruptRestartWithHandoff);
+        assert_eq!(
+            canonical_primary_action(&queue),
+            Some(QueuePrimaryAction::RestartWithHandoff)
+        );
+        queue.promotion_selection = serde_json::from_value(
+            serde_json::json!({"instanceId":"claude","model":"claude-opus"}),
+        )
+        .ok();
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::RestartWithHandoff, true, Some(&queue)),
+            "Send now on claude-opus (restart with handoff)"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Restart, true, Some(&queue)),
+            "Send now on claude-opus (interrupt and restart)"
+        );
+        queue.promotion_selection_deferred = true;
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, true, Some(&queue)),
+            "Steer active response (the new model applies next turn)"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, true, None),
+            "Steer active response"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, false, Some(&queue)),
+            "Waiting for provider capabilities"
+        );
+        queue.promotion_blocked = Some("Send it after the current run.".into());
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, false, Some(&queue)),
+            "Send it after the current run."
+        );
     }
 
     #[test]

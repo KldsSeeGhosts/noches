@@ -60,6 +60,14 @@ pub struct QueueUiState {
     /// The UI names an interrupting restart explicitly. Host admission checks
     /// the observed mode again, so stale Steer clicks cannot become restarts.
     pub promotion_mode: Option<QueuePromotionMode>,
+    /// The saved next-turn selection the promotion would run on (restart modes),
+    /// or would leave waiting (`promotion_selection_deferred`). Clients echo it
+    /// back so the host can refuse an action reviewed against a stale selection.
+    pub promotion_selection: Option<crate::provider_instance::ModelSelection>,
+    /// Active steering keeps the live selection; the saved one applies next turn.
+    pub promotion_selection_deferred: bool,
+    /// Why a selection change cannot be delivered into the running turn.
+    pub promotion_blocked: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +75,8 @@ pub struct QueueUiState {
 pub enum QueuePromotionMode {
     ActiveSteering,
     InterruptRestart,
+    /// The saved selection needs a new provider generation seeded with context.
+    InterruptRestartWithHandoff,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,9 +124,16 @@ pub enum QueuedRunAction {
     },
     PromoteToSteer {
         target_run_id: String,
+        #[serde(default)]
+        expected_selection: Option<crate::provider_instance::ModelSelection>,
     },
     PromoteToRestart {
         target_run_id: String,
+        /// The restart replaces the provider generation and carries a handoff.
+        #[serde(default)]
+        handoff: bool,
+        #[serde(default)]
+        expected_selection: Option<crate::provider_instance::ModelSelection>,
     },
 }
 
@@ -158,9 +175,13 @@ mod tests {
         let mut value = value;
         value["action"]["expectedText"] = serde_json::json!("old");
         let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
-        assert_eq!(request.action, super::QueuedRunAction::Edit {
-            text: "new".into(), expected_text: "old".into(),
-        });
+        assert_eq!(
+            request.action,
+            super::QueuedRunAction::Edit {
+                text: "new".into(),
+                expected_text: "old".into(),
+            }
+        );
     }
 
     #[test]

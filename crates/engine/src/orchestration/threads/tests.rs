@@ -299,18 +299,11 @@ fn js_surrogate_slice_and_exact_wire_json() {
 async fn transfer_merge_refusals_precede_thread_send_side_effects() {
     use crate::orchestration::transfer::{SourcePoint, TransferOperation};
 
-    for (queued, children, detail) in [
-        (
-            true,
-            1,
-            "has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it.",
-        ),
-        (
-            false,
-            2,
-            "has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together.",
-        ),
-    ] {
+    for (queued, children, detail) in [(
+        false,
+        2,
+        "has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together.",
+    )] {
         let f = Fixture::new();
         f.running(false);
         let mut parent_run = f
@@ -400,6 +393,96 @@ async fn transfer_merge_refusals_precede_thread_send_side_effects() {
         assert_eq!(json!(after.runs), json!(before.runs));
         assert_eq!(after.records, before.records);
     }
+}
+
+/// T3 refuses to queue while a merge-back waits; Noches admits the queued run
+/// and lets the first non-automatic run to start consume the merge-back, so a
+/// queued admission leaves the transfer pending and cancelling it changes nothing.
+#[tokio::test]
+async fn queued_send_is_admitted_while_a_merge_back_waits_and_leaves_it_pending() {
+    use crate::orchestration::transfer::{SourcePoint, TransferOperation};
+
+    let f = Fixture::new();
+    f.running(false);
+    let mut parent_run = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap()
+        .runs[0]
+        .clone();
+    parent_run.status = OrchestrationV2RunStatus::Completed;
+    f.emit("parent", "run.updated", json!(parent_run));
+    let fork = f
+        .service
+        .kernel
+        .transfer_command(
+            &"parent".into(),
+            "fork-command".into(),
+            TransferOperation::Fork {
+                target: "fork".into(),
+                source: SourcePoint::Run {
+                    run_id: parent_run.id.clone(),
+                },
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fork.status, ReceiptStatus::Accepted);
+    let mut run = parent_run.clone();
+    run.id = "run:fork".into();
+    run.thread_id = "fork".into();
+    f.emit("fork", "run.updated", json!(run));
+    let merge = f
+        .service
+        .kernel
+        .transfer_command(
+            &"fork".into(),
+            "merge-command".into(),
+            TransferOperation::MergeBack {
+                target: "parent".into(),
+                source: SourcePoint::Run { run_id: run.id },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(merge.status, ReceiptStatus::Accepted);
+    parent_run.status = OrchestrationV2RunStatus::Running;
+    f.emit("parent", "run.updated", json!(parent_run));
+    f.service
+        .send(
+            f.caller.clone(),
+            serde_json::from_value(json!({
+                "threadId":"parent", "message":"Queued behind the merge", "mode":"queue",
+                "clientRequestId":"queued-with-merge",
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        after
+            .runs
+            .iter()
+            .any(|r| r.status == OrchestrationV2RunStatus::Queued)
+    );
+    let transfers = f.service.kernel.store.thread_transfers(&"parent".into()).unwrap();
+    let merge = transfers
+        .iter()
+        .find(|t| t["type"] == "merge_back")
+        .expect("merge-back transfer");
+    assert_eq!(merge["status"], "pending");
+    assert!(merge["targetRunId"].is_null());
 }
 
 /// A user merging a second fork would leave the parent unsendable ("multiple

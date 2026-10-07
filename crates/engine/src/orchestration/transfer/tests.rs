@@ -2391,17 +2391,13 @@ async fn oracle_omissions_deferred_inline_and_accumulated_coverage() {
     );
 }
 #[test]
-fn queue_and_multiple_merge_refusals_are_exact() {
+fn multiple_merge_refusal_is_exact_and_one_pending_merge_does_not_block_queueing() {
     let pending = json!({"targetThreadId":"t","sourceThreadId":"fork:one","type":"merge_back","status":"pending"});
-    let error = ensure_start_allowed(&[pending.clone()], &"t".into(), true).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "orchestration invariant: Thread t has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it."
-    );
+    ensure_start_allowed(&[pending.clone()], &"t".into()).unwrap();
     let mut other = pending.clone();
     other["sourceThreadId"] = json!("fork:two");
     assert_eq!(
-        ensure_start_allowed(&[pending, other], &"t".into(), false)
+        ensure_start_allowed(&[pending, other], &"t".into())
             .unwrap_err()
             .to_string(),
         "orchestration invariant: Thread t has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together."
@@ -2598,3 +2594,413 @@ async fn same_instance_selection_change_keeps_the_native_session_unless_the_driv
 }
 
 mod native_policy;
+
+/// Make the exact provider session of the running run interruptible and
+/// restartable, as the live adapter would advertise.
+fn allow_restart(kernel: &Kernel) {
+    let p = kernel.store.thread(&"source".into()).unwrap().unwrap();
+    let mut session = crate::orchestration::task::records(&p, "provider-session")[0].clone();
+    session["capabilities"]["turns"]["supportsInterrupt"] = json!(true);
+    session["capabilities"]["turns"]["supportsSteeringByInterruptRestart"] = json!(true);
+    kernel
+        .store
+        .write(|tx| {
+            kernel.store.append_event(
+                tx,
+                None,
+                crate::orchestration::event::make(
+                    EventId(format!("test:{}", uuid::Uuid::new_v4())),
+                    &"source".into(),
+                    "provider-session.attached",
+                    &session,
+                    1_800_000_000_100,
+                )?,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Queue "promoted direction", save `instance`/`model` as the next-turn
+/// selection and promote it into the running run. Returns the restarted run.
+async fn promote_with_selection(
+    kernel: &Kernel,
+    run: &OrchestrationV2Run,
+    instance: &str,
+    model: &str,
+    target_driver: &str,
+    command: &str,
+) -> OrchestrationV2Run {
+    use crate::orchestration::queue::QueueDomain;
+    let domain = QueueDomain::new(kernel.clone());
+    let rows = vec![zeron_doc::QueuedMessage::new(
+        "queue-one",
+        "promoted direction",
+        "host",
+    )];
+    let sync = domain
+        .mutate(
+            None,
+            "source".into(),
+            "host.sync_loro_queue",
+            json!({"items":rows,"driver":"mock"}),
+            format!("sync:{command}").into(),
+            1_800_000_000_200,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync.status, ReceiptStatus::Accepted, "{:?}", sync.error);
+    let queued = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .runs
+        .iter()
+        .find(|r| r.status == OrchestrationV2RunStatus::Queued)
+        .unwrap()
+        .id
+        .clone();
+    select_instance(kernel, instance, Some(model)).await;
+    let selection = json!({"instanceId":instance,"model":model});
+    let mode = if instance == run.provider_instance_id.0
+        && target_driver != "mock"
+    {
+        "interrupt_restart"
+    } else {
+        "interrupt_restart_with_handoff"
+    };
+    let receipt = domain
+        .mutate(
+            None,
+            "source".into(),
+            "t3_queue_promote_to_steer",
+            json!({"queuedRunId":queued,"targetRunId":run.id,"expectedExecution":mode,
+                "expectedSelection":selection,"resolvedSelection":selection,"targetDriver":target_driver}),
+            command.into(),
+            1_800_000_000_300,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{:?}", receipt.error);
+    kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .runs
+        .into_iter()
+        .find(|r| r.id == run.id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn selection_restart_handoff_carries_partial_run_history_under_a_per_attempt_identity() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, _) = fixture(cwd.path());
+    let run = start_driver(&kernel, "source", "a-input", "original direction", "mock").await;
+    accept(&kernel, &run, cwd.path(), "native-a").await;
+    observe(
+        &kernel,
+        &run,
+        zeron_proto::AgentEvent::TextDelta {
+            text: "partial answer before the interrupt".into(),
+        },
+    )
+    .await;
+    allow_restart(&kernel);
+    let restarted =
+        promote_with_selection(&kernel, &run, "other", "other-model", "claudeAgent", "promote-b")
+            .await;
+    assert_eq!(restarted.provider_instance_id.0, "other");
+    assert_ne!(restarted.provider_thread_id, run.provider_thread_id);
+    let mut input = request(cwd.path());
+    input.prompt = "promoted direction".into();
+    prepare(&kernel, &restarted, &mut input).await.unwrap();
+    assert_eq!(
+        input.resume, None,
+        "a new generation never resumes the old native session"
+    );
+    // The prompt is the promoted input; the history carries what ran before it.
+    assert!(input.prompt.ends_with("promoted direction"));
+    assert!(input.prompt.contains("original direction"), "{}", input.prompt);
+    assert!(
+        input.prompt.contains("partial answer before the interrupt"),
+        "{}",
+        input.prompt
+    );
+    assert_eq!(
+        input.prompt.matches("promoted direction").count(),
+        1,
+        "the promoted input is not also replayed as history"
+    );
+    let id = format!("provider-handoff:{}:attempt:2", encode_component(&run.id.0));
+    let transfers = kernel.store.thread_transfers(&"source".into()).unwrap();
+    assert!(transfers.iter().any(|t| t["id"] == id));
+    assert!(
+        !transfers
+            .iter()
+            .any(|t| t["id"] == format!("provider-handoff:{}", encode_component(&run.id.0))),
+        "the run-level handoff identity is never reused for a restart"
+    );
+    let handoff = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .records["context-handoff"]
+        .iter()
+        .find(|h| h["transferId"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(handoff["toProviderThreadId"], json!(restarted.provider_thread_id));
+    assert_eq!(handoff["coveredRunOrdinals"]["to"], restarted.ordinal);
+    // Response-loss replay of the same start prepares exactly one handoff.
+    let mut again = request(cwd.path());
+    again.prompt = "promoted direction".into();
+    kernel.store.rebuild().unwrap();
+    prepare(&kernel, &restarted, &mut again).await.unwrap();
+    assert_eq!(
+        kernel
+            .store
+            .thread_transfers(&"source".into())
+            .unwrap()
+            .iter()
+            .filter(|t| t["type"] == "provider_handoff")
+            .count(),
+        1
+    );
+    assert_eq!(again.prompt, input.prompt);
+}
+
+#[tokio::test]
+async fn absorbed_model_change_restart_keeps_native_resume_without_a_handoff() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, _) = fixture(cwd.path());
+    let run = start_driver(&kernel, "source", "a-input", "original direction", "codex").await;
+    accept(&kernel, &run, cwd.path(), "native-a").await;
+    allow_restart(&kernel);
+    let restarted = promote_with_selection(
+        &kernel,
+        &run,
+        &run.provider_instance_id.0,
+        "other-model",
+        "codex",
+        "promote-model",
+    )
+    .await;
+    assert_eq!(restarted.provider_thread_id, run.provider_thread_id);
+    assert_eq!(restarted.model_selection.model.to_string(), "other-model");
+    let mut input = request(cwd.path());
+    input.prompt = "promoted direction".into();
+    prepare(&kernel, &restarted, &mut input).await.unwrap();
+    assert_eq!(
+        input.resume.as_deref(),
+        Some("native-a"),
+        "the accepted predecessor of the same generation keeps its native history"
+    );
+    assert!(
+        !kernel
+            .store
+            .thread_transfers(&"source".into())
+            .unwrap()
+            .iter()
+            .any(|t| t["type"] == "provider_handoff" && t["targetRunId"] == restarted.id.0),
+        "an absorbed selection change needs no handoff for this run"
+    );
+}
+
+/// A fork of `source` with a completed run whose merge-back into `source` waits.
+async fn waiting_merge_back(kernel: &Kernel, run: &OrchestrationV2Run) -> String {
+    let fork = kernel
+        .transfer_command(
+            &"source".into(),
+            "fork:waiting".into(),
+            TransferOperation::Fork {
+                target: "fork".into(),
+                source: SourcePoint::Run {
+                    run_id: run.id.clone(),
+                },
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fork.status, ReceiptStatus::Accepted);
+    kernel.store.write(|tx| {
+        let mut child = json!(run); child["id"] = json!("run:fork"); child["threadId"] = json!("fork");
+        tx.execute("INSERT INTO orchestration_projection_runs(id,thread_id,ordinal,status,provider_instance_id,payload_json,last_sequence)
+            VALUES('run:fork','fork',1,'completed',?1,?2,1)",rusqlite::params![child["providerInstanceId"].as_str(),child.to_string()])?;
+        // The merge-back source needs its own provider thread to resolve.
+        let raw: String = tx.query_row("SELECT payload_json FROM orchestration_projection_records WHERE thread_id='source' AND kind='provider-thread'",[],|r| r.get(0))?;
+        let mut provider: Value = serde_json::from_str(&raw)?;
+        provider["id"] = json!("provider:fork"); provider["appThreadId"] = json!("fork");
+        tx.execute("INSERT INTO orchestration_projection_records (thread_id,kind,id,payload_json,last_sequence) VALUES('fork','provider-thread','provider:fork',?1,1)",[provider.to_string()])?;
+        let mut child = child; child["providerThreadId"] = json!("provider:fork");
+        tx.execute("UPDATE orchestration_projection_runs SET payload_json=?1 WHERE id='run:fork'",[child.to_string()])?;
+        Ok(())
+    }).unwrap();
+    let merge = kernel
+        .transfer_command(
+            &"fork".into(),
+            "merge:waiting".into(),
+            TransferOperation::MergeBack {
+                target: "source".into(),
+                source: SourcePoint::Run {
+                    run_id: "run:fork".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(merge.status, ReceiptStatus::Accepted);
+    kernel
+        .store
+        .thread_transfers(&"source".into())
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "merge_back")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn merge_back(kernel: &Kernel, id: &str) -> Value {
+    kernel
+        .store
+        .thread_transfers(&"source".into())
+        .unwrap()
+        .into_iter()
+        .find(|t| t["id"] == id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_waiting_merge_back_is_consumed_once_by_the_first_run_that_actually_starts() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, source) = fixture(cwd.path());
+    let id = waiting_merge_back(&kernel, &source).await;
+    let first = start_text(&kernel, "source", "queued-a", "first queued").await;
+    let mut input = request(cwd.path());
+    input.prompt = "first queued".into();
+    prepare(&kernel, &first, &mut input).await.unwrap();
+    assert!(input.prompt.ends_with("first queued"));
+    assert!(input.prompt.len() > "first queued".len(), "the merge-back context is delivered");
+    let consumed = merge_back(&kernel, &id);
+    assert_eq!(consumed["status"], "consumed");
+    assert_eq!(consumed["targetRunId"], first.id.0);
+    accept(&kernel, &first, cwd.path(), "native-a").await;
+    observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+    let second = start_text(&kernel, "source", "queued-b", "second queued").await;
+    let mut input = request(cwd.path());
+    input.prompt = "second queued".into();
+    prepare(&kernel, &second, &mut input).await.unwrap();
+    assert_eq!(
+        input.prompt, "second queued",
+        "a later run never receives an already consumed merge-back"
+    );
+    assert_eq!(merge_back(&kernel, &id)["targetRunId"], first.id.0);
+    // A response-lost retry of the consuming start does not consume again.
+    let mut retry = request(cwd.path());
+    retry.prompt = "first queued".into();
+    prepare(&kernel, &first, &mut retry).await.unwrap();
+    assert_eq!(merge_back(&kernel, &id)["targetRunId"], first.id.0);
+}
+
+#[tokio::test]
+async fn automatic_deliveries_leave_a_waiting_merge_back_for_the_next_user_run() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, source) = fixture(cwd.path());
+    let id = waiting_merge_back(&kernel, &source).await;
+    let automatic = start_text(&kernel, "source", "delegated-result", "child finished").await;
+    let p = kernel.store.thread(&"source".into()).unwrap().unwrap();
+    let mut message = crate::orchestration::task::records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == "delegated-result")
+        .unwrap()
+        .clone();
+    message["delegatedCompletion"] =
+        json!({"parentRunId":"run:source","generation":1,"taskIds":[]});
+    kernel
+        .store
+        .write(|tx| {
+            kernel.store.append_event(
+                tx,
+                None,
+                crate::orchestration::event::make(
+                    EventId(format!("test:{}", uuid::Uuid::new_v4())),
+                    &"source".into(),
+                    "message.updated",
+                    &message,
+                    1_800_000_000_100,
+                )?,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut input = request(cwd.path());
+    input.prompt = "child finished".into();
+    prepare(&kernel, &automatic, &mut input).await.unwrap();
+    assert_eq!(input.prompt, "child finished");
+    let still = merge_back(&kernel, &id);
+    assert_eq!(still["status"], "pending");
+    assert!(still["targetRunId"].is_null());
+    accept(&kernel, &automatic, cwd.path(), "native-auto").await;
+    observe(&kernel, &automatic, done(zeron_proto::DoneStatus::Completed)).await;
+    let user = start_text(&kernel, "source", "user-run", "user message").await;
+    let mut input = request(cwd.path());
+    input.prompt = "user message".into();
+    prepare(&kernel, &user, &mut input).await.unwrap();
+    assert_eq!(merge_back(&kernel, &id)["targetRunId"], user.id.0);
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_run_leaves_the_waiting_merge_back_pending() {
+    use crate::orchestration::queue::QueueDomain;
+    let cwd = tempfile::tempdir().unwrap();
+    let (_db, kernel, source) = fixture(cwd.path());
+    let id = waiting_merge_back(&kernel, &source).await;
+    let running = start_text(&kernel, "source", "running", "running now").await;
+    accept(&kernel, &running, cwd.path(), "native-a").await;
+    let domain = QueueDomain::new(kernel.clone());
+    let sync = domain
+        .mutate(
+            None,
+            "source".into(),
+            "host.sync_loro_queue",
+            json!({"items":[zeron_doc::QueuedMessage::new("queue-one","queued behind","host")],"driver":"mock"}),
+            "sync:queued".into(),
+            1_800_000_000_200,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sync.status, ReceiptStatus::Accepted, "{:?}", sync.error);
+    let queued = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .runs
+        .iter()
+        .find(|r| r.status == OrchestrationV2RunStatus::Queued)
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(merge_back(&kernel, &id)["status"], "pending", "admission consumes nothing");
+    let cancel = domain
+        .mutate(
+            None,
+            "source".into(),
+            "t3_queue_cancel",
+            json!({"queuedRunId":queued}),
+            "cancel:queued".into(),
+            1_800_000_000_300,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status, ReceiptStatus::Accepted, "{:?}", cancel.error);
+    let still = merge_back(&kernel, &id);
+    assert_eq!(still["status"], "pending");
+    assert!(still["targetRunId"].is_null());
+}
