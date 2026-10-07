@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::{sync::Arc, time::Duration};
 use zeron_doc::{SessionCommandPayload, SessionCommandStatus};
-use zeron_engine::{EngineCore, EngineProfile, HarnessId, default_registry};
-use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_engine::{EngineCore, EngineProfile, HarnessId, HarnessRegistry};
+use zeron_harness::{Harness, HarnessError, RunControls, mock::MockHarness};
 use zeron_proto::{AgentEvent, DoneStatus, Model, ReasoningLevel, SteeringMode};
 use zeron_proto::{RunRequest, SandboxLevel};
 use zeron_rpc::{memory_client, methods};
@@ -148,12 +148,32 @@ async fn restart_preparation_retires_completed_warm_wrappers_before_ready() {
     core.shutdown().await;
 }
 
+/// Only the mock harness: the production registry's catalog migration lists
+/// Mock solely for a mock-only rig, and its other slots depend on host CLIs.
+fn mock_registry() -> HarnessRegistry {
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(MockHarness {
+        script: vec![
+            AgentEvent::TextDelta {
+                text: "resumed reply".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ],
+    }));
+    registry
+}
+
 #[tokio::test]
 async fn restart_lease_blocks_terminals_preserves_commands_and_resumes_after_cancel() {
     let dir = tempfile::tempdir().unwrap();
     let core = EngineCore::assemble_with_profile(
         EngineProfile::local(dir.path()).unwrap(),
-        Arc::new(default_registry()),
+        Arc::new(mock_registry()),
         HarnessId::Mock,
         None,
     )
