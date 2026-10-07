@@ -16,6 +16,26 @@ async fn pi_idle_crash_next_dispatch_loads_stored_session() {
             .with_graces(Duration::from_millis(50), Duration::from_millis(100)),
     ));
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
+    // Startup discovery probes the fixture's models and then account auth. Let
+    // it finish so it cannot race the first dispatch, then mark the fixture as
+    // a signed-in Pi so the test never depends on this host's Pi login.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !core
+            .registry
+            .provider_instances
+            .snapshot(&core.registry)
+            .iter()
+            .any(|p| p.harness_id == Some(HarnessId::Pi) && p.models.len() >= 2)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup provider discovery");
+    core.registry.provider_instances.set_authentication(
+        HarnessId::Pi,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+    );
     let chat = "pi-idle-crash";
     let handle = core.doc_host.open(chat).unwrap();
     for prompt in ["idle-crash", "require-resume"] {
