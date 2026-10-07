@@ -569,6 +569,163 @@ async fn persistent_session_serves_multiple_turns_on_one_child() {
     core.shutdown().await;
 }
 
+/// A persistent process whose teardown takes a while: after its interrupt token
+/// fires it keeps the steering mailbox open for `teardown` before the stream
+/// ends, the window in which the engine's run handle is still registered.
+struct DyingHarness {
+    runs_started: Arc<Mutex<usize>>,
+    teardown_requested: Arc<std::sync::atomic::AtomicBool>,
+    teardown: Duration,
+}
+
+#[async_trait]
+impl Harness for DyingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Dying"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let run = {
+            let mut started = self.runs_started.lock().unwrap();
+            *started += 1;
+            *started
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(32);
+        let mut steering = controls.steering;
+        let interrupt = controls.interrupt;
+        let requested = self.teardown_requested.clone();
+        let teardown = self.teardown;
+        let session = format!("hs-dying-{run}");
+        tokio::spawn(async move {
+            let opening = [
+                AgentEvent::SessionStarted {
+                    instance_id: None,
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: session.clone(),
+                    assistant_message_id: format!("a-{run}"),
+                },
+                AgentEvent::TextDelta {
+                    text: format!("run {run} ack"),
+                },
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some(session.clone()),
+                },
+            ];
+            for event in opening {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            // Parked between turns. Once told to stop, linger like a child
+            // process that needs time to exit, mailbox still open.
+            loop {
+                tokio::select! {
+                    _ = interrupt.cancelled() => {
+                        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(teardown).await;
+                        let _ = tx.send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Interrupted,
+                            result: None,
+                            error: None,
+                            session_id: Some(session.clone()),
+                        })).await;
+                        return;
+                    }
+                    steer = steering.recv() => {
+                        // A routed send would be consumed here by a live
+                        // process; a dying one never answers it.
+                        if steer.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
+        )
+        .boxed())
+    }
+}
+
+/// Stop, session reset and disconnect all cancel a parked handle that stays
+/// registered until its process exits. A message sent in that window used to
+/// be routed into the dying mailbox: accepted, shown in the transcript, then
+/// lost with an interrupted run (found by the live reset scenario).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_during_a_requested_teardown_starts_a_fresh_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let runs_started = Arc::new(Mutex::new(0usize));
+    let teardown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(DyingHarness {
+        runs_started: runs_started.clone(),
+        teardown_requested: teardown_requested.clone(),
+        teardown: Duration::from_millis(700),
+    }));
+    let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+    pre_title(&core);
+
+    queue_run(&core, "first", "/tmp", "msg-user-1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "first turn to complete and park",
+    )
+    .await;
+
+    let sessions = core.sessions.clone();
+    let stop = tokio::spawn(async move { sessions.interrupt(CHAT).await });
+    wait_for(
+        || teardown_requested.load(std::sync::atomic::Ordering::SeqCst),
+        "teardown to be requested",
+    )
+    .await;
+    // The process is still exiting; the run handle is still registered.
+    queue_run(&core, "second", "/tmp", "msg-user-2");
+
+    wait_for(
+        || *runs_started.lock().unwrap() == 2,
+        "the message to start a fresh run instead of joining the dying one",
+    )
+    .await;
+    wait_for(
+        || complete_assistant_count(&core) == 2,
+        "the fresh run to answer",
+    )
+    .await;
+    assert!(stop.await.unwrap().unwrap());
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     let tmp = tempfile::tempdir().unwrap();
