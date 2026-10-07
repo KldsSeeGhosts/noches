@@ -577,6 +577,17 @@ impl RunnerBridge {
         projection.thread.provider_instance_id = scope.provider_instance_id.clone();
         projection.thread.runtime_mode = scope.runtime_mode;
         projection.thread.interaction_mode = scope.interaction_mode;
+        // The chat row is what a send revives (`unarchive_on_send`); a thread
+        // adopted or archived earlier must follow it or the turn is refused.
+        if self
+            .workspace
+            .chat(&thread.0)
+            .ok()
+            .flatten()
+            .is_some_and(|chat| !chat.archived)
+        {
+            projection.thread.archived_at = None;
+        }
         let project_root = self
             .workspace
             .space(&scope.project_id.0)
