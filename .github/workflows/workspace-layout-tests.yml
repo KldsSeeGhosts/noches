@@ -12,7 +12,7 @@ on:
       - 'crates/ui/src/shell/**'
       - '.github/workflows/workspace-layout-tests.yml'
   push:
-    branches: [main, dev]
+    branches: [dev]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'

@@ -9,7 +9,7 @@ on:
       - '.github/workflows/testflight.yml'
       - '.github/actions/ios-tests/**'
   push:
-    branches: [main, dev]
+    branches: [dev]
     paths:
       - 'apps/ios/**'
       - '.github/workflows/ios-tests.yml'

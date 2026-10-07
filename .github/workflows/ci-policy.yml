@@ -3,7 +3,7 @@ name: CI policy
 on:
   pull_request:
   push:
-    branches: [dev, main]
+    branches: [dev]
     paths:
       - '.github/workflows/**'
       - 'scripts/ci/**'

@@ -22,12 +22,12 @@ concurrency:
 
 jobs:
   validation:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/dev'
     uses: ./.github/workflows/ios-tests.yml
 
   upload:
     needs: validation
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/dev'
     runs-on: macos-latest
     timeout-minutes: 45
     env:

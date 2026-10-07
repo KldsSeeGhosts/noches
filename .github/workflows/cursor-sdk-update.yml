@@ -24,7 +24,7 @@ jobs:
         run: |
           if git diff --quiet; then exit 0; fi
           git diff -- crates/harness/src/cursor/mod.rs > "$RUNNER_TEMP/cursor-sdk-update.patch"
-          echo 'A newer SDK is available. Apply the patch on dev and run Cursor compatibility before promotion to main.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'A newer SDK is available. Apply the patch on dev and run Cursor compatibility before promotion.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cursor-sdk-proposed-update
