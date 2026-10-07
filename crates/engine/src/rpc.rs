@@ -2686,20 +2686,37 @@ impl RpcService for EngineRpc {
                     }
                     _ => None,
                 };
-                self.mutate(p)?;
+                let Some((chat_id, written)) = selection else {
+                    self.mutate(p)?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                };
+                let Some(service) = self
+                    .delegation
+                    .as_ref()
+                    .filter(|_| self.doc_host.is_host(&chat_id))
+                else {
+                    self.mutate(p)?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                };
                 // The chat row is the LWW record; the thread's saved selection
                 // follows it so a mid-run composer change drives the queue's
-                // promotion mode. One kernel command, and none when unchanged.
-                if let Some((chat_id, config)) = selection
-                    && self.doc_host.is_host(&chat_id)
-                    && let Some(service) = &self.delegation
-                    && let Err(error) = crate::orchestration::selection_sync::mirror_chat_config(
-                        &service.kernel,
-                        &self.registry,
-                        &chat_id,
-                        &config,
-                    )
-                    .await
+                // promotion mode. The write and its mirror share the chat's
+                // owner lane, and the mirror reads the row back, so overlapping
+                // writes cannot leave the thread on an older selection.
+                let handle = self
+                    .doc_host
+                    .open(&chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let _lane = handle.orchestration_queue_lock().await;
+                self.mutate(p)?;
+                let config = self.workspace.chat_config(&chat_id).unwrap_or(written);
+                if let Err(error) = crate::orchestration::selection_sync::mirror_chat_config(
+                    &service.kernel,
+                    &self.registry,
+                    &chat_id,
+                    &config,
+                )
+                .await
                 {
                     tracing::warn!(chat = %chat_id, %error, "composer selection was not mirrored to the thread");
                 }

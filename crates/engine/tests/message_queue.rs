@@ -4193,95 +4193,6 @@ async fn a_cancelled_first_run_after_reset_does_not_turn_the_next_start_back_int
     core.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_first_run_after_reset_does_not_turn_the_next_start_back_into_a_resume() {
-    use zeron_proto::transfer::{ResetThreadSessionParams, StopThreadWorkParams};
-    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
-    let client = zeron_rpc::memory_client(core.rpc_service());
-    core.doc_host
-        .queue_message(CHAT, "opening question", vec![])
-        .unwrap();
-    attached_sessions(&core).await;
-    for text in ["first after reset", "second after reset"] {
-        core.doc_host.queue_message(CHAT, text, vec![]).unwrap();
-    }
-    // Stop freezes the queue; the two rows stay queued across the reset.
-    client
-        .stop_thread_work(
-            StopThreadWorkParams {
-                chat_id: CHAT.into(),
-                client_request_id: "stop-before-reset".into(),
-            },
-            &core.device_id,
-        )
-        .await
-        .unwrap();
-    wait_for(
-        || !core.sessions.turn_in_flight(CHAT),
-        "the stopped turn to settle",
-    )
-    .await;
-    let observed = core
-        .orchestration
-        .store
-        .transfer_ui_state(&CHAT.into())
-        .unwrap()
-        .latest_started_run_id;
-    let live = core
-        .orchestration
-        .store
-        .transfer_ui_state(&CHAT.into())
-        .unwrap()
-        .attached_provider_sessions;
-    let reset = client
-        .reset_thread_session(
-            ResetThreadSessionParams {
-                chat_id: CHAT.into(),
-                client_request_id: "reset-then-cancel".into(),
-                observed_run_id: observed,
-                provider_sessions: live,
-            },
-            &core.device_id,
-        )
-        .await
-        .unwrap();
-    assert!(reset.refusal.is_none(), "{:?}", reset.refusal);
-    wait_for(|| !core.sessions.has_live_runtime(CHAT), "reset teardown").await;
-    // The first row never reaches a provider; the second is the first to start.
-    let rows = core.doc_host.open(CHAT).unwrap().doc().read_queue().unwrap();
-    assert_eq!(rows.len(), 2, "{:?}", queue_texts(&core));
-    core.doc_host
-        .remove_queued_message(CHAT, &rows[0].id)
-        .await
-        .unwrap();
-    assert!(
-        core.doc_host
-            .send_queued_now(CHAT, &rows[1].id)
-            .await
-            .unwrap()
-    );
-    wait_for(
-        || prompts.lock().unwrap().len() == 2,
-        "the run after the cancelled one",
-    )
-    .await;
-    {
-        let requests = harness.requests.lock().unwrap();
-        assert_eq!(
-            requests[1].resume, None,
-            "a cancelled queued run must not hide the reset"
-        );
-        assert!(
-            requests[1].prompt.contains("opening question")
-                && requests[1].prompt.contains("second after reset"),
-            "{}",
-            requests[1].prompt
-        );
-    }
-    let _ = harness.finish.send(());
-    core.shutdown().await;
-}
-
 fn composer_config(harness: HarnessId, model: &str) -> zeron_proto::ChatConfig {
     zeron_proto::ChatConfig {
         instance_id: None,
@@ -4799,6 +4710,78 @@ async fn a_queued_run_that_starts_on_a_new_generation_does_not_resume_the_rememb
         );
     }
     let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_composer_writes_leave_the_thread_on_the_chat_rows_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut harness, _prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().id = HarnessId::Codex;
+    let registry = HarnessRegistry::new();
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(
+        &tmp.keep().join("data"),
+        Arc::new(registry),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    create_chat(&core).await;
+    wait_for(
+        || {
+            core.registry
+                .provider_instances
+                .snapshot(&core.registry)
+                .iter()
+                .any(|p| p.harness_id == Some(HarnessId::Codex) && !p.models.is_empty())
+        },
+        "startup provider discovery",
+    )
+    .await;
+    core.registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+    );
+    let advertised: Vec<String> = core
+        .registry
+        .provider_instances
+        .snapshot(&core.registry)
+        .into_iter()
+        .find(|p| p.harness_id == Some(HarnessId::Codex))
+        .unwrap()
+        .models
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(advertised.len() >= 3, "{advertised:?}");
+    for round in 0..8 {
+        let models = [
+            &advertised[round % 3],
+            &advertised[(round + 1) % 3],
+            &advertised[(round + 2) % 3],
+        ];
+        let configs = models.map(|m| composer_config(HarnessId::Codex, m));
+        tokio::join!(
+            set_composer(&core, &configs[0]),
+            set_composer(&core, &configs[1]),
+            set_composer(&core, &configs[2]),
+        );
+        let row = core.workspace.chat_config(CHAT).expect("chat row config");
+        let thread = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap()
+            .thread
+            .model_selection;
+        assert_eq!(
+            Some(&*thread.model),
+            row.model.as_deref(),
+            "round {round}: thread selection must follow the chat row"
+        );
+    }
     core.shutdown().await;
 }
 

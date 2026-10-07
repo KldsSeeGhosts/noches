@@ -20,10 +20,19 @@ pub(crate) async fn mirror_chat_config(
     config: &ChatConfig,
 ) -> Result<bool> {
     let thread = chat_id.into();
-    let Some(projection) = kernel.store.thread(&thread)? else {
+    if kernel.store.registry_unavailable(&thread, None) {
         return Ok(false);
+    }
+    // Only the thread row for the equality check; the full projection (and a
+    // first-use adoption) is loaded when the selection actually differs.
+    let saved = match kernel.store.thread_row(&thread)? {
+        Some(saved) => saved,
+        None => match kernel.store.thread(&thread)? {
+            Some(projection) => projection.thread,
+            None => return Ok(false),
+        },
     };
-    let saved = &projection.thread;
+    let saved = &saved;
     if saved.archived_at.is_some()
         || saved.deleted_at.is_some()
         || serde_json::to_value(&saved.lineage)?["relationshipToParent"] == "subagent"

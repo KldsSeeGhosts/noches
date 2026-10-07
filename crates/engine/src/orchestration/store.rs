@@ -241,6 +241,15 @@ impl Store {
         self.thread_in_project(id, None)
     }
 
+    /// Just the thread row: no runs, attempts, nodes or records. For checks
+    /// that only compare thread-level fields on a hot write path.
+    pub(crate) fn thread_row(
+        &self,
+        id: &ThreadId,
+    ) -> Result<Option<zeron_proto::orchestration::OrchestrationV2AppThread>> {
+        self.read(|conn| projection::read_entity(conn, projection::TABLES[0], &id.0, &id.0))
+    }
+
     pub(crate) fn stored_thread(&self, id: &ThreadId) -> Result<Option<ThreadProjection>> {
         self.read(|conn| projection::read_thread(conn, id))
     }
