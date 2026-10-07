@@ -584,7 +584,20 @@ impl Runner {
         let started = match started {
             Ok(started) => started,
             Err(error) => {
-                let status = self.child.try_wait().ok().flatten();
+                // Let the stderr reader drain the dying child's last words.
+                let status = match self.child.try_wait().ok().flatten() {
+                    Some(status) => Some(status),
+                    None if matches!(error, HarnessError::Transport(_)) => {
+                        tokio::time::timeout(Duration::from_millis(500), self.child.wait())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                    }
+                    None => None,
+                };
+                if status.is_some() {
+                    self.stderr_tail.wait_closed().await;
+                }
                 let message = match (&error, status) {
                     // A child that died before answering is better explained
                     // by its exit and stderr than by the transport symptom.

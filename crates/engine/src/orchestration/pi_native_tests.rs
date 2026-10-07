@@ -347,3 +347,26 @@ async fn a_steer_is_confirmed_by_pis_queued_ack_not_by_the_local_boundary() {
     assert_eq!(accepted, 1, "exactly one native receipt for the steered message");
     fixture.core.shutdown().await;
 }
+
+#[test]
+fn pi_model_and_effort_changes_ride_the_resumed_session_while_other_acp_agents_still_hand_off() {
+    use super::task::{SelectionTransition, selection_transition};
+    use zeron_proto::provider_instance::ModelSelection;
+    let selection = |model: &str| -> ModelSelection {
+        serde_json::from_value(json!({"instanceId":"pi-instance","model":model})).unwrap()
+    };
+    // Pi's RPC `set_model` switches the session in place before the turn.
+    assert_eq!(
+        selection_transition("pi", &selection("cpa/a"), &selection("cpa/b")),
+        SelectionTransition::ApplyOnNextTurn
+    );
+    // A generic ACP agent has no negotiated in-session switch.
+    assert_eq!(
+        selection_transition("hermes", &selection("a"), &selection("b")),
+        SelectionTransition::CreateWithHandoff
+    );
+    assert_eq!(
+        selection_transition("hermes", &selection("a"), &selection("a")),
+        SelectionTransition::ApplyOnNextTurn
+    );
+}

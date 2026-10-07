@@ -5,9 +5,9 @@
 //! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
 //! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
-//! pinned release archive) — plus pi ([`AcpHarness::pi`]) via the community
-//! `pi-acp` adapter until a native driver exists. Claude, Codex and Cursor moved to native drivers
-//! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
+//! pinned release archive). Pi, Claude, Codex and Cursor moved to native drivers
+//! ([`crate::PiHarness`], [`crate::ClaudeHarness`], [`crate::CodexHarness`],
+//! [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
 //!
@@ -94,7 +94,7 @@ struct AcpAgentSpec {
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
     /// means to the user. Distinct from `executable` where the spawned adapter
-    /// wraps the CLI (`claude-agent-acp`, `codex-acp`, `pi-acp`), and the npx
+    /// wraps the CLI (`claude-agent-acp`, `codex-acp`), and the npx
     /// fallback deliberately doesn't count: npx can fetch an adapter on
     /// demand, but an absent CLI still means no logins/config to drive.
     cli_executable: &'static str,

@@ -1024,6 +1024,82 @@ mod tests {
     }
 
     #[test]
+    fn pi_launch_args_are_validated_when_the_instance_is_written() {
+        let registry = HarnessRegistry::new();
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Pi,
+                name: "Pi".into(),
+                supports_steering: true,
+                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                reasoning_levels: Vec::new(),
+                installed: true,
+                enabled: None,
+            },
+            Box::new(|| true),
+            Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()))),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let catalog = &registry.provider_instances;
+        catalog.load(&registry, root.path()).unwrap();
+        let config = |value: Value| -> ProviderInstanceConfig {
+            serde_json::from_value(json!({"driver":"pi","config":value})).unwrap()
+        };
+        // The binary and launch resources are configurable...
+        let binary = root.path().join(if cfg!(windows) { "pi.exe" } else { "pi" });
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        catalog
+            .write_instance(
+                "pi-ok".into(),
+                config(json!({"binaryPath":binary,
+                    "launchArgs":"--provider cpa --model gemini-3.8-flash --no-skills --my-ext-flag v"})),
+                true,
+            )
+            .unwrap();
+        // ...but Noches owns RPC mode and the native session.
+        for (name, args, reason) in [
+            ("pi-session", "--session /tmp/x.jsonl", "'--session' is controlled by Noches"),
+            ("pi-mode", "--mode text", "'--mode' is controlled by Noches"),
+            ("pi-prompt", "write a poem", "positional prompt"),
+            ("pi-provider", "--provider openrouter", "'--provider' requires '--model'"),
+        ] {
+            let result = catalog.write_instance(
+                name.into(),
+                config(json!({"launchArgs":args})),
+                true,
+            );
+            let rows = catalog.snapshot(&registry);
+            let constrained = rows
+                .iter()
+                .find(|r| r.provider_instance_id.as_ref() == name)
+                .map(|r| r.constraints().join(" "))
+                .unwrap_or_default();
+            assert!(
+                result.is_err() || constrained.contains(reason),
+                "{name}: {result:?} {constrained}"
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains(reason))
+                    .unwrap_or(true),
+                "{name}: {result:?}"
+            );
+        }
+        assert!(
+            catalog
+                .resolve_runtime(&registry, &"pi-ok".into(), true)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn executable_environment_override_supplies_instance_installation_readiness() {
         let registry = HarnessRegistry::new();
         registry.register_lazy(

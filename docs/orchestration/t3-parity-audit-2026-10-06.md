@@ -276,9 +276,9 @@ attempted here.
 
 ## Remaining gaps
 
-Still open after #49: native Pi/negotiated-ACP fork and exact input receipts
-(ACP `session/fork` is unstable and head-only; those adapters keep boundary
-retirement), loaded-process history injection, driver-authorized cross-account
+Still open after #49: negotiated-ACP fork and exact input receipts (ACP
+`session/fork` is unstable and head-only; those adapters keep boundary
+retirement; native Pi now has both, see `pi-native-rpc.md`), loaded-process history injection, driver-authorized cross-account
 and cross-checkout native continuation, conversation rollback, provider
 clone/setup progress edges, project/environment PR-settlement settings,
 sparse/submodule checkpoints, catalog context windows beyond Claude, and
