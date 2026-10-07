@@ -1,5 +1,6 @@
 //! Durable native/inline delivery receipts. Pending means acceptance may have
 //! happened: use a fresh native thread, never blindly re-inject into the old one.
+use super::super::task::{SelectionTransition, selection_transition};
 use super::{context, provider_for_run};
 use crate::orchestration::{
     Error, Kernel, Result,
@@ -188,9 +189,13 @@ pub(super) fn resumable_native(
                         })
             })
     });
-    let Some(accepted) =
-        accepted.filter(|previous| previous.model_selection == run.model_selection)
-    else {
+    let Some(accepted) = accepted.filter(|previous| {
+        selection_transition(
+            provider["driver"].as_str().unwrap_or_default(),
+            &previous.model_selection,
+            &run.model_selection,
+        ) == SelectionTransition::ApplyOnNextTurn
+    }) else {
         return Ok(None);
     };
     let Some(session_id) = provider["providerSessionId"].as_str() else {
@@ -552,6 +557,7 @@ pub async fn prepare_run(
     let mut handoffs = vec![];
     let mut durable_transfers = vec![];
     let target_native = resumable_native(kernel, &projection, run, &request.cwd)?;
+    let target_provider = provider_for_run(&projection, run).unwrap_or(Value::Null);
     if request.resume.is_none()
         || target_native.is_some()
         || provider_for_run(&projection, run)
@@ -565,7 +571,11 @@ pub async fn prepare_run(
         .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
         .max_by_key(|r| r.ordinal)
         && (previous.provider_instance_id != run.provider_instance_id
-            || previous.model_selection != run.model_selection
+            || selection_transition(
+                target_provider["driver"].as_str().unwrap_or_default(),
+                &previous.model_selection,
+                &run.model_selection,
+            ) == SelectionTransition::CreateWithHandoff
             || (provider_for_run(&projection, run)
                 .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
                 && target_native.is_none()

@@ -144,13 +144,23 @@ async fn start_text(
     message_id: &str,
     text: &str,
 ) -> OrchestrationV2Run {
+    start_driver(kernel, thread, message_id, text, "mock").await
+}
+
+async fn start_driver(
+    kernel: &Kernel,
+    thread: &str,
+    message_id: &str,
+    text: &str,
+    driver: &str,
+) -> OrchestrationV2Run {
     kernel
         .task_command(
             &thread.into(),
             format!("start:{message_id}").into(),
             crate::orchestration::task::TaskOperation::ExternalMessage {
                 prompt: text.into(),
-                driver: zeron_proto::provider_instance::ProviderDriverKind("mock".into()),
+                driver: zeron_proto::provider_instance::ProviderDriverKind(driver.into()),
                 message_id: message_id.into(),
             },
         )
@@ -2510,4 +2520,70 @@ async fn merge_parent_lineage_supersession_reopen_consumption_and_wire_privacy()
     assert_eq!(h["summaryText"], "");
     assert!(h.get("history").is_none());
     assert!(h.get("delivery").is_none());
+}
+
+async fn change_selection(kernel: &Kernel, change: &str) {
+    let mut thread = kernel
+        .store
+        .thread(&"source".into())
+        .unwrap()
+        .unwrap()
+        .thread;
+    match change {
+        "model" => thread.model_selection.model = "other-model".into(),
+        _ => {
+            thread.model_selection.options =
+                serde_json::from_value(json!([{"id":"reasoningEffort","value":"high"}])).unwrap()
+        }
+    }
+    let command = Command {
+        id: format!("select:{}", uuid::Uuid::new_v4()).into(),
+        thread_id: thread.id.clone(),
+        operation: Operation::SessionBinding(Box::new(thread)),
+    };
+    assert_eq!(
+        kernel
+            .dispatch(&command, crate::now_ms())
+            .await
+            .unwrap()
+            .status,
+        ReceiptStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn same_instance_selection_change_keeps_the_native_session_unless_the_driver_cannot_switch() {
+    for (driver, change, reuses) in [
+        ("codex", "effort", true),
+        ("codex", "model", true),
+        ("claudeAgent", "model", true),
+        ("grok", "effort", true),
+        ("grok", "model", false),
+        ("antigravity", "effort", false),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_db, kernel, _) = fixture(cwd.path());
+        let first = start_driver(&kernel, "source", "first", "first turn", driver).await;
+        accept(&kernel, &first, cwd.path(), "native-first").await;
+        observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+        change_selection(&kernel, change).await;
+        let second = start_driver(&kernel, "source", "second", "second turn", driver).await;
+        assert_ne!(first.model_selection, second.model_selection);
+        let mut input = request(cwd.path());
+        prepare(&kernel, &second, &mut input).await.unwrap();
+        let label = format!("{driver}/{change}");
+        let handoffs = kernel.store.thread_transfers(&second.thread_id).unwrap();
+        let handed_off = handoffs
+            .iter()
+            .any(|t| t["id"].as_str().is_some_and(|id| id.starts_with("provider-handoff:")));
+        if reuses {
+            assert_eq!(second.provider_thread_id, first.provider_thread_id, "{label}");
+            assert_eq!(input.resume.as_deref(), Some("native-first"), "{label}");
+            assert!(!handed_off, "{label}");
+        } else {
+            assert_ne!(second.provider_thread_id, first.provider_thread_id, "{label}");
+            assert_eq!(input.resume, None, "{label}");
+            assert!(handed_off, "{label}");
+        }
+    }
 }

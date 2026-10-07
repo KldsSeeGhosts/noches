@@ -562,10 +562,47 @@ pub(crate) fn execution_seed(
     })
 }
 
+/// How a same-instance model/options change reaches the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionTransition {
+    /// The new selection rides the next turn on the existing native session.
+    ApplyOnNextTurn,
+    /// Start a new provider-thread generation seeded with portable context.
+    CreateWithHandoff,
+}
+
+/// Port of T3 `ProviderSelectionTransition.ts`. Session capabilities are all
+/// advertised false (`assembly::capabilities`), so the driver is the capability
+/// source. Drivers not listed (including test mocks) hand off, the conservative choice.
+pub(crate) fn selection_transition(
+    driver: &str,
+    current: &ModelSelection,
+    target: &ModelSelection,
+) -> SelectionTransition {
+    if current == target {
+        return SelectionTransition::ApplyOnNextTurn;
+    }
+    match driver {
+        // Resume spawns/turns carry `--model`/`--effort`, `turn/start`
+        // model+effort, per-run shim model options, per-prompt model.
+        "claudeAgent" | "codex" | "cursor" | "opencode" => {
+            SelectionTransition::ApplyOnNextTurn
+        }
+        // ACP agents expose no negotiated in-session model switch (T3 rejects it),
+        // so only option changes ride along. Antigravity folds effort into the
+        // model id, so any change there is a model change and hands off.
+        "grok" | "devin" | "hermes" | "pi" if current.model == target.model => {
+            SelectionTransition::ApplyOnNextTurn
+        }
+        _ => SelectionTransition::CreateWithHandoff,
+    }
+}
+
 /// Keep the provider's native identity, context usage, fork provenance and
 /// handoff coverage across turns. Old single-handle records are reusable only
 /// when their recorded instance/driver actually agrees with the selected run.
-/// Model/options changes get a new generation and portable reconstruction.
+/// Turn-scoped model/options changes keep the generation; others get a new one
+/// and portable reconstruction (see `selection_transition`).
 pub(crate) fn execution_seed_for(
     projection: &ThreadProjection,
     thread: &OrchestrationV2AppThread,
@@ -596,7 +633,8 @@ pub(crate) fn execution_seed_for(
             Some((run, provider))
         });
     if let Some((run, provider)) = previous
-        && run.model_selection == thread.model_selection
+        && selection_transition(driver, &run.model_selection, &thread.model_selection)
+            == SelectionTransition::ApplyOnNextTurn
     {
         seed.provider_thread = serde_json::from_value(provider.clone())?;
         seed.run.provider_thread_id = Some(seed.provider_thread.id.clone());
