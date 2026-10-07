@@ -512,6 +512,23 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
 }
 
 #[tokio::test]
+async fn app_server_exit_during_steer_is_uncertain_not_a_rejection() {
+    let (controls, steer, _token) = controls("Yes");
+    let (receipt, response) = oneshot::channel();
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: Some("lost-transport-message".into()),
+            notification_acceptance: Some(receipt),
+        })
+        .await
+        .unwrap();
+    let _ = run_to_end(&harness(), request("scenario:steer-exit"), controls).await;
+    // The receipt is dropped unanswered; `false` would claim a definite rejection.
+    assert!(response.await.is_err());
+}
+
+#[tokio::test]
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
     steer

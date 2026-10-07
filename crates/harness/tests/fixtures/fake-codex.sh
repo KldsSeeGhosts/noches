@@ -255,6 +255,14 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
   ;;
 
+# The app-server dies while handling turn/steer: transport loss, not a rejection.
+*scenario:steer-exit*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  exit 1
+  ;;
+
 # NOTE: steer-race before steer — `case` takes the first matching glob.
 *scenario:steer-race*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

@@ -1471,7 +1471,11 @@ async fn run_session(session: Session) {
                             // fallback for older Codex without steering).
                             Err(e) => {
                                 if let Some(receipt) = notification {
-                                    let _ = receipt.send(false);
+                                    // A dead transport may still have applied the steer:
+                                    // drop the receipt (uncertain), never claim rejection.
+                                    if !matches!(e, HarnessError::Transport(_)) {
+                                        let _ = receipt.send(false);
+                                    }
                                     continue 'main; // V2 queues using its original message ID
                                 }
                                 tracing::debug!(

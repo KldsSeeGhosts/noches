@@ -190,6 +190,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {}", crate::redact::redact_registered(.0))]
     Protocol(String),
+    /// The peer process went away before answering, so whether it applied the
+    /// request is unknown (unlike a `Protocol` rejection, which is definite).
+    #[error("harness protocol error: {}", crate::redact::redact_registered(.0))]
+    Transport(String),
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
     #[error("adapter install failed: {}", crate::redact::redact_registered(.0))]
