@@ -25,6 +25,13 @@ and
 ordinary steering pins the recorded session/thread/turn, and only an exactly
 completed turn can authorize late follow-up. Failure or Stop is not completion.
 
+The 2026-10-07 control follow-up rechecked current T3
+[`365aa879`](https://github.com/pingdotgg/t3code/tree/365aa87982a4d81cc8e0c085e8d1a40ca7daecdc).
+`ProviderTurnControlService.ts` and `EffectWorker.ts` have identical Git blob
+IDs to the previously audited `bfec2387` versions. This is a service freshness
+check, not a claim that all newer upstream UI/device/settings changes have been
+implemented or verified.
+
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
 context transfer and file checkpoint. Correctness depends on their ownership
@@ -214,6 +221,25 @@ is not an acceptable substitute.
   changes remain independently dirty; a real failed snapshot write still leaves
   the repair outbox unacknowledged. This fixes an RPC failure despite the queue
   patch already being durably saved, without serializing away concurrent tests.
+- Ordinary Stop, managed child interruption and interrupt/restart now freeze
+  their process target in a host-only outbox admission record. Restart pins both
+  the interrupted attempt/root and its already-committed replacement attempt.
+  Session/thread/turn and provider-ordinal checks precede exact runtime-map
+  signalling. Missing legacy admission does not acquire authority over a new
+  process. Owner-cancelled controls cannot run or synthesize terminal repair.
+- Control waits release the kernel lane needed by provider ingestion. The
+  executor waits for the signalled process to retire, gives ordinary terminal
+  ingestion a bounded grace period, then performs any synthetic settlement in
+  a transaction that rechecks the admission and physical-process fence.
+  A late observer cannot terminalize the superseding restart attempt. These
+  checks do not implement Stop on an already-completed root that still owns
+  background work.
+- Delegated completion steering uses the live canonical run/attempt/root/process
+  fence and adapter acknowledgement, not a chat-only mailbox lookup. The
+  delegated mailbox retains its prior retry/recovery policy; complete durable
+  per-notification acceptance/uncertainty retirement is not claimed. Its offline
+  fixture now issues a real scoped MCP credential before dispatch rather than
+  relying on an unbound ordinary runtime.
 
 ## Remaining gaps — not claimed 1:1
 
@@ -246,10 +272,12 @@ is not an acceptable substitute.
 7. Older builds stored false acceptance at session initialization. Existing
    provider-turn/delivery rows cannot retrospectively prove provider submission;
    no speculative migration or historical duplicate replay is performed.
-8. The latest upstream interruption/attachment cleanup and relationship-panel
-   app-owned subagent Stop interaction require further parity verification.
-   Ordinary interrupt/restart and delegated-notification effects do not yet
-   share the new steering path's complete physical-process target fence.
+8. Stop on already-settled roots with remaining native background work,
+   complete attachment cleanup and the relationship-panel app-owned subagent
+   Stop interaction require further parity verification. Ordinary/managed
+   interruption and restart now pin their physical process and atomically fence
+   terminal repair; delegated steering pins its live process, but its complete
+   receipt/uncertainty policy remains a gap.
 
 ## Verification
 
@@ -258,20 +286,26 @@ worktree and the main checkout's untracked files are untouched. Final full
 library/integration checks use serial execution where noted below; queue
 repeats and the broader session-sync gate also pass with default parallelism.
 
-A read-only `git merge-tree` comparison of the disconnect implementation and
-instruction EOL rule at `4cc81afe` with performance PR #46 at
-`89f648f60f20160152214645df96ea495b00fc3d` reports no textual conflicts.
-PR #46 subsequently merged into `dev` at `6dc76ff4`. Neither its commits nor
-its worktree are changed or copied into this feature branch.
-CI tested the previously published parity implementation combined with PR #46
-through PR merge ref `8f627e2c`. That is not live-provider proof or verification
-of this later acceptance/retry follow-up combined with the performance changes.
+The feature branch deliberately merges `dev` at `14ce2955`, including the
+existing performance PRs #46 and #48; neither separate worktree was modified.
+Merge commit `b23898c2` preserves dev's published performance migration 7,
+appends steering at version 8 and resolves the actual `store.rs` conflict.
+Control admission is the subsequent migration 9. The database upgrade
+regression constructs the published versions 1–7, preserves their timestamps,
+host epoch and legacy succeeded effects, and verifies that performance indexes,
+steering tables and control targets coexist without speculative legacy markers.
+The final checks below run the actual combined production source, not the
+previous PR merge ref or the earlier standalone feature revision.
+Production source is committed at `337371ed`; the subsequent audit/evidence
+refresh does not change production code. Fresh logs are retained locally under
+`/tmp/noches-parity-final.aSdcwl`, and native artifacts under
+`/tmp/noches-parity-native-final.Gwqi01`.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 658 passed, 0 failed, 2 ignored |
-| Selected engine integration suites | 93 passed, 0 failed, 3 ignored |
-| Desktop library, including pane/sidebar regressions | 1,506 passed, 0 failed, 1 ignored |
+| Engine library | 671 passed, 0 failed, 4 ignored |
+| Selected engine integration suites | 96 passed, 0 failed, 3 ignored |
+| Desktop library, including pane/sidebar regressions | 1,515 passed, 0 failed, 2 ignored |
 | Doc/proto/RPC libraries and integration suites | 244 passed, 0 failed, 2 ignored |
 | Full harness library, integrations and doctest | 435 passed, 0 failed, 12 ignored |
 | Production `zeron` desktop build (`--locked`) | Passed |
@@ -283,7 +317,7 @@ The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
 `restart_resume`, `message_queue`, `queue_lifecycle_rpc`,
 `scheduler_bootstrap`, `codex_subagents`, `e2e`, `turn_quiesce` and
-`self_continued_quiesce`. These checks total 2,936 distinct
+`self_continued_quiesce`. These checks total 2,961 distinct
 passing tests. Focused transfer coverage is included in the engine library
 count, not counted a second time. The session-sync gate supplies additional
 coverage; its overlapping engine/restart/child tests are not added to this total.
@@ -303,10 +337,18 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   acceptance, and distinguish untold retry from accepted interrupted history.
 - A→B→A with/without restart, changed model/options/checkout, legacy history,
   accepted-current-run replay and native delivery receipt cases pass.
-- All 32 message-queue tests pass, including shared native session with
+- All 35 message-queue tests pass, including shared native session with
   coherent run/attempt/root binding and changed-selection reconstruction.
-  The final canonical-steering source also passes all 32 with default
+  The final combined source also passes all 35 with default
   parallelism, separately from the full serial engine batch.
+- Exact control regressions cover current-process interruption, changed
+  run/attempt/root/provider/process and unbound-target refusal, missing-runtime
+  handling, durable restart admission across rebuild and cancellation/replacement
+  refusal in the settlement transaction. A paused-worker fixture deliberately
+  restores stale SQL projection rows while a replacement runtime is active or
+  parked idle; delayed production Stop preserves both replacements. Ordinary
+  production Stop releases ingestion and terminalizes its exact run; restart
+  supersedes the old attempt, starts its replacement and preserves one logical run.
 - Canonical steering regressions cover exact session/attempt/root/message/
   provider-ordinal/process fences, including replacement of a process with
   the same logical attempt; refused Stop/failure/cancelled-target follow-up;
@@ -401,17 +443,22 @@ IPC attachment. Existing compiler/Objective-C/linker warnings remain.
 The fresh steering verification exposed a fixture-only IPC port reservation
 race: the fixture dropped its ephemeral listener before rebinding the server.
 It now retains that listener and passes it directly to the same production
-RPC server loop; both final appearance runs pass on that source. A dark run
-also logged `Orchestration snapshot is not yet durable` from the existing
-publication worker and still passed its workflow assertions. That worker
-retries publication; this batch does not claim to eliminate that deferral
-or its error-level logging.
+RPC server loop; both final appearance runs pass on that source. Both fresh
+combined-source appearance runs logged `Orchestration snapshot is not yet
+durable` from the existing publication worker and still passed their workflow
+assertions. That worker retries publication; this batch does not claim to
+eliminate that deferral or its error-level logging.
 
 Whole-workspace `cargo fmt --all --check` reports pre-existing formatting
-differences in untouched files. Task-owned Rust files use scoped `rustfmt`
-with child-module traversal disabled; no unrelated formatting is included.
+differences. A broader changed-file check also reports existing differences in
+mixed/prior-feature files (`codex_subagents.rs`, `thread_lifecycle.rs`, composer,
+shell and state), including incoming performance hunks. The latest
+steering/control Rust files and native fixture pass scoped `rustfmt --check`
+with child-module traversal disabled. No unrelated formatting is included.
 
-Ignored live-provider/edge/tailnet/private-snapshot tests are not passes.
+Ignored live-provider/edge/tailnet/private-snapshot and optional comparative
+profiling tests are not passes. Child-process reruns of an already-counted
+library test are also excluded from the distinct-test total.
 Current installed-provider, remote-device and non-Mac verification has not
 been performed. No release or integration-branch mutation is part of this task.
 
@@ -429,7 +476,7 @@ same generic RPC error during queue promotion. A deterministic snapshot hook
 then proved that the queue patch was saved but a later transcript change made
 the whole-document cleanliness check fail. The command-generation watermark
 fix passes that regression and a real SQLite write-failure guard. Four
-consecutive default-parallel local queue runs now pass all 31 tests. New-head
+  consecutive default-parallel local queue runs passed all 31 tests. New-head
 Linux CI for `005ad0a6` subsequently passed; the older failed job is not claimed
 green. This is evidence for that published revision, not the later correlated
 steering/request-lifecycle follow-up.
