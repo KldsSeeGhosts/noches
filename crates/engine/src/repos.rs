@@ -1636,8 +1636,16 @@ pub fn git_history_matches(query: &str, commit: &GitHistoryCommit) -> bool {
         return true;
     }
     let normalized = query.to_ascii_lowercase();
-    commit.sha.to_ascii_lowercase().starts_with(&normalized)
-        || fuzzy_score(query, &format!("{} {}", commit.sha, commit.subject)).is_some()
+    if commit.sha.to_ascii_lowercase().starts_with(&normalized) {
+        return true;
+    }
+    // A pasted SHA prefix is an identity lookup. Fuzzy-matching it against the
+    // other commits' hashes would admit arbitrary rows chosen by hash entropy.
+    let sha_prefix = normalized.len() >= 7 && normalized.bytes().all(|b| b.is_ascii_hexdigit());
+    if sha_prefix {
+        return fuzzy_score(query, &commit.subject).is_some();
+    }
+    fuzzy_score(query, &format!("{} {}", commit.sha, commit.subject)).is_some()
 }
 
 /// Contract hidden commits to their nearest visible ancestors. Search results
@@ -2389,6 +2397,20 @@ tmpfs /run tmpfs rw 0 0
         candidate.subject = "RÉPARER la recherche".into();
 
         assert!(git_history_matches("réparer", &candidate));
+    }
+
+    #[test]
+    fn git_history_sha_prefix_is_an_identity_lookup_not_a_fuzzy_one() {
+        // The query's characters appear in order inside this other hash.
+        let mut other = history_commit("0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3".into(), None);
+        other.subject = "unrelated".into();
+        assert!(!git_history_matches("abcdef0", &other));
+        let named = history_commit("abcdef0123456789abcdef0123456789abcdef01".into(), None);
+        assert!(git_history_matches("abcdef0", &named));
+        // Short or non-hex queries stay fuzzy over hash and subject.
+        assert!(git_history_matches("abc", &other));
+        other.subject = "abcdef0 fixes".into();
+        assert!(git_history_matches("abcdef0", &other));
     }
 
     #[test]
