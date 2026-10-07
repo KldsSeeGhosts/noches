@@ -507,6 +507,21 @@ fn prompt_attachment_paths(prompt: &str) -> Vec<String> {
     )
 }
 
+/// Paths from user text that are existing uploads of this host; anything else
+/// named in a prompt is just text and never read for the provider.
+fn host_owned_images(uploads: Option<&crate::uploads::Uploads>, paths: Vec<String>) -> Vec<String> {
+    let Some(uploads) = uploads else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter(|path| {
+            let local = std::path::Path::new(path);
+            uploads.owns(local) && local.is_file()
+        })
+        .collect()
+}
+
 fn queue_text_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -5800,7 +5815,9 @@ impl DocHost {
         {
             tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
         }
-        let images = prompt_attachment_paths(&prompt);
+        // The trailer is free text (typed, pasted, or from a paired device):
+        // only files this host committed as uploads may ride in as images.
+        let images = host_owned_images(self.uploads(), prompt_attachment_paths(&prompt));
         match sessions
             .steer_with_attachments(chat_id, &prompt, message_id.clone(), images)
             .await?
@@ -6901,3 +6918,34 @@ mod publication_eviction_tests {
 #[cfg(test)]
 #[path = "doc_host_sync_tests.rs"]
 mod sync_lifecycle_tests;
+
+#[cfg(test)]
+mod steer_image_tests {
+    use super::*;
+
+    #[test]
+    fn steer_prompt_images_must_be_existing_host_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        std::fs::create_dir_all(uploads.dir()).unwrap();
+        let owned = uploads.dir().join("shot.png");
+        std::fs::write(&owned, b"x").unwrap();
+        let outside = dir.path().join("secret.png");
+        std::fs::write(&outside, b"x").unwrap();
+        let prompt = format!(
+            "look\n\n{ATTACHMENT_PROMPT_HEADER}\n- {}\n- {}\n- {}\n- {}/missing.png\n- {}/../secret.png",
+            owned.display(),
+            outside.display(),
+            "/etc/passwd.png",
+            uploads.dir().display(),
+            uploads.dir().display(),
+        );
+        let parsed = prompt_attachment_paths(&prompt);
+        assert_eq!(parsed.len(), 5, "the parser alone trusts the text");
+        assert_eq!(
+            host_owned_images(Some(&uploads), parsed.clone()),
+            vec![owned.to_string_lossy().into_owned()]
+        );
+        assert!(host_owned_images(None, parsed).is_empty());
+    }
+}
