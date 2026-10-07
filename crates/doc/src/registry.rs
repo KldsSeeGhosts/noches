@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
 
+use crate::constants::UNTITLED_THREAD_TITLE;
 use crate::schema::DocError;
 use crate::workspace::{DeletedSpace, WorkspaceState};
 
@@ -1006,8 +1007,10 @@ impl RegistryDoc {
         let mut patch = fields([("orchestration", summary.clone())]);
         // Mirror only source changes; an unrelated execution publication must
         // not undo a legacy UI rename/seen write made since the last summary.
+        // The untitled placeholder is not a name and must not block auto-titling.
         if previous.is_none_or(|old| old["title"] != summary["title"])
             && let Some(title) = summary["title"].as_str()
+            && title != UNTITLED_THREAD_TITLE
         {
             patch.insert("title".into(), json!(title));
         }

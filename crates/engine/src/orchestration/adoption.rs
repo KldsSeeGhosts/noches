@@ -111,7 +111,7 @@ impl RegistryAdmission {
             .or_else(|| space.as_ref().map(|s| s.path.clone()));
         let thread = serde_json::from_value(json!({
             "id":id,"projectId":project_id(&chat),
-            "title":chat.title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("Conversation"),
+            "title":chat.title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(zeron_doc::UNTITLED_THREAD_TITLE),
             "createdBy":"user","creationSource":"web","providerInstanceId":instance,
             "modelSelection":selection,"runtimeMode":config.map(|c| c.runtime_mode).unwrap_or_default(),
             "interactionMode":config.map(|c| c.interaction_mode).unwrap_or_default(),

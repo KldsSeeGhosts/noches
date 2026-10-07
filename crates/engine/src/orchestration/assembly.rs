@@ -562,7 +562,7 @@ impl RunnerBridge {
             let create = Command::wire(serde_json::from_value(json!({
                 "type":"thread.create","commandId":format!("session-adopt:{}",thread.0),
                 "createdBy":"user","creationSource":"web","threadId":thread,"projectId":scope.project_id,
-                "title":self.workspace.chat(&thread.0).ok().flatten().and_then(|c| c.title).unwrap_or_else(|| "Conversation".into()),
+                "title":self.workspace.chat(&thread.0).ok().flatten().and_then(|c| c.title).unwrap_or_else(|| zeron_doc::UNTITLED_THREAD_TITLE.into()),
                 "modelSelection":selection,"runtimeMode":scope.runtime_mode,"interactionMode":scope.interaction_mode,
                 "branch":null,"worktreePath":request.cwd
             }))?)?;
