@@ -224,11 +224,18 @@ impl ClaudeHarness {
         // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
         // always-on thinking are settings overrides.
         if let Some(model) = &request.model {
-            let one_m = request
-                .model_options
-                .get("contextWindow")
-                .and_then(Value::as_str)
-                == Some("1m");
+            // The catalog default applies when no window was chosen, so the
+            // process runs the window the picker and the budget report.
+            let one_m = match catalog::selected_context_window(model, &request.model_options) {
+                Some(choice) => choice == "1m",
+                None => {
+                    request
+                        .model_options
+                        .get("contextWindow")
+                        .and_then(Value::as_str)
+                        == Some("1m")
+                }
+            };
             cmd.arg("--model");
             cmd.arg(if one_m {
                 format!("{model}[1m]")
@@ -834,6 +841,59 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     blocks
 }
 
+/// A steer line ready to write, in submission order.
+enum PreparedSteer {
+    Line {
+        line: String,
+        uuid: String,
+        /// The mailbox message the echo of `uuid` retires, when identified.
+        receipt_for: Option<String>,
+        notification_acceptance: Option<tokio::sync::oneshot::Sender<bool>>,
+    },
+    /// The mailbox closed after every steer before it.
+    Close,
+}
+
+/// Builds steer lines one at a time off the run loop: inlining host-owned
+/// images reads files and base64-encodes them, which must not stall stdout
+/// draining or interrupt handling. `None` marks the mailbox closing.
+fn spawn_steer_preparer(
+    reasoning: Option<ReasoningLevel>,
+) -> (
+    mpsc::UnboundedSender<Option<crate::SteerMessage>>,
+    mpsc::UnboundedReceiver<PreparedSteer>,
+) {
+    let (prepare_tx, mut prepare_rx) = mpsc::unbounded_channel::<Option<crate::SteerMessage>>();
+    let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(item) = prepare_rx.recv().await {
+            let Some(msg) = item else {
+                let _ = ready_tx.send(PreparedSteer::Close);
+                return;
+            };
+            // Same best-effort inlining as the first prompt: an unreadable
+            // image keeps its path ref in the text.
+            let images = load_image_blocks(&msg.attachments).await;
+            let uuid = new_input_uuid();
+            let line = wire::user_message_line_with_images(
+                &apply_ultrathink(reasoning, &msg.prompt),
+                &images,
+                &uuid,
+            );
+            let ready = PreparedSteer::Line {
+                line,
+                uuid,
+                receipt_for: msg.message_id,
+                notification_acceptance: msg.notification_acceptance,
+            };
+            if ready_tx.send(ready).is_err() {
+                return;
+            }
+        }
+    });
+    (prepare_tx, ready_rx)
+}
+
 fn new_input_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -1019,6 +1079,7 @@ async fn run_session(session: Session) {
     let _permission_lifetime = interrupt.clone().drop_guard();
 
     let mut steering_open = true;
+    let (prepare_tx, mut ready_rx) = spawn_steer_preparer(reasoning);
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut any_done = false;
@@ -1115,18 +1176,23 @@ async fn run_session(session: Session) {
                 }
             },
 
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
-                    let uuid = new_input_uuid();
-                    // Same best-effort inlining as the first prompt: an
-                    // unreadable image keeps its path ref in the text.
-                    let images = load_image_blocks(&msg.attachments).await;
-                    let line = wire::user_message_line_with_images(
-                        &apply_ultrathink(reasoning, &msg.prompt),
-                        &images,
-                        &uuid,
-                    );
-                    let queued = if let Some(receipt) = msg.notification_acceptance {
+            // Steers are prepared (image read + base64) off this loop, in
+            // order, so stdout draining and interrupts never wait on a file.
+            steer = steering.recv(), if steering_open && !interrupted => {
+                steering_open = steer.is_some();
+                let _ = prepare_tx.send(steer);
+            },
+
+            Some(ready) = ready_rx.recv() => match ready {
+                PreparedSteer::Line { line, uuid, receipt_for, notification_acceptance } => {
+                    // Prepared before an interrupt landed: never written.
+                    if interrupted {
+                        if let Some(receipt) = notification_acceptance {
+                            let _ = receipt.send(false);
+                        }
+                        continue 'main;
+                    }
+                    let queued = if let Some(receipt) = notification_acceptance {
                         match stdin_tx.send(StdinMsg::Steer { line, receipt }) {
                             Ok(()) => true,
                             Err(error) => {
@@ -1142,7 +1208,7 @@ async fn run_session(session: Session) {
                     if !queued {continue 'main;}
                     // Only an identified mailbox message can be retired by its
                     // echo; an anonymous steer has nothing to acknowledge.
-                    if let Some(message_id) = msg.message_id {
+                    if let Some(message_id) = receipt_for {
                         pending_inputs.register(uuid, Some(message_id));
                         // Once a result has shown this CLI does not echo,
                         // the write is the only acknowledgement there is.
@@ -1166,10 +1232,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                 }
-                None => {
+                PreparedSteer::Close => {
                     // Mailbox closed: end the input so the run can finish
-                    // after the current turn.
-                    steering_open = false;
+                    // after the current turn (after every prepared steer).
                     let _ = stdin_tx.send(StdinMsg::Close);
                 }
             },
@@ -1527,13 +1592,26 @@ mod tests {
     fn declared_context_window_follows_the_catalog_option() {
         let harness = ClaudeHarness::new();
         let mut options = serde_json::Map::new();
+        // 1M-default models report 1M with nothing selected; Sonnet is 200K.
+        for model in ["claude-opus-5-5", "claude-fable-5", "claude-fable-5-1"] {
+            assert_eq!(
+                harness.model_context_window(model, &options),
+                Some(1_000_000),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            harness.model_context_window("claude-sonnet-5", &options),
+            Some(200_000)
+        );
+        options.insert("contextWindow".into(), "200k".into());
         assert_eq!(
             harness.model_context_window("claude-opus-5-5", &options),
             Some(200_000)
         );
         options.insert("contextWindow".into(), "1m".into());
         assert_eq!(
-            harness.model_context_window("claude-opus-5-5", &options),
+            harness.model_context_window("claude-sonnet-5", &options),
             Some(1_000_000)
         );
         // No selectable window: the option cannot widen it. Custom IDs are

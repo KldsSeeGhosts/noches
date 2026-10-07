@@ -133,6 +133,13 @@ async fn legacy_fork_forks_at_head_then_reverts_the_counted_paginated_turns() {
         .await
         .unwrap_err();
     assert!(short.to_string().contains("fewer turns"), "{short}");
+    // A boundary turn without an id is a protocol error, never a head fork.
+    let noid = harness
+        .fork_thread(request("legacy-noid-source", Some(2)))
+        .await
+        .unwrap_err();
+    assert!(matches!(noid, HarnessError::Protocol(_)), "{noid}");
+    assert!(noid.to_string().contains("without an id"), "{noid}");
     // No counted boundary at all still refuses to fork a moving head.
     assert!(
         harness

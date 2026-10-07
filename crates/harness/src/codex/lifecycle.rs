@@ -26,6 +26,9 @@ async fn revert_forked_turns(
                 .into(),
         ));
     }
+    if turns == 0 {
+        return Ok(thread_id.to_owned());
+    }
     let mut remaining = turns;
     let mut before_turn: Option<String> = None;
     let mut cursor: Option<String> = None;
@@ -46,7 +49,21 @@ async fn revert_forked_turns(
             )
             .await?;
         for turn in page["data"].as_array().into_iter().flatten() {
-            before_turn = turn["id"].as_str().map(str::to_owned);
+            // The boundary is the last counted turn: without its id the revert
+            // point is unknown, and the un-reverted head fork would leak the
+            // later turns into the child.
+            before_turn = Some(
+                turn["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(
+                            "Codex returned a turn without an id at the legacy fork boundary."
+                                .into(),
+                        )
+                    })?,
+            );
             remaining -= 1;
             if remaining == 0 {
                 break;
@@ -63,7 +80,9 @@ async fn revert_forked_turns(
         ));
     }
     let Some(before_turn) = before_turn else {
-        return Ok(thread_id.to_owned());
+        return Err(HarnessError::Protocol(
+            "Codex fork has no turn to revert before.".into(),
+        ));
     };
     let reverted = client
         .request(

@@ -1940,7 +1940,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                     // one-off "Opus (1M context)" row (user request). The
                     // send path recomposes the advertised id via
                     // `pick_model_value`'s compose/family fallback.
-                    let mut window = crate::claude::catalog::context_window();
+                    let mut window = crate::claude::catalog::context_window("200k");
                     window.default_choice = "1m".into();
                     options.push(window);
                     return Some(build(
@@ -1955,7 +1955,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                     .iter()
                     .any(|raw| strip_context_hint(raw) == Some(id))
                 {
-                    options.push(crate::claude::catalog::context_window());
+                    options.push(crate::claude::catalog::context_window("200k"));
                 }
                 Some(build(id, name, description, options))
             })

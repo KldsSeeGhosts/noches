@@ -74,6 +74,7 @@ if has "$line" '"method":"thread/fork"' && has "$line" '"threadId":"legacy-'; th
   case "$line" in
     *legacy-history-source*) fork_id=legacy-history-fork; mode=legacy ;;
     *legacy-short-source*) fork_id=legacy-short-fork; mode=paginated ;;
+    *legacy-noid-source*) fork_id=legacy-noid-fork; mode=paginated ;;
     *) fork_id=legacy-fork; mode=paginated ;;
   esac
   emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$fork_id\"}}}"
@@ -88,6 +89,11 @@ if has "$line" '"method":"thread/fork"' && has "$line" '"threadId":"legacy-'; th
   has "$line" '"sortDirection":"desc"' || exit 1
   if [ "$fork_id" = legacy-short-fork ]; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"}],\"nextCursor\":null}}"
+    exec sleep 30
+  fi
+  if [ "$fork_id" = legacy-noid-fork ]; then
+    # The boundary turn carries no id: the revert point is unknown.
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"},{\"status\":\"completed\"}],\"nextCursor\":null}}"
     exec sleep 30
   fi
   has "$line" '"limit":2' || exit 1
