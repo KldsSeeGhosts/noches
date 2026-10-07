@@ -31,7 +31,6 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
-mod pi_usage;
 mod subagent;
 mod subagent_devin;
 
@@ -56,7 +55,7 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::process::{Command, Stdio};
 use crate::scratch::ScratchDir;
 use child::Child;
-mod child;
+pub(crate) mod child;
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
@@ -64,16 +63,14 @@ use subagent_devin::DevinTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Pi's discovery budget: `pi-acp` cold-starts the agent (plus extensions)
-/// before the session probe can answer.
-const PI_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The widest initialize → session/new discovery budget across the ACP
-/// agents (Pi's 60s cold start). Callers bounding a `models()` round trip -
-/// the model picker's ListModels deadline, the engine's forward deadline -
-/// derive from this plus their own transport margin, so a widened harness
-/// budget can never be abandoned mid-probe by an outer timeout.
-pub const MAX_MODEL_DISCOVERY_TIMEOUT: Duration = PI_MODEL_DISCOVERY_TIMEOUT;
+/// The widest discovery budget across drivers that probe for their model
+/// list (Pi's 60s cold start, extensions included). Callers bounding a
+/// `models()` round trip - the model picker's ListModels deadline, the
+/// engine's forward deadline - derive from this plus their own transport
+/// margin, so a widened harness budget can never be abandoned mid-probe by an
+/// outer timeout.
+pub const MAX_MODEL_DISCOVERY_TIMEOUT: Duration = crate::pi::MODEL_DISCOVERY_TIMEOUT;
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -178,27 +175,6 @@ fn default_effort_values(
             vec!["ultra", "max", "high"]
         }
     }
-}
-
-/// npm-global bin dirs for an adapter binary (`npm i -g` installs).
-fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
-    // fn pointers can't capture; probe the fixed npm-global locations and
-    // append the exe at call time via a small per-exe shim table.
-    match exe {
-        "pi-acp" => || npm_global_bins("pi-acp"),
-        _ => || Vec::new(),
-    }
-}
-
-fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = crate::executable::home_dir() {
-        dirs.push(home.join(".local").join("bin").join(exe));
-        dirs.push(home.join(".npm-global").join("bin").join(exe));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
-    dirs.push(PathBuf::from("/usr/local/bin").join(exe));
-    dirs
 }
 
 fn grok_install_paths() -> Vec<PathBuf> {
@@ -409,67 +385,6 @@ fn hermes_spec() -> AcpAgentSpec {
         // Hermes exposes no effort config over ACP today (hybrid reasoning is
         // model-internal); revisit when the adapter advertises a ladder.
         reasoning_levels: &[],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
-        effort_in_model_id: false,
-        auth_method: None,
-        skill_dirs: Vec::new,
-        hidden_commands: &[],
-    }
-}
-
-fn pi_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Pi,
-        display_name: "Pi",
-        executable: "pi-acp",
-        env_override: "PI_ACP_EXECUTABLE",
-        args: &[],
-        npm_package: Some("pi-acp@0.0.34"),
-        archive: None,
-        extra_paths: npm_global_paths("pi-acp"),
-        cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
-        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
-        // pi routes models through its own provider config (~/.pi); the picker
-        // advertises the pass-through entry and pi keeps whatever the user set
-        // up. Unknown ids are skipped by the config-option set.
-        models: || {
-            vec![Model {
-                id: "default".into(),
-                label: "pi default".into(),
-                description: Some("Runs the model configured in pi (`pi` settings)".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Minimal,
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                    ReasoningLevel::Max,
-                ],
-                options: Vec::new(),
-            }]
-        },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
-        // equivalent and is left to the agent default).
-        reasoning_levels: &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -838,7 +753,7 @@ pub fn prewarm_managed_adapters() {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    for spec in [grok_spec(), pi_spec()] {
+    for spec in [grok_spec()] {
         let Some(pkg) = spec.npm_package else {
             continue;
         };
@@ -908,10 +823,6 @@ pub struct AcpHarness {
     /// opens must see account changes and newly available models.
     models_cache: tokio::sync::Mutex<Option<(Instant, Vec<Model>)>>,
     devin_models: devin_models::Catalog,
-    /// Test seam: a pre-existing context-usage file path, bypassing the
-    /// real-Pi launch-dir provisioning in `prepare_pi_cua`.
-    #[doc(hidden)]
-    pub pi_usage_file_override: Option<PathBuf>,
 }
 
 impl AcpHarness {
@@ -931,7 +842,6 @@ impl AcpHarness {
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::Mutex::new(None),
             devin_models: devin_models::Catalog::default(),
-            pi_usage_file_override: None,
         }
     }
 
@@ -948,12 +858,6 @@ impl AcpHarness {
     /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
     pub fn hermes() -> Self {
         Self::with_spec(hermes_spec())
-    }
-
-    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
-    /// pi's RPC mode.
-    pub fn pi() -> Self {
-        Self::with_spec(pi_spec()).with_model_discovery_timeout(PI_MODEL_DISCOVERY_TIMEOUT)
     }
 
     /// google antigravity over its acp server (`agy_acp_server`).
@@ -1329,7 +1233,7 @@ impl AcpHarness {
     /// resolved exactly as a launch resolves it - the env override, PATH, the
     /// login shell, install dirs, the managed npm install - minus the ACP
     /// server arguments. Only meaningful for agents whose server IS their CLI
-    /// (Grok, Devin, Hermes); Pi's server is a separate adapter.
+    /// (Grok, Devin, Hermes).
     pub async fn cli_command(&self, args: &[&str]) -> Result<Command, HarnessError> {
         let (exe, mut launch_args) = self.resolve_program(false).await?;
         let prefix = launch_args.len().saturating_sub(self.spec.args.len());
@@ -1339,177 +1243,6 @@ impl AcpHarness {
         crate::compose_child_environment(&mut cmd, &exe);
         self.launch.apply(&mut cmd);
         Ok(cmd)
-    }
-
-    const CUA_EXTENSION: &str = include_str!("../pi/noches-cua.ts");
-    const CONTEXT_USAGE_EXTENSION: &str = include_str!("../pi/noches-context-usage.ts");
-
-    /// Point pi-acp at a wrapper that loads the Noches extensions. The CUA
-    /// extension loads even when the managed bridge is unavailable so it can
-    /// disable Pi's legacy `cua` tool on every platform; the context-usage
-    /// extension is independent and always loads with it.
-    fn prepare_pi_cua(
-        socket: Option<&Path>,
-        mcp: &crate::mcp::SessionMcpContext,
-    ) -> Result<PiLaunch, HarnessError> {
-        let configured = std::env::var_os("PI_ACP_PI_COMMAND")
-            .map(PathBuf::from)
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .file_stem()
-                        .is_some_and(|name| name != "pi-with-noches-cua")
-            });
-        let real = configured.or_else(|| find_on_paths("pi", npm_global_bins("pi")));
-        let Some(real) = real else {
-            // Without a real Pi executable, no Pi session can expose legacy
-            // CUA. Let pi-acp report its usual launch/install error instead.
-            if socket.is_none() {
-                return Ok((Vec::new(), None, None));
-            }
-            return Err(HarnessError::NotInstalled(
-                "pi (install @earendil-works/pi-coding-agent, or set PI_ACP_PI_COMMAND)".into(),
-            ));
-        };
-        let (dir, launch_dir) = Self::pi_cua_launch_dir(socket)?;
-        let extension = dir.join("noches-cua.ts");
-        Self::write_private_file(&extension, Self::CUA_EXTENSION, false)?;
-        let usage_extension = dir.join("noches-context-usage.ts");
-        Self::write_private_file(&usage_extension, Self::CONTEXT_USAGE_EXTENSION, false)?;
-        let mcp_extension = if mcp.entries().is_empty() && mcp.instructions().is_empty() {
-            None
-        } else {
-            Some(mcp.pi_extension(&dir)?)
-        };
-        let usage_file = dir.join("context-usage.json");
-        let (wrapper, script, executable) =
-            Self::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
-        Self::write_private_file(&wrapper, &script, executable)?;
-        let mut env = vec![
-            ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
-            ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
-            (
-                "NOCHES_CUA_USAGE_EXTENSION",
-                usage_extension.display().to_string(),
-            ),
-            ("NOCHES_PI_USAGE_FILE", usage_file.display().to_string()),
-        ];
-        if let Some(extension) = mcp_extension {
-            env.push(("NOCHES_PI_MCP_EXTENSION", extension.display().to_string()));
-        }
-        #[cfg(windows)]
-        env.push(("NOCHES_CUA_PI_COMMAND", real.display().to_string()));
-        if let Some(socket) = socket {
-            env.push(("NOCHES_CUA_SOCKET", socket.display().to_string()));
-        }
-        Ok((env, launch_dir, Some(usage_file)))
-    }
-
-    fn pi_cua_launch_dir(
-        socket: Option<&Path>,
-    ) -> Result<(PathBuf, Option<tempfile::TempDir>), HarnessError> {
-        if let Some(parent) = socket
-            .and_then(Path::parent)
-            .filter(|parent| Self::is_private_directory(parent))
-        {
-            return Ok((parent.to_path_buf(), None));
-        }
-
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("noches-cua-");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(0o700));
-        }
-        let dir = builder.tempdir().map_err(HarnessError::Io)?;
-        Ok((dir.path().to_path_buf(), Some(dir)))
-    }
-
-    #[cfg(unix)]
-    fn is_private_directory(path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-
-        // POSIX `geteuid` has no pointer arguments or preconditions.
-        let effective_uid = unsafe { libc::geteuid() };
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-            metadata.file_type().is_dir()
-                && metadata.uid() == effective_uid
-                && metadata.mode() & 0o077 == 0
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn is_private_directory(_path: &Path) -> bool {
-        false
-    }
-
-    fn write_private_file(
-        path: &Path,
-        contents: &str,
-        executable: bool,
-    ) -> Result<(), HarnessError> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(if executable { 0o700 } else { 0o600 });
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
-        use std::io::Write;
-        options
-            .open(path)
-            .and_then(|mut file| file.write_all(contents.as_bytes()))
-            .map_err(HarnessError::Io)
-    }
-
-    #[cfg(unix)]
-    fn pi_cua_wrapper(
-        dir: &Path,
-        real: &Path,
-        extension: &Path,
-        usage_extension: &Path,
-    ) -> (PathBuf, String, bool) {
-        (
-            dir.join("pi-with-noches-cua"),
-            format!(
-                "#!/bin/sh\nif [ -n \"$NOCHES_PI_MCP_EXTENSION\" ]; then set -- -e \"$NOCHES_PI_MCP_EXTENSION\" \"$@\"; fi\nexec {} -e {} -e {} \"$@\"\n",
-                Self::shell_quote(real),
-                Self::shell_quote(extension),
-                Self::shell_quote(usage_extension),
-            ),
-            true,
-        )
-    }
-
-    #[cfg(windows)]
-    fn pi_cua_wrapper(
-        dir: &Path,
-        _real: &Path,
-        _extension: &Path,
-        _usage_extension: &Path,
-    ) -> (PathBuf, String, bool) {
-        (
-            dir.join("pi-with-noches-cua.cmd"),
-            concat!(
-                "@echo off\r\n",
-                "setlocal DisableDelayedExpansion\r\n",
-                "if defined NOCHES_PI_MCP_EXTENSION (\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" -e \"%NOCHES_PI_MCP_EXTENSION%\" %*\r\n",
-                ") else (\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
-                ")\r\n",
-            )
-            .to_string(),
-            false,
-        )
-    }
-
-    #[cfg(unix)]
-    fn shell_quote(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
     fn adapter_scratch(&self) -> Result<Option<ScratchDir>, HarnessError> {
@@ -1542,15 +1275,9 @@ impl AcpHarness {
             cmd.env("GEMINI_HOME", antigravity_paths::home()?);
         }
         self.launch.apply_launch(&mut cmd);
-        // A parent shell may export stale computer-use launch variables. Pi
-        // sets fresh values through extra_env; every other agent must not inherit them.
+        // A parent shell may export stale launch variables; no ACP agent may inherit them.
         for key in [
             "NOCHES_CUA_SOCKET",
-            "NOCHES_CUA_EXTENSION",
-            "NOCHES_CUA_USAGE_EXTENSION",
-            "NOCHES_CUA_PI_COMMAND",
-            "NOCHES_PI_USAGE_FILE",
-            "NOCHES_PI_MCP_EXTENSION",
             crate::mcp::ACP_EXECUTABLE_ENV,
             crate::mcp::ACP_ENDPOINT_ENV,
             crate::mcp::ACP_AUTHORIZATION_ENV,
@@ -1665,7 +1392,7 @@ impl AcpHarness {
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
-        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
+        let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
                 child.shutdown(self.kill_grace).await;
@@ -1683,9 +1410,6 @@ impl AcpHarness {
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             discovered = Some(models.clone());
-            if self.spec.id == HarnessId::Pi {
-                refine_pi_ladders(&client, &mut incoming, &session, &mut models).await;
-            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -1721,90 +1445,6 @@ impl AcpHarness {
                 }
                 Err(HarnessError::Protocol(error))
             }
-        }
-    }
-}
-
-/// The `thought_level` ladder in a `configOptions` array, mapped onto zeron's
-/// levels. Values zeron has no level for (pi's `off`) are dropped.
-fn thought_ladder(config_options: Option<&Value>) -> Vec<ReasoningLevel> {
-    config_options
-        .and_then(Value::as_array)
-        .and_then(|options| {
-            options
-                .iter()
-                .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
-        })
-        .and_then(|o| o.get("options").and_then(Value::as_array))
-        .map(|opts| {
-            opts.iter()
-                .filter_map(|o| o.get("value").and_then(Value::as_str))
-                .filter_map(reasoning_from_value)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn reported_thought_ladder(config_options: Option<&Value>) -> Option<Vec<ReasoningLevel>> {
-    config_options?
-        .as_array()?
-        .iter()
-        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))?
-        .get("options")?
-        .as_array()?;
-    Some(thought_ladder(config_options))
-}
-
-/// pi-acp advertises one `thought_level` ladder — the CURRENT model's — so
-/// every other model would inherit it. Pi's supported levels differ per model
-/// (`thinkingLevelMap`: no `minimal` on gpt-6.x, `max` only where mapped), so
-/// switch the probe session through each model and keep the ladder the
-/// adapter reports back. A model that fails to switch keeps its fallback.
-async fn refine_pi_ladders(
-    client: &RpcClient,
-    incoming: &mut mpsc::Receiver<Incoming>,
-    session: &Value,
-    models: &mut [Model],
-) {
-    let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(model_config_id) = session
-        .get("configOptions")
-        .and_then(Value::as_array)
-        .and_then(|options| {
-            options
-                .iter()
-                .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
-        })
-        .and_then(|o| o.get("id").and_then(Value::as_str))
-    else {
-        return;
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    for model in models.iter_mut() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let response = tokio::time::timeout(
-            remaining.min(Duration::from_secs(2)),
-            request_draining(
-                client,
-                incoming,
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": model_config_id,
-                    "value": model.id,
-                }),
-            ),
-        )
-        .await;
-        let Ok(response) = response else { break };
-        let Ok(response) = response else { continue };
-        if let Some(ladder) = reported_thought_ladder(response.get("configOptions")) {
-            model.reasoning_levels = ladder;
         }
     }
 }
@@ -2165,16 +1805,7 @@ impl Harness for AcpHarness {
         let mcp_guard = controls.mcp.run_guard();
         controls.bind_browser()?;
         crate::policy::compile(self.spec.id, request.runtime_mode, request.interaction_mode)?;
-        // `with_executable` is used by tests and embedders that supply a
-        // complete ACP server. Installed Pi runs always load the policy
-        // extension, even when this host cannot provide the managed bridge.
-        let (mut cua_env, pi_launch_dir, pi_usage_file) =
-            if self.spec.id == HarnessId::Pi && self.executable.is_none() {
-                Self::prepare_pi_cua(controls.computer_use_socket.as_deref(), &controls.mcp)?
-            } else {
-                (Vec::new(), None, self.pi_usage_file_override.clone())
-            };
-        cua_env.extend(controls.mcp.process_environment());
+        let cua_env = controls.mcp.process_environment();
         let policy_args = if self.spec.id == HarnessId::Grok {
             crate::policy::grok_args(request.runtime_mode)
         } else {
@@ -2216,8 +1847,6 @@ impl Harness for AcpHarness {
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
             stderr_tail,
-            pi_usage_file,
-            _pi_launch_dir: pi_launch_dir,
         };
         tokio::spawn(async move {
             let _mcp_start_guard = mcp_guard;
@@ -2234,14 +1863,6 @@ impl Harness for AcpHarness {
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
-
-/// Launch plumbing prepared per Pi run: env for the adapter, the private
-/// launch dir guard, and the context-usage file to poll.
-type PiLaunch = (
-    Vec<(&'static str, String)>,
-    Option<tempfile::TempDir>,
-    Option<PathBuf>,
-);
 
 struct Session {
     child: Child,
@@ -2266,10 +1887,6 @@ struct Session {
     kill_grace: Duration,
     handshake_timeout: Duration,
     stderr_tail: crate::StderrTail,
-    /// Pi run's context-usage file (extension-written, harness-polled).
-    /// `None` for every other agent and for test embedders.
-    pi_usage_file: Option<PathBuf>,
-    _pi_launch_dir: Option<tempfile::TempDir>,
 }
 
 fn initialize_params(harness: HarnessId) -> Value {
@@ -2501,18 +2118,6 @@ fn validate_config_model_selection(
     )))
 }
 
-fn is_thought_level_option(session_response: &Value, config_id: &str) -> bool {
-    session_response
-        .get("configOptions")
-        .and_then(Value::as_array)
-        .is_some_and(|options| {
-            options.iter().any(|option| {
-                option.get("id").and_then(Value::as_str) == Some(config_id)
-                    && option.get("category").and_then(Value::as_str) == Some("thought_level")
-            })
-        })
-}
-
 fn is_model_config_option(session_response: &Value, config_id: &str) -> bool {
     session_response
         .get("configOptions")
@@ -2654,20 +2259,6 @@ impl SubagentObserver {
     }
 }
 
-/// Consume only the exact pi-acp startup inventory advertised by session/new.
-/// Ordinary agent text (including a response that happens to mention Pi) stays.
-fn consume_pi_startup_info(method: &str, update: &Value, pending: &mut Option<String>) -> bool {
-    let matches = method == "session/update"
-        && update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk")
-        && pending.as_deref().is_some_and(|startup| {
-            update.pointer("/content/text").and_then(Value::as_str) == Some(startup)
-        });
-    if matches {
-        pending.take();
-    }
-    matches
-}
-
 /// The events of one notification, session-filtered. `session/update` maps
 /// per [`map_update`]; `_x.ai/session_notification` is grok's extension
 /// channel — same `{sessionId, update}` envelope, but its updates (the
@@ -2680,19 +2271,11 @@ fn session_update_events(
     session_id: &str,
     subagents: &mut SubagentObserver,
     shapes: &mut normalize::ToolShapes,
-    pi_startup_info: &mut Option<String>,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
     let update = params.get("update").unwrap_or(&Value::Null);
-    // pi-acp includes its startup inventory in session/new's _meta, then
-    // repeats that exact text as an agent_message_chunk on a timer. It is
-    // adapter chrome, not the model's answer. Match the response's payload
-    // rather than heuristically stripping real assistant text or slash output.
-    if consume_pi_startup_info(method, update, pi_startup_info) {
-        return Vec::new();
-    }
     match method {
         "session/update" => match subagents {
             SubagentObserver::Devin(tracker) => tracker.map(update),
@@ -3362,8 +2945,6 @@ async fn run_session(session: Session) {
         kill_grace,
         handshake_timeout,
         stderr_tail,
-        pi_usage_file,
-        _pi_launch_dir,
     } = session;
     let RunControls {
         mcp,
@@ -3520,7 +3101,6 @@ async fn run_session(session: Session) {
                 .await
                 .map_err(|e| HarnessError::Protocol(format!("permission mode rejected: {e}")))?;
         }
-        let mut switched_options: Option<Value> = None;
         for (config_id, payload) in config_option_sets(
             &options_snapshot,
             requested_model.as_deref(),
@@ -3543,13 +3123,7 @@ async fn run_session(session: Session) {
             )
             .await
             {
-                Ok(response) => {
-                    if is_model_config_option(&options_snapshot, &config_id)
-                        && let Some(options) = response.get("configOptions")
-                    {
-                        switched_options = Some(options.clone());
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => {
                     if matches!(harness, HarnessId::Antigravity | HarnessId::Devin)
                         && requested_model.is_some()
@@ -3567,55 +3141,13 @@ async fn run_session(session: Session) {
                 }
             }
         }
-        // pi's thinking ladder belongs to the model it is switched to. The
-        // snapshot above still describes the default model, so re-pick the
-        // effort against the options the model switch handed back.
-        if harness == HarnessId::Pi
-            && let Some(fresh) = switched_options
-        {
-            let fresh = json!({ "configOptions": fresh });
-            let resets = config_option_sets(&fresh, None, &efforts, &serde_json::Map::new());
-            for (config_id, payload) in resets {
-                if !is_thought_level_option(&fresh, &config_id) {
-                    continue;
-                }
-                let mut params = serde_json::Map::new();
-                params.insert("sessionId".into(), session_id.clone().into());
-                params.insert("configId".into(), config_id.clone().into());
-                if let Some(payload) = payload.as_object() {
-                    for (k, v) in payload {
-                        params.insert(k.clone(), v.clone());
-                    }
-                }
-                if let Err(e) = request_draining(
-                    &client,
-                    &mut incoming,
-                    "session/set_config_option",
-                    Value::Object(params),
-                )
-                .await
-                {
-                    tracing::debug!(
-                        target: "zeron_harness::acp",
-                        "pi effort re-apply {config_id}={payload} rejected (agent default runs): {e}"
-                    );
-                }
-            }
-        }
-        let pi_startup_info = (harness == HarnessId::Pi)
-            .then(|| options_snapshot.pointer("/_meta/piAcp/startupInfo"))
-            .flatten()
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned);
-        Ok::<(String, bool, Vec<SlashCommand>, Option<String>), HarnessError>((
+        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
-            pi_startup_info,
         ))
     };
-    let (session_id, steer_ext, init_commands, mut pi_startup_info) = tokio::select! {
+    let (session_id, steer_ext, init_commands) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -3712,12 +3244,6 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Pi never emits ACP `usage_update`; its extension writes context stats
-    // to a per-run file instead. Poll it for the life of the run.
-    let usage_watcher = pi_usage_file
-        .clone()
-        .map(|path| pi_usage::spawn_watcher(path, event_tx.clone()));
-
     // Subagent correlation + transcript tails: Devin carries nested updates
     // on ACP itself; everything else gets the Grok tracker (inert without
     // Grok's subagent lifecycle extension).
@@ -3754,10 +3280,9 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-    // Pi uses before_agent_start in its real system-prompt channel. Other
     // ACP flavors have no standard system-instructions field.
     let instructions = mcp.acp_instructions();
-    let first_prompt = if harness != HarnessId::Pi && !instructions.is_empty() {
+    let first_prompt = if !instructions.is_empty() {
         format!("{}\n\n{}", instructions, request.prompt)
     } else {
         request.prompt.clone()
@@ -3911,7 +3436,6 @@ async fn run_session(session: Session) {
                                 &session_id,
                                 &mut subagents,
                                 &mut tool_shapes,
-                                &mut pi_startup_info,
                             );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
@@ -3965,16 +3489,6 @@ async fn run_session(session: Session) {
                     break 'main;
                 }
                 let (status, error) = stop_outcome(&res, interrupted);
-                // The context ring is torn down at Done, so the extension's
-                // final snapshot must land first; a cancelled turn skips it
-                // (the write races teardown and is not meaningful).
-                if !interrupted
-                    && let Some(path) = pi_usage_file.as_deref()
-                    && let Some(ev) = pi_usage::read_event(path)
-                    && !send(&event_tx, ev).await
-                {
-                    break 'main;
-                }
                 done_current = true;
                 if interrupted {
                     done_after_interrupt = true;
@@ -4110,7 +3624,6 @@ async fn run_session(session: Session) {
                         &session_id,
                         &mut subagents,
                         &mut tool_shapes,
-                        &mut pi_startup_info,
                     );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
@@ -4159,12 +3672,6 @@ async fn run_session(session: Session) {
                         .await;
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
-                        }
-                        if !interrupted
-                            && let Some(path) = pi_usage_file.as_deref()
-                            && let Some(ev) = pi_usage::read_event(path)
-                        {
-                            let _ = send(&event_tx, ev).await;
                         }
                         let (status, error) = stop_outcome(&res, interrupted);
                         done_current = true;
@@ -4237,7 +3744,6 @@ async fn run_session(session: Session) {
                                         &session_id,
                                         &mut subagents,
                                         &mut tool_shapes,
-                                        &mut pi_startup_info,
                                     );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
@@ -4640,23 +4146,6 @@ async fn run_session(session: Session) {
         }
     }
 
-    // The extension's last write can race the poll's final tick; a direct
-    // read lands the settled number. The turn-settle path already emitted
-    // it before its Done; this covers exits that reach bookkeeping without
-    // one (a crash mid-turn). Skip on cancellation - the ring is torn down
-    // with the turn and a post-Done snapshot is dead weight.
-    if !interrupted
-        && !done_current
-        && let Some(watcher) = &usage_watcher
-    {
-        watcher.abort();
-        if let Some(path) = pi_usage_file.as_deref()
-            && let Some(ev) = pi_usage::read_event(path)
-        {
-            let _ = send(&event_tx, ev).await;
-        }
-    }
-
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
@@ -4694,161 +4183,12 @@ async fn run_session(session: Session) {
     // Escalation now lives in the owner task's select, so it cannot outlive
     // the reaped child; there is no detached handle left to abort. (May
     // already be aborted above; aborting twice is a no-op.)
-    if let Some(watcher) = usage_watcher {
-        watcher.abort();
-    }
     child.shutdown(kill_grace).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pi_startup_inventory_is_not_assistant_text() {
-        let inventory = "pi v0.87.1\n## Skills\n- /home/agent/SKILL.md\n";
-        let mut pending = Some(inventory.to_owned());
-        let chunk = |text: &str| {
-            json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": { "type": "text", "text": text }
-            })
-        };
-        assert!(!consume_pi_startup_info(
-            "session/update",
-            &chunk("Hey! How can I help?"),
-            &mut pending,
-        ));
-        assert!(!consume_pi_startup_info(
-            "session/update",
-            &chunk("pi v0.87.1"),
-            &mut pending,
-        ));
-        assert!(consume_pi_startup_info(
-            "session/update",
-            &chunk(inventory),
-            &mut pending,
-        ));
-        assert_eq!(pending, None);
-        assert!(!consume_pi_startup_info(
-            "session/update",
-            &chunk(inventory),
-            &mut pending,
-        ));
-    }
-
-    #[test]
-    fn pi_cua_without_bridge_gets_a_private_per_run_launch_directory() {
-        let (first, first_guard) = AcpHarness::pi_cua_launch_dir(None).unwrap();
-        let (second, second_guard) = AcpHarness::pi_cua_launch_dir(None).unwrap();
-
-        assert_ne!(first, second);
-        assert!(first.is_dir());
-        assert!(second.is_dir());
-        assert!(first_guard.is_some());
-        assert!(second_guard.is_some());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(first).unwrap().permissions().mode() & 0o077,
-                0
-            );
-            assert_eq!(
-                std::fs::metadata(second).unwrap().permissions().mode() & 0o077,
-                0
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_cua_reuses_only_a_private_socket_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let bridge_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(bridge_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket = bridge_dir.path().join("bridge.sock");
-        let (launch_dir, guard) = AcpHarness::pi_cua_launch_dir(Some(&socket)).unwrap();
-        assert_eq!(launch_dir, bridge_dir.path());
-        assert!(guard.is_none());
-
-        std::fs::set_permissions(bridge_dir.path(), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        let (fallback_dir, guard) = AcpHarness::pi_cua_launch_dir(Some(&socket)).unwrap();
-        assert_ne!(fallback_dir, bridge_dir.path());
-        assert!(guard.is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_cua_launch_files_do_not_follow_existing_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        let link = dir.path().join("noches-cua.ts");
-        std::fs::write(&target, "untouched").unwrap();
-        symlink(&target, &link).unwrap();
-
-        assert!(AcpHarness::write_private_file(&link, "replacement", false).is_err());
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn pi_cua_windows_wrapper_uses_environment_paths_and_disables_delayed_expansion() {
-        let dir = PathBuf::from(r"C:\Temp\Noches");
-        let real = PathBuf::from(r"C:\Users\100%!\AppData\Roaming\npm\pi.cmd");
-        let extension = dir.join("日本語 100%!-noches-cua.ts");
-        let usage_extension = dir.join("noches-context-usage.ts");
-        let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
-
-        assert_eq!(wrapper, dir.join("pi-with-noches-cua.cmd"));
-        assert!(!executable);
-        assert_eq!(
-            script,
-            concat!(
-                "@echo off\r\n",
-                "setlocal DisableDelayedExpansion\r\n",
-                "if defined NOCHES_PI_MCP_EXTENSION (\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" -e \"%NOCHES_PI_MCP_EXTENSION%\" %*\r\n",
-                ") else (\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
-                ")\r\n",
-            )
-        );
-        assert!(!script.contains(real.to_string_lossy().as_ref()));
-        assert!(!script.contains(extension.to_string_lossy().as_ref()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pi_cua_unix_wrapper_remains_an_executable_shell_launcher() {
-        let dir = PathBuf::from("/tmp/noches-private");
-        let real = PathBuf::from("/opt/pi agent/bin/pi");
-        let extension = dir.join("noches-cua.ts");
-        let usage_extension = dir.join("noches-context-usage.ts");
-        let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
-
-        assert_eq!(wrapper, dir.join("pi-with-noches-cua"));
-        assert!(executable);
-        assert_eq!(
-            script,
-            "#!/bin/sh\nif [ -n \"$NOCHES_PI_MCP_EXTENSION\" ]; then set -- -e \"$NOCHES_PI_MCP_EXTENSION\" \"$@\"; fi\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' -e '/tmp/noches-private/noches-context-usage.ts' \"$@\"\n"
-        );
-    }
-
-    #[test]
-    fn pi_discovery_allows_cold_extension_startup() {
-        let pi = AcpHarness::pi();
-        assert_eq!(pi.model_discovery_timeout, Duration::from_secs(60));
-        assert_eq!(pi.handshake_timeout, Duration::from_secs(120));
-        assert!(pi.spec.prompt_stall.is_none());
-    }
 
     fn all_antigravity_auth_methods() -> Value {
         json!({

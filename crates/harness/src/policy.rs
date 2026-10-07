@@ -26,12 +26,14 @@ pub fn compile(
             "{harness:?} cannot enforce {runtime:?}/{interaction:?}: {detail}"
         ))
     };
-    if harness == HarnessId::Pi
-        && (runtime != RuntimeMode::FullAccess || interaction != InteractionMode::Default)
-    {
-        return Err(unsupported(
-            "pi-acp has no verified blocking policy extension; native Pi RPC is required",
-        ));
+    // Pi enforces Supervised and Auto-accept through its blocking `tool_call`
+    // extension hook (pi/noches-policy.ts), verified against the live RPC
+    // protocol. It has no native Auto classifier and no plan gate.
+    if harness == HarnessId::Pi && runtime == RuntimeMode::Auto {
+        return Err(unsupported("Pi has no native Auto classifier"));
+    }
+    if harness == HarnessId::Pi && interaction != InteractionMode::Default {
+        return Err(unsupported("Pi has no native plan gate"));
     }
     if harness == HarnessId::Grok && runtime == RuntimeMode::AutoAcceptEdits {
         return Err(unsupported(
@@ -277,7 +279,7 @@ mod tests {
                 RuntimeMode::ApprovalRequired,
                 InteractionMode::Default
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             compile(
@@ -453,11 +455,12 @@ mod tests {
         );
     }
     #[test]
-    fn pi_acp_refuses_to_invent_a_blocking_policy_fixture() {
+    fn native_pi_enforces_supervised_and_auto_accept_but_invents_no_classifier_or_plan_gate() {
         for mode in RuntimeMode::ALL {
             assert_eq!(
                 compile(HarnessId::Pi, mode, InteractionMode::Default).is_ok(),
-                mode == RuntimeMode::FullAccess
+                mode != RuntimeMode::Auto,
+                "{mode:?}"
             );
             assert!(compile(HarnessId::Pi, mode, InteractionMode::Plan).is_err());
         }

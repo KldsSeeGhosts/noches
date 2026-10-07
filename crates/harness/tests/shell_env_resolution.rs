@@ -24,7 +24,7 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
     std::fs::create_dir(&shell_bin).unwrap();
     write_executable(&shell_bin.join("devin"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("hermes"), "#!/bin/sh\nexit 0\n");
-    write_executable(&shell_bin.join("pi-acp"), "#!/bin/sh\nexit 0\n");
+    write_executable(&shell_bin.join("pi"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("claude"), "#!/bin/sh\nexit 0\n");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex.sh");
     write_executable(
@@ -59,7 +59,7 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
         std::env::set_var("PATH", "/usr/bin:/bin");
         std::env::remove_var("DEVIN_EXECUTABLE");
         std::env::remove_var("HERMES_EXECUTABLE");
-        std::env::remove_var("PI_ACP_EXECUTABLE");
+        std::env::remove_var("PI_EXECUTABLE");
         std::env::remove_var("CLAUDE_CODE_EXECUTABLE");
         std::env::remove_var("CODEX_EXECUTABLE");
         std::env::remove_var("CPA_API_KEY");
@@ -89,10 +89,10 @@ async fn gui_host_resolves_clis_and_launches_with_shell_provider_credentials() {
         .launch_program()
         .expect("hermes resolves via login-shell PATH");
     assert_eq!(hermes, shell_bin.join("hermes"), "{hermes:?}");
-    let pi = AcpHarness::pi()
-        .launch_program()
-        .expect("pi-acp resolves via login-shell PATH");
-    assert_eq!(pi, shell_bin.join("pi-acp"), "{pi:?}");
+    assert!(
+        zeron_harness::PiHarness::new().installed(),
+        "pi resolves via login-shell PATH"
+    );
 
     // The actual Codex child refuses to start without the shell-only CPA key.
     // Successful skills/model probes prove the shared environment reaches both

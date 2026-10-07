@@ -584,14 +584,16 @@ pub(crate) fn selection_transition(
     }
     match driver {
         // Resume spawns/turns carry `--model`/`--effort`, `turn/start`
-        // model+effort, per-run shim model options, per-prompt model.
-        "claudeAgent" | "codex" | "cursor" | "opencode" => {
+        // model+effort, per-run shim model options, per-prompt model. Pi's
+        // RPC `set_model`/`set_thinking_level` switch the resumed session
+        // before the turn (T3's PiAdapterV2 advertises supportsModelSwitchInSession).
+        "claudeAgent" | "codex" | "cursor" | "opencode" | "pi" => {
             SelectionTransition::ApplyOnNextTurn
         }
         // ACP agents expose no negotiated in-session model switch (T3 rejects it),
         // so only option changes ride along. Antigravity folds effort into the
         // model id, so any change there is a model change and hands off.
-        "grok" | "devin" | "hermes" | "pi" if current.model == target.model => {
+        "grok" | "devin" | "hermes" if current.model == target.model => {
             SelectionTransition::ApplyOnNextTurn
         }
         _ => SelectionTransition::CreateWithHandoff,

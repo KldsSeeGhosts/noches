@@ -182,16 +182,13 @@ fn config_problem(config: &ProviderInstanceConfig) -> Option<String> {
     if object.get("customModels").is_some_and(|v| !v.is_array()) {
         return Some("customModels must be an array.".into());
     }
-    // Never mistake T3's native Pi binary for pi-acp. Transport migration
-    // belongs to the native Pi slice; configured native overrides fail closed.
+    // Pi owns RPC mode and the native session: launch arguments that would
+    // change either are rejected here, not at the first prompt.
     if config.driver.as_ref() == "pi"
-        && (config_string(config, "binaryPath").is_some()
-            || config_string(config, "launchArgs").is_some())
+        && let Some(args) = config_string(config, "launchArgs")
+        && let Err(error) = zeron_harness::PiHarness::validate_launch_args(&tokenize(args))
     {
-        return Some(
-            "Native Pi RPC launch overrides require a native Pi driver; this build uses pi-acp."
-                .into(),
-        );
+        return Some(error);
     }
     if config_string(config, "shadowHomePath").is_some() {
         return Some("Codex auth-overlay shadow homes are not supported by this build; use a private homePath.".into());
@@ -331,7 +328,7 @@ fn executable_key(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "GROK_EXECUTABLE",
         HarnessId::Devin => "DEVIN_EXECUTABLE",
         HarnessId::Hermes => "HERMES_EXECUTABLE",
-        HarnessId::Pi => "PI_ACP_EXECUTABLE",
+        HarnessId::Pi => "PI_EXECUTABLE",
         HarnessId::Antigravity => "ANTIGRAVITY_ACP_EXECUTABLE",
         HarnessId::Opencode => "OPENCODE_EXECUTABLE",
         HarnessId::Mock => "",
@@ -381,7 +378,7 @@ fn build(
         HarnessId::Grok => native!(zeron_harness::AcpHarness::grok()),
         HarnessId::Devin => native!(zeron_harness::AcpHarness::devin()),
         HarnessId::Hermes => native!(zeron_harness::AcpHarness::hermes()),
-        HarnessId::Pi => native!(zeron_harness::AcpHarness::pi()),
+        HarnessId::Pi => native!(zeron_harness::PiHarness::new()),
         HarnessId::Antigravity => native!(zeron_harness::AcpHarness::antigravity()),
         HarnessId::Mock => Arc::new(zeron_harness::mock::MockHarness { script: Vec::new() }),
     }
