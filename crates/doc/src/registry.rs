@@ -1014,7 +1014,10 @@ impl RegistryDoc {
         {
             patch.insert("title".into(), json!(title));
         }
-        if previous.is_none_or(|old| old["archivedAt"] != summary["archivedAt"]) {
+        // The first summary is derived from the chat row (adoption copies its
+        // archive flag), so it carries no archive change: published late it
+        // would undo an unarchive the user made in between.
+        if previous.is_some_and(|old| old["archivedAt"] != summary["archivedAt"]) {
             patch.insert("archived".into(), json!(!summary["archivedAt"].is_null()));
         }
         if previous.is_none_or(|old| old["lastVisitedAt"] != summary["lastVisitedAt"])
