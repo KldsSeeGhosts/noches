@@ -413,6 +413,56 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
 }
 
 #[tokio::test]
+async fn replayed_stdin_lines_are_the_exact_native_input_receipts() {
+    let (controls, steer, _token) = controls("A");
+    let (receipt, flushed) = oneshot::channel();
+    steer
+        .send(SteerMessage {
+            notification_acceptance: Some(receipt),
+            prompt: "redirect".into(),
+            message_id: Some("m-steer".into()),
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:receipts"), controls).await;
+
+    // The local flush answers delivery; only the echo is the native receipt.
+    assert!(flushed.await.expect("flush receipt"));
+    let accepted: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::InputAccepted | AgentEvent::InputAcceptedFor { .. }
+            )
+        })
+        .collect();
+    // Root prompt (uncorrelated) first, then exactly one receipt for the steer:
+    // the duplicate and the unknown-uuid echo accept nothing.
+    assert_eq!(
+        accepted,
+        vec![
+            &AgentEvent::InputAccepted,
+            &AgentEvent::InputAcceptedFor {
+                message_id: "m-steer".into()
+            }
+        ]
+    );
+    // Replays are receipts, never conversation.
+    assert!(!events.iter().any(|e| match e {
+        AgentEvent::UserMessage { .. } => true,
+        AgentEvent::TextDelta { text } => text.contains("REPLAYED"),
+        _ => false,
+    }));
+}
+
+#[test]
+fn claude_retires_steers_only_by_native_receipt() {
+    use zeron_harness::Harness;
+    assert!(harness().confirms_steered_inputs());
+}
+
+#[tokio::test]
 async fn interrupt_escalates_to_sigterm_and_ends_with_interrupted_done() {
     let harness = ClaudeHarness::new()
         .with_executable(fixture_path())

@@ -27,6 +27,15 @@
 //! - Steering: queued [`SteerMessage`]s are written to stdin as user lines at
 //!   any time; the CLI folds them into the running turn at its own step
 //!   boundary.
+//! - RECEIPTS: every stdin user line carries a host-chosen `uuid`, and the CLI
+//!   runs with `--replay-user-messages`, which re-emits a user line on stdout
+//!   (`isReplay`, same `uuid`) when it consumes it. That echo — not the pipe
+//!   write/flush, which only proves the bytes left us — is the exact native
+//!   receipt: it becomes [`AgentEvent::InputAcceptedFor`] for the mailbox
+//!   message (or [`AgentEvent::InputAccepted`] for the initial prompt). The
+//!   flush result still answers `notification_acceptance` (local delivery);
+//!   an echo that never arrives stays unaccepted so the host's recovery owns
+//!   it. Replay frames are never folded into the transcript.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
@@ -165,6 +174,9 @@ impl ClaudeHarness {
             // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            // Echo each consumed stdin user line (same `uuid`) as the native
+            // input receipt.
+            "--replay-user-messages",
             // Newer Claude models emit no readable thinking text unless a
             // summary is asked for (raw reasoning stays provider-private).
             "--thinking-display",
@@ -358,6 +370,11 @@ impl Harness for ClaudeHarness {
     }
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
+    }
+    /// Receipts are the CLI's `--replay-user-messages` echo of the submitted
+    /// `uuid`, so the local `Steered` boundary cannot retire a pending input.
+    fn confirms_steered_inputs(&self) -> bool {
+        true
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[
@@ -567,11 +584,17 @@ impl ClaudeHarness {
         // also ride the prompt text, so a skipped/unreadable file degrades to
         // the old-app behavior (the agent opens the path with its Read tool).
         let images = load_image_blocks(&request.attachments).await;
+        let first_uuid = new_input_uuid();
         let first = wire::user_message_line_with_images(
             &apply_ultrathink(request.reasoning, &request.prompt),
             &images,
+            &first_uuid,
         );
         let _ = stdin_tx.send(StdinMsg::Line(first));
+        // The prompt has no mailbox identity: its echo is the uncorrelated
+        // root-input receipt.
+        let mut pending_inputs = PendingInputs::default();
+        pending_inputs.register(first_uuid, None);
 
         let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
         let session = Session {
@@ -581,6 +604,7 @@ impl ClaudeHarness {
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
             event_tx,
+            pending_inputs,
             controls,
             reasoning: request.reasoning,
             interrupt_grace: self.interrupt_grace,
@@ -687,6 +711,27 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     blocks
 }
 
+fn new_input_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Submitted stdin user lines awaiting their `--replay-user-messages` echo,
+/// keyed by the host-chosen line `uuid`. A line's echo is consumed once: a
+/// duplicate or unknown echo yields nothing, so it can never accept another
+/// message.
+#[derive(Default)]
+struct PendingInputs(std::collections::HashMap<String, Option<String>>);
+
+impl PendingInputs {
+    fn register(&mut self, uuid: String, message_id: Option<String>) {
+        self.0.insert(uuid, message_id);
+    }
+
+    fn accept(&mut self, uuid: &str) -> Option<AgentEvent> {
+        self.0.remove(uuid).map(crate::input_accepted_event)
+    }
+}
+
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
 /// tolerated and logged.
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
@@ -722,6 +767,8 @@ struct Session {
     stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    /// Submitted stdin user lines still waiting for their native echo.
+    pending_inputs: PendingInputs,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
     interrupt_grace: Duration,
@@ -741,6 +788,7 @@ async fn run_session(session: Session) {
         mut stdout_lines,
         stdin_tx,
         event_tx,
+        mut pending_inputs,
         controls,
         reasoning,
         interrupt_grace,
@@ -796,6 +844,21 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
+                    // A replayed stdin line is the CLI's consumption receipt for
+                    // that exact submission, never conversation traffic.
+                    if let Frame::User(user) = &frame
+                        && user.is_replay
+                    {
+                        if let Some(receipt) = user
+                            .uuid
+                            .as_deref()
+                            .and_then(|uuid| pending_inputs.accept(uuid))
+                            && event_tx.send(Ok(receipt)).await.is_err()
+                        {
+                            break 'main;
+                        }
+                        continue;
+                    }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         if event_tx.send(Ok(ev)).await.is_err() {
@@ -819,7 +882,11 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
+                    let uuid = new_input_uuid();
+                    let line = wire::user_message_line(
+                        &apply_ultrathink(reasoning, &msg.prompt),
+                        &uuid,
+                    );
                     let queued = if let Some(receipt) = msg.notification_acceptance {
                         match stdin_tx.send(StdinMsg::Steer { line, receipt }) {
                             Ok(()) => true,
@@ -834,6 +901,11 @@ async fn run_session(session: Session) {
                         stdin_tx.send(StdinMsg::Line(line)).is_ok()
                     };
                     if !queued {continue 'main;}
+                    // Only an identified mailbox message can be retired by its
+                    // echo; an anonymous steer has nothing to acknowledge.
+                    if let Some(message_id) = msg.message_id {
+                        pending_inputs.register(uuid, Some(message_id));
+                    }
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.

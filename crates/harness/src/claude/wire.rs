@@ -86,6 +86,14 @@ pub(crate) struct MessageFrame {
     /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
+    /// Message identity. On a replayed stdin user line this is the `uuid` the
+    /// host submitted, which is how an echo is tied back to one input.
+    #[serde(default)]
+    pub uuid: Option<String>,
+    /// `--replay-user-messages` echo of a stdin user line (set once the CLI
+    /// has consumed it), not new conversation traffic.
+    #[serde(default, rename = "isReplay")]
+    pub is_replay: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -204,13 +212,16 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
     Ok(frame)
 }
 
-/// A stdin user turn: `{"type":"user","message":{...},"parent_tool_use_id":null}`.
-/// Steering = another such line mid-run (consumed at a step boundary).
-pub(crate) fn user_message_line(text: &str) -> String {
+/// A stdin user turn: `{"type":"user","message":{...},"parent_tool_use_id":null,
+/// "uuid":...}`. Steering = another such line mid-run (consumed at a step
+/// boundary). The `uuid` is host-chosen so `--replay-user-messages` can echo
+/// it back as the native consumption receipt for exactly this line.
+pub(crate) fn user_message_line(text: &str, uuid: &str) -> String {
     json!({
         "type": "user",
         "message": { "role": "user", "content": text },
         "parent_tool_use_id": null,
+        "uuid": uuid,
     })
     .to_string()
 }
@@ -227,9 +238,13 @@ pub(crate) struct ImageBlock {
 /// first, then the text — the standard Anthropic image+text message shape
 /// (verified against the real CLI: `--input-format stream-json` accepts image
 /// content blocks in user frames). Empty `images` degrades to the plain line.
-pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -> String {
+pub(crate) fn user_message_line_with_images(
+    text: &str,
+    images: &[ImageBlock],
+    uuid: &str,
+) -> String {
     if images.is_empty() {
-        return user_message_line(text);
+        return user_message_line(text, uuid);
     }
     let mut blocks: Vec<Value> = images
         .iter()
@@ -249,6 +264,7 @@ pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -
         "type": "user",
         "message": { "role": "user", "content": blocks },
         "parent_tool_use_id": null,
+        "uuid": uuid,
     })
     .to_string()
 }
@@ -304,11 +320,29 @@ mod tests {
 
     #[test]
     fn user_line_shape_matches_protocol() {
-        let line = user_message_line("hi");
+        let line = user_message_line("hi", "u-1");
         let v: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(v["uuid"], "u-1");
         assert_eq!(v["type"], "user");
         assert_eq!(v["message"]["content"], "hi");
         assert!(v["parent_tool_use_id"].is_null());
+    }
+
+    #[test]
+    fn replayed_user_frame_carries_the_submitted_uuid() {
+        let echo = r#"{"type":"user","message":{"role":"user","content":"hi"},"session_id":"s","parent_tool_use_id":null,"uuid":"u-1","isReplay":true}"#;
+        match parse_frame(echo).expect("parses") {
+            Frame::User(f) => {
+                assert!(f.is_replay);
+                assert_eq!(f.uuid.as_deref(), Some("u-1"));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        let live = r#"{"type":"user","message":{"content":[]}}"#;
+        match parse_frame(live).expect("parses") {
+            Frame::User(f) => assert!(!f.is_replay && f.uuid.is_none()),
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 
     #[test]
@@ -319,6 +353,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "QUJD".into(),
             }],
+            "u-2",
         );
         let v: Value = serde_json::from_str(&line).expect("json");
         assert_eq!(v["type"], "user");
@@ -332,8 +367,8 @@ mod tests {
         assert_eq!(content[1]["text"], "what is this?");
         // No images ⇒ identical to the plain string line.
         assert_eq!(
-            user_message_line_with_images("hi", &[]),
-            user_message_line("hi")
+            user_message_line_with_images("hi", &[], "u-3"),
+            user_message_line("hi", "u-3")
         );
     }
 }

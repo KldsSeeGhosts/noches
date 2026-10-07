@@ -126,6 +126,25 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer"}'
   ;;
 
+*scenario:receipts*)
+  # --replay-user-messages: the CLI echoes each stdin user line (same uuid,
+  # isReplay) once it has consumed it. The prompt echo precedes any output; the
+  # steer echo follows its line; a duplicate and an unknown-uuid echo must be
+  # ignored, and the replay text must never reach the transcript.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-receipts\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  case "$*" in *--replay-user-messages*) ;; *) exit 1 ;; esac
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-receipts"}'
+  echo_user "$(uuid_of "$first")"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
+  read -r steer || exit 1
+  echo_user "unknown-uuid"
+  sid=$(uuid_of "$steer")
+  echo_user "$sid"
+  echo_user "$sid"
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-receipts"}'
+  ;;
+
 *scenario:interrupt*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-int"}'
   # Wedge without reading stdin — forces the SIGTERM escalation path.
