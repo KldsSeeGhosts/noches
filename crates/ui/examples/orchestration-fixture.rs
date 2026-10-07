@@ -29,7 +29,7 @@ impl Harness for FixtureHarness {
         "Fixture"
     }
     fn supports_steering(&self) -> bool {
-        false
+        true
     }
     fn steering_mode(&self) -> zeron_proto::SteeringMode {
         zeron_proto::SteeringMode::TurnBoundary
@@ -55,6 +55,38 @@ impl Harness for FixtureHarness {
         _: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let native = uuid::Uuid::new_v4().to_string();
+        if request
+            .prompt
+            .ends_with("Leave native background work running after this reply.")
+        {
+            return Ok(stream::iter([
+                Ok(AgentEvent::SessionStarted {
+                    instance_id: None,
+                    session_id: native.clone(),
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    cwd: request.cwd,
+                    tools: vec![],
+                    assistant_message_id: uuid::Uuid::new_v4().to_string(),
+                }),
+                Ok(AgentEvent::InputAccepted),
+                Ok(AgentEvent::TextDelta {
+                    text: "The main reply is complete. Stop remains available while the native background work runs.".into(),
+                }),
+                Ok(AgentEvent::Subagent {
+                    parent_tool_use_id: "native-background".into(),
+                    event: Box::new(AgentEvent::TextDelta {
+                        text: "A native child is still working after the main reply.".into(),
+                    }),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: Some("The main reply is complete. Stop remains available while the native background work runs.".into()),
+                    error: None,
+                    session_id: Some(native),
+                }),
+            ]).chain(stream::pending()).boxed());
+        }
         if request
             .prompt
             .ends_with("Hold this response while I arrange the queue.")
@@ -281,6 +313,12 @@ fn main() -> anyhow::Result<()> {
                 "runtimeMode":"full-access", "interactionMode":"default"}
         })).await?;
         core.workspace.rename_chat("fixture-queue", "Arrange queued work")?;
+        client.call(methods::MUTATE, json!({
+            "op":"createChat", "chatId":"fixture-background", "spaceId":"fixture-project", "cwd":checkout,
+            "config":{"harness":"mock", "model":"mock-1", "reasoning":null, "sandbox":"workspace-write",
+                "runtimeMode":"full-access", "interactionMode":"default"}
+        })).await?;
+        core.workspace.rename_chat("fixture-background", "Stop native background work")?;
         send(&core, "fixture-parent", "initial", "Review how conversation forks and agent handoffs preserve context.").await
     })?;
     // Keep the actual listener through server startup: dropping a port probe
@@ -473,13 +511,67 @@ fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(!model.session_busy && !model.session_retry && model.attached_provider_sessions.is_empty(),
                     "The disconnect UI retained an attachment or uncertain retry");
                 capture(window.into(), cx, &output, &format!("disconnected-{mode}"))?;
+                let background_core = renderer_core.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    send(&background_core, "fixture-background", "background",
+                        "Leave native background work running after this reply.").await
+                }).await??;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_open("fixture-background".into(), cx))?;
+                let mut loaded = false;
+                for _ in 0..100 {
+                    pause(cx, 100).await;
+                    loaded = state.read_with(cx, |state, _| state.fixture_background_pending("fixture-background"));
+                    if loaded { break; }
+                }
+                anyhow::ensure!(loaded, "Completed-root background Stop did not load");
+                let before = renderer_core.orchestration.store.thread(&"fixture-background".into())?.unwrap();
+                anyhow::ensure!(before.runs[0].status == OrchestrationV2RunStatus::Completed,
+                    "Background fixture must finish its root before Stop");
+                anyhow::ensure!(renderer_core.sessions.has_live_runtime("fixture-background"),
+                    "Background fixture must retain the exact native process");
+                pause(cx, 300).await;
+                capture(window.into(), cx, &output, &format!("background-stop-ready-{mode}"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_stop_background(cx))?;
+                let background_core = renderer_core.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let p = background_core.orchestration.store.thread(&"fixture-background".into())?.unwrap();
+                            if !background_core.sessions.has_live_runtime("fixture-background")
+                                && p.records.get("subagent")
+                                    .is_some_and(|tasks| !tasks.is_empty()
+                                        && tasks.iter().all(|task| task["status"] == "interrupted")) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }).await??;
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                for _ in 0..100 {
+                    if !state.read_with(cx, |state, _| state.fixture_background_pending("fixture-background")) {
+                        break;
+                    }
+                    pause(cx, 100).await;
+                }
+                let after = renderer_core.orchestration.store.thread(&"fixture-background".into())?.unwrap();
+                anyhow::ensure!(after.runs[0].status == OrchestrationV2RunStatus::Completed
+                    && before.runs[0].completed_at == after.runs[0].completed_at
+                    && before.attempts == after.attempts,
+                    "Background Stop rewrote the completed foreground result");
+                anyhow::ensure!(!state.read_with(cx, |state, _| state.fixture_background_pending("fixture-background")),
+                    "Stopped background work retained the composer Stop control; host background run: {:?}",
+                    renderer_core.orchestration.store.queue_ui_state(&"fixture-background".into())?.background_run_id);
+                capture(window.into(), cx, &output, &format!("background-stopped-{mode}"))?;
                 anyhow::ensure!(std::fs::read_to_string(checkout.join("README.md"))? == "# Fixture checkout\n",
                     "A conversation transfer changed working files");
                 std::fs::write(output.join(format!("result-{mode}.txt")),
                     format!("PASS ({mode}): production UI fork/merge handlers and RPCs; idle fork; \
                         inherited lineage/text; continued fork; context-only merge; native GPUI \
                         regular/narrow render; live mixed document/canonical queue; composer text edit; \
-                        reorder and cancel; owner-fenced session disconnect through production handlers. \
+                        reorder and cancel; owner-fenced session disconnect; completed-root native background Stop \
+                        through production composer/RPC/kernel/runtime handlers, preserving the completed reply. \
                         Mock provider only; no live-provider or physical-device claims.\n"))?;
                 Ok(())
             }.await;

@@ -6179,7 +6179,7 @@ impl Composer {
                 matches!(
                     state.indicator_for(chat_id, now),
                     Indicator::Working | Indicator::AwaitingInput
-                )
+                ) || state.native_background_pending(chat_id)
             });
             // `target_queue` is this composer's own projection - selected or
             // pane-fixed - so removal markers verify against its rows without
@@ -6391,6 +6391,14 @@ impl Composer {
                 self.staged().len() + self.staged_appshots().len(),
                 self.staged_comments(cx).len(),
             );
+        if !has_text
+            && self
+                .target
+                .chat_id(self.state.read(cx))
+                .is_some_and(|id| self.state.read(cx).native_background_pending(id))
+        {
+            return SendButtonMode::Stop;
+        }
         follow_up_mode(
             send_button_mode(self.run_live(cx), has_text),
             crate::settings::current(cx).follow_up_behavior,
@@ -7197,6 +7205,16 @@ impl Composer {
             return;
         };
         self.interrupt_chat(chat_id, cx);
+    }
+
+    #[cfg(feature = "orchestration-fixture")]
+    pub(crate) fn fixture_stop_background(&mut self, cx: &mut Context<Self>) {
+        assert!(
+            !self.run_live(cx),
+            "fixture must stop an already-settled root"
+        );
+        assert_eq!(self.button_mode(cx), SendButtonMode::Stop);
+        self.interrupt_selected(cx);
     }
 
     pub(crate) fn interrupt_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -9322,6 +9340,51 @@ mod tests {
                 composer.send_blocked(cx),
                 "Pending edits must still block submission"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn settled_background_offers_stop_without_turning_new_input_into_queue(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("background".into());
+            state.canonical_queues.insert(
+                "background".into(),
+                zeron_proto::QueueUiState {
+                    thread_id: "background".into(),
+                    background_run_id: Some("completed-run".into()),
+                    ..Default::default()
+                },
+            );
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            assert!(!composer.run_live(cx));
+            assert_eq!(composer.button_mode(cx), SendButtonMode::Stop);
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("New turn", cx));
+            assert_eq!(composer.button_mode(cx), SendButtonMode::Send);
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("", cx));
+            composer.interrupting.insert("background".into());
+            composer.on_state_changed(cx);
+            assert!(composer.is_interrupting("background"));
+        });
+        state.update(cx, |state, _| {
+            state
+                .canonical_queues
+                .get_mut("background")
+                .unwrap()
+                .background_run_id = None;
+        });
+        composer.update(cx, |composer, cx| {
+            composer.on_state_changed(cx);
+            assert_eq!(composer.button_mode(cx), SendButtonMode::Send);
+            assert!(!composer.is_interrupting("background"));
         });
     }
 

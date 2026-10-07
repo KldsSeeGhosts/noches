@@ -2080,7 +2080,16 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     // Interrupt while blocked: settles promptly (well under the 3s grace —
     // the unparked resolver lets the harness wind down on its own).
     let start = std::time::Instant::now();
-    core.sessions.interrupt(CHAT).await.unwrap();
+    // Exercise the user's actual Stop boundary, including canonical
+    // admission before any provider session/turn has been reported.
+    core.doc_host
+        .queue_command(CHAT, zeron_doc::SessionCommandPayload::Interrupt {})
+        .unwrap();
+    wait_for(
+        || !core.sessions.has_live_runtime(CHAT),
+        "early-question user Stop",
+    )
+    .await;
     assert!(
         start.elapsed() < std::time::Duration::from_secs(3),
         "interrupt settled via the unparked resolver, not the grace timeout"

@@ -566,6 +566,7 @@ struct HeldHarness {
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
     park_after_done: bool,
+    native_background: bool,
     steering_receipt: Arc<Mutex<Option<bool>>>,
 }
 
@@ -589,6 +590,7 @@ impl HeldHarness {
                 requests: Mutex::new(Vec::new()),
                 asks,
                 park_after_done: false,
+                native_background: false,
                 steering_receipt: Arc::new(Mutex::new(Some(true))),
             }),
             prompts,
@@ -639,7 +641,7 @@ impl Harness for HeldHarness {
         }
         let mut steering = controls.steering;
         let steering_receipt = self.steering_receipt.clone();
-        let started = futures::stream::iter(vec![
+        let mut opening = vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
                 harness: HarnessId::Mock,
@@ -650,14 +652,26 @@ impl Harness for HeldHarness {
                 assistant_message_id: format!("a-{}", request.prompt),
             }),
             Ok(AgentEvent::InputAccepted),
-        ]);
+        ];
+        if self.native_background {
+            opening.push(Ok(AgentEvent::Subagent {
+                parent_tool_use_id: "background-child".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "Working in background".into(),
+                }),
+            }));
+        }
+        let started = futures::stream::iter(opening);
+        let result = self
+            .native_background
+            .then(|| "Finished main reply".to_owned());
         let done = futures::stream::once(async move {
             loop {
                 tokio::select! {
                     _ = finish.recv() => {
                         return Ok(AgentEvent::Done {
                             status: DoneStatus::Completed,
-                            result: None,
+                            result: result.clone(),
                             error: None,
                             session_id: Some("sess-queue".into()),
                         });
@@ -672,7 +686,7 @@ impl Harness for HeldHarness {
                         } else {
                             return Ok(AgentEvent::Done {
                                 status: DoneStatus::Completed,
-                                result: None,
+                                result: result.clone(),
                                 error: None,
                                 session_id: Some("sess-queue".into()),
                             });
@@ -1628,6 +1642,187 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
     .await;
     let _ = harness.finish.send(());
     core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_stop_reaches_completed_native_background_and_holds_queue_without_agent_credentials() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    fn records<'a>(
+        p: &'a zeron_engine::orchestration::projection::ThreadProjection,
+        kind: &str,
+    ) -> &'a [serde_json::Value] {
+        p.records.get(kind).map(Vec::as_slice).unwrap_or_default()
+    }
+    for parked in [false, true] {
+        let (mut harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let fixture = Arc::get_mut(&mut harness).unwrap();
+        fixture.park_after_done = parked;
+        fixture.native_background = true;
+        let (core, harness, prompts) = setup_with((harness, prompts)).await;
+        core.doc_host
+            .queue_message(CHAT, "opening with background", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        let run_id = original.runs[0].id.clone();
+        let queued_id = core
+            .doc_host
+            .queue_message(CHAT, "held follow-up", vec![])
+            .unwrap();
+        let BeginQueueEditOutcome::Acquired {
+            lease_id,
+            base_text_hash,
+            ..
+        } = core
+            .doc_host
+            .begin_queued_message_edit(CHAT, &queued_id, "desktop", "editor")
+            .await
+            .unwrap()
+        else {
+            panic!("fixture queue edit must be acquired");
+        };
+        let _ = harness.finish.send(());
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .queue_ui_state(&CHAT.into())
+                    .is_ok_and(|s| {
+                        s.background_run_id.as_ref() == Some(&run_id.0) && s.active_run_id.is_none()
+                    })
+                    && !core.sessions.turn_in_flight(CHAT)
+            },
+            "completed root with pending native work",
+        )
+        .await;
+        if parked {
+            assert!(
+                core.sessions.has_live_runtime(CHAT),
+                "must exercise a settled live process"
+            );
+        } else {
+            wait_for(
+                || !core.sessions.has_live_runtime(CHAT),
+                "already dead native process",
+            )
+            .await;
+        }
+        let before = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+        let transcript_before = core
+            .doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        client
+            .call(
+                zeron_rpc::methods::QUEUE_COMMAND,
+                serde_json::json!({
+                    "chatId":CHAT,"command":{"kind":"interrupt"}
+                }),
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || {
+                !core.sessions.has_live_runtime(CHAT)
+                    && core
+                        .orchestration
+                        .store
+                        .thread(&CHAT.into())
+                        .unwrap()
+                        .is_some_and(|p| {
+                            records(&p, "subagent").iter().any(|task| {
+                                task["origin"] == "provider_native"
+                                    && task["status"] == "interrupted"
+                            })
+                        })
+            },
+            "exact background Stop and durable settlement",
+        )
+        .await;
+        let after = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Completed);
+        assert_eq!(after.runs[0].completed_at, before.runs[0].completed_at);
+        assert_eq!(after.attempts[0], before.attempts[0]);
+        assert_eq!(
+            core.doc_host
+                .open(CHAT)
+                .unwrap()
+                .doc()
+                .read_entries()
+                .unwrap(),
+            transcript_before,
+            "background Stop must preserve the ordinary completed transcript too"
+        );
+        assert_eq!(
+            records(&after, "message")
+                .iter()
+                .find(|m| m["role"] == "assistant"),
+            records(&before, "message")
+                .iter()
+                .find(|m| m["role"] == "assistant")
+        );
+        assert!(
+            core.orchestration
+                .store
+                .queue_ui_state(&CHAT.into())
+                .unwrap()
+                .background_run_id
+                .is_none()
+        );
+        assert!(matches!(
+            core.doc_host
+                .finish_queued_message_edit(
+                    CHAT,
+                    &queued_id,
+                    &lease_id,
+                    FinishQueueEditAction::Commit,
+                    Some("edited held follow-up"),
+                    Some(&base_text_hash),
+                )
+                .await
+                .unwrap(),
+            FinishQueueEditOutcome::Committed
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(queue_texts(&core), vec!["edited held follow-up"]);
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "Stop cannot release a queued inference"
+        );
+        assert!(core.orchestration.store.verify_projections().unwrap());
+        core.doc_host
+            .send_queued_now(CHAT, &queued_id)
+            .await
+            .unwrap();
+        wait_for(
+            || {
+                prompts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "edited held follow-up")
+            },
+            "explicit next send after background Stop",
+        )
+        .await;
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
 }
 
 /// A `Steer` command asks for the running turn directly — a client that decided

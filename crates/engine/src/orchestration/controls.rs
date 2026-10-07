@@ -11,6 +11,54 @@ use super::{
     task::records,
 };
 
+pub(crate) async fn interrupt_for_user(
+    bridge: &super::runner::RunnerBridge,
+    thread: &ThreadId,
+    command_id: &str,
+) -> Result<Option<bool>> {
+    let _guards = bridge.kernel.locks.acquire([thread.clone()]).await;
+    let id = CommandId(format!(
+        "command:user-stop:{}:{}",
+        super::event::encode_component(&thread.0),
+        super::event::encode_component(command_id)
+    ));
+    if let Some(receipt) = bridge.kernel.store.receipt(&id)? {
+        return if receipt.status == super::ReceiptStatus::Accepted {
+            Ok(Some(true))
+        } else {
+            Err(super::Error::Invariant(receipt.error.unwrap_or_default()))
+        };
+    }
+    let Some(p) = bridge.kernel.store.thread(thread)? else {
+        return Ok(None);
+    };
+    if p.thread.deleted_at.is_some() || p.thread.archived_at.is_some() {
+        return Err(super::Error::Invariant(
+            "Thread is not interruptible.".into(),
+        ));
+    }
+    let Some(run) = super::background::interruptible_run(&p) else {
+        return Ok(Some(false));
+    };
+    let receipt = bridge.kernel.store.dispatch(
+        &super::Command {
+            id,
+            thread_id: thread.clone(),
+            operation: super::Operation::Thread(Box::new(
+                super::threads::planner::ThreadOperation::Interrupt {
+                    run_id: run.id.clone(),
+                    reason: None,
+                },
+            )),
+        },
+        crate::now_ms(),
+    )?;
+    if receipt.status == super::ReceiptStatus::Rejected {
+        return Err(super::Error::Invariant(receipt.error.unwrap_or_default()));
+    }
+    Ok(Some(true))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlTarget {
     runtime: RuntimeTarget,
@@ -186,7 +234,13 @@ pub(crate) fn plan_settlement(
         },
         None,
         now,
-    )
+    )?;
+    let run = p
+        .runs
+        .iter()
+        .find(|r| r.id == saved.runtime.run_id)
+        .unwrap();
+    super::background::settle(p, command, plan, run, effect_id, now)
 }
 
 pub(crate) async fn execute(
@@ -298,27 +352,42 @@ pub(crate) async fn execute(
     if !same_runtime || !still_targeted {
         return Ok(EffectOutcome::Succeeded);
     }
-    drop(guards);
     if matches!(effect.request, EffectRequest::ProviderTurnRestart { .. }) {
+        drop(guards);
         // start() refuses a busy replacement; its run/attempt admission also
         // prevents a late control from reopening an already-started attempt.
         return bridge.start(effect, &run.id, cancellation).await;
     }
     // Prefer the observer's native terminal result; synthesize only if the
     // exact attempt still needs settlement after its process has retired.
+    // Hold the runtime map empty across the synchronous repair transaction.
+    // An unbound ordinary-session replacement is fenced too, even if it has
+    // not updated the durable canonical runtime binding yet.
     bridge
-        .kernel
-        .task_command(
-            &effect.thread_id,
-            CommandId(format!(
-                "command:control-settlement:{}",
-                super::event::encode_component(&effect.id)
-            )),
-            super::task::TaskOperation::ControlSettlement {
-                effect_id: effect.id.clone(),
-            },
-        )
-        .await?;
+        .sessions
+        .with_retired_runtime(&effect.thread_id.0, || {
+            let receipt = bridge.kernel.store.dispatch(
+                &super::Command {
+                    id: CommandId(format!(
+                        "command:control-settlement:{}",
+                        super::event::encode_component(&effect.id)
+                    )),
+                    thread_id: effect.thread_id.clone(),
+                    operation: super::Operation::Task(Box::new(
+                        super::task::TaskOperation::ControlSettlement {
+                            effect_id: effect.id.clone(),
+                        },
+                    )),
+                },
+                crate::now_ms(),
+            )?;
+            if receipt.status == super::ReceiptStatus::Rejected {
+                return Err(super::Error::Invariant(receipt.error.unwrap_or_default()));
+            }
+            Ok(())
+        })
+        .transpose()?;
+    drop(guards);
     bridge.settle(&effect.thread_id, &run).await?;
     Ok(EffectOutcome::Succeeded)
 }

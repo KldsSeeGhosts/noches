@@ -935,6 +935,11 @@ pub(crate) fn plan_event(
     {
         return Ok(());
     }
+    if matches!(event, AgentEvent::Subagent { .. })
+        && super::background::was_stopped(projection, run)
+    {
+        return Ok(());
+    }
     let selected_model = run.model_selection.model.clone();
     let queued_input = run.queue_position.as_ref().is_some();
     let mut run = serde_json::to_value(run)?;

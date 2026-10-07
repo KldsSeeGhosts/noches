@@ -2995,6 +2995,12 @@ impl AppState {
         }
     }
 
+    pub(crate) fn native_background_pending(&self, chat_id: &str) -> bool {
+        self.canonical_queues
+            .get(chat_id)
+            .is_some_and(|queue| queue.background_run_id.is_some())
+    }
+
     /// Select a project; the caller (shell) decides which chat to land on.
     /// `Some` clears a "Don't work in a project" opt-out and re-aims the
     /// device pick at the project's host; `None` IS that opt-out.
@@ -6078,6 +6084,10 @@ impl AppState {
 
 #[cfg(feature = "orchestration-fixture")]
 impl AppState {
+    pub fn fixture_background_pending(&self, chat_id: &str) -> bool {
+        self.native_background_pending(chat_id)
+    }
+
     /// Use the production subscription/reducer for active composer and sidebar
     /// status; static fixture rows must not pretend a held provider is idle.
     pub fn fixture_watch_sessions(&mut self, cx: &mut Context<Self>) {

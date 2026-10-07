@@ -220,6 +220,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
         pending_questions,
         lifecycle,
         active_run_id: task::active_run(&p).map(|run| run.id.0.clone()),
+        background_run_id: super::background::settled_run(&p).map(|run| run.id.0.clone()),
         can_promote_to_steer: queue::can_promote_to_steer(&p),
     })
 }

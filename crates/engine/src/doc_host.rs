@@ -563,6 +563,7 @@ impl PartialEq for QueueSnapshot {
                         && a.pending_questions == b.pending_questions
                         && a.lifecycle == b.lifecycle
                         && a.active_run_id == b.active_run_id
+                        && a.background_run_id == b.background_run_id
                         && a.can_promote_to_steer == b.can_promote_to_steer
                 }
                 _ => false,
@@ -684,6 +685,12 @@ mod queue_snapshot_tests {
         next = first.clone();
         next.canonical.as_mut().unwrap().can_promote_to_steer = true;
         assert!(first != next);
+        next = first.clone();
+        next.canonical.as_mut().unwrap().background_run_id = Some("completed".into());
+        assert!(first != next, "background Stop availability must publish");
+        let mut cleared = next.clone();
+        cleared.canonical.as_mut().unwrap().background_run_id = None;
+        assert!(next != cleared, "background Stop clearance must publish");
     }
 }
 
@@ -4368,20 +4375,31 @@ impl DocHost {
         &self,
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
+        command_id: &str,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
-        if !sessions.turn_in_flight(&handle.chat_id) {
-            return Ok(false);
-        }
-        handle.queue_paused.store(true, Ordering::Release);
-        match sessions.interrupt(&handle.chat_id).await {
+        self.prepare_orchestration_queue(handle).await?;
+        let previously_paused = handle.queue_paused.swap(true, Ordering::AcqRel);
+        let outcome = match sessions.interrupt_owned(&handle.chat_id, command_id).await {
+            Ok(Some(stopped)) => Ok(stopped),
+            Ok(None) if sessions.turn_in_flight(&handle.chat_id) => {
+                sessions.interrupt(&handle.chat_id).await
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(true) => Ok(true),
             Ok(false) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle
+                    .queue_paused
+                    .store(previously_paused, Ordering::Release);
                 Ok(false)
             }
             Err(err) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle
+                    .queue_paused
+                    .store(previously_paused, Ordering::Release);
                 Err(err)
             }
         }
@@ -5555,7 +5573,8 @@ impl DocHost {
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
-                self.interrupt_and_pause_queue(sessions, handle).await?;
+                self.interrupt_and_pause_queue(sessions, handle, &entry.id)
+                    .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondPermission {

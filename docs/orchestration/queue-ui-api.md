@@ -63,6 +63,9 @@ keep the rendered order and `sidebar_visible_order` in sync.
 {
   "threadId": "chat",
   "version": 42,
+  "activeRunId": "run:chat:1",
+  "backgroundRunId": null,
+  "canPromoteToSteer": false,
   "queue": [{
     "queuedRunId": "run:chat:2",
     "messageId": "queued-user-message",
@@ -97,6 +100,20 @@ objects; `attachmentPaths` retains Noches uploads without changing T3 schemas.
 Pending questions exclude approvals; `responseType=not_resumable` remains
 readable but `answerable=false`. Reads never acknowledge tasks, answer questions,
 approve permissions, deliver messages, or execute on replicas.
+
+`backgroundRunId` is an additive, nullable hint for the latest non-queued
+finished root with pending native work. Older documents default it to null.
+It is distinct from `activeRunId`: an empty composer offers **Stop**, but typing
+a new message still uses normal new-turn delivery. The optional Escape shortcut
+shares that availability. Background-only transitions participate in the queue
+watch's equality check; unrelated sequence advances still do not repaint it.
+
+The existing user `QueueCommand {chatId, command:{kind:"interrupt"}}` routes
+through owning-host canonical admission. It needs no agent credential, holds
+the queue, and pins the exact run/attempt/root/process. Background settlement
+preserves completed output, ends native work through that run's ordinal, and
+excludes independently owned delegated tasks, persistent monitors, rolled-back
+work and later runs. No background-only effect may cancel a replacement process.
 
 ## Merge seams and validation scope
 

@@ -1453,6 +1453,40 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
+    /// User Stop uses host authority, never a fabricated agent credential.
+    /// The durable session-command identity keeps retries on their first
+    /// admitted target. None denotes a legacy session without kernel ownership.
+    pub(crate) async fn interrupt_owned(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+    ) -> Result<Option<bool>, EngineError> {
+        let runner = lock(&self.inner.orchestration_runner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let Some(runner) = runner else {
+            return Ok(None);
+        };
+        self.refuse_readonly_child(chat_id)?;
+        crate::orchestration::controls::interrupt_for_user(&runner, &chat_id.into(), command_id)
+            .await
+            .map_err(|error| EngineError::Other(error.to_string()))
+    }
+
+    /// No replacement, including an unbound warm runtime, may inherit a
+    /// retired process's projection cleanup. The callback is synchronous.
+    pub(crate) fn with_retired_runtime<T>(
+        &self,
+        chat_id: &str,
+        settle: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let runs = lock(&self.inner.runs);
+        if runs.contains_key(chat_id) {
+            return None;
+        }
+        Some(settle())
+    }
+
     /// Interrupt the live run, if any. The run settles with a synthetic
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
@@ -4418,6 +4452,18 @@ mod tests {
                 "a stale control cannot cancel the live process"
             );
         }
+        let mut repaired = false;
+        assert!(
+            core.sessions
+                .with_retired_runtime("control-target", || {
+                    repaired = true;
+                })
+                .is_none()
+        );
+        assert!(
+            !repaired,
+            "a live replacement must fence projection cleanup"
+        );
         assert_eq!(
             core.sessions
                 .request_canonical_interrupt("control-target", &original),
@@ -4434,6 +4480,14 @@ mod tests {
                 .request_canonical_interrupt("control-target", &original),
             CanonicalInterruptOutcome::Missing
         );
+        assert!(
+            core.sessions
+                .with_retired_runtime("control-target", || {
+                    repaired = true;
+                })
+                .is_some()
+        );
+        assert!(repaired, "retired runtime cleanup must remain usable");
         core.shutdown().await;
     }
 

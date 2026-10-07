@@ -624,10 +624,8 @@ pub(crate) fn plan(
             }
         }
         ThreadOperation::Interrupt { run_id, reason } => {
-            let run = projection
-                .runs
-                .iter()
-                .find(|r| &r.id == run_id && !run_terminal(&r.status))
+            let run = crate::orchestration::background::interruptible_run(&projection)
+                .filter(|r| &r.id == run_id)
                 .ok_or_else(|| unsupported(command, "No interruptible run"))?;
             if !projection
                 .nodes
@@ -653,7 +651,7 @@ pub(crate) fn plan(
                 run.active_attempt_id
                     .as_ref()
                     .is_some_and(|id| t["runAttemptId"] == id.0)
-                    && t["status"] == "running"
+                    && (t["status"] == "running" || run_terminal(&run.status))
             });
             let item = json!({"id":format!("turn-item:{}:interrupt-request",encode_component(&run.id.0)),
                 "type":"run_interrupt_request","threadId":projection.thread.id,"runId":run.id,"nodeId":run.root_node_id,
@@ -670,10 +668,36 @@ pub(crate) fn plan(
                     OrchestrationV2RunStatus::Preparing
                         | OrchestrationV2RunStatus::Starting
                         | OrchestrationV2RunStatus::Running
+                        | OrchestrationV2RunStatus::Waiting
                 )
             {
-                // T3 records this terminality synchronously; no provider exists
-                // to interrupt, and cancelled starts may never be replayed.
+                // No accepted native turn exists, so terminalize synchronously.
+                // A process can nevertheless be parked on an early callback;
+                // retire that exact admission without inventing a native turn.
+                let provider = records(&projection, "provider-thread")
+                    .iter()
+                    .find(|provider| {
+                        Some(provider["id"].as_str().unwrap_or_default())
+                            == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                    })
+                    .unwrap();
+                crate::orchestration::queue::runtime::observe(
+                    &projection,
+                    command,
+                    &mut plan,
+                    &run.id,
+                    provider,
+                    &zeron_proto::AgentEvent::Done {
+                        status: zeron_proto::DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    now,
+                )?;
+                plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                    run_id: run.id.clone(),
+                });
                 let mut next = serde_json::to_value(run)?;
                 next["status"] = json!("interrupted");
                 next["completedAt"] = json!(iso(now)?);
@@ -720,6 +744,12 @@ pub(crate) fn plan(
                 result["title"] = json!("Interrupted");
                 result["message"] = json!("Run interrupted before provider start");
                 plan.emit(command, "turn-item.updated", &result, now)?;
+            } else if !has_turn && run_terminal(&run.status) {
+                // A failed/settled root may have no accepted provider turn.
+                // Keep exact attempt/process admission even for local repair.
+                plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                    run_id: run.id.clone(),
+                });
             } else {
                 let turn =
                     turn.ok_or_else(|| unsupported(command, "No running turn to interrupt"))?;
@@ -727,21 +757,26 @@ pub(crate) fn plan(
                     .iter()
                     .find(|p| p["id"] == turn["providerThreadId"])
                     .ok_or_else(|| unsupported(command, "Missing provider thread"))?;
-                let session_id = provider["providerSessionId"]
-                    .as_str()
-                    .ok_or_else(|| unsupported(command, "Missing provider session"))?;
-                let session = records(&projection, "provider-session")
-                    .iter()
-                    .find(|s| s["id"] == session_id)
-                    .ok_or_else(|| unsupported(command, "Inactive provider session"))?;
-                if session["capabilities"]["turns"]["supportsInterrupt"] != true {
-                    return Err(unsupported(command, "Provider cannot interrupt"));
+                if let Some(session_id) = provider["providerSessionId"].as_str() {
+                    let session = records(&projection, "provider-session")
+                        .iter()
+                        .find(|s| s["id"] == session_id)
+                        .ok_or_else(|| unsupported(command, "Inactive provider session"))?;
+                    if session["capabilities"]["turns"]["supportsInterrupt"] != true {
+                        return Err(unsupported(command, "Provider cannot interrupt"));
+                    }
+                    plan.effects.push(EffectRequest::ProviderTurnInterrupt {
+                        provider_session_id: session_id.into(),
+                        provider_thread_id: turn["providerThreadId"].as_str().unwrap().into(),
+                        provider_turn_id: turn["id"].as_str().unwrap().into(),
+                    });
+                } else {
+                    // Real output can precede attachment metadata too. The
+                    // host's physical runtime fence still permits user Stop.
+                    plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                        run_id: run.id.clone(),
+                    });
                 }
-                plan.effects.push(EffectRequest::ProviderTurnInterrupt {
-                    provider_session_id: session_id.into(),
-                    provider_thread_id: turn["providerThreadId"].as_str().unwrap().into(),
-                    provider_turn_id: turn["id"].as_str().unwrap().into(),
-                });
             }
         }
     }

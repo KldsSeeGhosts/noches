@@ -2422,6 +2422,491 @@ async fn control_settlement_is_transactionally_fenced_against_process_replacemen
     }
 }
 
+fn completed_with_native_background(f: &Fixture) {
+    f.running(false);
+    finish_root_with_native_background(f);
+}
+
+fn finish_root_with_native_background(f: &Fixture) {
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Subagent {
+            parent_tool_use_id: "native-child".into(),
+            event: Box::new(zeron_proto::AgentEvent::TextDelta {
+                text: "still working".into(),
+            }),
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["pendingBackgroundTasks"] =
+        json!([{"taskId":"shell","kind":"command","description":"dev server"}]);
+    f.emit("parent", "provider-thread.updated", provider);
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: Some("Finished main reply".into()),
+            error: None,
+            session_id: None,
+        },
+    );
+}
+
+async fn stop_background(f: &Fixture) -> crate::orchestration::effects::Effect {
+    let result = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"background-stop"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        OrchestratorMcpThreadInterruptResultStatus::InterruptRequested
+    );
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.request,
+                crate::orchestration::effects::EffectRequest::ProviderTurnInterrupt { .. }
+            )
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn settled_root_stop_preserves_reply_holds_queue_and_repairs_only_bounded_native_work() {
+    use crate::orchestration::task::TaskOperation;
+    let f = Fixture::new();
+    f.running(false);
+    let queued = f
+        .send(json!({"threadId":"parent","message":"held next turn","mode":"queue"}))
+        .await;
+    finish_root_with_native_background(&f);
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let run = &before.runs[0];
+    let provider = records(&before, "provider-thread")[0]["id"].clone();
+    let turn = records(&before, "provider-turn")[0]["id"].clone();
+    let mut delegated = records(&before, "subagent")[0].clone();
+    delegated["id"] = json!("delegated");
+    delegated["origin"] = json!("app_owned");
+    delegated["childThreadId"] = json!("independent-child");
+    f.emit("parent", "subagent.updated", delegated);
+    // Canonical queued runs have later ordinals but do not own the Stop.
+    for (id, kind, input, origin, owner) in [
+        (
+            "old-shell",
+            "command_execution",
+            json!("serve"),
+            Value::Null,
+            json!(run.id),
+        ),
+        (
+            "runless-tool",
+            "dynamic_tool",
+            json!({}),
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            "persistent-monitor",
+            "dynamic_tool",
+            json!({"persistent":true}),
+            Value::Null,
+            json!(run.id),
+        ),
+        (
+            "delegated-item",
+            "subagent",
+            Value::Null,
+            json!("app_owned"),
+            json!(run.id),
+        ),
+        (
+            "later-shell",
+            "command_execution",
+            json!("later"),
+            Value::Null,
+            json!(queued.run_id),
+        ),
+    ] {
+        f.emit("parent", "turn-item.updated", json!({
+            "id":id,"threadId":"parent","runId":owner,"nodeId":run.root_node_id,
+            "providerThreadId":provider,"providerTurnId":turn,"nativeItemRef":null,"parentItemId":null,
+            "ordinal":100+f.service.kernel.store.events().unwrap().len(),"status":"running","title":id,
+            "startedAt":null,"completedAt":null,"updatedAt":"2026-10-07T04:00:00.000Z",
+            "type":kind,"input":input,"output":"","origin":origin,"toolName":"fixture",
+            "subagentId":"delegated","driver":"mock","providerInstanceId":"mock",
+            "childThreadId":"independent-child","prompt":"","result":null
+        }));
+    }
+    // An older, no-longer-live provider's roster must not leave the Waiting
+    // strip stuck after the owning app thread's only runtime has retired.
+    let mut old_provider = records(&before, "provider-thread")[0].clone();
+    old_provider["id"] = json!("old-provider");
+    old_provider["providerSessionId"] = Value::Null;
+    f.emit("parent", "provider-thread.updated", old_provider);
+    let hint = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"parent".into())
+        .unwrap();
+    assert_eq!(hint.background_run_id.as_deref(), Some(run.id.0.as_str()));
+    assert!(hint.active_run_id.is_none());
+    let effect = stop_background(&f).await;
+    f.service
+        .kernel
+        .task_command(
+            &"parent".into(),
+            "background-repair".into(),
+            TaskOperation::ControlSettlement {
+                effect_id: effect.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Completed);
+    assert_eq!(after.runs[0].completed_at, before.runs[0].completed_at);
+    assert_eq!(after.attempts[0], before.attempts[0]);
+    assert_eq!(
+        crate::orchestration::task::result_text(&after, &after.runs[0]),
+        "Finished main reply"
+    );
+    assert_eq!(
+        records(&after, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "provider_native")
+            .unwrap()["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        records(&after, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "app_owned")
+            .unwrap()["status"],
+        "running"
+    );
+    assert!(
+        records(&after, "provider-thread")
+            .iter()
+            .all(|p| p["pendingBackgroundTasks"] == json!([]))
+    );
+    for (id, status) in [
+        ("old-shell", "interrupted"),
+        ("runless-tool", "interrupted"),
+        ("persistent-monitor", "running"),
+        ("delegated-item", "running"),
+        ("later-shell", "running"),
+    ] {
+        assert_eq!(
+            records(&after, "turn-item")
+                .iter()
+                .find(|i| i["id"] == id)
+                .unwrap()["status"],
+            status
+        );
+    }
+    let next = after.runs.iter().find(|r| r.id == queued.run_id).unwrap();
+    assert_eq!(next.status, OrchestrationV2RunStatus::Queued);
+    assert_eq!(next.queue_held.as_ref(), Some(&true));
+    // A late native event cannot reopen the stopped child or invent a new one.
+    for tool in ["native-child", "new-late-child"] {
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Subagent {
+                parent_tool_use_id: tool.into(),
+                event: Box::new(zeron_proto::AgentEvent::TextDelta {
+                    text: "late".into(),
+                }),
+            },
+        );
+    }
+    let late = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(records(&late, "subagent").len(), 2);
+    assert_eq!(
+        records(&late, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "provider_native")
+            .unwrap()["status"],
+        "interrupted"
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let retry = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"background-stop"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The later queued run is not promoted by an idempotent Stop retry.
+    assert_eq!(
+        retry.status,
+        OrchestratorMcpThreadInterruptResultStatus::NoActiveRun
+    );
+}
+
+#[tokio::test]
+async fn completed_background_repair_refuses_cancelled_replaced_and_superseded_controls() {
+    use crate::orchestration::{steering::RuntimeTarget, task::TaskOperation};
+    for fence in ["cancelled", "replacement", "new-run"] {
+        let f = Fixture::new();
+        completed_with_native_background(&f);
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let runtime = RuntimeTarget::for_run(&p.runs[0]).unwrap();
+        f.service
+            .kernel
+            .store
+            .write(|conn| {
+                crate::orchestration::steering::bind_runtime(
+                    conn,
+                    &"parent".into(),
+                    &runtime,
+                    "old-runtime",
+                )
+            })
+            .unwrap();
+        let effect = stop_background(&f).await;
+        match fence {
+            "cancelled" => {
+                f.service
+                    .kernel
+                    .store
+                    .cancel_effect(&effect.id, crate::now_ms())
+                    .unwrap();
+            }
+            "replacement" => {
+                f.service
+                    .kernel
+                    .store
+                    .write(|conn| {
+                        crate::orchestration::steering::bind_runtime(
+                            conn,
+                            &"parent".into(),
+                            &runtime,
+                            "replacement",
+                        )
+                    })
+                    .unwrap();
+            }
+            _ => {
+                f.send(json!({"threadId":"parent","message":"new foreground turn"}))
+                    .await;
+            }
+        }
+        f.service
+            .kernel
+            .task_command(
+                &"parent".into(),
+                "refused-background-repair".into(),
+                TaskOperation::ControlSettlement {
+                    effect_id: effect.id,
+                },
+            )
+            .await
+            .unwrap();
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            records(&after, "subagent")[0]["status"],
+            "running",
+            "{fence}"
+        );
+        assert_eq!(
+            records(&after, "provider-thread")[0]["pendingBackgroundTasks"],
+            records(&p, "provider-thread")[0]["pendingBackgroundTasks"],
+            "{fence}"
+        );
+        assert!(
+            !records(&after, "turn-item")
+                .iter()
+                .any(|i| i["title"] == "Background work stopped")
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_roots_without_native_work_and_rolled_back_roots_do_not_offer_background_stop() {
+    for rolled_back in [false, true] {
+        let f = Fixture::new();
+        if rolled_back {
+            completed_with_native_background(&f);
+        } else {
+            f.running(false);
+            f.provider_event(
+                "parent",
+                zeron_proto::AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Completed,
+                    result: Some("Done".into()),
+                    error: None,
+                    session_id: None,
+                },
+            );
+        }
+        if rolled_back {
+            let p = f
+                .service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap();
+            let mut run = json!(p.runs[0]);
+            run["status"] = json!("rolled_back");
+            f.emit("parent", "run.updated", run);
+        }
+        assert!(
+            f.service
+                .kernel
+                .store
+                .queue_ui_state(&"parent".into())
+                .unwrap()
+                .background_run_id
+                .is_none()
+        );
+        let effects_before = f.service.kernel.store.effects().unwrap();
+        let result = f
+            .service
+            .interrupt(
+                f.caller.clone(),
+                serde_json::from_value(json!({"threadId":"parent","runId":f.caller.run_id}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json!(result.status),
+            if rolled_back {
+                json!("rolled_back")
+            } else {
+                json!("completed")
+            }
+        );
+        assert_eq!(f.service.kernel.store.effects().unwrap(), effects_before);
+    }
+}
+
+#[tokio::test]
+async fn failed_root_without_accepted_turn_can_settle_dead_background_without_inventing_a_session()
+{
+    use crate::orchestration::{effects::EffectRequest, task::TaskOperation};
+    let f = Fixture::new();
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut run = json!(p.runs[0]);
+    run["status"] = json!("failed");
+    run["completedAt"] = json!("2026-10-07T04:00:00.000Z");
+    f.emit("parent", "run.updated", run);
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["pendingBackgroundTasks"] = json!([{"taskId":"old-shell","kind":"command"}]);
+    f.emit("parent", "provider-thread.updated", provider);
+    let result = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"failed-background"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        OrchestratorMcpThreadInterruptResultStatus::InterruptRequested
+    );
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.request, EffectRequest::ManagedRunInterrupt { .. }))
+        .unwrap();
+    f.service
+        .kernel
+        .task_command(
+            &"parent".into(),
+            "failed-background-repair".into(),
+            TaskOperation::ControlSettlement {
+                effect_id: effect.id,
+            },
+        )
+        .await
+        .unwrap();
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Failed);
+    assert!(records(&after, "provider-session").is_empty());
+    assert!(records(&after, "provider-turn").is_empty());
+    assert_eq!(
+        records(&after, "provider-thread")[0]["pendingBackgroundTasks"],
+        json!([])
+    );
+}
+
 #[tokio::test]
 async fn created_thread_record_stays_bound_to_the_accepting_parent_run_after_it_finishes() {
     let f = Fixture::new();

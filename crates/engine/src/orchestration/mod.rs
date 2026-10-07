@@ -4,6 +4,7 @@
 
 pub(crate) mod adoption;
 pub mod assembly;
+mod background;
 pub mod checkpoint;
 pub mod command;
 pub mod continuation;

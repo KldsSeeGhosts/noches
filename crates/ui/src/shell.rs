@@ -1471,7 +1471,7 @@ fn resolve_shell_escape(
     escape_stops_active_agent: bool,
     route: Route,
     selected_chat: Option<&str>,
-    indicator: Indicator,
+    stop_available: bool,
     interrupting: bool,
 ) -> ShellEscapeOutcome {
     if key != "escape" {
@@ -1480,7 +1480,7 @@ fn resolve_shell_escape(
         ShellEscapeOutcome::Blocked
     } else if !escape_stops_active_agent || !matches!(route, Route::Chat) || interrupting {
         ShellEscapeOutcome::Ignored
-    } else if matches!(indicator, Indicator::Working | Indicator::AwaitingInput) {
+    } else if stop_available {
         selected_chat
             .map(|chat_id| ShellEscapeOutcome::InterruptChat(chat_id.to_owned()))
             .unwrap_or(ShellEscapeOutcome::Ignored)
@@ -8755,6 +8755,10 @@ impl Shell {
             .as_deref()
             .is_some_and(|chat_id| self.active_composer().read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
+        let stop_available = matches!(indicator, Indicator::Working | Indicator::AwaitingInput)
+            || selected_chat
+                .as_deref()
+                .is_some_and(|chat_id| self.state.read(cx).native_background_pending(chat_id));
 
         match resolve_shell_escape(
             &event.keystroke.key,
@@ -8762,7 +8766,7 @@ impl Shell {
             escape_stops_active_agent,
             self.route,
             selected_chat.as_deref(),
-            indicator,
+            stop_available,
             interrupting,
         ) {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
@@ -12902,7 +12906,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::InterruptChat("chat-a".to_owned())
@@ -12914,7 +12918,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-b"),
-                Indicator::AwaitingInput,
+                true,
                 false,
             ),
             ShellEscapeOutcome::InterruptChat("chat-b".to_owned())
@@ -12930,19 +12934,19 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::Blocked
         );
-        for (route, selected, indicator, interrupting) in [
-            (Route::Chat, Some("chat-a"), Indicator::None, false),
-            (Route::Chat, None, Indicator::Working, false),
-            (Route::Chat, Some("chat-a"), Indicator::Working, true),
+        for (route, selected, stop_available, interrupting) in [
+            (Route::Chat, Some("chat-a"), false, false),
+            (Route::Chat, None, true, false),
+            (Route::Chat, Some("chat-a"), true, true),
             (
                 Route::Settings(SettingsSection::Devices),
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
         ] {
@@ -12953,7 +12957,7 @@ mod tests {
                     true,
                     route,
                     selected,
-                    indicator,
+                    stop_available,
                     interrupting,
                 ),
                 ShellEscapeOutcome::Ignored
@@ -12966,7 +12970,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::OtherKey
@@ -12982,7 +12986,7 @@ mod tests {
                 false,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::Ignored
@@ -15462,6 +15466,11 @@ impl Shell {
     pub fn fixture_orchestration_disconnect(&mut self, chat: String, cx: &mut Context<Self>) {
         let actions = self.live_details_actions(chat);
         (actions.disconnect_session)(self, (), cx);
+    }
+
+    pub fn fixture_orchestration_stop_background(&self, cx: &mut Context<Self>) {
+        self.active_composer()
+            .update(cx, |composer, cx| composer.fixture_stop_background(cx));
     }
 
     pub fn fixture_orchestration_transcript_start(&self, cx: &mut Context<Self>) {

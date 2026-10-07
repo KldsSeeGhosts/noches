@@ -52,6 +52,9 @@ pub struct QueueUiState {
     pub pending_questions: Vec<PendingQuestionUi>,
     pub lifecycle: ChatLifecycle,
     pub active_run_id: Option<String>,
+    /// Completed foreground output can still own native background work.
+    /// This is a passive hint; Stop rechecks ownership on the host.
+    pub background_run_id: Option<String>,
     /// A passive hint only. The owner rechecks the exact run/attempt/turn.
     pub can_promote_to_steer: bool,
 }
@@ -124,10 +127,13 @@ pub struct PendingQuestionUi {
 mod tests {
     #[test]
     fn old_queue_snapshots_do_not_claim_document_provenance_or_steering() {
-        let state: super::QueueUiState = serde_json::from_str(r#"{"threadId":"old","queue":[{"messageId":"m","text":"work"}]}"#).unwrap();
+        let state: super::QueueUiState =
+            serde_json::from_str(r#"{"threadId":"old","queue":[{"messageId":"m","text":"work"}]}"#)
+                .unwrap();
         assert_eq!(state.schema_version, 0);
         assert!(!state.can_promote_to_steer);
         assert!(state.active_run_id.is_none());
+        assert!(state.background_run_id.is_none());
     }
 
     #[test]

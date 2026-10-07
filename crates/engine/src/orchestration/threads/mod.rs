@@ -641,13 +641,15 @@ impl ThreadService for KernelThreadService {
         } else {
             None
         };
-        if let Some(run) = explicit.filter(|r| run_terminal(&r.status)) {
+        let active = super::background::interruptible_run(&target);
+        if let Some(run) = explicit
+            .filter(|r| run_terminal(&r.status) && active.is_none_or(|active| active.id != r.id))
+        {
             return serde_json::from_value(
                 json!({"threadId":target.thread.id,"runId":run.id,"status":run.status}),
             )
             .map_err(failure);
         }
-        let active = active_run(&target);
         if input.run_id.as_ref().is_none() && active.is_none() {
             return serde_json::from_value(
                 json!({"threadId":target.thread.id,"runId":null,"status":"no_active_run"}),
