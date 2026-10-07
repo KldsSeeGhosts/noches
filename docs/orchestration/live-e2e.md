@@ -256,14 +256,15 @@ line and writes `evidence/<n>.json`. The engine copies installed CLI logins into
 on shutdown, so retained evidence never holds credentials.
 
 Authorized, cheap models only (all via the owner's CPA proxy): `claude-haiku-4-5`
-(`claudeAgent`), `gpt-6-luna` and `gemini-3.8-flash` (`codex`, medium effort).
+(`claudeAgent`), `gpt-6-luna` and `gemini-3.8-flash` (`codex`, medium effort), and the
+same models on the native Pi driver as exact `cpa/...` slugs (`pi` instance).
 Provider turns are capped by `--max-turns` (default 60).
 
 ```sh
 LINUX_TARGET=w3-live /Volumes/DevDrive/AiStack/noches-t3-program/linux-test.sh <worktree> build -p zeron
 python3 scripts/orchestration-live-scenarios.py \
   --binary /Volumes/DevDrive/AiStack/noches-wt/targets/w3-live/debug/zeron \
-  [--only 1,2,...] [--stop-parent claude|codex] [--reset-pause SECONDS]
+  [--only 1,2,...] [--stop-parent claude|codex|codex-gemini|pi] [--reset-pause SECONDS]
 ```
 
 ## Results
@@ -280,16 +281,33 @@ Evidence: `…/noches-t3-program/w3/live-scratch/<run>/evidence/<n>.json` (not c
 | 6 | Multimodal steer: solid-red PNG into a running turn, delivered natively once, answer `red` | luna; Haiku | PASS | run6b |
 | 7 | Codex fork at a turn boundary (native `thread/fork`, child rollout names the parent); installed app-server uses `historyMode: paginated` and `thread/fork` + `thread/turns/list` + `thread/revert` leave exactly the first of two turns | luna | PASS | run7a |
 | 8 | Stop all: parent + delegated Haiku child both stopped (`stoppedRuns: 2`), no `sleep` survives, queued message stays queued | Haiku parent, Haiku child | PASS² | run8c |
+| 8 | Same, with a **Codex** parent and no Noches-side tool workaround: the CPA proxy now answers `tool_search`, the parent finds the deferred `delegate_task` itself (`stoppedRuns: 2`, no `sleep 90`, queue intact) | gpt-6-luna; gemini-3.8-flash | PASS | run8-luna, run8-gemini |
 | 9 | Reset agent session: new native session without `--resume`, portable context in the new session's prompt | Haiku | PASS³ | run9b, run9c |
+
+| 10 | Pi parent delegates to a Haiku child and receives the wake: one `delegate_task`, child on `claudeAgent`/`claude-haiku-4-5` completes `PONGHAIKU`, delivery `acknowledged` by the parent's run, parent reports it | Pi (`cpa/gemini-3.8-flash`), Haiku | PASS | run10a |
+| 11 | Haiku parent delegates to a Pi child (`pi`, `cpa/gemini-3.8-flash`) and receives the wake: child session is a Pi session file, result `PONGPI` acknowledged | Haiku, Pi | PASS⁴ | run11b |
+| 12 | Haiku → Pi → Haiku: Pi answers from a `full_thread_summary` and has a real session file; Haiku resumes its own session and gets the build number told only to Pi via `delta_since_target_last_seen` | Haiku, Pi | PASS | run12a |
+| 13 | Pi lazy native fork through `ForkThread`: nothing starts at fork time; turn-1 child knows `X=1; Y=unknown`, head child `X=1; Y=2`; both resolve `native_fork` (no portable preamble), distinct Pi session files, parent file byte-identical | Pi | PASS | run13a |
+| 14 | Pi queue promotion with a model change (`cpa/gemini-3.8-flash` → `cpa/gpt-6-luna`): Pi is not interrupt/restart-steerable (as in T3), so the promotion is a **deferred active steer**: turn 1 takes the steer on gemini, the next turn runs on luna in the SAME Pi session file; one receipt + one acceptance row, no handoff, queue drained | Pi | PASS⁵ | run14c |
+| 15 | Pi steer receipts: mid-tool and right after the last tool result, each exactly one user message, one `inputAcceptedFor`, one acceptance row, both honored | Pi | PASS | run15a |
+| 16 | Stop all with a Pi parent delegating a slow Haiku child: `stoppedRuns: 2`, no `sleep 90`, queued message stays queued | Pi, Haiku | PASS | run16a |
 
 ¹ Run2a predates the fork-token assertions added afterwards; they were replayed
 read-only against run2a's own SQL/journal data (child id = token child id; token
 turn = the parent's `nativeReference` for turn 1 / head) but not re-run live.
-² `--stop-parent codex` (gpt-6-luna) is an environment limitation: luna calls
-`tool_search`, which the CPA route answers `unsupported call`, so it can never
-discover the deferred `delegate_task` MCP tool (run8a). The Stop-all contract is
-provider independent and was verified with a Claude parent.
+² At the time of run8c, `--stop-parent codex` (gpt-6-luna) was an environment limitation: luna called
+`tool_search`, which the CPA route answered `unsupported call`, so it could never discover the deferred
+`delegate_task` MCP tool (run8a). The proxy now speaks `tool_search`; the Codex-parent rows (run8-luna,
+run8-gemini) pass.
 ³ Run9a (immediate send after Reset, before the fix) failed; see below.
+⁴ Run11a passed every product check; its one FAIL was a driver bug (the "delegated exactly once" check
+counted a `ToolSearch` call that merely mentioned `delegate_task`), fixed in the script and re-run live.
+⁵ Run14a (written for a Codex-style interrupt/restart) failed because Pi reports
+`supportsSteeringByInterruptRestart: false`; the scenario was rewritten for the deferred-steer semantics and
+run14b passed except one driver assertion (it expected no `cancelled` run, but the promoted queue row is the
+cancelled middle run, as for Claude in scenario 1, and the idle warm Pi process retired for the model change
+journals one trailing `interrupted` done), corrected and re-run as run14c. Run14b's scratch directory was
+accidentally reused for a rerun and is not evidence.
 
 ## Findings
 
@@ -311,6 +329,13 @@ provider independent and was verified with a Claude parent.
   between the first `done` and the trailing answer (≈0.9–1.1 s in
   scenario 1's state samples) `GetQueueState` reports no active run and
   `workState: result_available`.
+* **Pi (wave 3 Q):** no product bug found by the seven Pi scenarios; the model change on the same Pi
+  instance applies on the next turn via RPC `set_model` on the resumed session. Pi writes its own session
+  files under the real `~/.pi/agent/sessions/--<scratch cwd>--/` (not under the scratch data directory).
+  About 32 provider turns were spent (gemini-3.8-flash, gpt-6-luna and Haiku, all through the CPA proxy).
+* **Codex parent (Stop all):** with the CPA proxy answering `tool_search` natively, gpt-6-luna and
+  gemini-3.8-flash parents both discover and call the deferred `delegate_task` without any Noches eager-tools
+  workaround (none exists on this branch); the earlier environment limitation no longer applies.
 * **Environment, not product:** `codex` retried `Connection failed` against
   `127.0.0.1:8317` for minutes once (run5b); the same scenario passed on re-run.
   Driver races fixed along the way: `run()` now returns only after the host

@@ -109,9 +109,36 @@ CLI facts that shaped the driver:
 - `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` relocate configuration and sessions; instance
   environments set them for private provider instances.
 
+## Behaviours added after review
+
+- **Baseline leaf and turn refs never list a whole session.** `get_entries` without `since` serialises every entry
+  (hundreds of MB on a long chat) and can exceed the 8 MiB frame cap, so the baseline leaf is read from the tail of
+  the session file (the last complete non-header entry, which is the leaf Pi itself loads), and each turn's ref comes
+  from `get_entries since <leaf>`. A cursor Pi no longer recognises is resynced from the file; that turn simply has
+  no ref.
+- **A vanished resume target** is announced ("The earlier Pi session is no longer available on this device ...") and,
+  when the engine plans the run, `SessionLifecycle::can_resume_now` makes the planner rebuild the conversation from
+  portable context instead of starting a blank session. Resume and fork paths must sit under one of Pi's session
+  roots; legacy pi-acp ids resolve through `~/.pi/pi-acp/session-map.json` first, then a store walk off the async
+  workers. A fork with no destination cwd is refused (`--fork` would re-home the copy to the app's own cwd).
+- **Terminal commands.** Pi's RPC `prompt` hands `/foo` to the model unless it is an extension command, skill or
+  prompt template. `/compact` maps to `compact`; `/name`, `/session`, `/autocompact`, `/steering`, `/follow-up`
+  and `/export` map to `set_session_name`, `get_session_stats`, `set_auto_compaction`, `set_steering_mode`,
+  `set_follow_up_mode` and `export_html` (the mode and compaction toggles persist in Pi's settings, as they did under
+  pi-acp), and are advertised in the composer. The other TUI built-ins (`/model`, `/login`, `/tree`, `/changelog`,
+  ...) are refused with a message instead of being sent to the model. Anything else (paths, unknown names, commands
+  Pi itself lists) goes to Pi untouched, as in T3. A mapped command sent mid-turn is refused, not queued.
+- **Auto-accept edits** confirms any `edit`/`write` whose resolved path (after `~`, `@`, `file://` and symlink
+  resolution) leaves the working directory or touches Pi's agent dir, `~/.pi` or a project's `.pi` directory (Pi
+  loads extensions from those). The policy mode fails closed: a missing or unknown mode means approval-required. The
+  `subagent` extension tool is gated as one call, and the child Pi processes it spawns do not load this policy.
+- **Probes and visibility.** The settle probe, usage snapshot and turn-ref lookup give way to a Stop; a failed
+  discovery is remembered for 20 s; the version gate re-checks a replaced executable and reads the last line of
+  stdout, else stderr; `auto_retry_start` and a failed automatic compaction surface as errors without ending the turn.
+
 ## Verification
 
-- `cargo test -p zeron-harness --test pi` (33, fake `pi`), `--lib pi::` (33), `--test pi_policy_extension`
+- `cargo test -p zeron-harness --test pi` (fake `pi`), `--lib pi::`, `--test pi_policy_extension`
   (node), `--test pi_mcp_extension` (node), engine `pi_native_tests` (3, real runner/store/transfer) and
   `pi_resume`.
 - Live (`NOCHES_PI_LIVE=1 cargo test -p zeron-harness --test pi_live -- --ignored --test-threads=1`, model

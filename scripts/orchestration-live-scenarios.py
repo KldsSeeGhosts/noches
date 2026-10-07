@@ -37,6 +37,9 @@ _spec.loader.exec_module(live_e2e)
 CLAUDE = {"instance": "claudeAgent", "harness": "claude-code", "model": "claude-haiku-4-5"}
 LUNA = {"instance": "codex", "harness": "codex", "model": "gpt-6-luna"}
 GEMINI = {"instance": "codex", "harness": "codex", "model": "gemini-3.8-flash"}
+# Pi's catalog ids are exact `provider/model` slugs from the owner's CPA provider.
+PI = {"instance": "pi", "harness": "pi", "model": "cpa/gemini-3.8-flash"}
+PI_LUNA = {"instance": "pi", "harness": "pi", "model": "cpa/gpt-6-luna"}
 
 
 class Skip(Exception):
@@ -301,7 +304,7 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
-STOP_PARENT = "claude"  # scenario 8 parent; gpt-6-luna cannot discover deferred MCP tools (tool_search unsupported)
+STOP_PARENT = "claude"  # scenario 8 parent (see --stop-parent)
 RESET_PAUSE_SECONDS = 4  # scenario 9: --reset-pause 0 reproduces the immediate-send race
 SCENARIOS = []
 
@@ -872,8 +875,17 @@ def probe_codex_revert(cwd, parent_thread):
 @scenario(8, "Stop all: parent delegating a slow Claude child; queued message stays queued")
 def stop_all(engine, checks, engine_evidence):
     evidence = engine_evidence
-    parent = {"codex": LUNA, "claude": CLAUDE}[STOP_PARENT]
-    effort = "medium" if STOP_PARENT == "codex" else None
+    parent = {"codex": LUNA, "codex-gemini": GEMINI, "claude": CLAUDE, "pi": PI}[STOP_PARENT]
+    stop_all_with(engine, checks, engine_evidence, parent)
+
+
+@scenario(16, "Stop all with a Pi parent delegating a slow Claude child; queued message stays queued")
+def stop_all_pi(engine, checks, evidence):
+    stop_all_with(engine, checks, evidence, PI)
+
+
+def stop_all_with(engine, checks, evidence, parent):
+    effort = "medium" if parent["harness"] == "codex" else None
     evidence["parent"] = parent
     engine.require_model(parent)
     engine.require_model(CLAUDE)
@@ -982,6 +994,333 @@ def reset_session(engine, checks, evidence):
     checks.ok("answer is correct via portable context", "MERIDIAN-77" in answer, answer)
 
 
+# -- Pi scenarios ------------------------------------------------------------
+def pi_session_file(engine, chat):
+    started = events_of(engine.journal(chat), "sessionStarted")
+    return Path(started[0]["sessionId"]) if started else None
+
+
+def sha_file(path):
+    return sha(path) if path else None
+
+
+def delegation_prompt(target, token, client_request_id):
+    return ("This is a Noches orchestration integration test. Do not change files or run shell commands. "
+            "First call the injected t3-code orchestrator_capabilities tool. Then call the injected t3-code "
+            f"delegate_task tool exactly once with target {json.dumps(target)}, mode=\"async\", "
+            f"clientRequestId=\"{client_request_id}\", task=\"Do not modify files or run commands. Reply with "
+            f"exactly the word {token}.\". Retain taskId. Say WAITING_FOR_CHILD and finish this turn. When the "
+            "app sends 'Delegated task completion available', call task_status with that taskId to "
+            f"acknowledge its result. Then report exactly 'LIVE_PASS: result={token}' if the child summary is "
+            f"{token}. Do not use native subagents, delegate more tasks, poll before the wake, or create threads.")
+
+
+def delegate_and_wake(engine, checks, evidence, parent, child, token, chat):
+    engine.require_model(parent)
+    engine.require_model(child)
+    effort = "medium" if parent["harness"] == "codex" else None
+    engine.create_chat(chat, parent, reasoning=effort, options=opt(effort) if effort else None)
+    target = {"providerInstanceId": child["instance"], "model": child["model"]}
+    engine.run(chat, delegation_prompt(target, token, f"live-{chat}"), parent, reasoning=effort,
+               options=opt(effort) if effort else None)
+    engine.spend(2)  # the delegated child's turn and the parent's wake continuation
+    final = {}
+
+    def settled():
+        state = engine.state(chat)
+        final["state"] = state
+        tasks = state.get("tasks", [])
+        if tasks and tasks[0]["status"] in ("failed", "interrupted", "cancelled"):
+            raise RuntimeError("child terminal failure: " + json.dumps(tasks[0]))
+        return bool(tasks) and tasks[0]["status"] == "completed" and \
+            tasks[0].get("completionDelivery", {}).get("state") == "acknowledged" and \
+            "LIVE_PASS" in (state.get("latestResult") or "")
+    try:
+        engine.wait_for(settled, timeout=300, interval=1.0, what="child completion, wake and parent report")
+    finally:
+        evidence["state"] = final.get("state")
+    engine.wait_idle(chat, timeout=120)
+    state = engine.state(chat)
+    task = state["tasks"][0]
+    evidence["task"] = task
+    evidence["parentTranscript"] = [message_text(m) for m in engine.transcript(chat) if m["role"] == "assistant"]
+    child_thread = task["childThreadId"]
+    child_started = events_of(engine.journal(child_thread), "sessionStarted")
+    evidence["childSessions"] = [{k: e.get(k) for k in ("harness", "model", "sessionId")} for e in child_started]
+    checks.ok("child ran on the requested provider instance and model",
+              task["providerInstanceId"] == child["instance"] and task["model"] == child["model"], task)
+    checks.ok("child completed with its result", token in (task.get("result") or ""), task.get("result"))
+    checks.ok("child process is the requested harness",
+              bool(child_started) and child_started[0].get("harness") == child["harness"], evidence["childSessions"])
+    checks.ok("parent received the wake and acknowledged it",
+              task["completionDelivery"]["state"] == "acknowledged" and bool(task["completionDelivery"].get("observedByRunId")),
+              task["completionDelivery"])
+    checks.ok("parent reported the child's result after the wake", f"LIVE_PASS: result={token}" in (state.get("latestResult") or ""),
+              state.get("latestResult"))
+    calls = [e.get("call") for e in events_of(engine.journal(chat), "toolCall")]
+    evidence["parentTools"] = [str(c) for c in calls]
+    delegations = [c for c in calls if isinstance(c, dict) and c.get("tool") == "delegate_task"]
+    checks.ok("parent delegated exactly once", len(delegations) == 1, evidence["parentTools"])
+
+
+@scenario(10, "Pi parent delegates to a Haiku child and receives the wake")
+def pi_parent_haiku_child(engine, checks, evidence):
+    delegate_and_wake(engine, checks, evidence, PI, CLAUDE, "PONGHAIKU", "s10")
+
+
+@scenario(11, "Haiku parent delegates to a Pi child and receives the wake")
+def haiku_parent_pi_child(engine, checks, evidence):
+    delegate_and_wake(engine, checks, evidence, CLAUDE, PI, "PONGPI", "s11")
+
+
+@scenario(12, "Haiku -> Pi -> Haiku: Pi gets portable context, Haiku resumes natively with the delta")
+def haiku_pi_haiku(engine, checks, evidence):
+    engine.require_model(CLAUDE)
+    engine.require_model(PI)
+    chat = "s12"
+    engine.create_chat(chat, CLAUDE)
+    engine.run(chat, "Remember: the project name is AURORA. Reply with exactly: OK-A1", CLAUDE)
+    engine.wait_idle(chat)
+    engine.set_config(chat, PI)
+    engine.run(chat, "Earlier in this conversation you were given a project name. State it. "
+                     "Also remember: the build number is 4242. Reply as `name=<project name>; ok`.", PI)
+    engine.wait_idle(chat, timeout=240)
+    engine.set_config(chat, CLAUDE)
+    engine.run(chat, "Without tools, what is the project name and what is the build number? "
+                     "Reply as `name=<n>; build=<b>`.", CLAUDE)
+    engine.wait_idle(chat)
+    answers = [message_text(m).strip() for m in engine.transcript(chat)
+               if m["role"] == "assistant" and message_text(m).strip()]
+    evidence["answers"] = answers
+    state = engine.transfer_state(chat)
+    evidence["handoffs"] = state["handoffs"]
+    evidence["transfers"] = state["transfers"]
+    runs = [json.loads(r["payload_json"]) for r in engine.sql(
+        "select payload_json from orchestration_projection_runs where thread_id=? order by ordinal", (chat,))]
+    evidence["runs"] = [{"run": r["id"], "instance": r["providerInstanceId"],
+                         "contextHandoffId": r.get("contextHandoffId")} for r in runs]
+    started = events_of(engine.journal(chat), "sessionStarted")
+    evidence["sessionStarted"] = [{k: e.get(k) for k in ("instanceId", "model", "sessionId")} for e in started]
+    claude_sessions = [e["sessionId"] for e in started if e["instanceId"] == "claudeAgent"]
+    pi_sessions = [e["sessionId"] for e in started if e["instanceId"] == "pi"]
+    checks.ok("Pi answered with Haiku's project name via portable context",
+              len(answers) >= 2 and "AURORA" in answers[1].upper(), answers)
+    checks.ok("Pi's native id is a session file under Pi's own store",
+              len(pi_sessions) == 1 and Path(pi_sessions[0]).is_file() and pi_sessions[0].endswith(".jsonl"), pi_sessions)
+    checks.ok("Haiku resumed its OWN native session (same Claude session id on turn 3)",
+              len(claude_sessions) == 2 and claude_sessions[0] == claude_sessions[1], evidence["sessionStarted"])
+    checks.ok("Haiku recalls the name (native) and the build number told only to Pi (delta handoff)",
+              bool(answers) and "AURORA" in answers[-1].upper() and "4242" in answers[-1], answers[-1:])
+    with_handoff = [r for r in evidence["runs"] if r["contextHandoffId"]]
+    checks.ok("both provider switches carried a handoff (Pi portable, Haiku delta)",
+              len(with_handoff) == 2 and with_handoff[0]["instance"] == "pi"
+              and with_handoff[1]["instance"] == "claudeAgent", evidence["runs"])
+    strategies = [h.get("strategy") for h in state["handoffs"]]
+    checks.ok("Pi received the full summary, Haiku only the delta",
+              strategies == ["full_thread_summary", "delta_since_target_last_seen"], strategies)
+
+
+@scenario(13, "Pi lazy native fork: turn-1 checkpoint vs head through ForkThread")
+def pi_lazy_fork(engine, checks, evidence):
+    engine.require_model(PI)
+    parent = "s13p"
+    engine.create_chat(parent, PI)
+    engine.run(parent, "Remember: X=1. Reply with exactly: OK1", PI)
+    engine.wait_idle(parent, timeout=240)
+    engine.run(parent, "Remember: Y=2. Reply with exactly: OK2", PI)
+    engine.wait_idle(parent, timeout=240)
+    parent_file = pi_session_file(engine, parent)
+    before = sha_file(parent_file)
+    evidence["parentSession"] = str(parent_file)
+    checks.ok("parent session file exists", bool(parent_file) and parent_file.is_file(), str(parent_file))
+    turn_refs = [e.get("turnId") for e in events_of(engine.journal(parent), "nativeReference")]
+    evidence["turnRefs"] = turn_refs
+    checks.ok("each parent turn recorded a native user-entry ref", len(turn_refs) == 2 and all(turn_refs), turn_refs)
+    state = engine.transfer_state(parent)
+    turn1 = next(c["checkpoint"]["id"] for c in state["checkpoints"]
+                 if c["checkpoint"]["runId"].endswith(":1") and c["phase"] == "completed")
+    ask = ("What do you remember from this conversation? Answer in one line exactly as "
+           "`X=<value or unknown>; Y=<value or unknown>`. Use `unknown` for anything you were not told.")
+    for name, point in (("turn1", {"type": "checkpoint", "checkpointId": turn1}), ("head", {"type": "latest_stable"})):
+        child = f"s13-{name}"
+        fork_thread(engine, parent, child, point, f"pi-{name}")
+        checks.ok(f"{name}: forking starts no provider process yet", not engine.journal(child), len(engine.journal(child)))
+        engine.run(child, ask, PI)
+        engine.wait_idle(child, timeout=240)
+        answer = last_assistant_text(engine.transcript(child))
+        child_file = pi_session_file(engine, child)
+        transfer = (engine.transfer_state(child).get("transfers") or [{}])[0]
+        evidence[f"{name}Answer"] = answer
+        evidence[f"{name}Session"] = str(child_file)
+        evidence[f"{name}Transfer"] = transfer
+        text = child_file.read_text() if child_file and child_file.is_file() else ""
+        checks.ok(f"{name}: child has its own Pi session file", bool(child_file) and child_file != parent_file
+                  and child_file.is_file(), str(child_file))
+        checks.ok(f"{name}: delivered by a native Pi fork, not portable context",
+                  (transfer.get("resolution") or {}).get("strategy") == "native_fork"
+                  and "Context handoff" not in text, transfer.get("resolution"))
+    t1, head = evidence["turn1Answer"].replace(" ", ""), evidence["headAnswer"].replace(" ", "")
+    checks.ok("turn-1 fork knows X only", "X=1" in t1 and "Y=2" not in t1, evidence["turn1Answer"])
+    checks.ok("head fork knows X and Y", "X=1" in head and "Y=2" in head, evidence["headAnswer"])
+    checks.ok("parent session file unchanged by forking", sha_file(parent_file) == before, parent_file.name)
+    checks.ok("children are distinct native sessions", evidence["turn1Session"] != evidence["headSession"])
+
+
+def pi_models_used(path):
+    """The model each assistant message in a Pi session file was produced by."""
+    models = []
+    for line in (path.read_text().splitlines() if path and path.is_file() else []):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        message = entry.get("message") or {}
+        if entry.get("type") == "message" and message.get("role") == "assistant" and message.get("model"):
+            models.append(f"{message.get('provider')}/{message['model']}")
+    return models
+
+
+@scenario(14, "Pi queue promotion with a model change: steer now, new model on the next turn of the same native session")
+def pi_queue_promotion(engine, checks, evidence):
+    # Pi cannot be steered by interrupt/restart (T3's PiAdapterV2 says
+    # supportsSteeringByInterruptRestart=false), so with a composer model change
+    # the promotion is a DEFERRED active steer: the running turn takes the
+    # message on its current model and the selection applies to the next turn
+    # (selection_transition = ApplyOnNextTurn, via RPC set_model on the resumed
+    # session). Nothing is interrupted and nothing is handed off.
+    engine.require_model(PI)
+    engine.require_model(PI_LUNA)
+    chat = "s14"
+    engine.create_chat(chat, PI)
+    engine.run(chat, "Run `sleep 20` with your shell tool, then reply with exactly: DONE1", PI)
+    engine.wait_for(lambda: events_of(engine.journal(chat), "toolCall"), timeout=120, what="long tool call")
+    first = engine.queue_message(chat, "Follow-up one: also append the word F1 to your reply.")
+    second = engine.queue_message(chat, "Follow-up two: reply with exactly: F2")
+    engine.set_config(chat, PI_LUNA)
+
+    def deferred_ready():
+        state = engine.queue_state(chat)
+        if state.get("promotionSelectionDeferred") and len(state.get("queue", [])) == 2:
+            return state
+    queue = engine.wait_for(deferred_ready, timeout=20, what="deferred promotion hint")
+    evidence["queueBefore"] = queue
+    selection = queue.get("promotionSelection") or {}
+    checks.ok("a model change on the same Pi instance promotes as a deferred active steer",
+              queue.get("promotionMode") == "active_steering" and queue.get("promotionSelectionDeferred")
+              and selection.get("model") == PI_LUNA["model"], {"mode": queue.get("promotionMode"),
+                                                              "selection": selection})
+    entry = next(e for e in queue["queue"] if e["messageId"] == first)
+    reply = engine.call("MutateQueuedRun", {
+        "chatId": chat, "queuedRunId": entry["queuedRunId"], "clientRequestId": "live-pi-promote-deferred",
+        "action": {"type": "promoteToSteer", "targetRunId": queue["activeRunId"],
+                   "expectedSelection": queue.get("promotionSelection")}})
+    evidence["promotion"] = reply
+    checks.ok("promotion accepted", reply.get("refusal") is None, reply)
+    engine.spend(2)  # the steered reply is part of turn 1; F2 is the second provider turn
+    engine.wait_idle(chat, timeout=300, settle=6)
+    started = events_of(engine.journal(chat), "sessionStarted")
+    dones = events_of(engine.journal(chat), "done")
+    evidence["sessionStarted"] = [{k: e.get(k) for k in ("model", "sessionId")} for e in started]
+    evidence["dones"] = [{k: e.get(k) for k in ("status", "sessionId")} for e in dones]
+    sessions = {e["sessionId"] for e in started}
+    runs = engine.sql("select run_id, status from orchestration_projection_runs where thread_id=? order by ordinal",
+                      (chat,))
+    evidence["runs"] = runs
+    # The promoted queue row is the cancelled middle run (its message rode the
+    # steer, as for Claude in scenario 1). The warm Pi process is retired idle
+    # when the next turn needs a different model, which journals one trailing
+    # `interrupted` done by design; the turns themselves must complete.
+    checks.ok("the turn was steered, not interrupted: turn 1 and the next turn completed",
+              [r["status"] for r in runs] == ["completed", "cancelled", "completed"]
+              and dones[0]["status"] == "completed" and dones[-1]["status"] == "completed",
+              {"runs": runs, "dones": evidence["dones"]})
+    checks.ok("the next turn ran on the SAME native Pi session with the new model",
+              len(sessions) == 1 and len(started) == 2 and started[0]["model"] == PI["model"]
+              and started[1]["model"] == PI_LUNA["model"], evidence["sessionStarted"])
+    transcript = engine.transcript(chat)
+    texts = [t for t in user_texts(transcript) if t.startswith("Follow-up")]
+    answers = [message_text(m).strip() for m in transcript if m["role"] == "assistant"]
+    evidence["userMessages"], evidence["assistantTexts"] = texts, answers
+    checks.ok("each follow-up delivered exactly once, in order",
+              texts == ["Follow-up one: also append the word F1 to your reply.",
+                        "Follow-up two: reply with exactly: F2"], texts)
+    checks.ok("steer honored in turn 1 and F2 answered in turn 2",
+              any("F1" in a for a in answers) and "F2" in answers, answers)
+    delivery = steer_delivery(engine, chat, first)
+    evidence["delivery"] = delivery
+    checks.ok("steer delivered natively once (receipt + acceptance row)",
+              len(delivery["inputAcceptedFor"]) == 1 and len(delivery["acceptances"]) == 1
+              and delivery["transcriptCount"] == 1, delivery)
+    state = engine.transfer_state(chat)
+    checks.ok("no portable handoff for a same-session model change", not state["handoffs"] and not state["transfers"],
+              {"handoffs": state["handoffs"], "transfers": state["transfers"]})
+    models = pi_models_used(Path(next(iter(sessions))))
+    evidence["sessionFileModels"] = models
+    checks.ok("Pi's own session file shows gemini for turn 1 (steer included) and luna for turn 2",
+              len(models) >= 2 and models[0] == PI["model"] and models[-1] == PI_LUNA["model"]
+              and PI_LUNA["model"] not in models[:-1], models)
+    checks.ok("queue drained", not engine.queue_state(chat)["queue"])
+    checks.ok("no leftover `sleep 20`", not [p for p in engine.descendants() if "sleep 20" in p[1]])
+
+
+@scenario(15, "Pi steer receipts: mid-tool and right after the last tool result, each exactly once")
+def pi_receipts(engine, checks, evidence):
+    engine.require_model(PI)
+    chat = "s15"
+    engine.create_chat(chat, PI)
+    engine.run(chat, "Run `sleep 10` with your shell tool, then reply with exactly: ALPHA", PI)
+    engine.wait_for(lambda: events_of(engine.journal(chat), "toolCall"), timeout=120, what="first tool call")
+    token_a = "STEER-A-7731"
+    id_a, reply_a = steer_once(engine, chat, f"{token_a}: when you finish, also append the word BRAVO.", "pi-a", evidence)
+    checks.ok("A promotion accepted", reply_a.get("refusal") is None, reply_a)
+    engine.wait_idle(chat, timeout=240, settle=8)
+    id_b = token_b = None
+    for attempt in range(2):
+        seen = len(events_of(engine.journal(chat), "toolResult"))
+        engine.run(chat, "Run `ls` with your shell tool, then reply with exactly: GAMMA", PI)
+        engine.wait_for(lambda: len(events_of(engine.journal(chat), "toolResult")) > seen, timeout=90,
+                        interval=0.03, what="tool result")
+        if not engine.queue_state(chat).get("activeRunId"):
+            engine.wait_idle(chat, settle=3)
+            evidence["bLostRace"] = evidence.get("bLostRace", 0) + 1
+            continue
+        token_b = "STEER-B-4492"
+        id_b, reply_b = steer_once(engine, chat, f"{token_b}: also append the word DELTA.", "pi-b", evidence)
+        break
+    if not checks.ok("B: steer landed while a run was active", id_b is not None, evidence.get("bLostRace")):
+        return
+    engine.wait_idle(chat, timeout=240, settle=8)
+    transcript = engine.transcript(chat)
+    evidence["delivery"] = {"a": steer_delivery(engine, chat, id_a), "b": steer_delivery(engine, chat, id_b)}
+    evidence["userMessages"] = user_texts(transcript)
+    evidence["assistantTexts"] = [message_text(m) for m in transcript if m["role"] == "assistant"]
+    evidence["effects"] = engine.sql("select effect_type, status, count(*) n from orchestration_effect_outbox "
+                                     "where thread_id=? group by 1,2", (chat,))
+    evidence["runs"] = engine.sql("select run_id, status from orchestration_projection_runs where thread_id=? "
+                                  "order by ordinal", (chat,))
+    for tag, token in (("A", token_a), ("B", token_b)):
+        delivery = evidence["delivery"][tag.lower()]
+        checks.ok(f"{tag}: exactly one user message carries the steer",
+                  sum(token in t for t in user_texts(transcript)) == 1, user_texts(transcript))
+        checks.ok(f"{tag}: transcript has the message id once", delivery["transcriptCount"] == 1, delivery)
+        checks.ok(f"{tag}: native receipt recorded once", len(delivery["inputAcceptedFor"]) == 1, delivery)
+        checks.ok(f"{tag}: steering acceptance row recorded once", len(delivery["acceptances"]) == 1, delivery)
+    steers = sum(e["n"] for e in evidence["effects"] if e["effect_type"] == "provider-turn.steer")
+    checks.ok("two steer effects, all succeeded", steers == 2 and not [
+        e for e in evidence["effects"] if e["effect_type"] == "provider-turn.steer" and e["status"] != "succeeded"],
+        evidence["effects"])
+    redispatch = engine.sql("select effect_type, count(*) n from orchestration_effect_outbox where thread_id=? "
+                            "and effect_type != 'provider-turn.steer' and (payload_json like ? or payload_json like ?) "
+                            "group by 1", (chat, f"%{token_a}%", f"%{token_b}%"))
+    checks.ok("no orphan redispatch of either steer text", not redispatch, redispatch)
+    bad = [e for e in evidence["effects"] if e["status"] in ("failed", "uncertain", "pending", "running")]
+    checks.ok("no failed/uncertain/pending effects", not bad, bad)
+    checks.ok("no failed runs", not [r for r in evidence["runs"] if r["status"] == "failed"], evidence["runs"])
+    final = "\n".join(evidence["assistantTexts"])
+    checks.ok("A steer honored (BRAVO)", "BRAVO" in final, evidence["assistantTexts"])
+    checks.ok("B steer honored (DELTA)", "DELTA" in final, evidence["assistantTexts"])
+
+
 def main():
     global RESET_PAUSE_SECONDS, STOP_PARENT
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -989,8 +1328,9 @@ def main():
     parser.add_argument("--only", help="comma separated scenario numbers")
     parser.add_argument("--max-turns", type=int, default=60)
     parser.add_argument("--scratch", help="scratch directory (default: a fresh mkdtemp)")
-    parser.add_argument("--stop-parent", choices=["claude", "codex"], default=STOP_PARENT,
-                        help="provider of the scenario-8 parent (codex = gpt-6-luna)")
+    parser.add_argument("--stop-parent", choices=["claude", "codex", "codex-gemini", "pi"], default=STOP_PARENT,
+                        help="provider of the scenario-8 parent (codex = gpt-6-luna, codex-gemini = "
+                             "gemini-3.8-flash on Codex, pi = Pi on gemini-3.8-flash)")
     parser.add_argument("--reset-pause", type=float, default=RESET_PAUSE_SECONDS,
                         help="seconds to wait after the reset's disconnect effect before the next turn (scenario 9)")
     args = parser.parse_args()
