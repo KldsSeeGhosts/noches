@@ -120,7 +120,7 @@ pub fn acp_mode_set(
     runtime: RuntimeMode,
     session: &Value,
 ) -> Result<Option<(String, Value)>, HarnessError> {
-    if matches!(harness, HarnessId::Grok | HarnessId::Pi) {
+    if harness == HarnessId::Grok {
         return Ok(None);
     }
     let candidates: &[&str] = match (harness, runtime) {
