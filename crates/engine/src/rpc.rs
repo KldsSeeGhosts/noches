@@ -1813,6 +1813,17 @@ impl RpcService for EngineRpc {
                     .delegation
                     .as_ref()
                     .ok_or_else(|| RpcError::Failed("Thread Stop is unavailable.".into()))?;
+                let handle = self
+                    .doc_host
+                    .open(&request.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Same freeze as an ordinary user Stop: the interrupt's Idle
+                // must not release the next queued message.
+                let mut freeze = self
+                    .doc_host
+                    .freeze_queue_for_stop(&handle)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let thread = request.chat_id.into();
                 let result = match crate::orchestration::stop_all::stop_thread_work(
                     &service.kernel,
@@ -1821,7 +1832,12 @@ impl RpcService for EngineRpc {
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if result.stopped_runs > 0 {
+                            freeze.keep();
+                        }
+                        result
+                    }
                     // A definite refusal is not an uncertain transport failure.
                     Err(crate::orchestration::Error::Invariant(refusal)) => {
                         zeron_proto::transfer::StopThreadWorkResult {

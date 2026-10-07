@@ -737,6 +737,31 @@ mod queue_snapshot_tests {
 }
 
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
+
+/// See `DocHost::freeze_queue_for_stop`.
+pub(crate) struct QueueFreeze<'a> {
+    handle: &'a ChatDocHandle,
+    previously_paused: bool,
+    keep: bool,
+    _drain: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl QueueFreeze<'_> {
+    pub(crate) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for QueueFreeze<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.handle
+                .queue_paused
+                .store(self.previously_paused, Ordering::Release);
+        }
+    }
+}
+
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
@@ -4459,6 +4484,26 @@ impl DocHost {
                 Err(err)
             }
         }
+    }
+
+    /// Freeze the queue for a whole-thread Stop exactly like an ordinary user
+    /// Stop: interrupting publishes Idle, which would otherwise let the
+    /// drainer start the next queued message. The returned guard holds the
+    /// drain lock and restores the previous pause state on drop unless
+    /// `keep` is called (some step was admitted).
+    pub(crate) async fn freeze_queue_for_stop<'a>(
+        &self,
+        handle: &'a Arc<ChatDocHandle>,
+    ) -> Result<QueueFreeze<'a>, EngineError> {
+        let drain = handle.drain_lock.lock().await;
+        self.prepare_orchestration_queue(handle).await?;
+        let previously_paused = handle.queue_paused.swap(true, Ordering::AcqRel);
+        Ok(QueueFreeze {
+            handle,
+            previously_paused,
+            keep: false,
+            _drain: drain,
+        })
     }
 
     /// Send one taken queue row.

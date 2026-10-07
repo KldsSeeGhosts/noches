@@ -2482,6 +2482,68 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_all_freezes_the_queue_like_ordinary_stop_including_the_replay() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    use zeron_proto::transfer::StopThreadWorkParams;
+    let (core, _harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+    core.doc_host
+        .queue_message(CHAT, "loro follow-up", vec![])
+        .unwrap();
+    let sql_run = canonical_input(&core, "sql follow-up").await;
+    let request = StopThreadWorkParams {
+        chat_id: CHAT.into(),
+        client_request_id: "stop-all-freeze".into(),
+    };
+    let result = client
+        .stop_thread_work(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(result.stopped_runs >= 1, "{result:?}");
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the stopped turn to settle",
+    )
+    .await;
+    // A replay after an uncertain response must not release the queue either.
+    let replay = client
+        .stop_thread_work(request, &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(replay.stopped_runs, result.stopped_runs);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(queue_texts(&core), vec!["loro follow-up"]);
+    let prompts = prompts.lock().unwrap().clone();
+    assert!(
+        !prompts
+            .iter()
+            .any(|p| p == "loro follow-up" || p == "sql follow-up"),
+        "Stop all must not turn a queued row into a new inference: {prompts:?}"
+    );
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let sql = projection
+        .runs
+        .iter()
+        .find(|run| run.id.0 == sql_run)
+        .expect("sql-only run");
+    assert_eq!(sql.status, OrchestrationV2RunStatus::Queued);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_stop_reaches_completed_native_background_and_holds_queue_without_agent_credentials() {
     use zeron_proto::orchestration::OrchestrationV2RunStatus;
     fn records<'a>(
