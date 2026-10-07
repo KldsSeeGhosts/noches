@@ -1375,6 +1375,23 @@ async fn late_steering_becomes_one_receipted_followup_with_the_same_message() {
 }
 
 async fn steering_effect(f: &Fixture, key: &str) -> crate::orchestration::effects::Effect {
+    // Dispatchable steering is admitted against a bound live runtime.
+    let p = f.service.kernel.store.thread(&"parent".into()).unwrap().unwrap();
+    let target = crate::orchestration::steering::RuntimeTarget::for_run(&p.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            if crate::orchestration::steering::runtime_id(tx, &"parent".into(), &target)?.is_none() {
+                crate::orchestration::steering::bind_runtime(tx, &"parent".into(), &target, "test-runtime")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    unbound_steering_effect(f, key).await
+}
+
+async fn unbound_steering_effect(f: &Fixture, key: &str) -> crate::orchestration::effects::Effect {
     let sent = f
         .send(
             json!({"threadId":"parent","message":format!("steering input {key}"),
@@ -1780,6 +1797,21 @@ async fn steering_receipts_are_correlated_durable_and_release_only_their_uncerta
             )?))
             .unwrap(),
         1
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_cannot_confirm_steering_admitted_without_a_bound_runtime() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = unbound_steering_effect(&f, "no-runtime").await;
+    let p = f.service.kernel.store.thread(&"parent".into()).unwrap().unwrap();
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .write(|tx| crate::orchestration::steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .unwrap()
     );
 }
 

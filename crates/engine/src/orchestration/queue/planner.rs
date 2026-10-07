@@ -407,6 +407,10 @@ fn steer(
     now: i64,
 ) -> Result<()> {
     let (run, session_id, turn, mode) = steering_target(p, target, message)?;
+    let message_id = message["id"]
+        .as_str()
+        .ok_or_else(|| Error::Invariant("Promoted message has no id.".into()))?
+        .to_owned();
     let restarted;
     let run = if mode == zeron_proto::QueuePromotionMode::InterruptRestart {
         restarted = crate::orchestration::threads::planner::restart_attempt(
@@ -416,7 +420,7 @@ fn steer(
             run,
             session_id,
             turn,
-            &MessageId(message["id"].as_str().unwrap().into()),
+            &MessageId(message_id.clone()),
             now,
         )?;
         &restarted
@@ -429,7 +433,7 @@ fn steer(
     message["createdAt"] = json!(iso(now)?);
     message["updatedAt"] = json!(iso(now)?);
     plan.emit(command, "message.updated", &message, now)?;
-    let mut item = json!({"id":format!("turn-item:message:{}",crate::orchestration::event::encode_component(message["id"].as_str().unwrap())),
+    let mut item = json!({"id":format!("turn-item:message:{}",crate::orchestration::event::encode_component(&message_id)),
         "threadId":p.thread.id,"runId":run.id,"nodeId":run.root_node_id,"providerThreadId":run.provider_thread_id,
         "providerTurnId":if mode == zeron_proto::QueuePromotionMode::ActiveSteering {turn["id"].clone()}else{Value::Null},"nativeItemRef":null,"parentItemId":null,
         "ordinal":records(p,"turn-item").iter().filter_map(|i|i["ordinal"].as_i64()).max().unwrap_or(0)+1,
@@ -446,9 +450,16 @@ fn steer(
     if mode == zeron_proto::QueuePromotionMode::ActiveSteering {
         plan.effects.push(EffectRequest::ProviderTurnSteer {
             provider_session_id: ProviderSessionId(session_id.into()),
-            provider_thread_id: run.provider_thread_id.clone().unwrap(),
-            provider_turn_id: ProviderTurnId(turn["id"].as_str().unwrap().into()),
-            message_id: MessageId(message["id"].as_str().unwrap().into()),
+            provider_thread_id: run.provider_thread_id.clone().ok_or_else(|| {
+                Error::Invariant("Promotion target run has no provider thread.".into())
+            })?,
+            provider_turn_id: ProviderTurnId(
+                turn["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Invariant("Promotion target turn has no id.".into()))?
+                    .into(),
+            ),
+            message_id: MessageId(message_id),
         });
     }
     Ok(())

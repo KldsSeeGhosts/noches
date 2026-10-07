@@ -291,12 +291,9 @@ pub(crate) fn enqueue(
     if matches!(request, EffectRequest::ProviderTurnSteer { .. }) {
         let runtime_id = if let Some(p) = super::projection::read_thread(conn, thread)?
             && let Some((run, _)) = super::steering::target(&p, request)
+            && let Some(target) = super::steering::RuntimeTarget::for_run(run)
         {
-            super::steering::runtime_id(
-                conn,
-                thread,
-                &super::steering::RuntimeTarget::for_run(run).unwrap(),
-            )?
+            super::steering::runtime_id(conn, thread, &target)?
         } else {
             None
         };

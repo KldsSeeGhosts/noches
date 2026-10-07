@@ -883,10 +883,11 @@ fn attach_session(
     capabilities: &OrchestrationV2ProviderCapabilities,
     now: i64,
 ) -> Result<()> {
-    let session_id = format!(
-        "provider-session:{}",
-        encode_component(run["id"].as_str().unwrap())
-    );
+    let run_id = run["id"]
+        .as_str()
+        .ok_or_else(|| Error::Invariant("Run record has no id.".into()))?
+        .to_owned();
+    let session_id = format!("provider-session:{}", encode_component(&run_id));
     let session = json!({"id":session_id,"driver":provider["driver"],"providerInstanceId":run["providerInstanceId"],
         "status":"running","cwd":cwd,"model":model,"capabilities":capabilities,"createdAt":iso(now)?,"updatedAt":iso(now)?,"lastError":null});
     plan.emit(command, "provider-session.attached", &session, now)?;
@@ -900,7 +901,7 @@ fn attach_session(
         projection,
         command,
         plan,
-        &RunId(run["id"].as_str().unwrap().into()),
+        &RunId(run_id),
         &session_id,
         now,
     )?;

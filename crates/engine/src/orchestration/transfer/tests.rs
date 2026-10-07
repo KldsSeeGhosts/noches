@@ -922,6 +922,15 @@ async fn restart_recovers_only_unconfirmed_steering_not_the_accepted_root_or_oth
     )
     .await;
     accept(&kernel, &source, cwd.path(), "native-steering").await;
+    let bound = kernel.store.thread(&"source".into()).unwrap().unwrap();
+    let target = steering::RuntimeTarget::for_run(
+        bound.runs.iter().find(|r| r.id == source.id).unwrap(),
+    )
+    .unwrap();
+    kernel
+        .store
+        .write(|tx| steering::bind_runtime(tx, &"source".into(), &target, "test-runtime"))
+        .unwrap();
     for (id, text) in [
         ("accepted-steer", "Already accepted steering."),
         ("untold-steer", "Unconfirmed steering 日本語 🧪."),

@@ -173,8 +173,16 @@ pub(crate) fn restart_attempt(
     plan.cancel_process_effects = true;
     plan.effects.push(EffectRequest::ProviderTurnRestart {
         provider_session_id: ProviderSessionId(session_id.into()),
-        provider_thread_id: run.provider_thread_id.clone().unwrap(),
-        provider_turn_id: ProviderTurnId(turn["id"].as_str().unwrap().into()),
+        provider_thread_id: run
+            .provider_thread_id
+            .clone()
+            .ok_or_else(|| unsupported(command, "Restart run has no provider thread"))?,
+        provider_turn_id: ProviderTurnId(
+            turn["id"]
+                .as_str()
+                .ok_or_else(|| unsupported(command, "Restart turn has no id"))?
+                .into(),
+        ),
         interrupted_attempt_id: old.id.clone(),
         run_id: run.id.clone(),
     });
@@ -355,7 +363,8 @@ pub(crate) fn plan(
                 && crate::orchestration::steering::runtime_id(
                     conn,
                     &command.thread_id,
-                    &crate::orchestration::steering::RuntimeTarget::for_run(run).unwrap(),
+                    &crate::orchestration::steering::RuntimeTarget::for_run(run)
+                        .ok_or_else(|| unsupported(command, "Steering run has no runtime target"))?,
                 )?
                 .as_ref()
                     != Some(&expected)
@@ -377,7 +386,7 @@ pub(crate) fn plan(
             let message = records(&projection, "message")
                 .iter()
                 .find(|m| m["id"] == message_id.0)
-                .unwrap();
+                .ok_or_else(|| unsupported(command, "Steering message is missing"))?;
             let delegated = message["delegatedCompletion"].is_object();
             let provider_instance = if delegated {
                 &run.provider_instance_id
@@ -713,7 +722,7 @@ pub(crate) fn plan(
                         Some(provider["id"].as_str().unwrap_or_default())
                             == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
                     })
-                    .unwrap();
+                    .ok_or_else(|| unsupported(command, "Run has no provider thread record"))?;
                 crate::orchestration::queue::runtime::observe(
                     &projection,
                     command,
@@ -800,8 +809,14 @@ pub(crate) fn plan(
                     }
                     plan.effects.push(EffectRequest::ProviderTurnInterrupt {
                         provider_session_id: session_id.into(),
-                        provider_thread_id: turn["providerThreadId"].as_str().unwrap().into(),
-                        provider_turn_id: turn["id"].as_str().unwrap().into(),
+                        provider_thread_id: turn["providerThreadId"]
+                            .as_str()
+                            .ok_or_else(|| unsupported(command, "Turn has no provider thread"))?
+                            .into(),
+                        provider_turn_id: turn["id"]
+                            .as_str()
+                            .ok_or_else(|| unsupported(command, "Turn has no id"))?
+                            .into(),
                     });
                 } else {
                     // Real output can precede attachment metadata too. The

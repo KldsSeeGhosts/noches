@@ -118,7 +118,9 @@ pub(super) fn plan(
             provider_session_id: ProviderSessionId(id),
             run_id: run.id.clone(),
             run_attempt_id: attempt.id.clone(),
-            provider_thread_id: run.provider_thread_id.clone().unwrap(),
+            provider_thread_id: run.provider_thread_id.clone().ok_or_else(|| {
+                Error::Invariant("The attached run has no provider thread.".into())
+            })?,
         });
     }
     Ok(())

@@ -167,15 +167,14 @@ pub(crate) fn confirm(
     )? {
         return Ok(false);
     }
-    if let Some(expected) = admitted_runtime(conn, &effect.id)?
-        && runtime_id(
-            conn,
-            &effect.thread_id,
-            &RuntimeTarget::for_run(run).unwrap(),
-        )?
-        .as_ref()
-            != Some(&expected)
-    {
+    // An input without an admitted runtime was never dispatched (`execute`
+    // fails it), so a late receipt for it has nothing to prove.
+    let (Some(target), Some(expected)) =
+        (RuntimeTarget::for_run(run), admitted_runtime(conn, &effect.id)?)
+    else {
+        return Ok(false);
+    };
+    if runtime_id(conn, &effect.thread_id, &target)?.as_ref() != Some(&expected) {
         return Ok(false);
     }
     let EffectRequest::ProviderTurnSteer {
@@ -194,7 +193,7 @@ pub(crate) fn confirm(
             effect.id,
             effect.thread_id.0,
             message_id.0,
-            run.active_attempt_id.as_ref().unwrap().0,
+            target.attempt_id.0,
             provider_session_id.0,
             now
         ],
@@ -414,7 +413,9 @@ pub(crate) async fn execute(
             }
         }
     }
-    let mut expected = RuntimeTarget::for_run(run).unwrap();
+    let Some(mut expected) = RuntimeTarget::for_run(run) else {
+        return Ok(EffectOutcome::Failed);
+    };
     expected.runtime_id = bridge
         .kernel
         .store
