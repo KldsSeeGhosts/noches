@@ -206,19 +206,24 @@ async fn canonical_frame(
     rx: &mut zeron_rpc::RpcSubscription,
     predicate: impl Fn(&zeron_proto::QueueUiState) -> bool,
 ) -> zeron_proto::QueueUiState {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let mut last = None;
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let value = rx.recv().await.expect("queue watch remains open");
             if let Ok(queue) =
                 serde_json::from_value::<zeron_proto::QueueUiState>(value["canonical"].clone())
-                && predicate(&queue)
             {
-                return queue;
+                if predicate(&queue) {
+                    return queue;
+                }
+                last = Some(queue);
             }
         }
     })
-    .await
-    .expect("canonical queue snapshot must arrive without polling")
+    .await;
+    found.unwrap_or_else(|_| {
+        panic!("canonical queue snapshot must arrive without polling; last frame: {last:?}")
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -965,6 +970,14 @@ async fn desktop_model_change_promotion_restarts_on_the_native_session_fences_st
     core.shutdown().await;
 }
 
+struct ReleaseCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ReleaseCount {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A turn that does not end until the test says so, so "the agent is busy" is
 /// a state the test controls rather than races.
 struct HeldHarness {
@@ -978,6 +991,15 @@ struct HeldHarness {
     asks: bool,
     park_after_done: bool,
     native_background: bool,
+    /// Native session id this adapter reports (distinct per harness in the
+    /// two-instance fixtures).
+    session: String,
+    /// Assistant text streamed before the turn parks, so a restart has partial
+    /// same-run history to hand off.
+    partial_text: Option<String>,
+    /// Provider turn streams dropped so far: an interrupted or finished
+    /// process releases its stream exactly once.
+    released: Arc<std::sync::atomic::AtomicUsize>,
     steering_receipt: Arc<Mutex<Option<bool>>>,
     /// Keep each steer's ACK sender alive and unanswered (a hung adapter),
     /// instead of dropping it, which reads as an immediate uncertain result.
@@ -1006,6 +1028,9 @@ impl HeldHarness {
                 asks,
                 park_after_done: false,
                 native_background: false,
+                session: "sess-queue".into(),
+                partial_text: None,
+                released: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 steering_receipt: Arc::new(Mutex::new(Some(true))),
                 held_receipts: Arc::new(Mutex::new(None)),
             }),
@@ -1058,6 +1083,7 @@ impl Harness for HeldHarness {
         let mut steering = controls.steering;
         let steering_receipt = self.steering_receipt.clone();
         let held_receipts = self.held_receipts.clone();
+        let session = self.session.clone();
         let mut opening = vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
@@ -1065,11 +1091,15 @@ impl Harness for HeldHarness {
                 model: "mock-1".into(),
                 tools: vec![],
                 cwd: request.cwd.clone(),
-                session_id: "sess-queue".into(),
+                session_id: session.clone(),
                 assistant_message_id: format!("a-{}", request.prompt),
             }),
             Ok(AgentEvent::InputAccepted),
         ];
+        if let Some(text) = &self.partial_text {
+            opening.push(Ok(AgentEvent::TextDelta { text: text.clone() }));
+        }
+        let released = ReleaseCount(self.released.clone());
         if self.native_background {
             opening.push(Ok(AgentEvent::Subagent {
                 parent_tool_use_id: "background-child".into(),
@@ -1083,6 +1113,7 @@ impl Harness for HeldHarness {
             .native_background
             .then(|| "Finished main reply".to_owned());
         let done = futures::stream::once(async move {
+            let _released = released;
             loop {
                 tokio::select! {
                     _ = finish.recv() => {
@@ -1090,7 +1121,7 @@ impl Harness for HeldHarness {
                             status: DoneStatus::Completed,
                             result: result.clone(),
                             error: None,
-                            session_id: Some("sess-queue".into()),
+                            session_id: Some(session.clone()),
                         });
                     }
                     steer = steering.recv() => {
@@ -1107,7 +1138,7 @@ impl Harness for HeldHarness {
                                 status: DoneStatus::Completed,
                                 result: result.clone(),
                                 error: None,
-                                session_id: Some("sess-queue".into()),
+                                session_id: Some(session.clone()),
                             });
                         }
                     }
@@ -3785,6 +3816,617 @@ async fn forced_reset_starts_a_fresh_generation_with_portable_history_and_is_rep
         assert_eq!(requests[2].resume.as_deref(), Some("sess-queue"));
         assert!(!requests[2].prompt.contains("opening question"));
     }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+fn composer_config(harness: HarnessId, model: &str) -> zeron_proto::ChatConfig {
+    zeron_proto::ChatConfig {
+        instance_id: None,
+        harness,
+        model: Some(model.into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
+    }
+}
+
+/// The desktop composer's own write path (`Mutate setChatConfig`).
+async fn set_composer(core: &EngineCore, config: &zeron_proto::ChatConfig) {
+    zeron_rpc::memory_client(core.rpc_service())
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({"op":"setChatConfig","chatId":CHAT,"config":config}),
+        )
+        .await
+        .expect("setChatConfig");
+}
+
+async fn runs_completed(core: &EngineCore, count: usize) {
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs.len() == count && p.runs.iter().all(|r| {
+                        r.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Completed
+                    })
+                })
+        },
+        "runs completed",
+    )
+    .await;
+}
+
+fn assemble_two(
+    path: &std::path::Path,
+    first: Arc<HeldHarness>,
+    second: Arc<HeldHarness>,
+) -> EngineCore {
+    let registry = HarnessRegistry::new();
+    registry.register(first);
+    registry.register(second);
+    EngineCore::assemble(path, Arc::new(registry), HarnessId::Grok, None)
+        .expect("engine core assembles")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_turn_handoff_on_the_same_instance_starts_fresh_instead_of_resuming_the_remembered_session()
+ {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.workspace
+        .set_chat_config(CHAT, &composer_config(HarnessId::Mock, "model-a"))
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "first question", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "first turn").await;
+    let _ = harness.finish.send(());
+    runs_completed(&core, 1).await;
+    // The composer moves to another model of the same instance. This adapter
+    // cannot switch models inside a native session, so the planner chooses a new
+    // provider generation seeded with portable context.
+    set_composer(&core, &composer_config(HarnessId::Mock, "model-b")).await;
+    core.doc_host
+        .queue_message(CHAT, "second question", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 2, "handoff turn").await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(
+            requests[1].resume, None,
+            "the engine must not resume the native session it still remembers"
+        );
+        assert!(
+            requests[1].prompt.contains("first question")
+                && requests[1].prompt.contains("second question"),
+            "{}",
+            requests[1].prompt
+        );
+    }
+    let _ = harness.finish.send(());
+    runs_completed(&core, 2).await;
+    core.doc_host
+        .queue_message(CHAT, "third question", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 3, "continued turn").await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(
+            requests[2].resume.as_deref(),
+            Some("sess-queue"),
+            "an unchanged selection keeps native continuity on the new generation"
+        );
+        assert!(!requests[2].prompt.contains("first question"));
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composer_model_change_mid_run_drives_a_same_instance_handoff_restart_and_fences_the_old_process()
+ {
+    use serde_json::json;
+    use zeron_proto::{QueuePromotionMode, orchestration::*};
+    use zeron_rpc::methods;
+    let (mut harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().partial_text =
+        Some("partial answer before the switch".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let core = assemble_at(&tmp.keep().join("data"), harness.clone());
+    create_chat(&core).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.workspace
+        .set_chat_config(CHAT, &composer_config(HarnessId::Mock, "model-a"))
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "original direction", vec![])
+        .unwrap();
+    let original = running_canonical(&core).await;
+    let active = original.runs[0].id.clone();
+    let selected = canonical_input(&core, "new direction").await;
+    canonical_input(&core, "later SQL work").await;
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let before = canonical_frame(&mut watch, |state| {
+        state.queue.len() == 2 && state.promotion_mode.is_some()
+    })
+    .await;
+    assert_eq!(before.promotion_selection, None, "nothing changed yet");
+    set_composer(&core, &composer_config(HarnessId::Mock, "model-b")).await;
+    let hint = canonical_frame(&mut watch, |state| {
+        state.promotion_mode == Some(QueuePromotionMode::InterruptRestartWithHandoff)
+    })
+    .await;
+    let next = hint
+        .promotion_selection
+        .clone()
+        .expect("reviewed selection");
+    assert_eq!(&*next.model, "model-b");
+    // Changing the composer neither interrupts nor restarts the running turn.
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        harness.released.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    // A click reviewed against the wrong mode is refused before consuming input.
+    let stale = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"wrong-mode",
+                "action":{"type":"promoteToRestart","targetRunId":active,"handoff":false,
+                    "expectedSelection":next}}),
+        )
+        .await
+        .unwrap();
+    assert!(stale["refusal"].is_string(), "{stale}");
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+    let request = json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"handoff-once",
+        "action":{"type":"promoteToRestart","targetRunId":active,"handoff":true,
+            "expectedSelection":next}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, request.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || harness.requests.lock().unwrap().len() == 2,
+        "replacement start on the new generation",
+    )
+    .await;
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, request)
+            .await
+            .unwrap(),
+        reply,
+        "response-loss retry must not restart the replacement"
+    );
+    let after = running_canonical(&core).await;
+    let run = after.runs.iter().find(|r| r.id == active).unwrap();
+    assert_eq!(run.model_selection, next);
+    assert_ne!(
+        run.provider_thread_id, original.runs[0].provider_thread_id,
+        "a handoff needs a new provider generation"
+    );
+    assert_eq!(
+        harness.released.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly the old process was torn down"
+    );
+    assert_eq!(
+        after
+            .attempts
+            .iter()
+            .find(|a| Some(&a.id) == original.runs[0].active_attempt_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2RunAttemptStatus::Superseded
+    );
+    let requests = harness.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests[1].resume, None,
+        "a fresh generation must not resume the native session the engine remembers"
+    );
+    assert_eq!(requests[1].model.as_deref(), Some("model-b"));
+    assert!(
+        requests[1].prompt.ends_with("new direction"),
+        "the promoted message is the current input, after the handoff: {}",
+        requests[1].prompt
+    );
+    assert!(
+        requests[1].prompt.contains("original direction")
+            && requests[1]
+                .prompt
+                .contains("partial answer before the switch"),
+        "the handoff carries the run's partial history: {}",
+        requests[1].prompt
+    );
+    let handoffs: Vec<_> = core
+        .orchestration
+        .store
+        .thread_transfers(&CHAT.into())
+        .unwrap()
+        .into_iter()
+        .filter(|t| t["type"] == "provider_handoff")
+        .collect();
+    assert_eq!(handoffs.len(), 1, "replay must not duplicate the handoff");
+    assert_eq!(
+        handoffs[0]["id"],
+        format!(
+            "provider-handoff:{}:attempt:2",
+            active.0.replace(':', "%3A")
+        ),
+    );
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .find(|r| r.user_message_id.0 == "message:later SQL work")
+            .unwrap()
+            .status,
+        OrchestrationV2RunStatus::Queued,
+        "other queued rows are untouched"
+    );
+    assert!(core.orchestration.store.verify_projections().unwrap());
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// Two adapters on two provider instances: a mid-run composer switch restarts
+/// the running turn on the other one, then a later switch back returns to the
+/// first instance's earlier native conversation with only the missed delta.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_instance_composer_switch_restarts_with_portable_history_and_a_to_b_to_a_resumes_the_earlier_generation()
+ {
+    use serde_json::json;
+    use zeron_proto::QueuePromotionMode;
+    use zeron_rpc::methods;
+    // The mock adapter is hidden from the migrated catalog once a real driver
+    // is registered (`provider_instances::load`), so both instances are real
+    // drivers backed by the fake adapter.
+    let (mut a, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    {
+        let a = Arc::get_mut(&mut a).unwrap();
+        a.id = HarnessId::Grok;
+        a.session = "sess-a".into();
+    }
+    let (mut b, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    {
+        let b = Arc::get_mut(&mut b).unwrap();
+        b.id = HarnessId::Codex;
+        b.session = "sess-b".into();
+        b.partial_text = Some("partial answer on b".into());
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let core = assemble_two(&tmp.keep().join("data"), a.clone(), b.clone());
+    create_chat(&core).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let first_model = |harness: HarnessId, fallback: &str| {
+        core.registry
+            .provider_instances
+            .snapshot(&core.registry)
+            .into_iter()
+            .find(|p| p.harness_id == Some(harness))
+            .and_then(|p| p.models.into_iter().map(|m| m.id).next())
+            .unwrap_or_else(|| fallback.into())
+    };
+    // Startup discovery applies the host's real account state, then fills the
+    // model lists; pin readiness only after it has finished.
+    wait_for(
+        || {
+            core.registry
+                .provider_instances
+                .snapshot(&core.registry)
+                .iter()
+                .any(|p| p.harness_id == Some(HarnessId::Codex) && !p.models.is_empty())
+        },
+        "startup provider discovery",
+    )
+    .await;
+    for driver in [HarnessId::Grok, HarnessId::Codex] {
+        core.registry.provider_instances.set_authentication(
+            driver,
+            zeron_engine::provider_instances::Authentication::Authenticated,
+        );
+    }
+    // Turn 1 completes on instance A and leaves its native conversation.
+    core.workspace
+        .set_chat_config(CHAT, &composer_config(HarnessId::Grok, "a-model"))
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "first turn on a", vec![])
+        .unwrap();
+    wait_for(|| a.requests.lock().unwrap().len() == 1, "first turn on A").await;
+    let _ = a.finish.send(());
+    runs_completed(&core, 1).await;
+    let first = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    // Turn 2 starts on B (the composer switched while idle). Exact model ids
+    // are validated against the live catalog, which fills in after discovery.
+    let b_model = first_model(HarnessId::Codex, "b-model");
+    set_composer(&core, &composer_config(HarnessId::Codex, &b_model)).await;
+    core.doc_host
+        .queue_message(CHAT, "second turn on b", vec![])
+        .unwrap();
+    wait_for(|| b.requests.lock().unwrap().len() == 1, "second turn on B").await;
+    assert_eq!(b.requests.lock().unwrap()[0].resume, None);
+    let on_b = {
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .thread(&CHAT.into())
+                    .is_ok_and(|p| {
+                        p.is_some_and(|p| {
+                            p.runs.len() == 2
+                                && p.attempts.iter().any(|a| {
+                                    a.run_id == p.runs[1].id && a.provider_turn_id.is_some()
+                                })
+                        })
+                    })
+            },
+            "turn 2 running on B",
+        )
+        .await;
+        core.orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap()
+    };
+    let active = on_b.runs[1].id.clone();
+    assert_ne!(
+        on_b.runs[1].provider_instance_id,
+        on_b.runs[0].provider_instance_id
+    );
+    let selected = canonical_input(&core, "third direction").await;
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    canonical_frame(&mut watch, |state| {
+        state.queue.len() == 1 && state.promotion_mode.is_some()
+    })
+    .await;
+    // Back to A mid-run: the hint is a handoff restart on the earlier instance.
+    let a_model = first_model(HarnessId::Grok, "a-model");
+    set_composer(&core, &composer_config(HarnessId::Grok, &a_model)).await;
+    let hint = canonical_frame(&mut watch, |state| {
+        state.promotion_mode == Some(QueuePromotionMode::InterruptRestartWithHandoff)
+    })
+    .await;
+    let next = hint
+        .promotion_selection
+        .clone()
+        .expect("reviewed selection");
+    assert_eq!(next.instance_id, first.runs[0].provider_instance_id);
+    assert_eq!(b.requests.lock().unwrap().len(), 1);
+    assert_eq!(b.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+    core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+    let request = json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"back-to-a",
+        "action":{"type":"promoteToRestart","targetRunId":active,"handoff":true,
+            "expectedSelection":next}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, request.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || a.requests.lock().unwrap().len() == 2,
+        "restart on instance A",
+    )
+    .await;
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, request)
+            .await
+            .unwrap(),
+        reply
+    );
+    assert_eq!(
+        b.released.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly B's old process was torn down"
+    );
+    assert_eq!(
+        a.released.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "A's finished turn only"
+    );
+    let after = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active).unwrap();
+    assert_eq!(run.provider_instance_id, first.runs[0].provider_instance_id);
+    assert_eq!(
+        run.provider_thread_id, first.runs[0].provider_thread_id,
+        "A's earlier native generation is reused"
+    );
+    let requests = a.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests[1].resume.as_deref(),
+        Some("sess-a"),
+        "the accepted A conversation continues natively"
+    );
+    assert!(
+        requests[1].prompt.contains("second turn on b")
+            && requests[1].prompt.contains("partial answer on b"),
+        "{}",
+        requests[1].prompt
+    );
+    assert!(
+        !requests[1].prompt.contains("first turn on a"),
+        "A already holds its own earlier turn: {}",
+        requests[1].prompt
+    );
+    let handoffs: Vec<_> = core
+        .orchestration
+        .store
+        .thread_transfers(&CHAT.into())
+        .unwrap()
+        .into_iter()
+        .filter(|t| t["type"] == "provider_handoff")
+        .collect();
+    // One handoff per provider generation of the run: B's first turn (full
+    // portable context) and the return to A (only what A has not seen).
+    assert_eq!(handoffs.len(), 2);
+    let encoded = active.0.replace(':', "%3A");
+    let by_id = |id: String| handoffs.iter().find(|t| t["id"] == id).unwrap();
+    assert_eq!(
+        by_id(format!("provider-handoff:{encoded}:attempt:2"))["resolution"]["strategy"],
+        "delta_context"
+    );
+    assert_eq!(
+        by_id(format!("provider-handoff:{encoded}"))["resolution"]["strategy"],
+        "portable_context"
+    );
+    assert!(core.orchestration.store.verify_projections().unwrap());
+    let _ = a.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_run_that_starts_on_a_new_generation_does_not_resume_the_remembered_session() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.workspace
+        .set_chat_config(CHAT, &composer_config(HarnessId::Mock, "model-a"))
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "first question", vec![])
+        .unwrap();
+    running_canonical(&core).await;
+    // The selection moves while the first turn runs; the follow-up is queued on
+    // the new selection and starts through the runner when the turn ends.
+    set_composer(&core, &composer_config(HarnessId::Mock, "model-b")).await;
+    canonical_input(&core, "queued follow-up").await;
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+    let _ = harness.finish.send(());
+    wait_for(|| prompts.lock().unwrap().len() == 2, "queued run start").await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(requests[1].model.as_deref(), Some("model-b"));
+        assert_eq!(
+            requests[1].resume, None,
+            "a rebuilt generation must not resume the remembered native session"
+        );
+        assert!(
+            requests[1].prompt.contains("first question"),
+            "{}",
+            requests[1].prompt
+        );
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composer_selection_sync_is_catalog_validated_idempotent_and_never_starts_a_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().id = HarnessId::Codex;
+    let registry = HarnessRegistry::new();
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(
+        &tmp.keep().join("data"),
+        Arc::new(registry),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    create_chat(&core).await;
+    wait_for(
+        || {
+            core.registry
+                .provider_instances
+                .snapshot(&core.registry)
+                .iter()
+                .any(|p| p.harness_id == Some(HarnessId::Codex) && !p.models.is_empty())
+        },
+        "startup provider discovery",
+    )
+    .await;
+    core.registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+    );
+    let advertised: Vec<String> = core
+        .registry
+        .provider_instances
+        .snapshot(&core.registry)
+        .into_iter()
+        .find(|p| p.harness_id == Some(HarnessId::Codex))
+        .unwrap()
+        .models
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(advertised.len() >= 2, "{advertised:?}");
+    let selection = |core: &EngineCore| {
+        core.orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .map(|p| p.thread.model_selection)
+    };
+    // The thread exists from chat creation; the composer's pick lands on it
+    // before any turn has been admitted.
+    set_composer(&core, &composer_config(HarnessId::Codex, &advertised[1])).await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[1]);
+    set_composer(&core, &composer_config(HarnessId::Codex, &advertised[0])).await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[0]);
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "first turn").await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[0]);
+    // A model the live catalog does not advertise never becomes the saved
+    // selection (the chat row stays LWW, admission re-validates).
+    set_composer(
+        &core,
+        &composer_config(HarnessId::Codex, "not-a-real-model"),
+    )
+    .await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[0]);
+    set_composer(&core, &composer_config(HarnessId::Codex, &advertised[1])).await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[1]);
+    // Re-sending the same config (a retry after response loss, or an unrelated
+    // chat-config edit) appends nothing.
+    let frontier = core.orchestration.store.projection_frontier().unwrap();
+    set_composer(&core, &composer_config(HarnessId::Codex, &advertised[1])).await;
+    assert_eq!(
+        core.orchestration.store.projection_frontier().unwrap(),
+        frontier
+    );
+    // Returning to an earlier selection is a new change, not a replayed receipt.
+    set_composer(&core, &composer_config(HarnessId::Codex, &advertised[0])).await;
+    assert_eq!(&*selection(&core).unwrap().model, advertised[0]);
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "syncing the selection never starts or restarts a turn"
+    );
+    assert!(core.orchestration.store.verify_projections().unwrap());
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
