@@ -101,6 +101,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// How long an errored result waits for the echo of an already-written
+    /// steer before the run is allowed to end (see [`drain_echoes`]).
+    echo_drain: Duration,
     /// Command discovery cache: only a successful probe is cached, so a
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
@@ -113,6 +116,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            echo_drain: Duration::from_millis(500),
             commands: tokio::sync::OnceCell::new(),
         }
     }
@@ -138,6 +142,12 @@ impl ClaudeHarness {
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
+        self
+    }
+
+    /// Tune how long an errored result waits for in-flight steer echoes.
+    pub fn with_echo_drain(mut self, echo_drain: Duration) -> Self {
+        self.echo_drain = echo_drain;
         self
     }
 
@@ -637,6 +647,7 @@ impl ClaudeHarness {
             reasoning: request.reasoning,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            echo_drain: self.echo_drain,
             stderr_tail,
             _mcp_config: mcp_config,
         };
@@ -831,17 +842,99 @@ fn new_input_uuid() -> String {
 /// keyed by the host-chosen line `uuid`. A line's echo is consumed once: a
 /// duplicate or unknown echo yields nothing, so it can never accept another
 /// message.
+///
+/// The engine retires a steer only on its receipt (`confirms_steered_inputs`)
+/// and re-dispatches whatever is still pending when the run dies as a fresh
+/// turn, so a steer the CLI consumed without echoing would run twice. The echo
+/// is therefore only trusted once this process has proven it echoes: the first
+/// echo seen proves it, and a turn result with none seen disproves it, after
+/// which mailbox steers fall back to boundary retirement (a receipt as soon as
+/// the line is written, as before receipts existed).
 #[derive(Default)]
-struct PendingInputs(std::collections::HashMap<String, Option<String>>);
+struct PendingInputs {
+    entries: std::collections::HashMap<String, Option<String>>,
+    echo_proven: bool,
+    echo_disproved: bool,
+}
 
 impl PendingInputs {
     fn register(&mut self, uuid: String, message_id: Option<String>) {
-        self.0.insert(uuid, message_id);
+        self.entries.insert(uuid, message_id);
     }
 
     fn accept(&mut self, uuid: &str) -> Option<AgentEvent> {
-        self.0.remove(uuid).map(crate::input_accepted_event)
+        let message_id = self.entries.remove(uuid)?;
+        self.echo_proven = true;
+        Some(crate::input_accepted_event(message_id))
     }
+
+    /// Whether any mailbox steer still awaits its echo.
+    fn has_steers(&self) -> bool {
+        self.entries.values().any(Option::is_some)
+    }
+
+    /// A turn result arrived: an echo that never appeared by now never will.
+    fn note_turn_result(&mut self) {
+        self.echo_disproved |= !self.echo_proven;
+    }
+
+    /// Whether the echo cannot be relied on (no echo seen at a turn result).
+    fn echo_disproved(&self) -> bool {
+        self.echo_disproved
+    }
+
+    /// Boundary-retirement fallback: receipts for every mailbox steer still
+    /// pending, for a CLI that has not proven it echoes.
+    fn retire_unechoed_steers(&mut self) -> Vec<AgentEvent> {
+        let mut retired = Vec::new();
+        self.entries.retain(|_, message_id| match message_id.take() {
+            Some(message_id) => {
+                retired.push(crate::input_accepted_event(Some(message_id)));
+                false
+            }
+            None => true,
+        });
+        retired
+    }
+
+    /// Same fallback, applied only while the echo is unproven.
+    fn retire_if_unproven(&mut self) -> Vec<AgentEvent> {
+        if self.echo_proven {
+            Vec::new()
+        } else {
+            self.retire_unechoed_steers()
+        }
+    }
+}
+
+/// After an errored result the run ends and the engine would re-dispatch any
+/// steer still unechoed. A CLI that echoes does so as it dequeues the line,
+/// within moments of the result, so give already-written lines one bounded
+/// chance to be acknowledged (stdout is read to EOF or until nothing is
+/// pending). A line consumed in this window is never re-dispatched.
+async fn drain_echoes(
+    stdout_lines: &mut tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
+    pending_inputs: &mut PendingInputs,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    window: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    while pending_inputs.has_steers() {
+        let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, stdout_lines.next_line()).await
+        else {
+            break;
+        };
+        let Ok(Frame::User(user)) = wire::parse_frame(line.trim()) else {
+            continue;
+        };
+        if user.is_replay
+            && let Some(receipt) = user.uuid.as_deref().and_then(|uuid| pending_inputs.accept(uuid))
+            && event_tx.send(Ok(receipt)).await.is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
@@ -885,6 +978,7 @@ struct Session {
     reasoning: Option<ReasoningLevel>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    echo_drain: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
     _mcp_config: Option<tempfile::NamedTempFile>,
@@ -905,6 +999,7 @@ async fn run_session(session: Session) {
         reasoning,
         interrupt_grace,
         kill_grace,
+        echo_drain,
         stderr_tail,
         _mcp_config,
     } = session;
@@ -973,6 +1068,34 @@ async fn run_session(session: Session) {
                     }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
+                        if let AgentEvent::Done { status, .. } = &ev {
+                            // A turn result with no echo ever seen disproves
+                            // the echo: retire what is pending the old way
+                            // before the result can end the run.
+                            pending_inputs.note_turn_result();
+                            for receipt in pending_inputs.retire_if_unproven() {
+                                if event_tx.send(Ok(receipt)).await.is_err() {
+                                    break 'main;
+                                }
+                            }
+                            // An errored result ends the run, and the engine
+                            // re-dispatches steers still unechoed: let ones
+                            // the CLI is already consuming be acknowledged.
+                            // A completed turn parks with the process alive,
+                            // so a late echo still lands on its own.
+                            if *status == DoneStatus::Errored
+                                && !interrupted
+                                && !drain_echoes(
+                                    &mut stdout_lines,
+                                    &mut pending_inputs,
+                                    &event_tx,
+                                    echo_drain,
+                                )
+                                .await
+                            {
+                                break 'main;
+                            }
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
@@ -1021,6 +1144,15 @@ async fn run_session(session: Session) {
                     // echo; an anonymous steer has nothing to acknowledge.
                     if let Some(message_id) = msg.message_id {
                         pending_inputs.register(uuid, Some(message_id));
+                        // Once a result has shown this CLI does not echo,
+                        // the write is the only acknowledgement there is.
+                        if pending_inputs.echo_disproved() {
+                            for receipt in pending_inputs.retire_unechoed_steers() {
+                                if event_tx.send(Ok(receipt)).await.is_err() {
+                                    break 'main;
+                                }
+                            }
+                        }
                     }
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
@@ -1066,6 +1198,12 @@ async fn run_session(session: Session) {
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
+        // The process ended before any echo proved itself: its steers were
+        // written and cannot be told from consumed ones, so they retire here
+        // rather than run again as fresh turns.
+        for receipt in pending_inputs.retire_if_unproven() {
+            let _ = event_tx.send(Ok(receipt)).await;
+        }
         if interrupted && !done_after_interrupt {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {

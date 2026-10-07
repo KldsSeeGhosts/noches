@@ -191,6 +191,51 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-receipts"}'
   ;;
 
+*scenario:noecho*)
+  # An older CLI: --replay-user-messages is accepted but nothing is ever echoed.
+  # A steer is consumed silently, so the host must retire it by the write.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-noecho"}'
+  read -r steer || exit 1
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"consumed"}}}'
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-noecho"}'
+  ;;
+
+*scenario:echolate*)
+  # The steer is queued past the turn's last boundary: the turn's result
+  # arrives first and the CLI echoes the line only when it dequeues it.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-late\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-late"}'
+  echo_user "$(uuid_of "$first")"
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-late"}'
+  echo_user "$(uuid_of "$steer")"
+  ;;
+
+*scenario:neverconsumed*)
+  # The CLI echoes its root prompt, then errors out without ever consuming
+  # the steer: nothing may acknowledge it (it was not run).
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-never\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-never"}'
+  echo_user "$(uuid_of "$first")"
+  # Hold the result until the steer line is on stdin so it is genuinely written.
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["boom"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-never"}'
+  ;;
+
+*scenario:erroredecho*)
+  # The result errors, and the echo of the already-written steer follows it:
+  # the CLI had consumed the line, so the host must not run it again.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-erred\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-erred"}'
+  echo_user "$(uuid_of "$first")"
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["boom"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-erred"}'
+  echo_user "$(uuid_of "$steer")"
+  ;;
+
 *scenario:interrupt*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-int"}'
   # Wedge without reading stdin — forces the SIGTERM escalation path.

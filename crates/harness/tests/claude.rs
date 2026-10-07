@@ -485,6 +485,86 @@ async fn replayed_stdin_lines_are_the_exact_native_input_receipts() {
     }));
 }
 
+/// Runs `scenario` with one identified steer queued and returns the events
+/// plus every steer receipt in stream order.
+async fn steer_receipts(scenario: &str, harness: ClaudeHarness) -> (Vec<AgentEvent>, Vec<usize>) {
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect".into(),
+            message_id: Some("m-steer".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness, request(scenario), controls).await;
+    let receipts = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(e, AgentEvent::InputAcceptedFor { message_id } if message_id == "m-steer")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    (events, receipts)
+}
+
+fn done_index(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("a Done")
+}
+
+#[tokio::test]
+async fn a_cli_that_never_echoes_retires_steers_by_the_boundary_not_a_redispatch() {
+    let (events, receipts) = steer_receipts("scenario:noecho", harness()).await;
+    // Exactly one receipt, delivered before the result can end the run, so the
+    // host's orphan sweep finds nothing to run as a fresh (duplicate) turn.
+    assert_eq!(receipts.len(), 1, "{events:?}");
+    assert!(receipts[0] < done_index(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn an_echo_that_lands_after_the_turn_result_still_retires_the_steer_once() {
+    let (events, receipts) = steer_receipts("scenario:echolate", harness()).await;
+    // The echo was proven by the root prompt, so the result must not retire the
+    // steer early: the late echo is its one receipt.
+    assert_eq!(receipts.len(), 1, "{events:?}");
+    assert!(receipts[0] > done_index(&events), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_steer_the_cli_never_consumed_is_left_for_the_host_to_run() {
+    let harness = harness().with_echo_drain(Duration::from_millis(100));
+    let (events, receipts) = steer_receipts("scenario:neverconsumed", harness).await;
+    assert!(receipts.is_empty(), "{events:?}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn an_errored_result_waits_for_the_echo_of_a_line_the_cli_already_consumed() {
+    let harness = harness().with_echo_drain(Duration::from_secs(2));
+    let (events, receipts) = steer_receipts("scenario:erroredecho", harness).await;
+    // The echo follows the error result; the run must not end before it is
+    // read, or the host would run the consumed steer a second time.
+    assert_eq!(receipts.len(), 1, "{events:?}");
+    assert!(receipts[0] < done_index(&events), "{events:?}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn claude_retires_steers_only_by_native_receipt() {
     use zeron_harness::Harness;
