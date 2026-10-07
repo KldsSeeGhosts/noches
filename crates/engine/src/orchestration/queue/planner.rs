@@ -50,6 +50,12 @@ pub(crate) fn plan(
             }
             super::session_control::plan(conn, &mut plan, command, &p, &op.input, now)?;
         }
+        "host.reset_provider_session" => {
+            if op.caller.is_some() {
+                return Err(refuse("Provider session reset requires user authority."));
+            }
+            super::session_control::plan_reset(conn, &mut plan, command, &p, &op.input, now)?;
+        }
         "host.title_generated" => {
             let mut thread = serde_json::to_value(&p.thread)?;
             if thread["titleRegeneration"]["requestId"] != op.input["requestId"] {

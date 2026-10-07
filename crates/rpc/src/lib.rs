@@ -59,6 +59,12 @@ pub mod methods {
     pub const FORK_THREAD: &str = "ForkThread";
     pub const MERGE_THREAD_BACK: &str = "MergeThreadBack";
     pub const DISCONNECT_THREAD_SESSION: &str = "DisconnectThreadSession";
+    /// `{chatId,clientRequestId}` -> StopThreadWorkResult: one durable Stop for
+    /// the thread's run, native background work and app-owned child tasks.
+    pub const STOP_THREAD_WORK: &str = "StopThreadWork";
+    /// `{chatId,clientRequestId,observedRunId,providerSessions}` ->
+    /// ResetThreadSessionResult; the next turn rebuilds from portable history.
+    pub const RESET_THREAD_SESSION: &str = "ResetThreadSession";
     /// `{chatId,checkpointId}` -> RestorePreview. Does not change files.
     pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
     /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.

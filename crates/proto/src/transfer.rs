@@ -83,6 +83,10 @@ pub struct ThreadTransferState {
     pub latest_forkable_run_id: Option<String>,
     #[serde(default)]
     pub latest_mergeable_run_id: Option<String>,
+    /// Newest started run of any outcome: the stale-action fence for a
+    /// session reset (queued runs have not started and never move it).
+    #[serde(default)]
+    pub latest_started_run_id: Option<String>,
     /// Passive identities only: no credentials or native provider payload.
     #[serde(default)]
     pub attached_provider_sessions: Vec<ProviderSessionRef>,
@@ -153,6 +157,48 @@ pub struct ProviderSessionRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisconnectThreadSessionResult {
+    pub sequence: i64,
+    pub refusal: Option<String>,
+}
+
+/// Whole-thread Stop: the foreground run, native background work and every
+/// app-owned delegated child task (recursively) of this one thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopThreadWorkParams {
+    pub chat_id: String,
+    /// Replaying the same id repeats the first frozen target set exactly.
+    pub client_request_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopThreadWorkResult {
+    pub sequence: i64,
+    /// Runs whose Stop was admitted, including the thread's own.
+    pub stopped_runs: u32,
+    /// Targets that settled or changed before their fence was reached.
+    pub skipped: u32,
+    pub refusal: Option<String>,
+}
+
+/// Forced session reconstruction: the next turn starts a fresh provider-thread
+/// generation seeded with bounded portable history. Never edits history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetThreadSessionParams {
+    pub chat_id: String,
+    pub client_request_id: String,
+    /// Newest started run the panel observed; a newer turn refuses the reset.
+    pub observed_run_id: Option<String>,
+    /// Attachments the panel observed (may be empty for an idle thread).
+    #[serde(default)]
+    pub provider_sessions: Vec<ProviderSessionRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetThreadSessionResult {
     pub sequence: i64,
     pub refusal: Option<String>,
 }

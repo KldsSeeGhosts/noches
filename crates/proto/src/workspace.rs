@@ -18,6 +18,8 @@ pub mod capabilities {
     pub const RUNTIME_POLICY_V1: &str = "runtime-policy-v1";
     pub const THREAD_TRANSFERS_V1: &str = "thread-transfers-v1";
     pub const PROVIDER_SESSION_CONTROL_V1: &str = "provider-session-control-v1";
+    pub const THREAD_WORK_STOP_V1: &str = "thread-work-stop-v1";
+    pub const PROVIDER_SESSION_RESET_V1: &str = "provider-session-reset-v1";
 
     pub const CURRENT: &[&str] = &[
         QUEUED_ATTACHMENTS_V1,
@@ -31,6 +33,8 @@ pub mod capabilities {
         RUNTIME_POLICY_V1,
         THREAD_TRANSFERS_V1,
         PROVIDER_SESSION_CONTROL_V1,
+        THREAD_WORK_STOP_V1,
+        PROVIDER_SESSION_RESET_V1,
     ];
 
     pub fn current() -> Vec<String> {

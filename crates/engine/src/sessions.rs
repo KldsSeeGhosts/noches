@@ -1472,6 +1472,20 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
+    /// Explicit "do not resume" for this chat's next dispatch: the empty id is
+    /// the tombstone `resume_for` honours. The new session's `SessionStarted`
+    /// replaces it, so only that one fresh generation is affected.
+    pub(crate) fn forget_native_resume(&self, chat_id: &str) {
+        lock(&self.inner.harness_sessions).insert(
+            chat_id.to_string(),
+            HarnessSessionRef {
+                session_id: String::new(),
+                cwd: String::new(),
+                instance_id: None,
+            },
+        );
+    }
+
     /// User Stop uses host authority, never a fabricated agent credential.
     /// The durable session-command identity keeps retries on their first
     /// admitted target. None denotes a legacy session without kernel ownership.
@@ -3903,6 +3917,35 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn forced_reset_tombstone_blocks_remembered_resume_until_a_new_session_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let resume = |sessions: &SessionsEngine| {
+            sessions.inner.resume_for_instance(
+                "chat",
+                "/repo",
+                &"codex_work".into(),
+                HarnessId::Codex,
+            )
+        };
+        sessions
+            .inner
+            .remember_harness_session("chat", "old", "/repo", Some("codex_work".into()));
+        assert_eq!(resume(&sessions).as_deref(), Some("old"));
+        sessions.forget_native_resume("chat");
+        assert_eq!(resume(&sessions), None);
+        // The fresh generation's SessionStarted replaces the tombstone.
+        sessions
+            .inner
+            .remember_harness_session("chat", "new", "/repo", Some("codex_work".into()));
+        assert_eq!(resume(&sessions).as_deref(), Some("new"));
+    }
 
     #[tokio::test]
     async fn permission_bridge_round_trip_is_id_scoped_and_not_a_question() {

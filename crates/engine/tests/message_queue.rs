@@ -3397,3 +3397,205 @@ async fn queue_completion_markers_distinguish_normal_turns_from_interrupts() {
         core.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_reset_starts_a_fresh_generation_with_portable_history_and_is_replay_safe() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    use zeron_proto::transfer::ResetThreadSessionParams;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening question", vec![])
+        .unwrap();
+    let sessions = attached_sessions(&core).await;
+    let observed = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .latest_started_run_id;
+    let request = ResetThreadSessionParams {
+        chat_id: CHAT.into(),
+        client_request_id: "reset-once".into(),
+        observed_run_id: observed.clone(),
+        provider_sessions: sessions.clone(),
+    };
+    // A running turn is not silently stopped or rewritten by a reset.
+    let refused = client
+        .reset_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(
+        refused
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("Stop the current run"),
+        "{:?}",
+        refused.refusal
+    );
+    assert!(core.sessions.has_live_runtime(CHAT));
+    let _ = harness.finish.send(());
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs
+                        .iter()
+                        .all(|r| r.status == OrchestrationV2RunStatus::Completed)
+                })
+        },
+        "first turn completion",
+    )
+    .await;
+    let before = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let old_provider = before.runs[0].provider_thread_id.clone().unwrap();
+    let live = core
+        .orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .attached_provider_sessions;
+    let mut request = ResetThreadSessionParams {
+        provider_sessions: live,
+        ..request
+    };
+    let mut stale = request.clone();
+    stale.client_request_id = "reset-stale".into();
+    stale.observed_run_id = Some("run:an-older-turn".into());
+    assert!(
+        client
+            .reset_thread_session(stale, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("newer turn")
+    );
+    request.client_request_id = "reset-done".into();
+    let first = client
+        .reset_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(first.refusal.is_none(), "{:?}", first.refusal);
+    wait_for(|| !core.sessions.has_live_runtime(CHAT), "reset teardown").await;
+    let reset = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    // History is kept; only the provider conversation is closed.
+    assert_eq!(reset.runs.len(), before.runs.len());
+    assert_eq!(
+        reset.records["provider-thread"]
+            .iter()
+            .find(|p| p["id"] == old_provider.0)
+            .unwrap()["status"],
+        "closed"
+    );
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "reset must not start a provider"
+    );
+    // Retrying the exact request after response loss repeats it, and neither
+    // a changed payload under the same id nor a second reset of a thread with
+    // nothing left to reset is accepted.
+    let replay = client
+        .reset_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(first.sequence, replay.sequence);
+    let mut collision = request.clone();
+    collision.observed_run_id = Some("run:other".into());
+    assert!(
+        client
+            .reset_thread_session(collision, &core.device_id)
+            .await
+            .is_err()
+    );
+    request.client_request_id = "reset-again".into();
+    assert!(
+        client
+            .reset_thread_session(request, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .is_some()
+    );
+
+    core.doc_host
+        .queue_message(CHAT, "after the reset", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().len() == 2,
+        "fresh generation start",
+    )
+    .await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(
+            requests[1].resume, None,
+            "a reset never rides native resume"
+        );
+        assert!(
+            requests[1].prompt.contains("opening question")
+                && requests[1].prompt.contains("after the reset"),
+            "{}",
+            requests[1].prompt
+        );
+    }
+    let next = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        next.runs[1].provider_thread_id.as_ref(),
+        Some(&old_provider)
+    );
+    let _ = harness.finish.send(());
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs
+                        .iter()
+                        .all(|r| r.status == OrchestrationV2RunStatus::Completed)
+                })
+        },
+        "second turn completion",
+    )
+    .await;
+    // The new generation is an ordinary conversation again: no repeated
+    // reconstruction and no tombstone on the following turn.
+    core.doc_host
+        .queue_message(CHAT, "one more", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().len() == 3,
+        "continued generation",
+    )
+    .await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(requests[2].resume.as_deref(), Some("sess-queue"));
+        assert!(!requests[2].prompt.contains("opening question"));
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}

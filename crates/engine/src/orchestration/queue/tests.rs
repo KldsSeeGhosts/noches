@@ -74,6 +74,163 @@ async fn disconnect_fences_cover_reattachment_attempt_and_generation() {
     ));
 }
 
+#[tokio::test]
+async fn reset_generation_predicate_marks_only_the_first_run_after_a_closed_conversation() {
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    let index = p.runs.iter().position(|r| r.id == run.id).unwrap();
+    // An ordinary conversation, and the same one before any reset, resumes.
+    assert!(!super::session_control::fresh_after_reset(
+        &p,
+        &p.runs[index]
+    ));
+    let provider = run.provider_thread_id.clone().unwrap();
+    let mut fresh = p.runs[index].clone();
+    fresh.id = "after-reset".into();
+    fresh.ordinal += 1;
+    fresh.provider_thread_id = Some("fresh-generation".into());
+    let rows = p.records.get_mut("provider-thread").unwrap();
+    let mut closed = rows
+        .iter()
+        .find(|row| row["id"] == provider.0)
+        .unwrap()
+        .clone();
+    closed["status"] = json!("closed");
+    let mut generation = closed.clone();
+    generation["id"] = json!("fresh-generation");
+    generation["status"] = json!("not_loaded");
+    rows.retain(|row| row["id"] != provider.0);
+    rows.push(closed);
+    rows.push(generation);
+    // The conversation a user reset closed never resumes natively...
+    assert!(super::session_control::fresh_after_reset(
+        &p,
+        &p.runs[index]
+    ));
+    // ...the first turn on its replacement is rebuilt, a later one resumes it.
+    p.runs.push(fresh.clone());
+    assert!(super::session_control::fresh_after_reset(&p, &fresh));
+    let mut later = fresh.clone();
+    later.id = "later".into();
+    later.ordinal += 1;
+    p.runs.push(later.clone());
+    assert!(!super::session_control::fresh_after_reset(&p, &later));
+}
+
+#[tokio::test]
+async fn reset_plan_closes_started_conversations_and_moves_queued_runs_together() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::{Completed, Queued, Starting};
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    p.records.remove("provider-session");
+    let index = p.runs.iter().position(|r| r.id == run.id).unwrap();
+    p.runs[index].status = Completed;
+    // Two queued follow-ups bound to the started conversation, one already
+    // on its own fresh one: only the first two share a new generation.
+    for (id, ordinal) in [("queued-a", 2), ("queued-b", 3)] {
+        let mut queued = p.runs[index].clone();
+        queued.id = id.into();
+        queued.ordinal = ordinal;
+        queued.status = Queued;
+        queued.active_attempt_id = None;
+        p.runs.push(queued);
+    }
+    let plan_for = |p: &super::ThreadProjection, observed: Option<&str>| {
+        let command = Command {
+            id: CommandId("reset".into()),
+            thread_id: p.thread.id.clone(),
+            operation: Operation::Recover,
+        };
+        let mut plan = crate::orchestration::command::Plan::default();
+        let result = fixture.service.kernel.store.read(|conn| {
+            super::session_control::plan_reset(
+                conn,
+                &mut plan,
+                &command,
+                p,
+                &json!({"observedRunId":observed,"providerSessions":[]}),
+                NOW,
+            )
+        });
+        (result, plan)
+    };
+    let (stale, _) = plan_for(&p, Some("another-run"));
+    assert!(stale.unwrap_err().to_string().contains("newer turn"));
+    let (ok, plan) = plan_for(&p, Some(&run.id.0));
+    ok.unwrap();
+    let events: Vec<Value> = plan
+        .events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect();
+    let of = |kind: &str| -> Vec<&Value> { events.iter().filter(|e| e["type"] == kind).collect() };
+    let threads = of("provider-thread.updated");
+    assert_eq!(
+        threads.len(),
+        2,
+        "one closed conversation, one new generation"
+    );
+    assert_eq!(threads[0]["payload"]["status"], "closed");
+    assert_eq!(
+        threads[0]["payload"]["id"],
+        run.provider_thread_id.as_ref().unwrap().0
+    );
+    let fresh = threads[1]["payload"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(fresh, run.provider_thread_id.as_ref().unwrap().0);
+    assert!(threads[1]["payload"]["nativeThreadRef"].is_null());
+    let moved: Vec<_> = of("run.updated")
+        .into_iter()
+        .map(|e| {
+            (
+                e["payload"]["id"].clone(),
+                e["payload"]["providerThreadId"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        vec![
+            (json!("queued-a"), json!(fresh)),
+            (json!("queued-b"), json!(fresh))
+        ]
+    );
+    // The started run keeps its history; nothing else is rewritten.
+    assert!(
+        of("run.updated")
+            .iter()
+            .all(|e| e["payload"]["id"] != run.id.0)
+    );
+
+    // A turn that is still running refuses, and so does a thread that never
+    // started a conversation.
+    p.runs[index].status = Starting;
+    let (active, _) = plan_for(&p, Some(&run.id.0));
+    assert!(
+        active
+            .unwrap_err()
+            .to_string()
+            .contains("Stop the current run")
+    );
+    p.runs[index].status = Completed;
+    p.records.remove("provider-thread");
+    let (empty, _) = plan_for(&p, Some(&run.id.0));
+    assert!(empty.unwrap_err().to_string().contains("no agent session"));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     service: QueueDomain,

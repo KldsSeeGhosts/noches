@@ -1281,6 +1281,9 @@ fn forwardable(method: &str) -> bool {
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
             | methods::DISCONNECT_THREAD_SESSION
+            | methods::STOP_THREAD_WORK
+            | methods::RESET_THREAD_SESSION
+            | methods::CANCEL_DELEGATED_TASK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
@@ -1642,6 +1645,9 @@ impl RpcService for EngineRpc {
                 | methods::ACKNOWLEDGE_THREAD_WOKE
                 | methods::MUTATE_QUEUED_RUN
                 | methods::DISCONNECT_THREAD_SESSION
+                | methods::STOP_THREAD_WORK
+                | methods::RESET_THREAD_SESSION
+                | methods::CANCEL_DELEGATED_TASK
                 | methods::FORK_THREAD
                 | methods::MERGE_THREAD_BACK
                 | methods::GET_THREAD_TRANSFER_STATE
@@ -1780,6 +1786,63 @@ impl RpcService for EngineRpc {
                 })?;
                 let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
                 RpcReply::value(&domain.disconnect_for_user(&self.doc_host, request).await?)
+            }
+            methods::STOP_THREAD_WORK => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::StopThreadWorkParams = parse_params(params)?;
+                if request.client_request_id.trim().is_empty()
+                    || request.client_request_id.len() > 512
+                    || request.chat_id.trim().is_empty()
+                {
+                    return Err(RpcError::BadParams(
+                        "Stop requests need a chat and a request identity of at most 512 bytes."
+                            .into(),
+                    ));
+                }
+                if !self.doc_host.is_host(&request.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Stopping a thread requires the owning host.".into(),
+                    ));
+                }
+                let service = self
+                    .delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Thread Stop is unavailable.".into()))?;
+                let thread = request.chat_id.into();
+                let result = match crate::orchestration::stop_all::stop_thread_work(
+                    &service.kernel,
+                    &thread,
+                    &request.client_request_id,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    // A definite refusal is not an uncertain transport failure.
+                    Err(crate::orchestration::Error::Invariant(refusal)) => {
+                        zeron_proto::transfer::StopThreadWorkResult {
+                            refusal: Some(refusal),
+                            ..Default::default()
+                        }
+                    }
+                    Err(error) => return Err(RpcError::Failed(error.to_string())),
+                };
+                RpcReply::value(&result)
+            }
+            methods::RESET_THREAD_SESSION => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::ResetThreadSessionParams =
+                    parse_params(params)?;
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Provider session control is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                RpcReply::value(&domain.reset_for_user(&self.doc_host, request).await?)
             }
             methods::MUTATE_QUEUED_RUN => {
                 let request: zeron_proto::MutateQueuedRunParams = parse_params(params)?;
@@ -3753,6 +3816,9 @@ mod tests {
             methods::RESTORE_FILE_CHECKPOINT,
             methods::MUTATE_QUEUED_RUN,
             methods::DISCONNECT_THREAD_SESSION,
+            methods::STOP_THREAD_WORK,
+            methods::RESET_THREAD_SESSION,
+            methods::CANCEL_DELEGATED_TASK,
         ] {
             assert!(forwardable(method), "{method}");
             assert!(!is_stream_method(method), "{method}");

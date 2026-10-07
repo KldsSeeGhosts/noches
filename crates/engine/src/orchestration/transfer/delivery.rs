@@ -606,6 +606,10 @@ pub async fn prepare_run(
         .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
         .max_by_key(|r| r.ordinal)
         && (previous.provider_instance_id != run.provider_instance_id
+            // A user reset closed the previous conversation: rebuild fully.
+            || (previous.provider_thread_id != run.provider_thread_id
+                && provider_for_run(&projection, previous)
+                    .is_some_and(|p| p["status"] == "closed"))
             || selection_transition(
                 target_provider["driver"].as_str().unwrap_or_default(),
                 &previous.model_selection,

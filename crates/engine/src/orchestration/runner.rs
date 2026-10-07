@@ -412,6 +412,13 @@ impl RunnerBridge {
                 .unwrap_or_default(),
         )
         .await?;
+        // A user-reset conversation is rebuilt from portable history, never from
+        // the engine-remembered native session of the generation it left.
+        if request.resume.is_none()
+            && super::queue::session_control::fresh_after_reset(&projection, &run)
+        {
+            self.sessions.forget_native_resume(&effect.thread_id.0);
+        }
         if let Err(error) = (super::checkpoint::FileCheckpointService {
             kernel: self.kernel.clone(),
         })

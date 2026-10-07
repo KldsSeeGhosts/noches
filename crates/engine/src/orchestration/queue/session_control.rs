@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use zeron_proto::orchestration::{CommandId, ProviderSessionId};
 use zeron_proto::transfer::{
     DisconnectThreadSessionParams, DisconnectThreadSessionResult, ProviderSessionRef,
+    ResetThreadSessionParams, ResetThreadSessionResult,
 };
 use zeron_rpc::RpcError;
 
@@ -126,6 +127,162 @@ pub(super) fn plan(
     Ok(())
 }
 
+/// Forced reconstruction. History, runs and the app conversation are kept; the
+/// provider conversations they ran on are closed, so the next turn starts a new
+/// provider-thread generation seeded with bounded portable context. Queued runs
+/// already bound to a closed conversation move to one fresh generation together.
+pub(super) fn plan_reset(
+    conn: &Connection,
+    plan: &mut Plan,
+    command: &Command,
+    p: &ThreadProjection,
+    input: &Value,
+    now: i64,
+) -> Result<()> {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::Queued;
+    let latest = p
+        .runs
+        .iter()
+        .filter(|run| run.status != Queued)
+        .max_by_key(|run| run.ordinal)
+        .map(|run| run.id.0.as_str());
+    if p.thread.archived_at.is_some() {
+        return Err(Error::Invariant("Archived threads cannot be reset.".into()));
+    }
+    if p.runs.iter().any(|run| {
+        !crate::orchestration::command::run_terminal(&run.status) && run.status != Queued
+    }) {
+        return Err(Error::Invariant(
+            "Stop the current run before resetting the agent session.".into(),
+        ));
+    }
+    if input["observedRunId"].as_str() != latest {
+        return Err(Error::Invariant(
+            "A newer turn started. Refresh Details before resetting.".into(),
+        ));
+    }
+    let observed: Vec<ProviderSessionRef> =
+        serde_json::from_value(input["providerSessions"].clone())?;
+    if observed.is_empty() {
+        if !attached_sessions(conn, p)?.is_empty() {
+            return Err(Error::Invariant(
+                "The agent session changed. Refresh Details before resetting.".into(),
+            ));
+        }
+    } else {
+        // Live attachments are torn down exactly as Disconnect does.
+        self::plan(conn, plan, command, p, input, now)?;
+    }
+    let started: Vec<&str> = p
+        .runs
+        .iter()
+        .filter(|run| run.status != Queued)
+        .filter_map(|run| run.provider_thread_id.as_ref().map(|id| id.0.as_str()))
+        .collect();
+    let closing: Vec<&Value> = task::records(p, "provider-thread")
+        .iter()
+        .filter(|provider| {
+            provider["id"]
+                .as_str()
+                .is_some_and(|id| started.contains(&id))
+                && !matches!(
+                    provider["status"].as_str(),
+                    Some("closed" | "archived" | "error")
+                )
+        })
+        .collect();
+    if closing.is_empty() {
+        return Err(Error::Invariant(
+            "There is no agent session to reset yet.".into(),
+        ));
+    }
+    let time = iso(now)?;
+    for provider in &closing {
+        let mut next = (*provider).clone();
+        next["status"] = json!("closed");
+        next["updatedAt"] = json!(time);
+        plan.emit(command, "provider-thread.updated", &next, now)?;
+    }
+    // One fresh generation per closed conversation, named after the first queued
+    // run that will use it (the id convention `execution_seed` uses).
+    for provider in &closing {
+        let mut queued = p.runs.iter().filter(|run| {
+            run.status == Queued
+                && run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                    == provider["id"].as_str()
+        });
+        let Some(first) = queued.next() else { continue };
+        let fresh = format!(
+            "provider-thread:app:{}:{}:{}",
+            encode_component(&p.thread.id.0),
+            encode_component(&first.provider_instance_id.0),
+            first.ordinal
+        );
+        let mut thread = (*provider).clone();
+        thread["id"] = json!(fresh);
+        thread["status"] = json!("not_loaded");
+        for key in [
+            "providerSessionId",
+            "nativeThreadRef",
+            "nativeConversationHeadRef",
+            "forkedFrom",
+        ] {
+            thread[key] = Value::Null;
+        }
+        thread["ownerNodeId"] = json!(first.root_node_id);
+        thread["firstRunOrdinal"] = json!(first.ordinal);
+        thread["lastRunOrdinal"] = json!(first.ordinal);
+        thread["handoffIds"] = json!([]);
+        thread["pendingBackgroundTasks"] = json!([]);
+        thread["createdAt"] = json!(time);
+        thread["updatedAt"] = json!(time);
+        plan.emit(command, "provider-thread.updated", &thread, now)?;
+        for run in std::iter::once(first).chain(queued) {
+            let mut value = serde_json::to_value(run)?;
+            value["providerThreadId"] = json!(fresh);
+            plan.emit(command, "run.updated", &value, now)?;
+            for attempt in p.attempts.iter().filter(|a| a.run_id == run.id) {
+                let mut value = serde_json::to_value(attempt)?;
+                value["providerThreadId"] = json!(fresh);
+                plan.emit(command, "run-attempt.updated", &value, now)?;
+            }
+            for node in p
+                .nodes
+                .iter()
+                .filter(|n| n.run_id.as_ref() == Some(&run.id))
+            {
+                let mut value = serde_json::to_value(node)?;
+                value["providerThreadId"] = json!(fresh);
+                plan.emit(command, "node.updated", &value, now)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for a run that begins a new provider-thread generation after a user
+/// reset: it is bound to a closed conversation, or is the first run on a fresh
+/// one while a closed conversation exists. Later runs resume that generation.
+pub(crate) fn fresh_after_reset(
+    p: &ThreadProjection,
+    run: &zeron_proto::orchestration::OrchestrationV2Run,
+) -> bool {
+    let threads = task::records(p, "provider-thread");
+    let closed = |thread: &Value| thread["status"] == "closed";
+    let Some(own) = threads.iter().find(|thread| {
+        Some(thread["id"].as_str().unwrap_or(""))
+            == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+    }) else {
+        return false;
+    };
+    closed(own)
+        || (threads.iter().any(closed)
+            && !p.runs.iter().any(|earlier| {
+                earlier.ordinal < run.ordinal
+                    && earlier.provider_thread_id == run.provider_thread_id
+            }))
+}
+
 pub(super) fn target_still_disconnected(p: &ThreadProjection, request: &EffectRequest) -> bool {
     let EffectRequest::ProviderSessionDisconnect {
         provider_session_id,
@@ -240,6 +397,103 @@ impl QueueDomain {
                 receipt
                     .error
                     .unwrap_or_else(|| "Session disconnect was refused.".into())
+            }),
+        })
+    }
+}
+
+impl QueueDomain {
+    pub(crate) async fn reset_for_user(
+        &self,
+        docs: &crate::DocHost,
+        mut request: ResetThreadSessionParams,
+    ) -> std::result::Result<ResetThreadSessionResult, RpcError> {
+        let fail = |error: Error| RpcError::Failed(error.to_string());
+        if request.provider_sessions.len() > 64 {
+            return Err(RpcError::BadParams(
+                "Select at most 64 attached sessions.".into(),
+            ));
+        }
+        for id in [&request.chat_id, &request.client_request_id]
+            .into_iter()
+            .chain(request.provider_sessions.iter().map(|session| &session.id))
+            .chain(request.observed_run_id.as_ref())
+        {
+            if id.trim().is_empty() || id.len() > 512 {
+                return Err(RpcError::BadParams(
+                    "Session identities must be nonempty and at most 512 bytes.".into(),
+                ));
+            }
+        }
+        if !docs.is_host(&request.chat_id) {
+            return Err(RpcError::Failed(
+                "Session reset requires the owning host.".into(),
+            ));
+        }
+        request.provider_sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        if request
+            .provider_sessions
+            .windows(2)
+            .any(|pair| pair[0].id == pair[1].id)
+            || request
+                .provider_sessions
+                .iter()
+                .any(|session| session.attachment_sequence <= 0)
+        {
+            return Err(RpcError::BadParams(
+                "Session revisions must be positive and identities unique.".into(),
+            ));
+        }
+        let thread = request.chat_id.clone().into();
+        let handle = docs
+            .open(&request.chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let _queue_guard = handle.orchestration_queue_lock().await;
+        self.kernel
+            .store
+            .thread(&thread)
+            .map_err(fail)?
+            .filter(|p| p.thread.deleted_at.is_none())
+            .ok_or_else(|| RpcError::Failed("The thread was not found.".into()))?;
+        let id = CommandId(format!(
+            "ui:reset-session:{}:{}",
+            encode_component(&request.chat_id),
+            encode_component(&request.client_request_id)
+        ));
+        let input = json!({
+            "observedRunId":request.observed_run_id,
+            "providerSessions":request.provider_sessions
+        });
+        let payload = input.to_string();
+        let same = self
+            .kernel
+            .store
+            .write(|conn| {
+                super::reserve_request(conn, super::SESSION_USER_REQUESTS, &id.0, &payload)
+            })
+            .map_err(fail)?;
+        if !same {
+            return Err(RpcError::BadParams(
+                "This reset request already belongs to a different session state.".into(),
+            ));
+        }
+        let receipt = self
+            .mutate(
+                None,
+                thread,
+                "host.reset_provider_session",
+                input,
+                id,
+                crate::now_ms(),
+            )
+            .await
+            .map_err(fail)?;
+        Ok(ResetThreadSessionResult {
+            sequence: receipt.result_sequence,
+            refusal: (receipt.status == ReceiptStatus::Rejected).then(|| {
+                receipt
+                    .error
+                    .unwrap_or_else(|| "Session reset was refused.".into())
             }),
         })
     }

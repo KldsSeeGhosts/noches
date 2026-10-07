@@ -28,6 +28,7 @@ pub mod runner;
 pub mod scheduler;
 pub mod service;
 pub(crate) mod steering;
+pub(crate) mod stop_all;
 pub mod store;
 pub mod sync_publish;
 pub mod task;

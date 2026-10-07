@@ -118,6 +118,12 @@ impl Store {
                     )
                 })
                 .map(|r| r.id.0.clone()),
+            latest_started_run_id: projection
+                .runs
+                .iter()
+                .filter(|r| r.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Queued)
+                .max_by_key(|r| r.ordinal)
+                .map(|r| r.id.0.clone()),
             attached_provider_sessions: self
                 .read(|conn| super::queue::session_control::attached_sessions(conn, &projection))?,
         })
