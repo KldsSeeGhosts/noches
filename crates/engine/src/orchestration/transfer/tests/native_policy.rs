@@ -206,7 +206,10 @@ fn handoff_budget_uses_the_catalog_declared_window_before_any_telemetry() {
     let claude = zeron_harness::claude::ClaudeHarness::new();
     let mut input = request(std::path::Path::new("/tmp"));
     assert_eq!(declared_model_window(&claude, &input), None, "no model yet");
+    // Opus 5.5 defaults to the 1M window; Sonnet 5 defaults to 200K.
     input.model = Some("claude-opus-5-5".into());
+    assert_eq!(declared_model_window(&claude, &input), Some(1_000_000));
+    input.model = Some("claude-sonnet-5".into());
     assert_eq!(declared_model_window(&claude, &input), Some(200_000));
     input
         .model_options
