@@ -35,6 +35,7 @@ it is not alone evidence that a feature works in either application.
 | Thread launch/workspace binding | `ThreadLaunchService`, `ThreadManagementService` | `launch`, `worktree`, `thread_service`: explicit root/existing/new-worktree preparation, durable setup admission; existing with adapter gaps below. |
 | Lazy fork and merge-back | [ThreadForkService](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/server/src/orchestration-v2/ThreadForkService.ts) | **Added:** owner-routed user RPCs, pinned source, stable request identity, immediate inherited chat config, no eager provider start. Direct-parent merge prepares context; it is not a Git merge. |
 | Thread relationships | [ThreadRelationshipsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/ThreadRelationshipsControl.tsx) | **Added:** Details lineage, parent/fork navigation, bounded scroll regions, fork/checkpoint actions, merge-back action and sidebar fork shortcut. Existing Agents panel continues to own delegated-task controls. |
+| Disconnect agent session | `ThreadRelationshipsControl.stopSession`, client-runtime `stopThreadSession`, `Orchestrator.dispatchProviderSessionDetach`, `ProviderSessionManager` | **Added:** passive attachment revisions, owner-routed user RPC, atomic detach plan and durable exact-run teardown. Conversation/native history and app-owned child threads are preserved. Reattachment, changed attempts/generations and active or idle replacement runtimes fence delayed effects. |
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
 | Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering and capability-fenced active steering. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding and exact admitted-run transfer preparation. Interrupt/restart promotion and queued merge-back remain gaps. |
@@ -104,6 +105,14 @@ is not an acceptable substitute.
   SQL-only rows advertise **Steer** only when the running provider attempt/turn
   supports active steering. A passive UI hint and the actual mutation share the
   same steering fences; delayed effects cannot become a late send or restart.
+- Disconnect is distinct from archive, conversation reset and ordinary turn
+  interruption. It uses the exact observed attachment set and attachment-local
+  revisions, not changing token usage or a guessed provider generation. Stable
+  request reservations preserve the target across response loss and projection
+  rebuild. The worker additionally checks canonical attempt/provider identity
+  and a private runtime run tag, independent of agent credential expiry, before
+  signaling the exact handle under its map lock. Neutral feedback says
+  **requested**, not that an asynchronous teardown has already finished.
 
 ## Remaining gaps — not claimed 1:1
 
@@ -111,7 +120,8 @@ is not an acceptable substitute.
    Codex legacy paginated fork/revert fallback. Adapter capability flags remain
    conservative; portable fallback is functional, not equivalent native state.
 2. Full inherited tool/media history, complete lineage graph/hover interactions,
-   keyboard parity and user-controlled provider-session disconnect/reconstruction.
+   keyboard parity and user-controlled forced session reconstruction. Provider
+   session disconnect is implemented; it preserves rather than resets history.
 3. Canonical queue edits are text-only (existing attachment metadata is shown and
    preserved, not replaced). Native active-steering promotion is implemented;
    interrupt/restart promotion and queued merge-back consumption remain unsupported.
@@ -129,34 +139,42 @@ The task uses an isolated worktree and build target; the other performance
 worktree and the main checkout's untracked files are untouched. Serial tests
 avoid pre-existing timing-sensitive checkpoint/worker interactions.
 
-A read-only `git merge-tree` comparison of the canonical queue implementation
-and restored-child fixture correction at `66b212af` with performance PR #46 at
+A read-only `git merge-tree` comparison of the disconnect implementation and
+instruction EOL rule at `4cc81afe` with performance PR #46 at
 `89f648f60f20160152214645df96ea495b00fc3d` reports no textual conflicts.
-Neither that PR's commits nor its worktree are changed or included here.
+PR #46 subsequently merged into `dev` at `6dc76ff4`. Neither its commits nor
+its worktree are changed or copied into this feature branch.
 Combined performance-plus-parity runtime behavior has not been tested.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 632 passed, 0 failed, 2 ignored |
-| Selected engine integration suites | 51 passed, 0 failed, 1 ignored |
-| Desktop library, including pane/sidebar regressions | 1,505 passed, 0 failed, 1 ignored |
+| Engine library | 633 passed, 0 failed, 2 ignored |
+| Selected engine integration suites | 54 passed, 0 failed, 1 ignored |
+| Desktop library, including pane/sidebar regressions | 1,506 passed, 0 failed, 1 ignored |
 | Doc/proto/RPC libraries and integration suites | 243 passed, 0 failed, 2 ignored |
 | Offline Codex harness protocol integration suite | 25 passed, 0 failed, 4 ignored |
 | Production `zeron` desktop build (`--locked`) | Passed |
 | Native orchestration fixture, dark and light launches | Passed; 1320×900 and 960×720 layouts inspected |
+| Broader session-sync gate (`scripts/ci/run-session-sync.py`) | Passed; all 14 selected targets plus doctests, stable source |
 | `git diff --check` | Passed |
 
 The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
 `restart_resume`, `message_queue`, `queue_lifecycle_rpc` and
-`scheduler_bootstrap` and `codex_subagents`. These checks total 2,456 distinct
+`scheduler_bootstrap` and `codex_subagents`. These checks total 2,461 distinct
 passing tests. Focused transfer coverage is included in the engine library
-count, not counted a second time.
+count, not counted a second time. The session-sync gate supplies additional
+coverage; its overlapping engine/restart/child tests are not added to this total.
 
 - A→B→A with/without restart, changed model/options/checkout, legacy history,
   accepted-current-run replay and native delivery receipt cases pass.
-- All 28 message-queue tests pass, including shared native session with
+- All 31 message-queue tests pass, including shared native session with
   coherent run/attempt/root binding and changed-selection reconstruction.
+- Production disconnect tests cover active teardown, preserved native history
+  on the next input, no dependency on an unexpired agent MCP credential, stable
+  response-loss retries, request collisions, foreign ownership and delayed
+  effects after projection rebuild. A truly parked mock adapter proves that
+  an idle replacement, not just an active replacement, survives an old effect.
 - New production queue RPC tests cover live SQL-only snapshots without polling,
   unchanged legacy watch contracts, stable edit/cancel/promotion replay, request
   identity collision, stale edits, attachment/provenance preservation, foreign
@@ -185,6 +203,9 @@ count, not counted a second time.
   production session-status stream, and receives a real mixed queue. Production
   composer/Shell handlers edit SQL-only work, reorder it around a typed intent
   and cancel it. Assertions verify that only the typed row exists in Loro.
+  The disconnect action then uses the production Shell/RPC path and waits for
+  actual runtime disappearance, attachment removal and cleared UI retry/busy
+  state while the transcript remains visible.
 
 Reproduce from this checkout with Cargo available on `PATH`:
 
@@ -225,12 +246,19 @@ Ignored live-provider/edge/tailnet/private-snapshot tests are not passes.
 Current installed-provider, remote-device and non-Mac verification has not
 been performed. No release or integration-branch mutation is part of this task.
 
-CI on the prior PR revision (`e7775f5c`) was not fully green: Linux session-sync
-failed the two resumed-child fixtures corrected here; Windows engine tests
-reported eight fixture/platform-assumption failures (line endings, Git paths
-and terminal availability). The separate performance PR's `89f648f6` contains
-those Windows fixture corrections; its commits are not included here. These
-historical results are not proof that the latest revision's CI has passed.
+CI on published revision `161c498c` passed session-sync, native Mac/UI, Windows
+UI/harness/packaging, networking and policy checks. Windows engine tests still
+reported nine failures: eight fixture/platform assumptions (line endings, Git
+paths and terminal availability) addressed by performance PR #46, plus the
+byte-pinned MCP instruction fixture being converted to CRLF on checkout. This
+increment adds a narrowly scoped `.gitattributes` LF rule for that instruction
+file, preserving the existing length/SHA test rather than weakening it. PR #46
+also includes that identical LF rule; the read-only combined merge is clean.
+Windows verification of this branch's rule is pending. The other eight fixture
+corrections remain outside this feature branch. These results are not proof
+that a later revision's CI has passed.
+An isolated checkout-index probe with `core.autocrlf=true` retains the exact
+pinned instruction SHA on this Mac; it is not a Windows runtime test.
 
 ### Native rendering evidence
 
@@ -265,3 +293,13 @@ accepted edit, and the typed row is still the only Loro intent. The provider
 remains on its original running attempt.
 
 ![Managed native queue in dark appearance](evidence/t3-parity-2026-10-06/queue-managed-dark-960.png)
+
+The live attached session exposes a quiet Details action. Disconnect is not
+archive, fork, merge-back or a reset of the provider's native conversation.
+
+![Disconnect available for the attached session](evidence/t3-parity-2026-10-06/disconnect-ready-dark.png)
+
+After production teardown, the action is gone and the composer is idle.
+Conversation text remains; the neutral notice describes the accepted request.
+
+![Disconnected session with retained history in light appearance](evidence/t3-parity-2026-10-06/disconnected-light.png)
