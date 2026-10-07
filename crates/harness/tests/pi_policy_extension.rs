@@ -18,7 +18,21 @@ async fn policy_extension_gates_tools_by_runtime_mode_and_reports_structured_req
         &runner,
         r#"
 import assert from "node:assert/strict";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import extension from "./noches-policy.ts";
+
+// A workspace, an agent dir and a home, all under one scratch root.
+const root = process.env.SCRATCH;
+const cwd = join(root, "work");
+const outside = join(root, "outside");
+const home = process.env.HOME;
+mkdirSync(join(cwd, "src"), { recursive: true });
+mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+mkdirSync(outside, { recursive: true });
+mkdirSync(join(home, ".pi", "agent", "extensions"), { recursive: true });
+symlinkSync(outside, join(cwd, "link"));
+writeFileSync(join(outside, "target.txt"), "x");
 
 const handlers = new Map();
 extension({ on: (name, fn) => handlers.set(name, fn) });
@@ -26,12 +40,14 @@ const toolCall = handlers.get("tool_call");
 
 async function call(tool, input, answer) {
   const asked = [];
-  const ctx = { ui: { confirm: async (title, message) => { asked.push({ title, message }); return answer; } } };
+  const ctx = { cwd, ui: { confirm: async (title, message) => { asked.push({ title, message }); return answer; } } };
   const result = await toolCall({ toolName: tool, input }, ctx);
   return { asked, result };
 }
 
-const mode = process.env.NOCHES_PI_RUNTIME_MODE;
+// A missing or unknown mode fails closed to approval-required.
+const mode = process.env.NOCHES_PI_RUNTIME_MODE === "bogus" || process.env.NOCHES_PI_RUNTIME_MODE === undefined
+  ? "approval-required" : process.env.NOCHES_PI_RUNTIME_MODE;
 if (mode === "full-access") {
   const { asked, result } = await call("bash", { command: "rm -rf /" }, false);
   assert.equal(asked.length, 0);
@@ -54,10 +70,40 @@ if (mode === "full-access") {
   // A refusal blocks with a reason the model can read.
   const denied = await call("bash", { command: "ls" }, false);
   assert.deepEqual(denied.result, { block: true, reason: "bash was declined in Noches." });
-  // Edits are the one thing Auto-accept waves through.
-  const edit = await call("edit", { path: "a" }, false);
-  assert.equal(edit.asked.length, mode === "auto-accept-edits" ? 0 : 1, "edit in " + mode);
-  assert.equal((await call("write", { path: "a" }, false)).asked.length, mode === "auto-accept-edits" ? 0 : 1);
+  // Edits inside the working directory are the one thing Auto-accept waves through.
+  const auto = mode === "auto-accept-edits";
+  for (const tool of ["edit", "write"]) {
+    for (const path of ["a", "src/main.rs", join(cwd, "src", "new", "deep.rs"), "./src/../a", "@src/main.rs"]) {
+      assert.equal((await call(tool, { path }, false)).asked.length, auto ? 0 : 1, `${tool} ${path} in ${mode}`);
+    }
+    // ...and nothing that leaves it, reaches Pi's own code, or cannot be placed.
+    for (const path of [
+      "../outside/x.txt",
+      join(outside, "x.txt"),
+      "link/target.txt",
+      "link/new.txt",
+      "/etc/hosts",
+      "~/.ssh/authorized_keys",
+      "~/.pi/agent/extensions/x.ts",
+      join(home, ".pi", "agent", "extensions", "x.ts"),
+      ".pi/extensions/x.ts",
+      "src/../.pi/extensions/x.ts",
+      "file://" + join(outside, "x.txt"),
+      "",
+    ]) {
+      assert.equal((await call(tool, { path }, false)).asked.length, 1, `${tool} ${JSON.stringify(path)} in ${mode}`);
+    }
+    assert.equal((await call(tool, {}, false)).asked.length, 1, "no path");
+    assert.equal((await call(tool, { path: 3 }, false)).asked.length, 1, "bad path");
+  }
+  // A workspace that is the home directory still guards Pi's own dirs.
+  const homeCall = async (path) => {
+    const asked = [];
+    await toolCall({ toolName: "write", input: { path } }, { cwd: home, ui: { confirm: async () => { asked.push(1); return false; } } });
+    return asked.length;
+  };
+  assert.equal(await homeCall("notes.txt"), auto ? 0 : 1);
+  assert.equal(await homeCall(".pi/agent/extensions/x.ts"), 1);
   // Host-preapproved MCP tools skip the prompt: exact names and trailing-* wildcards only.
   assert.equal((await call("mcp__t3-code__task_status", {}, false)).asked.length, 0);
   assert.equal((await call("mcp__t3-code__anything", {}, false)).asked.length, 0);
@@ -78,17 +124,28 @@ console.log("POLICY_OK");
     )
     .unwrap();
 
-    for mode in ["full-access", "approval-required", "auto-accept-edits"] {
+    for mode in ["full-access", "approval-required", "auto-accept-edits", "bogus", ""] {
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
         let mut command = tokio::process::Command::new("node");
         command
             .args(["--experimental-strip-types"])
             .arg(&runner)
-            .env("NOCHES_PI_RUNTIME_MODE", mode)
+            .env("SCRATCH", scratch.path())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("NOCHES_PI_RUNTIME_MODE")
             .env(
                 "NOCHES_SESSION_MCP_ALLOWED_TOOLS",
                 r#"["mcp__t3-code__*","mcp__t3-code__task_status"]"#,
             )
             .kill_on_drop(true);
+        // "" stands for the variable missing altogether.
+        if !mode.is_empty() {
+            command.env("NOCHES_PI_RUNTIME_MODE", mode);
+        }
         let result = tokio::time::timeout(Duration::from_secs(20), command.output())
             .await
             .unwrap()

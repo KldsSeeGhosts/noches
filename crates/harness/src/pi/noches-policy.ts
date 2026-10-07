@@ -5,6 +5,10 @@
 // dialogs over the RPC extension-UI protocol; the host recognizes them by the
 // JSON marker in the message and routes them through its permission gate.
 // Never throw: a failing hook must not take the session down.
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -13,9 +17,87 @@ const MAX_FIELD = 2_000;
 
 type Mode = "approval-required" | "auto-accept-edits" | "full-access";
 
+// Fail closed: the host always sets the mode, so a missing or unrecognised
+// value must never widen access.
 function mode(): Mode {
   const value = process.env.NOCHES_PI_RUNTIME_MODE;
-  return value === "approval-required" || value === "auto-accept-edits" ? value : "full-access";
+  return value === "full-access" || value === "auto-accept-edits" ? value : "approval-required";
+}
+
+const UNICODE_SPACES = /[  -   　]/g;
+const CASE_INSENSITIVE = process.platform === "darwin" || process.platform === "win32";
+
+// The path a tool will touch, resolved the way Pi's own file tools do.
+function targetOf(raw: string, cwd: string): string | undefined {
+  let path = raw.replace(UNICODE_SPACES, " ");
+  if (path.startsWith("@")) path = path.slice(1);
+  if (path === "~") path = homedir();
+  else if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) {
+    path = join(homedir(), path.slice(2));
+  }
+  if (/^file:\/\//.test(path)) {
+    try {
+      path = fileURLToPath(path);
+    } catch {
+      return undefined;
+    }
+  }
+  return resolve(cwd, path);
+}
+
+// Follow symlinks through the deepest ancestor that exists, so a link inside
+// the workspace cannot lead a "workspace" write outside it.
+function canonical(path: string): string {
+  const tail: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return join(realpathSync.native(current), ...[...tail].reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return path;
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+function inside(child: string, parent: string): boolean {
+  const norm = (value: string) => (CASE_INSENSITIVE ? value.toLowerCase() : value);
+  const rel = relative(norm(parent), norm(child));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function agentDir(): string {
+  const env = process.env.PI_CODING_AGENT_DIR;
+  if (env) {
+    if (env === "~") return homedir();
+    return env.startsWith("~/") ? join(homedir(), env.slice(2)) : resolve(env);
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+// Auto-accept covers edits inside the working directory only. Pi runs code
+// from its agent dir, ~/.pi and a project's own .pi directory (extensions),
+// so those always ask, and anything that cannot be placed asks too.
+function editStaysInWorkspace(input: unknown, cwd: unknown): boolean {
+  if (typeof cwd !== "string" || cwd === "" || typeof input !== "object" || input === null) {
+    return false;
+  }
+  const fields = input as Record<string, unknown>;
+  const raw = fields.path ?? fields.file_path;
+  if (typeof raw !== "string" || raw === "") return false;
+  const resolved = targetOf(raw, cwd);
+  if (resolved === undefined) return false;
+  const target = canonical(resolved);
+  const root = canonical(resolve(cwd));
+  if (!inside(target, root)) return false;
+  for (const guarded of [agentDir(), join(homedir(), ".pi")]) {
+    if (inside(target, canonical(guarded))) return false;
+  }
+  return !relative(root, target)
+    .split(sep)
+    .some((part) => (CASE_INSENSITIVE ? part.toLowerCase() : part) === ".pi");
 }
 
 // MCP tools the host pre-approved (exact names or a trailing-`*` wildcard).
@@ -78,7 +160,13 @@ export default function nochesPolicy(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const current = mode();
     if (current === "full-access" || READ_ONLY_TOOLS.has(event.toolName)) return;
-    if (current === "auto-accept-edits" && FILE_CHANGE_TOOLS.has(event.toolName)) return;
+    if (
+      current === "auto-accept-edits" &&
+      FILE_CHANGE_TOOLS.has(event.toolName) &&
+      editStaysInWorkspace(event.input, ctx.cwd)
+    ) {
+      return;
+    }
     if (preApproved(event.toolName)) return;
     let approved = false;
     try {
