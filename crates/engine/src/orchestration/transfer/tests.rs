@@ -2387,7 +2387,7 @@ fn queue_and_multiple_merge_refusals_are_exact() {
     let error = ensure_start_allowed(&[pending.clone()], &"t".into(), true).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "orchestration invariant: Thread t has a pending merge-back transfer; queued merge-back consumption is not implemented yet."
+        "orchestration invariant: Thread t has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it."
     );
     let mut other = pending.clone();
     other["sourceThreadId"] = json!("fork:two");
@@ -2395,7 +2395,7 @@ fn queue_and_multiple_merge_refusals_are_exact() {
         ensure_start_allowed(&[pending, other], &"t".into(), false)
             .unwrap_err()
             .to_string(),
-        "orchestration invariant: Thread t has pending merge-back transfers from multiple forks."
+        "orchestration invariant: Thread t has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together."
     );
 }
 

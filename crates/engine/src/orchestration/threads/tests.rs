@@ -303,12 +303,12 @@ async fn transfer_merge_refusals_precede_thread_send_side_effects() {
         (
             true,
             1,
-            "has a pending merge-back transfer; queued merge-back consumption is not implemented yet.",
+            "has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it.",
         ),
         (
             false,
             2,
-            "has pending merge-back transfers from multiple forks.",
+            "has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together.",
         ),
     ] {
         let f = Fixture::new();
@@ -400,6 +400,82 @@ async fn transfer_merge_refusals_precede_thread_send_side_effects() {
         assert_eq!(json!(after.runs), json!(before.runs));
         assert_eq!(after.records, before.records);
     }
+}
+
+/// A user merging a second fork would leave the parent unsendable ("multiple
+/// forks") with no UI to clear it, so the planner refuses it up front.
+#[tokio::test]
+async fn user_merge_back_is_refused_while_another_fork_is_pending() {
+    use crate::orchestration::transfer::{SourcePoint, TransferOperation};
+
+    let f = Fixture::new();
+    f.running(false);
+    let mut parent_run = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap()
+        .runs[0]
+        .clone();
+    parent_run.status = OrchestrationV2RunStatus::Completed;
+    f.emit("parent", "run.updated", json!(parent_run));
+    for index in 0..2 {
+        let child = format!("fork:{index}");
+        let receipt = f
+            .service
+            .kernel
+            .transfer_command(
+                &"parent".into(),
+                format!("fork-command:{index}").into(),
+                TransferOperation::Fork {
+                    target: child.clone().into(),
+                    source: SourcePoint::Run {
+                        run_id: parent_run.id.clone(),
+                    },
+                    title: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let mut run = parent_run.clone();
+        run.id = format!("run:{child}").into();
+        run.thread_id = child.clone().into();
+        f.emit(&child, "run.updated", json!(run));
+        let receipt = f
+            .service
+            .kernel
+            .transfer_command(
+                &child.into(),
+                format!("merge-command:{index}").into(),
+                TransferOperation::User(Box::new(TransferOperation::MergeBack {
+                    target: "parent".into(),
+                    source: SourcePoint::Run { run_id: run.id },
+                })),
+            )
+            .await
+            .unwrap();
+        if index == 0 {
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        } else {
+            assert_eq!(receipt.status, ReceiptStatus::Rejected);
+            let message = receipt.error.unwrap();
+            assert!(message.contains("Send a message in parent"), "{message}");
+            assert!(!message.contains("not implemented"), "{message}");
+        }
+    }
+    let pending = f
+        .service
+        .kernel
+        .store
+        .thread_transfers(&"parent".into())
+        .unwrap()
+        .into_iter()
+        .filter(|t| t["type"] == "merge_back" && t["status"] == "pending")
+        .count();
+    assert_eq!(pending, 1);
 }
 
 #[test]

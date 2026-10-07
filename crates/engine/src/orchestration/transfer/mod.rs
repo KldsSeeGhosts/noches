@@ -262,6 +262,21 @@ pub(crate) fn plan(
                     run.id
                 )));
             }
+            // A second fork's merge-back would wedge the parent ("multiple forks")
+            // with no way to clear either, so a user must deliver the first.
+            if merge
+                && user
+                && transfers(conn, target)?.iter().any(|t| {
+                    t["type"] == "merge_back"
+                        && t["status"] == "pending"
+                        && t["targetThreadId"] == target.0
+                        && t["sourceThreadId"] != source.thread.id.0
+                })
+            {
+                return Err(Error::Invariant(format!(
+                    "Another fork is already waiting to merge back into {target}. Send a message in {target} to deliver it first, then merge this fork."
+                )));
+            }
             let source_transfers = transfers(conn, &source.thread.id)?;
             let base = if merge {
                 source_transfers
@@ -593,7 +608,7 @@ pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool
         .collect();
     if queued && !pending.is_empty() {
         return Err(Error::Invariant(format!(
-            "Thread {thread} has a pending merge-back transfer; queued merge-back consumption is not implemented yet."
+            "Thread {thread} has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it."
         )));
     }
     if pending
@@ -604,7 +619,7 @@ pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool
         > 1
     {
         return Err(Error::Invariant(format!(
-            "Thread {thread} has pending merge-back transfers from multiple forks."
+            "Thread {thread} has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together."
         )));
     }
     Ok(())
