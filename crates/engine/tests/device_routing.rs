@@ -1922,11 +1922,31 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
         remote_result.expect("remote contender")["sent"] == true,
         local_result.expect("local contender")["sent"] == true,
     ];
-    assert_eq!(
-        acknowledgements.into_iter().filter(|sent| *sent).count(),
-        1,
+    // Once B is the host again its own drain may legitimately take the idle
+    // row before either explicit send-now lands, so neither contender need
+    // win. What must hold is that the row is consumed exactly once overall.
+    assert!(
+        acknowledgements.into_iter().filter(|sent| *sent).count() <= 1,
         "the host must atomically take a queue row once"
     );
+    let b_doc = core_b.doc_host.open("chat-queue-remote").expect("B chat");
+    let consumed = || {
+        serde_json::to_string(&b_doc.doc().read_entries().expect("B transcript"))
+            .expect("serialize transcript")
+            .matches("consume me once")
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while consumed() == 0 || !b_doc.doc().read_queue().expect("B queue").is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the contested row was never consumed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // A duplicate consumption would land within a drain tick of the first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(consumed(), 1, "the row must run exactly once");
 
     core_a.shutdown().await;
     core_b.shutdown().await;

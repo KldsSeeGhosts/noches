@@ -4397,6 +4397,12 @@ impl DocHost {
             return;
         }
         loop {
+            // Hosting can move while this drain waited on the lock or the
+            // queue preparation above; the check at entry is only an early
+            // out. Only the current host may consume a row.
+            if !self.is_host(&handle.chat_id) {
+                return;
+            }
             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
                 return;
             };
