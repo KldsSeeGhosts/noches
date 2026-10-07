@@ -624,7 +624,10 @@ impl Store {
                 .iter()
                 .position(|e| e.entry.id == cursor)
                 .ok_or_else(|| {
-                    Error::Invariant("The inherited-history cursor is no longer valid.".into())
+                    Error::Invariant(format!(
+                        "{}: The inherited-history cursor is no longer valid.",
+                        zeron_proto::transfer::INHERITED_CURSOR_EXPIRED
+                    ))
                 })?,
         };
         let limit = limit.map_or(DEFAULT_PAGE, |n| (n as usize).clamp(1, MAX_PAGE));

@@ -99,6 +99,11 @@ pub struct TransferStateParams {
     pub chat_id: String,
 }
 
+/// Prefix of the error a host answers with when an inherited-history cursor is
+/// not one of its entries (the list moved or the cursor is foreign). Clients
+/// restart from the newest page on exactly this code and on no other failure.
+pub const INHERITED_CURSOR_EXPIRED: &str = "inherited-history-cursor-expired";
+
 /// One page of a fork's inherited history, newest page first. Entries are
 /// `SessionMessageEntry`-shaped (bounded text, tool summaries, media refs) so
 /// the client renders them with the ordinary transcript row builders.

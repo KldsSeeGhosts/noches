@@ -827,7 +827,13 @@ async fn inherited_history_pages_are_bounded_stable_and_follow_nested_forks() {
     let stale = client
         .thread_inherited_history("child", &core.device_id, Some("inherited:[\"gone\",\"x\"]"), None)
         .await;
-    assert!(stale.is_err());
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains(zeron_proto::transfer::INHERITED_CURSOR_EXPIRED),
+        "a stale cursor carries the typed code"
+    );
 
     // A fork of a fork inherits the whole chain, ids still collision-free.
     let child_run = send(&core, "child", "c1").await;

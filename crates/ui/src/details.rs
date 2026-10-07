@@ -675,7 +675,6 @@ fn lineage_section(
         let can_merge = is_parent && model.can_merge_back();
         let merge = actions.merge_back.clone();
         let group: SharedString = format!("details-{chat_id}-relation-{}", relation.chat_id).into();
-        let accent = theme.accent;
         relationships = relationships.child(
             hover_row(
                 row(
@@ -697,7 +696,7 @@ fn lineage_section(
             // between them, Enter or Space opens (gpui's keyboard click).
             .when(available, |el| {
                 el.tab_index(0)
-                    .focus_visible(move |style| style.bg(accent.opacity(0.14)))
+                    .focus_visible(|style| style.bg(crate::theme::wash(0.10)))
                     .on_key_down(|event, window, cx| {
                         let modifiers = event.keystroke.modifiers;
                         if modifiers.control || modifiers.alt || modifiers.platform {

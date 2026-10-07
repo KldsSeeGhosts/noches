@@ -2252,7 +2252,8 @@ impl Composer {
         self.input
             .update(cx, |input, cx| input.set_text(entry.text, cx));
         if !paths.is_empty() {
-            self.load_canonical_edit_attachments(run_id, host_device_id, paths, cx);
+            let key = self.current_key.clone();
+            self.load_canonical_edit_attachments(run_id, key, host_device_id, paths, cx);
         }
         cx.notify();
     }
@@ -2262,6 +2263,7 @@ impl Composer {
     fn load_canonical_edit_attachments(
         &mut self,
         run_id: String,
+        key: String,
         host_device_id: String,
         paths: Vec<String>,
         cx: &mut Context<Self>,
@@ -2294,11 +2296,12 @@ impl Composer {
                 ));
             }
             this.update(cx, |composer, cx| {
-                // The edit may have ended or moved to another row meanwhile.
+                // The edit may have ended or moved to another row, or the
+                // composer to another chat, meanwhile.
                 let Some(edit) = composer
                     .canonical_queue_edit
                     .as_mut()
-                    .filter(|edit| edit.run_id == run_id)
+                    .filter(|edit| edit.run_id == run_id && composer.current_key == key)
                 else {
                     return;
                 };
@@ -2310,7 +2313,7 @@ impl Composer {
                     edit.attachments_editable = true;
                     composer
                         .attachments
-                        .entry(composer.current_key.clone())
+                        .entry(key)
                         .or_default()
                         .extend(loaded.into_iter().map(|(_, staged)| staged));
                 } else {

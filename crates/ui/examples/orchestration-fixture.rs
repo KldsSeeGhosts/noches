@@ -199,6 +199,10 @@ impl Harness for FixtureHarness {
     }
 }
 
+/// Seeded earlier parent turns (plus the initial one) so the fork's inherited
+/// history pages and the load-earlier row shows.
+const EARLIER_PARENT_TURNS: usize = 14;
+
 async fn send(core: &EngineCore, chat: &str, key: &str, text: &str) -> anyhow::Result<()> {
     let result = core
         .orchestration_host
@@ -387,7 +391,7 @@ fn main() -> anyhow::Result<()> {
         })).await?;
         core.workspace.rename_chat("fixture-background", "Stop native background work")?;
         // Deep enough history that the fork pages: the load-earlier row shows.
-        for n in 1..=14 {
+        for n in 1..=EARLIER_PARENT_TURNS {
             send(&core, "fixture-parent", &format!("earlier-{n}"), &format!("Earlier note {n}.")).await?;
         }
         send(&core, "fixture-parent", "initial", &format!(
@@ -519,7 +523,7 @@ fn main() -> anyhow::Result<()> {
                     "Parent Details did not show the child's native acceptance receipt");
                 anyhow::ensure!(parent.transfers.iter().any(|row| row.title == "Merge-back context" && row.status == "Pending"),
                     "Merge-back was not pending for the parent's next message");
-                anyhow::ensure!(renderer_core.orchestration.store.thread(&"fixture-parent".into())?.unwrap().runs.len() == 15,
+                anyhow::ensure!(renderer_core.orchestration.store.thread(&"fixture-parent".into())?.unwrap().runs.len() == EARLIER_PARENT_TURNS + 1,
                     "Preparing merge-back eagerly started a parent provider");
                 capture(window.into(), cx, &output, &format!("merge-back-{mode}"))?;
                 window.update(cx, |_, window, _| window.resize(size(px(960.), px(720.))))?;
