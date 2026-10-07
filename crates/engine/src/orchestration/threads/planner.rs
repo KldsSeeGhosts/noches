@@ -113,6 +113,23 @@ pub(crate) fn user_item(
     Ok(item)
 }
 
+pub(crate) fn next_item_ordinal(projection: &ThreadProjection, plan: &Plan) -> Result<i64> {
+    let mut last = records(projection, "turn-item")
+        .iter()
+        .filter_map(|item| item["ordinal"].as_i64())
+        .max()
+        .unwrap_or(0);
+    for event in &plan.events {
+        if let OrchestrationV2DomainEvent::TurnItemUpdated(event) = event
+            && event.thread_id == projection.thread.id
+        {
+            let item = serde_json::to_value(&event.payload)?;
+            last = last.max(item["ordinal"].as_i64().unwrap_or(0));
+        }
+    }
+    Ok(last + 1)
+}
+
 pub(crate) fn assistant_item(
     projection: &ThreadProjection,
     command: &Command,
@@ -129,10 +146,14 @@ pub(crate) fn assistant_item(
         .iter()
         .find(|i| i["id"] == id);
     let time = iso(now)?;
+    let ordinal = match previous.and_then(|i| i["ordinal"].as_i64()) {
+        Some(ordinal) => ordinal,
+        None => next_item_ordinal(projection, plan)?,
+    };
     let item = json!({"id":id,"type":"assistant_message","threadId":projection.thread.id,
         "runId":message["runId"],"nodeId":message["nodeId"],"providerThreadId":attempt["providerThreadId"],
         "providerTurnId":attempt["providerTurnId"],"nativeItemRef":null,"parentItemId":null,
-        "ordinal":previous.and_then(|i| i["ordinal"].as_i64()).unwrap_or_else(|| records(projection,"turn-item").iter().filter_map(|i| i["ordinal"].as_i64()).max().unwrap_or(0)+1),
+        "ordinal":ordinal,
         "status":if message["streaming"] == true {"running"} else {"completed"},"title":null,
         "startedAt":previous.map(|i| &i["startedAt"]).cloned().unwrap_or(json!(time)),
         "completedAt":if message["streaming"] == true {Value::Null} else {json!(time)},"updatedAt":time,

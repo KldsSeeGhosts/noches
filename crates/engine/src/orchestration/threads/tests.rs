@@ -222,6 +222,7 @@ impl Fixture {
                 1_800_000_000_001,
             )
             .unwrap();
+        self.provider_event("parent", zeron_proto::AgentEvent::InputAccepted);
     }
 
     fn clone_thread(&self, id: &str, project: &str, lineage: Value) {

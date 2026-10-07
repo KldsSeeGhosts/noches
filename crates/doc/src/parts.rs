@@ -507,6 +507,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // the transcript. UserMessage becomes its own doc ENTRY (the engine's
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::InputAccepted
         | AgentEvent::Usage { .. }
         | AgentEvent::NativeReference { .. }
         | AgentEvent::ContextUsage { .. }
@@ -714,6 +715,13 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_acceptance_is_host_only_not_a_transcript_part() {
+        let mut parts = vec![];
+        super::fold_event_into_parts(&mut parts, &zeron_proto::AgentEvent::InputAccepted);
+        assert!(parts.is_empty());
+    }
+
     use super::*;
 
     fn text_delta(s: &str) -> AgentEvent {

@@ -129,12 +129,27 @@ fn messages() -> Vec<Value> {
 }
 
 async fn start(kernel: &Kernel, thread: &str, message_id: &str) -> OrchestrationV2Run {
+    start_text(
+        kernel,
+        thread,
+        message_id,
+        "Current request stays intact.\n🧪",
+    )
+    .await
+}
+
+async fn start_text(
+    kernel: &Kernel,
+    thread: &str,
+    message_id: &str,
+    text: &str,
+) -> OrchestrationV2Run {
     kernel
         .task_command(
             &thread.into(),
             format!("start:{message_id}").into(),
             crate::orchestration::task::TaskOperation::ExternalMessage {
-                prompt: "Current request stays intact.\n🧪".into(),
+                prompt: text.into(),
                 driver: zeron_proto::provider_instance::ProviderDriverKind("mock".into()),
                 message_id: message_id.into(),
             },
@@ -150,6 +165,558 @@ async fn start(kernel: &Kernel, thread: &str, message_id: &str) -> Orchestration
         .last()
         .unwrap()
         .clone()
+}
+
+#[tokio::test]
+async fn unaccepted_input_is_recovered_once_in_native_continuation_across_restart() {
+    for restart in [false, true] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (db, kernel, _) = fixture(cwd.path());
+        let first = start_text(
+            &kernel,
+            "source",
+            "known-input",
+            "Already in native history.",
+        )
+        .await;
+        accept(&kernel, &first, cwd.path(), "retained-native").await;
+        observe(
+            &kernel,
+            &first,
+            zeron_proto::AgentEvent::TextDelta {
+                text: "Do not duplicate the accepted decision.".into(),
+            },
+        )
+        .await;
+        observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
+        let missed_text = "Input never accepted by the provider.\n  Preserve 日本語 🧪.";
+        let missed = start_text(&kernel, "source", "unaccepted-input", missed_text).await;
+        observe(
+            &kernel,
+            &missed,
+            zeron_proto::AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("Provider unavailable before accepting input.".into()),
+                session_id: None,
+            },
+        )
+        .await;
+        let p = kernel.store.thread(&missed.thread_id).unwrap().unwrap();
+        assert!(
+            p.attempts
+                .iter()
+                .find(|a| Some(&a.id) == missed.active_attempt_id.as_ref())
+                .unwrap()
+                .native_thread_id
+                .as_ref()
+                .is_none()
+        );
+        assert!(
+            !crate::orchestration::task::records(&p, "provider-turn")
+                .iter()
+                .any(|turn| Some(turn["runAttemptId"].as_str().unwrap_or(""))
+                    == missed.active_attempt_id.as_ref().map(|id| id.0.as_str()))
+        );
+        let kernel = if restart {
+            let reopened =
+                Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+            reopened.recover(crate::now_ms()).await.unwrap();
+            reopened
+        } else {
+            kernel
+        };
+        let next = start(&kernel, "source", "continue-after-outage").await;
+        assert_eq!(next.provider_thread_id, first.provider_thread_id);
+        let mut input = request(cwd.path());
+        prepare(&kernel, &next, &mut input).await.unwrap();
+        assert_eq!(input.resume.as_deref(), Some("retained-native"));
+        assert!(
+            input.prompt.contains(missed_text),
+            "restart={restart}: missing unaccepted input"
+        );
+        assert!(
+            input
+                .prompt
+                .contains("Provider unavailable before accepting input.")
+        );
+        assert!(
+            !input
+                .prompt
+                .contains("Do not duplicate the accepted decision.")
+        );
+        assert!(input.prompt.ends_with(&request(cwd.path()).prompt));
+        accept(&kernel, &next, cwd.path(), "retained-native").await;
+        let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+        let retry = crate::orchestration::task::records(&p, "context-handoff")
+            .iter()
+            .find(|h| h["targetRunId"] == next.id.0)
+            .unwrap();
+        assert_eq!(retry["delivery"]["status"], "inline");
+        assert_eq!(
+            retry["coveredRunOrdinals"],
+            json!({"from":missed.ordinal,"to":missed.ordinal})
+        );
+        let mut accepted = request(cwd.path());
+        prepare(&kernel, &next, &mut accepted).await.unwrap();
+        assert_eq!(accepted.prompt, request(cwd.path()).prompt);
+        observe(&kernel, &next, done(zeron_proto::DoneStatus::Completed)).await;
+        let later = start(&kernel, "source", "normal-next-input").await;
+        let mut later_input = request(cwd.path());
+        prepare(&kernel, &later, &mut later_input).await.unwrap();
+        assert_eq!(later_input.prompt, request(cwd.path()).prompt);
+        assert_eq!(
+            kernel
+                .store
+                .thread_transfers(&later.thread_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn initialized_but_rejected_input_is_recovered_after_projection_rebuild() {
+    for (restart, status) in [
+        (false, zeron_proto::DoneStatus::Errored),
+        (true, zeron_proto::DoneStatus::Errored),
+        (false, zeron_proto::DoneStatus::Interrupted),
+        (true, zeron_proto::DoneStatus::Interrupted),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (db, kernel, _) = fixture(cwd.path());
+        let known = start_text(&kernel, "source", "known", "Native already knows this.").await;
+        accept(&kernel, &known, cwd.path(), "retained-native").await;
+        observe(&kernel, &known, done(zeron_proto::DoneStatus::Completed)).await;
+        let missed = start_text(
+            &kernel,
+            "source",
+            "rejected",
+            "Missing after turn/start rejection.",
+        )
+        .await;
+        let mut original = request(cwd.path());
+        prepare(&kernel, &missed, &mut original).await.unwrap();
+        observe(
+            &kernel,
+            &missed,
+            session_started(cwd.path(), "retained-native"),
+        )
+        .await;
+        observe(
+            &kernel,
+            &missed,
+            zeron_proto::AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: None,
+            },
+        )
+        .await;
+        observe(
+            &kernel,
+            &missed,
+            zeron_proto::AgentEvent::NativeReference {
+                thread_id: "retained-native".into(),
+                turn_id: None,
+            },
+        )
+        .await;
+        observe(
+            &kernel,
+            &missed,
+            zeron_proto::AgentEvent::ContextUsage {
+                tokens: Some(10),
+                window: Some(128_000),
+            },
+        )
+        .await;
+        let p = kernel.store.thread(&missed.thread_id).unwrap().unwrap();
+        let attempt = p
+            .attempts
+            .iter()
+            .find(|a| Some(&a.id) == missed.active_attempt_id.as_ref())
+            .unwrap();
+        assert_eq!(
+            attempt.native_thread_id.as_ref().map(String::as_str),
+            Some("retained-native")
+        );
+        assert!(
+            attempt.provider_turn_id.as_ref().is_none(),
+            "thread initialization is not input acceptance"
+        );
+        assert!(
+            !crate::orchestration::task::records(&p, "provider-turn")
+                .iter()
+                .any(|t| t["runAttemptId"] == attempt.id.0),
+            "usage/thread telemetry must not manufacture accepted turns"
+        );
+        observe(
+            &kernel,
+            &missed,
+            zeron_proto::AgentEvent::Done {
+                status,
+                result: None,
+                error: Some("turn/start rejected".into()),
+                session_id: Some("retained-native".into()),
+            },
+        )
+        .await;
+        let kernel = if restart {
+            let reopened =
+                Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+            reopened.store.rebuild().unwrap();
+            reopened.recover(crate::now_ms()).await.unwrap();
+            reopened
+        } else {
+            kernel
+        };
+        let next = start(&kernel, "source", "next").await;
+        let mut input = request(cwd.path());
+        input.attachments = vec!["/tmp/current-attachment.png".into()];
+        prepare(&kernel, &next, &mut input).await.unwrap();
+        assert_eq!(input.resume.as_deref(), Some("retained-native"));
+        assert!(input.prompt.contains("Missing after turn/start rejection."));
+        assert!(input.prompt.contains("turn/start rejected"));
+        assert!(!input.prompt.contains("Native already knows this."));
+        assert_eq!(input.attachments, vec!["/tmp/current-attachment.png"]);
+        observe(&kernel, &missed, zeron_proto::AgentEvent::InputAccepted).await;
+        let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+        assert_eq!(
+            p.records["context-handoff"].last().unwrap()["delivery"]["status"],
+            "pending",
+            "stale failed-attempt acceptance cannot settle the current retry"
+        );
+        accept(&kernel, &next, cwd.path(), "retained-native").await;
+        observe(&kernel, &next, done(zeron_proto::DoneStatus::Completed)).await;
+        let later = start(&kernel, "source", "later").await;
+        let mut input = request(cwd.path());
+        prepare(&kernel, &later, &mut input).await.unwrap();
+        assert_eq!(input.prompt, request(cwd.path()).prompt);
+        assert_eq!(
+            kernel
+                .store
+                .thread_transfers(&later.thread_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn warm_assignment_acceptance_attaches_and_settles_without_another_session_init() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_, kernel, _) = fixture(cwd.path());
+    let known = start(&kernel, "source", "known").await;
+    accept(&kernel, &known, cwd.path(), "warm-native").await;
+    observe(&kernel, &known, done(zeron_proto::DoneStatus::Completed)).await;
+    let missed = start_text(&kernel, "source", "missed", "Undelivered warm input.").await;
+    observe(&kernel, &missed, done(zeron_proto::DoneStatus::Errored)).await;
+    let next = start(&kernel, "source", "warm-retry").await;
+    let mut input = request(cwd.path());
+    prepare(&kernel, &next, &mut input).await.unwrap();
+    assert!(input.prompt.contains("Undelivered warm input."));
+    observe(
+        &kernel,
+        &next,
+        zeron_proto::AgentEvent::Steered {
+            assistant_message_id: None,
+            next_assistant_message_id: None,
+        },
+    )
+    .await;
+    let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+    assert!(
+        p.attempts
+            .iter()
+            .find(|a| Some(&a.id) == next.active_attempt_id.as_ref())
+            .unwrap()
+            .provider_turn_id
+            .as_ref()
+            .is_none(),
+        "a local steering boundary is not provider acceptance"
+    );
+    observe(&kernel, &next, zeron_proto::AgentEvent::InputAccepted).await;
+    let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+    let attempt = p
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == next.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(
+        attempt.native_thread_id.as_ref().map(String::as_str),
+        Some("warm-native")
+    );
+    assert!(attempt.provider_turn_id.as_ref().is_some());
+    assert_eq!(
+        p.records["context-handoff"][0]["delivery"]["status"],
+        "inline"
+    );
+    assert_eq!(
+        p.records["turn-item"]
+            .iter()
+            .filter(|i| i["type"] == "user_message" && i["messageId"] == next.user_message_id.0)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn full_model_switch_handoff_already_covers_unaccepted_input() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_, kernel, _) = fixture(cwd.path());
+    let known = start(&kernel, "source", "known").await;
+    accept(&kernel, &known, cwd.path(), "old-model-native").await;
+    observe(&kernel, &known, done(zeron_proto::DoneStatus::Completed)).await;
+    let missed = start_text(
+        &kernel,
+        "source",
+        "missed",
+        "Untold input before model switch.",
+    )
+    .await;
+    observe(&kernel, &missed, done(zeron_proto::DoneStatus::Errored)).await;
+    select_instance(
+        &kernel,
+        &known.provider_instance_id.0,
+        Some("different-model"),
+    )
+    .await;
+    let next = start(&kernel, "source", "switch").await;
+    let mut input = request(cwd.path());
+    prepare(&kernel, &next, &mut input).await.unwrap();
+    assert_eq!(
+        input
+            .prompt
+            .matches("Untold input before model switch.")
+            .count(),
+        1
+    );
+    assert!(input.resume.is_none());
+    assert_eq!(
+        kernel
+            .store
+            .thread_transfers(&next.thread_id)
+            .unwrap()
+            .len(),
+        1,
+        "a full switch must not allocate a duplicate retry handoff"
+    );
+}
+
+#[tokio::test]
+async fn real_acceptance_signals_bind_root_turns_but_not_session_metadata() {
+    use zeron_proto::AgentEvent;
+    for event in [
+        AgentEvent::InputAccepted,
+        AgentEvent::NativeReference {
+            thread_id: "native-accepted".into(),
+            turn_id: Some("actual-turn".into()),
+        },
+        AgentEvent::TextDelta {
+            text: "Response.".into(),
+        },
+        AgentEvent::ReasoningDelta {
+            text: "Thinking.".into(),
+        },
+        AgentEvent::UserMessage {
+            text: "Confirmed assignment.".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool".into(),
+            call: zeron_proto::ToolCall::Exec {
+                command: "pwd".into(),
+            },
+        },
+        done(zeron_proto::DoneStatus::Completed),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_, kernel, _) = fixture(cwd.path());
+        let run = start(&kernel, "source", "signal").await;
+        observe(
+            &kernel,
+            &run,
+            session_started(cwd.path(), "native-accepted"),
+        )
+        .await;
+        observe(
+            &kernel,
+            &run,
+            AgentEvent::ContextUsageSnapshot {
+                usage: zeron_proto::ContextUsage {
+                    tokens: Some(100),
+                    window: Some(128_000),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+        let p = kernel.store.thread(&run.thread_id).unwrap().unwrap();
+        assert!(
+            !crate::orchestration::task::records(&p, "provider-turn")
+                .iter()
+                .any(|t| Some(t["runAttemptId"].as_str().unwrap_or(""))
+                    == run.active_attempt_id.as_ref().map(|id| id.0.as_str()))
+        );
+        observe(&kernel, &run, event.clone()).await;
+        let p = kernel.store.thread(&run.thread_id).unwrap().unwrap();
+        let attempt = p
+            .attempts
+            .iter()
+            .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
+            .unwrap();
+        let turn = attempt
+            .provider_turn_id
+            .as_ref()
+            .unwrap_or_else(|| panic!("unbound acceptance: {event:?}"));
+        assert!(
+            p.records["provider-turn"]
+                .iter()
+                .any(|t| t["id"] == turn.0 && t["nodeId"] == attempt.root_node_id.0)
+        );
+        assert!(
+            p.records["turn-item"]
+                .iter()
+                .any(|i| i["type"] == "user_message"
+                    && i["messageId"] == run.user_message_id.0
+                    && i["providerTurnId"] == turn.0)
+        );
+        let user_ordinal = p.records["turn-item"]
+            .iter()
+            .find(|i| i["type"] == "user_message" && i["messageId"] == run.user_message_id.0)
+            .unwrap()["ordinal"]
+            .as_i64()
+            .unwrap();
+        for assistant in p.records["turn-item"].iter().filter(|i| {
+            i["type"] == "assistant_message"
+                && i["runId"] == run.id.0
+                && i["providerTurnId"] == turn.0
+        }) {
+            assert!(
+                user_ordinal < assistant["ordinal"].as_i64().unwrap(),
+                "acceptance and first output in one command must preserve user-before-assistant ordering: {event:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn accepted_failed_or_interrupted_turns_are_not_replayed() {
+    for status in [
+        zeron_proto::DoneStatus::Errored,
+        zeron_proto::DoneStatus::Interrupted,
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_, kernel, _) = fixture(cwd.path());
+        let run = start_text(
+            &kernel,
+            "source",
+            "accepted-failure",
+            "Already delivered, not retry context.",
+        )
+        .await;
+        accept(&kernel, &run, cwd.path(), "native-accepted").await;
+        observe(&kernel, &run, done(status)).await;
+        let next = start(&kernel, "source", "next").await;
+        let mut input = request(cwd.path());
+        prepare(&kernel, &next, &mut input).await.unwrap();
+        assert_eq!(input.resume.as_deref(), Some("native-accepted"));
+        assert_eq!(input.prompt, request(cwd.path()).prompt);
+        assert!(
+            kernel
+                .store
+                .thread_transfers(&next.thread_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn retry_budget_omissions_are_durable_and_not_reinjected() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (db, kernel, _) = fixture(cwd.path());
+    let known = start(&kernel, "source", "known").await;
+    accept(&kernel, &known, cwd.path(), "native-budget").await;
+    observe(&kernel, &known, done(zeron_proto::DoneStatus::Completed)).await;
+    let missed = start_text(&kernel, "source", "oversized-failure", &"🧪".repeat(40_000)).await;
+    observe(&kernel, &missed, done(zeron_proto::DoneStatus::Errored)).await;
+    let next = start(&kernel, "source", "retry").await;
+    let mut input = request(cwd.path());
+    prepare(&kernel, &next, &mut input).await.unwrap();
+    assert!(!input.prompt.contains("🧪🧪"));
+    assert!(input.prompt.ends_with(&request(cwd.path()).prompt));
+    accept(&kernel, &next, cwd.path(), "native-budget").await;
+    observe(&kernel, &next, done(zeron_proto::DoneStatus::Completed)).await;
+    let reopened = Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+    reopened.store.rebuild().unwrap();
+    let p = reopened.store.thread(&next.thread_id).unwrap().unwrap();
+    let receipt = &p.records["context-handoff"][0]["delivery"];
+    assert_eq!(receipt["status"], "inline");
+    assert!(!receipt["omittedItemIds"].as_array().unwrap().is_empty());
+    let later = start(&reopened, "source", "later").await;
+    let mut input = request(cwd.path());
+    prepare(&reopened, &later, &mut input).await.unwrap();
+    assert_eq!(input.prompt, request(cwd.path()).prompt);
+    assert_eq!(
+        reopened
+            .store
+            .thread_transfers(&later.thread_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn session_ready_does_not_settle_ambiguous_inline_delivery() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_, kernel, _) = fixture(cwd.path());
+    let known = start(&kernel, "source", "known").await;
+    accept(&kernel, &known, cwd.path(), "native-uncertain").await;
+    observe(&kernel, &known, done(zeron_proto::DoneStatus::Completed)).await;
+    let missed = start(&kernel, "source", "missed").await;
+    observe(&kernel, &missed, done(zeron_proto::DoneStatus::Errored)).await;
+    let next = start(&kernel, "source", "uncertain-retry").await;
+    let mut input = request(cwd.path());
+    prepare(&kernel, &next, &mut input).await.unwrap();
+    observe(
+        &kernel,
+        &next,
+        session_started(cwd.path(), "native-uncertain"),
+    )
+    .await;
+    let p = kernel.store.thread(&next.thread_id).unwrap().unwrap();
+    assert_eq!(
+        p.records["context-handoff"][0]["delivery"]["status"],
+        "pending"
+    );
+    assert!(
+        p.attempts
+            .iter()
+            .find(|a| Some(&a.id) == next.active_attempt_id.as_ref())
+            .unwrap()
+            .provider_turn_id
+            .as_ref()
+            .is_none()
+    );
+    observe(&kernel, &next, done(zeron_proto::DoneStatus::Errored)).await;
+    let later = start(&kernel, "source", "later").await;
+    let mut input = request(cwd.path());
+    assert!(
+        prepare(&kernel, &later, &mut input)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains(UNCERTAIN_ERROR)
+    );
+    let p = kernel.store.thread(&later.thread_id).unwrap().unwrap();
+    assert!(
+        p.records["context-handoff"]
+            .iter()
+            .all(|h| h["delivery"]["status"] != "inline")
+    );
 }
 
 async fn observe(kernel: &Kernel, run: &OrchestrationV2Run, event: zeron_proto::AgentEvent) {
@@ -195,7 +762,7 @@ async fn prepare(
     .await
 }
 
-fn acceptance(cwd: &std::path::Path, native: &str) -> zeron_proto::AgentEvent {
+fn session_started(cwd: &std::path::Path, native: &str) -> zeron_proto::AgentEvent {
     zeron_proto::AgentEvent::SessionStarted {
         instance_id: None,
         harness: zeron_proto::HarnessId::Mock,
@@ -205,6 +772,11 @@ fn acceptance(cwd: &std::path::Path, native: &str) -> zeron_proto::AgentEvent {
         session_id: native.into(),
         assistant_message_id: String::new(),
     }
+}
+
+async fn accept(kernel: &Kernel, run: &OrchestrationV2Run, cwd: &std::path::Path, native: &str) {
+    observe(kernel, run, session_started(cwd, native)).await;
+    observe(kernel, run, zeron_proto::AgentEvent::InputAccepted).await;
 }
 
 fn done(status: zeron_proto::DoneStatus) -> zeron_proto::AgentEvent {
@@ -426,7 +998,7 @@ async fn portable_fork_merge_and_failed_start_retry_preserve_prompt_and_consume_
     let mut retry_input = request(cwd.path());
     prepare(&reopened, &retry, &mut retry_input).await.unwrap();
     assert!(retry_input.prompt.contains("Source history only."));
-    observe(&reopened, &retry, acceptance(cwd.path(), "native-child")).await;
+    accept(&reopened, &retry, cwd.path(), "native-child").await;
     let projection = reopened.store.thread(&"child".into()).unwrap().unwrap();
     assert_eq!(
         projection.records["context-handoff"][0]["delivery"]["status"],
@@ -482,12 +1054,7 @@ async fn portable_fork_merge_and_failed_start_retry_preserve_prompt_and_consume_
             .to_string()
             .contains(UNCERTAIN_ERROR)
     );
-    observe(
-        &reopened,
-        &parent_run,
-        acceptance(cwd.path(), "native-parent"),
-    )
-    .await;
+    accept(&reopened, &parent_run, cwd.path(), "native-parent").await;
     let mut accepted = request(cwd.path());
     accepted.resume = Some("native-parent".into());
     prepare(&reopened, &parent_run, &mut accepted)
@@ -504,7 +1071,7 @@ async fn provider_switch_and_telemetry_use_only_accepted_root_native_identity() 
     let cwd = tempfile::tempdir().unwrap();
     let (_db, kernel, _run) = fixture(cwd.path());
     let first = start(&kernel, "source", "occupancy-input").await;
-    observe(&kernel, &first, acceptance(cwd.path(), "native-a")).await;
+    accept(&kernel, &first, cwd.path(), "native-a").await;
     // Unknown window/threshold must be omitted, not invalid null PositiveInts.
     observe(
         &kernel,
@@ -634,7 +1201,7 @@ async fn returning_provider_resumes_its_own_native_history_and_only_receives_the
             .thread
             .model_selection;
         let first = start(&kernel, "source", "a-input").await;
-        observe(&kernel, &first, acceptance(cwd.path(), "native-a")).await;
+        accept(&kernel, &first, cwd.path(), "native-a").await;
         observe(
             &kernel,
             &first,
@@ -656,7 +1223,7 @@ async fn returning_provider_resumes_its_own_native_history_and_only_receives_the
         );
         assert!(input.prompt.contains("full_thread_summary"));
         assert!(input.prompt.contains("A already knows this decision."));
-        observe(&kernel, &second, acceptance(cwd.path(), "native-b")).await;
+        accept(&kernel, &second, cwd.path(), "native-b").await;
         observe(
             &kernel,
             &second,
@@ -711,7 +1278,7 @@ async fn returning_provider_resumes_its_own_native_history_and_only_receives_the
                 .unwrap()
                 .contains(&handoff["id"])
         );
-        observe(&kernel, &returned, acceptance(cwd.path(), "native-a")).await;
+        accept(&kernel, &returned, cwd.path(), "native-a").await;
         let mut accepted = request(cwd.path());
         prepare(&kernel, &returned, &mut accepted).await.unwrap();
         assert_eq!(
@@ -734,7 +1301,7 @@ async fn changed_model_options_or_checkout_uses_full_context_and_never_a_foreign
         let other = tempfile::tempdir().unwrap();
         let (_db, kernel, _) = fixture(cwd.path());
         let first = start(&kernel, "source", "initial-input").await;
-        observe(&kernel, &first, acceptance(cwd.path(), "native-original")).await;
+        accept(&kernel, &first, cwd.path(), "native-original").await;
         observe(
             &kernel,
             &first,
@@ -793,7 +1360,7 @@ async fn same_provider_followup_preserves_its_native_handle_and_replaces_a_stale
     let cwd = tempfile::tempdir().unwrap();
     let (_db, kernel, _) = fixture(cwd.path());
     let first = start(&kernel, "source", "same-provider-first").await;
-    observe(&kernel, &first, acceptance(cwd.path(), "native-owned")).await;
+    accept(&kernel, &first, cwd.path(), "native-owned").await;
     observe(&kernel, &first, done(zeron_proto::DoneStatus::Completed)).await;
     let next = start(&kernel, "source", "same-provider-next").await;
     assert_eq!(first.provider_thread_id, next.provider_thread_id);
@@ -985,7 +1552,7 @@ async fn fresh_native_acceptance_receipt_records_budgeted_selection_not_original
     prepare(&kernel, &run, &mut input).await.unwrap();
     assert!(input.prompt.contains("Keep this."));
     assert!(!input.prompt.contains(&"x".repeat(8_000)));
-    observe(&kernel, &run, acceptance(cwd.path(), "fresh-native")).await;
+    accept(&kernel, &run, cwd.path(), "fresh-native").await;
     let p = kernel.store.thread(&run.thread_id).unwrap().unwrap();
     let h = &p.records["context-handoff"][0];
     assert_eq!(h["history"]["messages"].as_array().unwrap().len(), 2);

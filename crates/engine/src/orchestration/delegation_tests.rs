@@ -1477,6 +1477,13 @@ async fn live_parent_steer_is_noninterrupting_and_acceptance_does_not_acknowledg
             },
         )
         .await;
+    fixture
+        .event(
+            &parent.thread.id,
+            &parent.runs[0],
+            AgentEvent::InputAccepted,
+        )
+        .await;
     let delivery = fixture.delivery(DeliveryAction::Queue);
     for effect in fixture.kernel().store.effects().unwrap() {
         if matches!(
@@ -1936,6 +1943,13 @@ async fn steering_requires_always_wake_live_turn_capability_and_not_maintenance(
                 session_id: "live".into(),
                 assistant_message_id: "assistant".into(),
             },
+        )
+        .await;
+    fixture
+        .event(
+            &parent.thread.id,
+            &parent.runs[0],
+            AgentEvent::InputAccepted,
         )
         .await;
     fixture.complete(&task, "done").await;

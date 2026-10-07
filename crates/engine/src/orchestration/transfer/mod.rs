@@ -3,6 +3,7 @@
 pub mod context;
 pub mod delivery;
 pub mod mcp;
+mod retry;
 #[cfg(test)]
 pub(crate) mod tests;
 

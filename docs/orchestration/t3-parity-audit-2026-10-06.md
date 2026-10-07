@@ -4,11 +4,13 @@ Reference: [pingdotgg/t3code at fbe5df2d](https://github.com/pingdotgg/t3code/tr
 Noches baseline: `dev` at `d0e08ba2`. This is an original Rust/GPUI adaptation,
 not a replacement of Noches with T3's TypeScript/Electron stack.
 
-Freshness check: fetched T3 `main` at
-[`8ddf200e`](https://github.com/pingdotgg/t3code/tree/8ddf200e8f637eaf9a4f0d3036ece8f1d3869d10).
-The compared orchestration-v2 implementation, relationship controls and
-client-runtime state are unchanged from the pinned reference. The comparison
-found only an unrelated `ProjectStore` test edit in those areas.
+Latest freshness check: compared T3 `main` at
+[`d021f57b`](https://github.com/pingdotgg/t3code/tree/d021f57bf3a500e419e800c3eb957568bed8f713)
+with the pinned reference. `ProviderTurnStartService`, `ContextHandoffDelivery`
+and the fork/transfer services are unchanged. The newer adapter/session-manager
+interruption cleanup, per-turn busy identity and app-owned subagent Stop control
+were inspected; equivalent full current-upstream parity is not claimed.
+The earlier comparison at `8ddf200e` predated those changes.
 
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
@@ -29,6 +31,7 @@ it is not alone evidence that a feature works in either application.
 | Ordinary thread integration | `ThreadMessageIntake`, `RunExecutionService`, `ProviderEventIngestor` | `thread_service`, `threads/planner`, `sessions`, `runner`: legacy adoption, one logical run, no second provider start; existing and regression-tested. |
 | Exact provider/model selection | `ProviderAdapterRegistry`, `ProviderSelectionTransition` | `provider_instances` catalog shared by composer, MCP and runner; custom IDs/options remain exact. Existing. |
 | Return to a harness | [ProviderTurnStartService](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/server/src/orchestration-v2/ProviderTurnStartService.ts), `ProviderSwitchService` | **Fixed:** independent native handles per instance/generation; A→B→A resumes A, bridges B's delta, or reconstructs fully when unsafe. Prior code overwrote one app-wide handle and cleared resume even for a delta. |
+| Prompt acceptance and retry | `ProviderTurnStartService` missed-attempt history, `ContextHandoffDelivery` acceptance callback | **Fixed:** session readiness and local steering are not accepted input. Codex RPC/OpenCode POST acknowledgements or actual native response bind the exact root attempt; failed/interrupted untold inputs become bounded, restart-durable retry context. Settled deliveries and deliberate budget omissions are not repeatedly injected. |
 | Portable context | [ContextHandoffService](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/server/src/orchestration-v2/ContextHandoffService.ts), `ContextHandoffBudget`, `ContextHandoffDelivery` | `transfer/{context,delivery}`: bounded whole-item selection, occupancy/input/attachment budget, coverage and uncertain-delivery receipts. **Fixed:** imported runless history, checkout/native identity fences, restart metadata recovery. |
 | Delegation and handoff | `DelegatedTaskService`, `NotificationMailbox`, `RunFinalizationService` | `task`, `mailbox`, `runner`, scoped MCP: task ID distinct from backing thread, nested children, cancellation, steering/queued completion and explicit acknowledgement. Existing. |
 | Native vs app-owned agents | `SubagentProjection`, provider event ingest, client-runtime subagent selectors | `delegation`, `subagents`, `agents`, composer/sidebar: observational native children and app-owned tasks retain separate authority and share presentation. Existing. |
@@ -113,6 +116,31 @@ is not an acceptable substitute.
   and a private runtime run tag, independent of agent credential expiry, before
   signaling the exact handle under its map lock. Neutral feedback says
   **requested**, not that an asynchronous teardown has already finished.
+- A native session ID proves attachment, not input acceptance. `SessionStarted`,
+  local `Steered`, context telemetry and thread-only references cannot settle
+  handoff receipts. Host-only `InputAccepted` is emitted after successful Codex
+  turn-start/steer RPCs or the matching OpenCode prompt response, never on enqueue.
+  OpenCode responses carry unique submission identities; a late ACK/failure
+  from a finished input cannot bind or fail its successor.
+- Inline context receipts retain the actual bounded selected/omitted IDs and
+  prepared run/attempt/root/provider-thread fence in private SQLite state.
+  Acceptance settles only that exact preparation/native identity inside the
+  provider-event transaction. A repeated refused preparation preserves the
+  original pending ACK fence. Session readiness cannot manufacture delivery.
+- Retry context recovers earlier failed/interrupted untold root inputs on the
+  same provider thread. Its stable saved snapshot survives process restart and
+  projection rebuild; fork/switch context and accepted native coverage suppress
+  duplicate items. Historical attachments/private reasoning/native tools are
+  not re-executed. A successfully accepted failed turn is not replayed.
+- First-response acceptance and assistant/error materialization share a planned
+  item-ordinal allocator. Newly emitted items in the same transaction contribute
+  to the next ordinal, preserving user-before-assistant pagination and preventing
+  premature acknowledgement of a partial child result.
+- Queue repair acknowledges a saved command-generation watermark rather than
+  requiring the entire live document to stay clean. Concurrent later transcript
+  changes remain independently dirty; a real failed snapshot write still leaves
+  the repair outbox unacknowledged. This fixes an RPC failure despite the queue
+  patch already being durably saved, without serializing away concurrent tests.
 
 ## Remaining gaps — not claimed 1:1
 
@@ -125,34 +153,46 @@ is not an acceptable substitute.
 3. Canonical queue edits are text-only (existing attachment metadata is shown and
    preserved, not replaced). Native active-steering promotion is implemented;
    interrupt/restart promotion and queued merge-back consumption remain unsupported.
+   The legacy active-steer ledger still retires at a local transcript boundary;
+   per-steered-input native acknowledgement/rejection recovery is a separate gap
+   from the verified root-turn acceptance and missed-start recovery here.
 4. Live catalog context-window lookup, cross-account native continuation,
    `/compact` handoff deferral, conversation rollback and driver-authorized
    cross-checkout native continuation.
 5. Provider clone/setup progress edges, project/environment PR-settlement
    settings, sparse/submodule checkpoints and some cleanup/recovery policy.
 6. Live installed-provider, remote multi-device, Windows, Linux and iOS
-   verification must not be inferred from local Mac/mock tests.
+   runtime/visual verification must not be inferred from local Mac/mock tests
+   or from platform unit/integration CI.
+7. Older builds stored false acceptance at session initialization. Existing
+   provider-turn/delivery rows cannot retrospectively prove provider submission;
+   no speculative migration or historical duplicate replay is performed.
+8. The latest upstream interruption/attachment cleanup and relationship-panel
+   app-owned subagent Stop interaction require further parity verification.
 
 ## Verification
 
 The task uses an isolated worktree and build target; the other performance
-worktree and the main checkout's untracked files are untouched. Serial tests
-avoid pre-existing timing-sensitive checkpoint/worker interactions.
+worktree and the main checkout's untracked files are untouched. Final full
+library/integration checks use serial execution where noted below; queue
+repeats and the broader session-sync gate also pass with default parallelism.
 
 A read-only `git merge-tree` comparison of the disconnect implementation and
 instruction EOL rule at `4cc81afe` with performance PR #46 at
 `89f648f60f20160152214645df96ea495b00fc3d` reports no textual conflicts.
 PR #46 subsequently merged into `dev` at `6dc76ff4`. Neither its commits nor
 its worktree are changed or copied into this feature branch.
-Combined performance-plus-parity runtime behavior has not been tested.
+CI tested the previously published parity implementation combined with PR #46
+through PR merge ref `8f627e2c`. That is not live-provider proof or verification
+of this later acceptance/retry follow-up combined with the performance changes.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 633 passed, 0 failed, 2 ignored |
-| Selected engine integration suites | 54 passed, 0 failed, 1 ignored |
+| Engine library | 643 passed, 0 failed, 2 ignored |
+| Selected engine integration suites | 57 passed, 0 failed, 1 ignored |
 | Desktop library, including pane/sidebar regressions | 1,506 passed, 0 failed, 1 ignored |
-| Doc/proto/RPC libraries and integration suites | 243 passed, 0 failed, 2 ignored |
-| Offline Codex harness protocol integration suite | 25 passed, 0 failed, 4 ignored |
+| Doc/proto/RPC libraries and integration suites | 244 passed, 0 failed, 2 ignored |
+| Full harness library, integrations and doctest | 433 passed, 0 failed, 12 ignored |
 | Production `zeron` desktop build (`--locked`) | Passed |
 | Native orchestration fixture, dark and light launches | Passed; 1320×900 and 960×720 layouts inspected |
 | Broader session-sync gate (`scripts/ci/run-session-sync.py`) | Passed; all 14 selected targets plus doctests, stable source |
@@ -161,7 +201,7 @@ Combined performance-plus-parity runtime behavior has not been tested.
 The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
 `restart_resume`, `message_queue`, `queue_lifecycle_rpc` and
-`scheduler_bootstrap` and `codex_subagents`. These checks total 2,461 distinct
+`scheduler_bootstrap` and `codex_subagents`. These checks total 2,883 distinct
 passing tests. Focused transfer coverage is included in the engine library
 count, not counted a second time. The session-sync gate supplies additional
 coverage; its overlapping engine/restart/child tests are not added to this total.
@@ -187,13 +227,14 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   while another edit is acquiring, open or finishing.
 - Resumed Codex child fixtures use the root conversation accepted before
   restart, rather than substituting a different fixture-only native handle.
-  Both child-document/chip persistence regressions and all 25 offline Codex
+  Both child-document/chip persistence regressions and all 26 offline Codex
   protocol tests pass; production identity fences are not weakened.
-- Production `thread_transfers_rpc`: 3 passing tests. Real host assembly,
+- Production `thread_transfers_rpc`: 6 passing tests. Real host assembly,
   source→idle fork→child first input→merge-back→parent next input; inherited
   config, pinned source, user provenance, unchanged working files,
   after-commit response loss, replay/rebuild, identity collision, foreign
-  owner and wrong-project/non-parent refusal.
+  owner and wrong-project/non-parent refusal; real Codex/OpenCode rejection,
+  untold-input recovery, native acceptance and transcript-ordering regressions.
 - The native fixture invokes the production Shell actions and real transfer
   RPCs against an isolated engine/checkout. It asserts an idle child, parent
   lineage, first child completion, parent-visible Delivered receipt, Pending
@@ -218,7 +259,9 @@ cargo test -p zeron-engine --lib \
   --locked -- --test-threads=1
 cargo test -p zeron-ui --lib --locked -- --test-threads=1
 cargo test -p zeron-proto -p zeron-rpc -p zeron-doc --locked
-cargo test -p zeron-harness --test codex --locked -- --test-threads=1
+cargo test -p zeron-harness --locked -- --test-threads=1
+cargo test -p zeron-engine --test message_queue --locked
+python3 scripts/ci/run-session-sync.py
 cargo build -p zeron --locked
 ```
 
@@ -246,17 +289,26 @@ Ignored live-provider/edge/tailnet/private-snapshot tests are not passes.
 Current installed-provider, remote-device and non-Mac verification has not
 been performed. No release or integration-branch mutation is part of this task.
 
-CI on published revision `161c498c` passed session-sync, native Mac/UI, Windows
-UI/harness/packaging, networking and policy checks. Windows engine tests still
-reported nine failures: eight fixture/platform assumptions (line endings, Git
-paths and terminal availability) addressed by performance PR #46, plus the
-byte-pinned MCP instruction fixture being converted to CRLF on checkout. This
-increment adds a narrowly scoped `.gitattributes` LF rule for that instruction
-file, preserving the existing length/SHA test rather than weakening it. PR #46
-also includes that identical LF rule; the read-only combined merge is clean.
-Windows verification of this branch's rule is pending. The other eight fixture
-corrections remain outside this feature branch. These results are not proof
-that a later revision's CI has passed.
+CI on published revision `1eeebb14` completed: the executed Mac/UI/browser,
+Windows UI/harness/engine/packaging, session-sync, networking and policy jobs
+passed. Windows engine ran 637 library and 22 integration tests with no failures
+against PR merge ref `8f627e2c9978dece17767df2217465bd23e41b56`, combining the
+published source with performance PR #46. Windows native GUI and iOS jobs were
+skipped, not passes.
+
+The [Linux Cursor compatibility job](https://github.com/KldsSeeGhosts/noches/actions/runs/37550486502/job/112564548461)
+failed `desktop_mixed_queue_reorder_preserves_intents_and_edit_leases` (30 queue
+tests passed, one failed). A default-parallel local run also reproduced the
+same generic RPC error during queue promotion. A deterministic snapshot hook
+then proved that the queue patch was saved but a later transcript change made
+the whole-document cleanliness check fail. The command-generation watermark
+fix passes that regression and a real SQLite write-failure guard. Four
+consecutive default-parallel local queue runs now pass all 31 tests. New-head
+Linux CI remains required; the older job is not claimed green.
+
+The byte-pinned MCP instruction fixture retains its narrowly scoped LF checkout
+rule; the SHA/length tests are unchanged. These CI results do not prove a later
+revision's CI or installed-provider/native-GUI behavior.
 An isolated checkout-index probe with `core.autocrlf=true` retains the exact
 pinned instruction SHA on this Mac; it is not a Windows runtime test.
 

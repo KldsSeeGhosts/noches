@@ -95,6 +95,11 @@ pub(crate) fn local_items(projection: &ThreadProjection, ordinal: i64) -> Vec<Va
             i["ordinal"].as_i64().unwrap_or(0),
         )
     });
+    for item in &mut items {
+        if let Some(run) = item["runId"].as_str().and_then(|id| runs.get(id)) {
+            item["runStatus"] = json!(run.status);
+        }
+    }
     items
 }
 
@@ -247,8 +252,8 @@ async fn persist(kernel: &Kernel, transfer: &Value, handoff: Option<&Value>) -> 
 pub trait HandoffDelivery: Send + Sync {
     async fn inject(&self, native: &str, messages: &[Value], context: &str) -> Result<bool>;
     async fn persist(&self, handoff: &Value) -> Result<()>;
-    /// Before the fresh provider exposes a native ID, retain the exact bounded
-    /// inline selection locally; it cannot be put in a native delivery record.
+    /// Retain the exact bounded inline selection and its input-attempt fence.
+    /// A fresh provider has no native ID yet; readiness cannot settle it.
     async fn stage_inline(
         &self,
         _handoff: &Value,
@@ -372,6 +377,7 @@ pub async fn deliver_handoffs(
         return Err(Error::Invariant(context::UNCERTAIN_ERROR.into()));
     }
     let mut durable = Vec::new();
+    let mut inline = Vec::new();
     for h in &pending {
         let mut h = (*h).clone();
         let candidates = h["history"]["messages"]
@@ -403,9 +409,7 @@ pub async fn deliver_handoffs(
             h["delivery"] = json!({"nativeThreadId":native,"status":"pending","itemIds":items,"omittedItemIds":omitted});
         }
         delivery.persist(&h).await?;
-        if native_id.is_none() {
-            delivery.stage_inline(&h, &items, &omitted).await?;
-        }
+        inline.push((h.clone(), items, omitted));
         durable.push(h);
     }
     if native_injection
@@ -432,6 +436,9 @@ pub async fn deliver_handoffs(
             handoffs: vec![],
         });
     }
+    for (handoff, items, omitted) in inline {
+        delivery.stage_inline(&handoff, &items, &omitted).await?;
+    }
     Ok(DeliveredContext {
         context: context::render_history(&selected.messages, &selected.context),
         handoffs: durable,
@@ -440,6 +447,7 @@ pub async fn deliver_handoffs(
 
 struct EngineDelivery<'a> {
     kernel: &'a Kernel,
+    run: &'a OrchestrationV2Run,
     transfers: Vec<Value>,
     harness: &'a dyn Harness,
 }
@@ -469,10 +477,14 @@ impl HandoffDelivery for EngineDelivery<'_> {
         omitted: &[Value],
     ) -> Result<()> {
         self.kernel.store.write(|conn| {
-            conn.execute("INSERT INTO orchestration_transfer_delivery(transfer_id,target_run_id,status,payload_json)
-                VALUES(?1,?2,'inline_prepared',?3) ON CONFLICT(transfer_id) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json",
+            let native = handoff["delivery"]["nativeThreadId"].as_str();
+            let status = if native.is_some() { "pending" } else { "inline_prepared" };
+            conn.execute("INSERT INTO orchestration_transfer_delivery(transfer_id,target_run_id,native_thread_id,status,payload_json)
+                VALUES(?1,?2,?3,?4,?5) ON CONFLICT(transfer_id) DO UPDATE SET native_thread_id=excluded.native_thread_id,status=excluded.status,payload_json=excluded.payload_json",
                 rusqlite::params![handoff["transferId"].as_str(),handoff["targetRunId"].as_str(),
-                    json!({"status":"inline_prepared","itemIds":items,"omittedItemIds":omitted}).to_string()])?;
+                    native,status,json!({"status":status,"nativeThreadId":native,"itemIds":items,"omittedItemIds":omitted,
+                        "preparedRunId":self.run.id,"preparedAttemptId":self.run.active_attempt_id,
+                        "preparedRootNodeId":self.run.root_node_id,"preparedProviderThreadId":self.run.provider_thread_id}).to_string()])?;
             Ok(())
         })
     }
@@ -816,6 +828,19 @@ pub async fn prepare_run(
             durable_transfers.push(transfer);
         }
     }
+    if let Some((transfer, handoff)) = super::retry::prepare(
+        kernel,
+        &projection,
+        run,
+        request.resume.as_deref(),
+        &handoffs,
+    )
+    .await?
+        && !handoffs.iter().any(|h| h["id"] == handoff["id"])
+    {
+        handoffs.push(handoff);
+        durable_transfers.push(transfer);
+    }
     if handoffs.is_empty() {
         return Ok(());
     }
@@ -858,6 +883,8 @@ pub async fn prepare_run(
         .iter()
         .filter(|h| {
             native.is_some()
+                && h["toProviderThreadId"].as_str()
+                    == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
                 && h["delivery"]["nativeThreadId"].as_str() == native
                 && matches!(
                     h["delivery"]["status"].as_str(),
@@ -872,7 +899,11 @@ pub async fn prepare_run(
         .collect();
     let native_provider = super::super::task::records(&projection, "provider-thread")
         .iter()
-        .find(|p| native.is_some() && p["nativeThreadRef"]["nativeId"].as_str() == native);
+        .find(|p| {
+            native.is_some()
+                && p["id"].as_str() == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                && p["nativeThreadRef"]["nativeId"].as_str() == native
+        });
     let native_estimate = if usage.is_some() || native_provider.is_none() {
         0
     } else {
@@ -914,6 +945,7 @@ pub async fn prepare_run(
     );
     let delivery = EngineDelivery {
         kernel,
+        run,
         transfers: durable_transfers,
         harness,
     };
@@ -934,7 +966,8 @@ pub async fn prepare_run(
     Ok(())
 }
 
-/// SessionStarted / first native output confirms input acceptance. Persist the
+/// A provider acknowledgement / first native output confirms input acceptance.
+/// SessionStarted alone does not. Persist the
 /// inline receipt under the same kernel transaction as native run observation.
 pub(crate) fn accepted(
     conn: &rusqlite::Connection,
@@ -954,21 +987,25 @@ pub(crate) fn accepted(
         })
         .cloned()
     {
-        if handoff["delivery"].is_null() {
-            use rusqlite::OptionalExtension;
-            let prepared: Option<String> = conn.query_row(
-                "SELECT payload_json FROM orchestration_transfer_delivery WHERE transfer_id=?1 AND status='inline_prepared'",
-                [handoff["transferId"].as_str()],|r| r.get(0)).optional()?;
-            let prepared: Option<Value> = prepared.map(|v| serde_json::from_str(&v)).transpose()?;
-            handoff["delivery"] = json!({"nativeThreadId":native,"status":"inline",
-                "itemIds":prepared.as_ref().map(|p| p["itemIds"].clone()).unwrap_or_else(||
-                    json!(handoff["history"]["messages"].as_array().into_iter().flatten().map(|m| m["itemId"].clone()).collect::<Vec<_>>())),
-                "omittedItemIds":prepared.as_ref().map(|p| p["omittedItemIds"].clone()).unwrap_or_else(||
-                    json!(handoff["history"]["omittedItemIds"].as_array().cloned().unwrap_or_default()))});
-        } else {
-            handoff["delivery"]["status"] = json!("inline");
-            handoff["delivery"]["nativeThreadId"] = json!(native);
-        }
+        use rusqlite::OptionalExtension;
+        let prepared: Option<String> = conn.query_row(
+            "SELECT payload_json FROM orchestration_transfer_delivery WHERE transfer_id=?1 AND status IN ('inline_prepared','pending')",
+            [handoff["transferId"].as_str()],|r| r.get(0)).optional()?;
+        let prepared: Option<Value> = prepared.map(|v| serde_json::from_str(&v)).transpose()?;
+        let Some(prepared) = prepared.filter(|p| {
+            p["preparedRunId"] == run.id.0
+                && p["preparedAttemptId"].as_str()
+                    == run.active_attempt_id.as_ref().map(|id| id.0.as_str())
+                && p["preparedRootNodeId"].as_str()
+                    == run.root_node_id.as_ref().map(|id| id.0.as_str())
+                && p["preparedProviderThreadId"].as_str()
+                    == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                && (p["nativeThreadId"].is_null() || p["nativeThreadId"] == native)
+        }) else {
+            continue;
+        };
+        handoff["delivery"] = json!({"nativeThreadId":native,"status":"inline",
+            "itemIds":prepared["itemIds"],"omittedItemIds":prepared["omittedItemIds"]});
         persist_receipt(conn, &handoff)?;
         plan.emit(command, "context-handoff.updated", &handoff, now)?;
     }
@@ -979,8 +1016,18 @@ pub(crate) fn persist_receipt(conn: &rusqlite::Connection, handoff: &Value) -> R
     if handoff["delivery"].is_null() {
         return Ok(());
     }
+    // Re-observing the same pending native receipt must retain the private
+    // prepared-input fence/selection until its original acknowledgement. A
+    // different native identity or settled status discards that staging data.
     conn.execute("INSERT INTO orchestration_transfer_delivery(transfer_id,target_run_id,native_thread_id,status,payload_json)
-        VALUES(?1,?2,?3,?4,?5) ON CONFLICT(transfer_id) DO UPDATE SET native_thread_id=excluded.native_thread_id,status=excluded.status,payload_json=excluded.payload_json",
+        VALUES(?1,?2,?3,?4,?5) ON CONFLICT(transfer_id) DO UPDATE SET
+        payload_json=CASE
+            WHEN orchestration_transfer_delivery.status='pending' AND excluded.status='pending'
+              AND orchestration_transfer_delivery.native_thread_id IS excluded.native_thread_id
+              AND json_extract(orchestration_transfer_delivery.payload_json,'$.preparedRunId') IS NOT NULL
+            THEN json_patch(excluded.payload_json,orchestration_transfer_delivery.payload_json)
+            ELSE excluded.payload_json END,
+        native_thread_id=excluded.native_thread_id,status=excluded.status",
         rusqlite::params![handoff["transferId"].as_str(),handoff["targetRunId"].as_str(),
             handoff["delivery"]["nativeThreadId"].as_str(),handoff["delivery"]["status"].as_str(),handoff.to_string()])?;
     Ok(())

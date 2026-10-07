@@ -70,8 +70,19 @@ impl ChatPersistence {
         self.saved.load(Ordering::Acquire) == self.generation.load(Ordering::Acquire)
     }
 
+    /// A command needs its own snapshot watermark, not a globally quiet doc.
+    /// Later transcript/import changes retain their independent dirty state.
+    pub(crate) fn durable_through(&self, generation: u64) -> bool {
+        self.saved.load(Ordering::Acquire) >= generation
+    }
+
     pub(crate) fn snapshot_bytes(&self) -> usize {
         self.snapshot_bytes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_next_export(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_export.lock().unwrap() = Some(Box::new(hook));
     }
 
     pub(crate) fn applied(&self, cursor: u64, immediate: bool) {
@@ -85,8 +96,8 @@ impl ChatPersistence {
         }
     }
 
-    pub(crate) fn dirty(&self, immediate: bool) {
-        self.generation.fetch_add(1, Ordering::Release);
+    pub(crate) fn dirty(&self, immediate: bool) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         if immediate {
             self.urgent.store(true, Ordering::Release);
         }
@@ -96,6 +107,7 @@ impl ChatPersistence {
             // Offline synchronous tooling/tests have no executor to schedule.
             self.flush_sync();
         }
+        generation
     }
 
     async fn run(weak: Weak<Self>, mut rx: mpsc::Receiver<()>) {

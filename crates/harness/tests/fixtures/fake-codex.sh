@@ -108,6 +108,10 @@ tid=$(rid "$turnline")
 
 case "$turnline" in
 
+*scenario:turn-start-rejected*)
+  emit "{\"id\":$tid,\"error\":{\"code\":-32600,\"message\":\"turn/start rejected before input acceptance\"}}"
+  ;;
+
 *scenario:instance*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-instance\"}}}"
   emit "{\"method\":\"item/started\",\"params\":{\"threadId\":\"th-1\",\"turnId\":\"t-instance\",\"item\":{\"id\":\"instance-msg\",\"type\":\"agentMessage\",\"text\":\"$CODEX_HOME | $NOCHES_TEST_INSTANCE_MODEL\"}}}"

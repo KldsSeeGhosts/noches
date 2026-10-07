@@ -424,6 +424,9 @@ pub enum DoneStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
+    /// Host-only acknowledgement that the provider accepted the submitted
+    /// input. Creating/resuming a native session alone does not establish this.
+    InputAccepted,
     /// Host-only durable native conversation boundary, not a visible message.
     #[serde(rename_all = "camelCase")]
     NativeReference {
@@ -535,8 +538,10 @@ pub enum AgentEvent {
         #[serde(default)]
         interaction_mode: crate::InteractionMode,
     },
-    /// A confirmed new assignment. When tagged as Subagent, this reopens the
-    /// same child transcript even if the provider does not echo the user text.
+    /// Transcript boundary for a submitted assignment, not proof of provider
+    /// input acceptance: some drivers emit it at local mailbox enqueue. When
+    /// tagged as Subagent, this reopens the same child transcript even if the
+    /// provider does not echo the user text.
     #[serde(rename_all = "camelCase")]
     Steered {
         assistant_message_id: Option<String>,
@@ -580,6 +585,10 @@ mod tests {
 
     #[test]
     fn agent_event_round_trips() {
+        let accepted = AgentEvent::InputAccepted;
+        let wire = serde_json::to_string(&accepted).unwrap();
+        assert_eq!(wire, r#"{"type":"inputAccepted"}"#);
+        assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), accepted);
         let ev = AgentEvent::ToolCall {
             id: "t1".into(),
             call: ToolCall::Exec {

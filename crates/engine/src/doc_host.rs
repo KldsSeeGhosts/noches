@@ -557,8 +557,8 @@ impl PartialEq for QueueSnapshot {
                     // Transcript token publications advance the SQL sequence, but
                     // do not change queue controls. Do not repaint the composer
                     // merely because unrelated conversation content grew.
-                a.schema_version == b.schema_version
-                    && a.thread_id == b.thread_id
+                    a.schema_version == b.schema_version
+                        && a.thread_id == b.thread_id
                         && a.queue == b.queue
                         && a.pending_questions == b.pending_questions
                         && a.lifecycle == b.lifecycle
@@ -572,11 +572,106 @@ impl PartialEq for QueueSnapshot {
 
 #[cfg(test)]
 mod queue_snapshot_tests {
+    #[tokio::test]
+    async fn queue_durability_is_not_invalidated_by_a_later_transcript_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = super::DocHost::new(
+            store.clone(),
+            super::DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("queue-durability").unwrap();
+        for id in ["a", "b"] {
+            handle
+                .doc
+                .push_queued(&zeron_doc::QueuedMessage::new(id, id, "host"))
+                .unwrap();
+        }
+        handle.doc.move_queued("b", 0).unwrap();
+        let persistence = handle.persistence.as_ref().unwrap();
+        let changed_doc = handle.doc.clone();
+        persistence.before_next_export(move || {
+            changed_doc
+                .doc()
+                .get_text("unrelated-transcript")
+                .insert(0, "arrived while saving")
+                .unwrap();
+            changed_doc.doc().commit();
+        });
+        let result = host.persist_orchestration_queue(&handle);
+        assert!(
+            !persistence.is_clean(),
+            "the later change must remain pending for its own snapshot"
+        );
+        let raw = loro::LoroDoc::new();
+        raw.import(&store.load_snapshot("queue-durability").unwrap().unwrap())
+            .unwrap();
+        let restored = zeron_doc::SessionDoc::from_doc(raw);
+        assert_eq!(
+            restored
+                .read_queue()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert!(
+            result.is_ok(),
+            "the required queue patch was durably saved: {result:?}"
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn queue_durability_still_requires_a_successful_snapshot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = super::DocHost::new(
+            store.clone(),
+            super::DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("queue-write-failure").unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_queue_snapshot BEFORE INSERT ON snapshots
+             BEGIN SELECT RAISE(FAIL,'queue snapshot unavailable'); END;",
+        )
+        .unwrap();
+        handle
+            .doc
+            .push_queued(&zeron_doc::QueuedMessage::new("a", "unsaved", "host"))
+            .unwrap();
+        assert!(host.persist_orchestration_queue(&handle).is_err());
+        assert!(!handle.persistence.as_ref().unwrap().is_clean());
+        db.execute_batch("DROP TRIGGER fail_queue_snapshot;")
+            .unwrap();
+        host.persist_orchestration_queue(&handle).unwrap();
+        let raw = loro::LoroDoc::new();
+        raw.import(&store.load_snapshot("queue-write-failure").unwrap().unwrap())
+            .unwrap();
+        assert_eq!(
+            zeron_doc::SessionDoc::from_doc(raw).read_queue().unwrap()[0].text,
+            "unsaved"
+        );
+        host.shutdown_workers().await;
+    }
+
     #[test]
     fn unrelated_projection_sequences_do_not_repaint_queue_controls() {
         let first = super::QueueSnapshot {
             canonical: Some(zeron_proto::QueueUiState {
-                schema_version: 1, thread_id: "chat".into(), version: 3,
+                schema_version: 1,
+                thread_id: "chat".into(),
+                version: 3,
                 ..Default::default()
             }),
             ..Default::default()
@@ -3665,18 +3760,18 @@ impl DocHost {
         &self,
         handle: &Arc<ChatDocHandle>,
     ) -> Result<(), EngineError> {
+        if handle.retired.load(Ordering::Acquire) {
+            return Err(EngineError::Other("Queue document was retired.".into()));
+        }
         handle.publish_queue();
         // Do not acknowledge the SQL repair outbox on a failed snapshot write.
         if let Some(persistence) = &handle.persistence {
-            persistence.dirty(true);
+            let required = persistence.dirty(true);
             persistence.flush_sync();
-            if !persistence.is_clean() {
+            if !persistence.durable_through(required) {
                 return Err(EngineError::Other("Queue snapshot is not durable.".into()));
             }
         } else {
-            if handle.retired.load(Ordering::Relaxed) {
-                return Err(EngineError::Other("Queue document was retired.".into()));
-            }
             let bytes = handle.doc.export_snapshot()?;
             self.inner
                 .store

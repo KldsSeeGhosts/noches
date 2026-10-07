@@ -505,15 +505,18 @@ impl Harness for HeldHarness {
             }]);
         }
         let mut steering = controls.steering;
-        let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
-            instance_id: None,
-            harness: HarnessId::Mock,
-            model: "mock-1".into(),
-            tools: vec![],
-            cwd: request.cwd.clone(),
-            session_id: "sess-queue".into(),
-            assistant_message_id: format!("a-{}", request.prompt),
-        })]);
+        let started = futures::stream::iter(vec![
+            Ok(AgentEvent::SessionStarted {
+                instance_id: None,
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: request.cwd.clone(),
+                session_id: "sess-queue".into(),
+                assistant_message_id: format!("a-{}", request.prompt),
+            }),
+            Ok(AgentEvent::InputAccepted),
+        ]);
         let done = futures::stream::once(async move {
             loop {
                 tokio::select! {

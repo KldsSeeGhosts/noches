@@ -243,6 +243,20 @@ impl Fixture {
             )
             .await
             .unwrap();
+        self.service
+            .kernel
+            .task_command(
+                &thread,
+                CommandId("input-accepted".into()),
+                super::super::task::TaskOperation::RunnerEvent {
+                    run_id: run.id.clone(),
+                    attempt_id: run.active_attempt_id.clone().unwrap(),
+                    event: zeron_proto::AgentEvent::InputAccepted,
+                    capabilities: None,
+                },
+            )
+            .await
+            .unwrap();
         run
     }
 }

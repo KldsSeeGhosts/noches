@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn detached_prompt_ack_is_exact_once_and_cannot_accept_a_replacement_turn() {
+    let first = TurnState::begin(None);
+    let mut replacement = TurnState::begin(None);
+    assert!(!replacement.accept_submission(first.submission_id));
+    assert!(replacement.post_pending);
+    assert!(replacement.accept_submission(replacement.submission_id));
+    assert!(!replacement.accept_submission(replacement.submission_id));
+    replacement = TurnState::begin(None);
+    replacement.active = false;
+    assert!(!replacement.accept_submission(replacement.submission_id));
+    assert!(replacement.post_pending);
+}
+
 #[tokio::test]
 async fn owned_mcp_registration_and_cleanup_match_both_wire_generations() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

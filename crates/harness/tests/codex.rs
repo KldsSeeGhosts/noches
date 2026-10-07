@@ -152,6 +152,34 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn initialized_thread_is_not_input_acceptance_when_turn_start_is_rejected() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:turn-start-rejected"),
+        controls,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::InputAccepted
+            | AgentEvent::NativeReference {
+                turn_id: Some(_),
+                ..
+            }
+    )));
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. })
+        if error.contains("turn/start rejected before input acceptance"))
+    );
+}
+
+#[tokio::test]
 async fn reasoning_preserves_summary_parts_and_item_boundaries_per_thread() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(&harness(), request("scenario:reasoning"), controls).await;

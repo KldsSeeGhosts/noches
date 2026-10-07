@@ -42,6 +42,7 @@ struct FakeOpencode {
     /// Leading 500s to answer `POST /session` with (the opencode
     /// lazy-migration crash class: first access 500s, retry succeeds).
     fail_session_creates: Arc<Mutex<u32>>,
+    reject_prompt: Arc<Mutex<bool>>,
 }
 
 impl FakeOpencode {
@@ -58,6 +59,7 @@ impl FakeOpencode {
             statuses: Arc::default(),
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
             fail_session_creates: Arc::new(Mutex::new(0)),
+            reject_prompt: Arc::new(Mutex::new(false)),
         };
         let accept = fake.clone();
         tokio::spawn(async move {
@@ -238,7 +240,16 @@ impl FakeOpencode {
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
             ("PATCH", p) if p.starts_with("/session/") => ("200 OK", json!({})),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
-            ("POST", p) if p.ends_with("/prompt_async") => ("204 No Content", json!({})),
+            ("POST", p) if p.ends_with("/prompt_async") => {
+                if *self.reject_prompt.lock().unwrap() {
+                    (
+                        "400 Bad Request",
+                        json!({"message":"prompt rejected before acceptance"}),
+                    )
+                } else {
+                    ("204 No Content", json!({}))
+                }
+            }
             ("POST", p) if p.ends_with("/abort") => ("200 OK", json!(true)),
             ("POST", p) if p.contains("/permission/") || p.contains("/question/") => {
                 ("200 OK", json!(true))
@@ -321,7 +332,7 @@ fn idle(fake: &FakeOpencode, session: &str) {
     }));
 }
 
-async fn next_event(
+async fn next_wire_event(
     stream: &mut (impl futures::Stream<Item = Result<AgentEvent, HarnessError>> + Unpin),
 ) -> AgentEvent {
     tokio::time::timeout(Duration::from_secs(10), stream.next())
@@ -329,6 +340,19 @@ async fn next_event(
         .expect("event within budget")
         .expect("stream open")
         .expect("ok event")
+}
+
+/// Visible/transcript events; the acknowledgement is host-only. Acceptance
+/// tests and full lifecycle drains use next_wire_event without this filter.
+async fn next_event(
+    stream: &mut (impl futures::Stream<Item = Result<AgentEvent, HarnessError>> + Unpin),
+) -> AgentEvent {
+    loop {
+        let event = next_wire_event(stream).await;
+        if event != AgentEvent::InputAccepted {
+            return event;
+        }
+    }
 }
 
 /// Poll until `path` has received `n` POSTs; returns their bodies.
@@ -352,7 +376,7 @@ async fn drain_to_done(
 ) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     loop {
-        let ev = next_event(stream).await;
+        let ev = next_wire_event(stream).await;
         let done = matches!(&ev, AgentEvent::Done { .. });
         events.push(ev);
         if done {
@@ -364,6 +388,104 @@ async fn drain_to_done(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prompt_ack_not_session_creation_confirms_input_acceptance() {
+    for reject in [false, true] {
+        let fake = FakeOpencode::start().await;
+        *fake.reject_prompt.lock().unwrap() = reject;
+        let (controls, _steer, _token) = controls();
+        let mut stream = harness(&fake).run(request("hi"), controls).await.unwrap();
+        assert!(matches!(
+            next_wire_event(&mut stream).await,
+            AgentEvent::SessionStarted { .. }
+        ));
+        assert!(matches!(
+            next_wire_event(&mut stream).await,
+            AgentEvent::AvailableCommands { .. }
+        ));
+        let next = next_wire_event(&mut stream).await;
+        if reject {
+            assert!(
+                matches!(
+                    next,
+                    AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        ..
+                    }
+                ),
+                "rejected POST cannot acknowledge input: {next:?}"
+            );
+        } else {
+            assert_eq!(next, AgentEvent::InputAccepted);
+            assistant_message(&fake, "ses_test", "msg_1");
+            idle(&fake, "ses_test");
+            let tail = drain_to_done(&mut stream).await;
+            assert!(
+                !tail.contains(&AgentEvent::InputAccepted),
+                "one ack per prompt"
+            );
+            assert!(matches!(
+                tail.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_warm_submission_does_not_acknowledge_the_steering_boundary() {
+    let fake = FakeOpencode::start().await;
+    let (controls, steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_wire_event(&mut stream).await,
+        AgentEvent::SessionStarted { .. }
+    ));
+    assert!(matches!(
+        next_wire_event(&mut stream).await,
+        AgentEvent::AvailableCommands { .. }
+    ));
+    assert_eq!(
+        next_wire_event(&mut stream).await,
+        AgentEvent::InputAccepted
+    );
+    assistant_message(&fake, "ses_test", "msg_1");
+    steer
+        .send(SteerMessage {
+            prompt: "rejected follow-up".into(),
+            message_id: None,
+            notification_acceptance: None,
+        })
+        .await
+        .unwrap();
+    *fake.reject_prompt.lock().unwrap() = true;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. }))
+    );
+    assert!(
+        !events.contains(&AgentEvent::InputAccepted),
+        "the local steer is not a POST acceptance"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
+}
 
 #[tokio::test]
 async fn thinking_streams_and_the_turn_settles_only_on_idle() {
@@ -427,7 +549,7 @@ async fn thinking_streams_and_the_turn_settles_only_on_idle() {
     }));
     let text = next_event(&mut stream).await;
     assert!(matches!(&text, AgentEvent::TextDelta { text } if text == "Hello"));
-    let quiet = tokio::time::timeout(Duration::from_millis(600), stream.next()).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(600), next_event(&mut stream)).await;
     assert!(quiet.is_err(), "nothing may settle a quiet-but-live turn");
 
     idle(&fake, "ses_test");
@@ -504,7 +626,7 @@ async fn foreign_session_idle_never_settles_our_turn() {
 
     assistant_message(&fake, "ses_test", "msg_1");
     idle(&fake, "ses_OTHER");
-    let quiet = tokio::time::timeout(Duration::from_millis(600), stream.next()).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(600), next_event(&mut stream)).await;
     assert!(quiet.is_err(), "a foreign session's idle settled our turn");
 
     idle(&fake, "ses_test");
@@ -713,7 +835,7 @@ async fn session_error_with_no_content_settles_errored() {
             "data": { "message": "ProviderAuthError: no credentials for anthropic\n    at stack" },
         }},
     }));
-    let quiet = tokio::time::timeout(Duration::from_millis(400), stream.next()).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(400), next_event(&mut stream)).await;
     assert!(
         quiet.is_err(),
         "duplicate error must not mint a second chip"

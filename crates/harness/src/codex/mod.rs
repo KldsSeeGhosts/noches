@@ -1093,6 +1093,7 @@ async fn run_session(session: Session) {
     let mut router = TurnRouter::default();
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => {
+            let _ = send(&event_tx, AgentEvent::InputAccepted).await;
             if !id.is_empty() {
                 let _ = send(
                     &event_tx,
@@ -1455,6 +1456,7 @@ async fn run_session(session: Session) {
                                 {
                                     break 'main;
                                 }
+                                let _ = send(&event_tx, AgentEvent::InputAccepted).await;
                             }
                             // A failed `turn/steer` does NOT mean the text is
                             // bad: most commonly the active turn finished
@@ -1607,7 +1609,7 @@ async fn steer_as_new_turn(
             router.adopt_started(id);
             *done_current = false;
             let (prev, next) = rotate(assistant_message_id);
-            send(
+            if !send(
                 event_tx,
                 AgentEvent::Steered {
                     assistant_message_id: Some(prev),
@@ -1615,6 +1617,10 @@ async fn steer_as_new_turn(
                 },
             )
             .await
+            {
+                return false;
+            }
+            send(event_tx, AgentEvent::InputAccepted).await
         }
         Err(e) => {
             let _ = send(
