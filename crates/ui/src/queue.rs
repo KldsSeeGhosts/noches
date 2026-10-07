@@ -3145,7 +3145,7 @@ mod tests {
                 base_text: "work".into(),
                 request: None,
                 attachment_count: 0,
-                expected_attachments: "claims=|paths=/p/a.png".into(),
+                expected_attachments: "claims=|paths=8:/p/a.png".into(),
                 loaded: Vec::new(),
                 attachments_editable: false,
             });
