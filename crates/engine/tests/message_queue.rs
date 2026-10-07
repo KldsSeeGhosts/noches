@@ -778,9 +778,197 @@ async fn desktop_restart_promotion_preserves_identity_native_history_attachments
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_model_change_promotion_restarts_on_the_native_session_fences_stale_clicks_and_replays_once()
+ {
+    use serde_json::json;
+    use zeron_proto::{QueuePromotionMode, orchestration::*};
+    use zeron_rpc::methods;
+    let tmp = tempfile::tempdir().unwrap();
+    // A codex-driver adapter absorbs a model change on its live native session.
+    let (mut harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().id = HarnessId::Codex;
+    let registry = HarnessRegistry::new();
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    create_chat(&core).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "original direction", vec![])
+        .unwrap();
+    let original = running_canonical(&core).await;
+    let active = original.runs[0].id.clone();
+    let selected = canonical_input(&core, "new direction").await;
+    canonical_input(&core, "later SQL work").await;
+    let saved = original.thread.model_selection.clone();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let before = canonical_frame(&mut watch, |state| {
+        state.queue.len() == 2 && state.promotion_mode.is_some()
+    })
+    .await;
+    assert_eq!(before.promotion_selection, None, "nothing changed yet");
+    // The thread's saved next-turn selection moves to another model the live
+    // catalog advertises (exact ids are validated on the host).
+    let advertised = core
+        .registry
+        .provider_instances
+        .snapshot(&core.registry)
+        .into_iter()
+        .find(|p| p.provider_instance_id == saved.instance_id)
+        .and_then(|p| p.models.into_iter().map(|m| m.id).find(|id| *id != *saved.model))
+        .expect("the catalog advertises a second model");
+    let next: zeron_proto::provider_instance::ModelSelection =
+        serde_json::from_value(json!({"instanceId":saved.instance_id,"model":advertised}))
+            .unwrap();
+    let receipt = core
+        .orchestration
+        .dispatch(
+            &zeron_engine::orchestration::Command::wire(
+                serde_json::from_value(json!({"type":"thread.model-selection.set",
+                    "commandId":"select-next-model","threadId":CHAT,"modelSelection":next}))
+                .unwrap(),
+            )
+            .unwrap(),
+            1_800_000_000_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.status,
+        zeron_engine::orchestration::ReceiptStatus::Accepted
+    );
+    let hint = canonical_frame(&mut watch, |state| {
+        state.promotion_mode == Some(QueuePromotionMode::InterruptRestart)
+            && state.promotion_selection.is_some()
+    })
+    .await;
+    assert_eq!(hint.promotion_selection.as_ref(), Some(&next));
+    assert!(!hint.can_promote_to_steer);
+    // The host refuses clicks reviewed against another mode or selection.
+    for (id, action) in [
+        (
+            "stale-steer",
+            json!({"type":"promoteToSteer","targetRunId":active,"expectedSelection":next}),
+        ),
+        (
+            "handoff-click",
+            json!({"type":"promoteToRestart","targetRunId":active,"handoff":true,
+                "expectedSelection":next}),
+        ),
+        (
+            "stale-selection",
+            json!({"type":"promoteToRestart","targetRunId":active,"handoff":false,
+                "expectedSelection":{"instanceId":saved.instance_id,"model":"not-the-reviewed-model"}}),
+        ),
+        (
+            "unreviewed-selection",
+            json!({"type":"promoteToRestart","targetRunId":active,"handoff":false}),
+        ),
+    ] {
+        let reply = client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":id,"action":action}),
+            )
+            .await
+            .unwrap();
+        assert!(reply["refusal"].is_string(), "{id}: {reply}");
+    }
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+    let request = json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"model-once",
+        "action":{"type":"promoteToRestart","targetRunId":active,"handoff":false,"expectedSelection":next}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, request.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .is_ok_and(|p| {
+                    p.is_some_and(|p| {
+                        p.runs.iter().any(|r| {
+                            r.id == active
+                                && r.status == OrchestrationV2RunStatus::Running
+                                && r.active_attempt_id != original.runs[0].active_attempt_id
+                        })
+                    })
+                })
+                && harness.requests.lock().unwrap().len() == 2
+        },
+        "replacement acceptance on the new model",
+    )
+    .await;
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, request)
+            .await
+            .unwrap(),
+        reply,
+        "response-loss retry must not restart the replacement"
+    );
+    let after = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active).unwrap();
+    assert_eq!(run.model_selection, next);
+    assert_eq!(
+        run.provider_thread_id, original.runs[0].provider_thread_id,
+        "an absorbed model change keeps the native generation"
+    );
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .find(|r| r.user_message_id.0 == "message:later SQL work")
+            .unwrap()
+            .status,
+        OrchestrationV2RunStatus::Queued,
+        "other queued rows are untouched"
+    );
+    let requests = harness.requests.lock().unwrap().clone();
+    assert_eq!(requests[1].model.as_deref(), Some(&*next.model));
+    assert_eq!(
+        requests[1].resume.as_deref(),
+        Some("sess-queue"),
+        "the accepted predecessor conversation continues natively"
+    );
+    assert!(requests[1].prompt.starts_with("new direction"));
+    assert!(
+        core.orchestration
+            .store
+            .thread_transfers(&CHAT.into())
+            .unwrap()
+            .iter()
+            .all(|t| t["type"] != "provider_handoff"),
+        "an absorbed selection change needs no handoff"
+    );
+    assert!(core.orchestration.store.verify_projections().unwrap());
+    core.shutdown().await;
+}
+
 /// A turn that does not end until the test says so, so "the agent is busy" is
 /// a state the test controls rather than races.
 struct HeldHarness {
+    id: HarnessId,
     steering: SteeringMode,
     finish: tokio::sync::broadcast::Sender<()>,
     prompts: Arc<Mutex<Vec<String>>>,
@@ -810,6 +998,7 @@ impl HeldHarness {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
+                id: HarnessId::Mock,
                 steering,
                 finish,
                 prompts: prompts.clone(),
@@ -828,7 +1017,7 @@ impl HeldHarness {
 #[async_trait]
 impl Harness for HeldHarness {
     fn id(&self) -> HarnessId {
-        HarnessId::Mock
+        self.id
     }
     fn display_name(&self) -> &str {
         "Held"
@@ -872,7 +1061,7 @@ impl Harness for HeldHarness {
         let mut opening = vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
-                harness: HarnessId::Mock,
+                harness: self.id,
                 model: "mock-1".into(),
                 tools: vec![],
                 cwd: request.cwd.clone(),

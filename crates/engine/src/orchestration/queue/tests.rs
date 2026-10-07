@@ -1677,7 +1677,7 @@ async fn promotion_hint_follows_the_complete_selection_and_transition_policy() {
         ("codex", ("mock", "mock-2"), true, false, Some(ActiveSteering), true, false),
         ("codex", ("mock", "mock-2"), false, true, Some(InterruptRestart), false, false),
         ("codex", ("mock", "mock-2"), false, false, None, false, false),
-        ("mock", ("mock", "mock-2"), true, true, Some(InterruptRestartWithHandoff), false, false),
+        ("mock", ("mock", "mock-2"), true, true, None, false, true),
         ("mock", ("mock", "mock-2"), true, false, None, false, true),
         ("codex", ("other", "other-1"), true, true, Some(InterruptRestartWithHandoff), false, false),
         ("codex", ("other", "other-1"), true, false, None, false, true),

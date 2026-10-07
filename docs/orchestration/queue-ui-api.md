@@ -67,6 +67,9 @@ keep the rendered order and `sidebar_visible_order` in sync.
   "backgroundRunId": null,
   "canPromoteToSteer": false,
   "promotionMode": "interrupt_restart",
+  "promotionSelection": null,
+  "promotionSelectionDeferred": false,
+  "promotionBlocked": null,
   "queue": [{
     "queuedRunId": "run:chat:2",
     "messageId": "queued-user-message",
@@ -119,7 +122,13 @@ work and later runs. No background-only effect may cancel a replacement process.
 ### Canonical queue promotion
 
 `promotionMode` is an additive passive hint: `active_steering`,
-`interrupt_restart`, or null. Older snapshots default it to null.
+`interrupt_restart`, `interrupt_restart_with_handoff`, or null. Older snapshots
+default it to null. It is computed from the thread's complete saved selection
+(instance, model and options) against the running run's: `promotionSelection`
+echoes the saved selection a restart mode would move the run to (or that an
+active steer leaves waiting, with `promotionSelectionDeferred` true), and
+`promotionBlocked` explains a selection change that cannot be delivered into the
+running turn.
 `canPromoteToSteer` remains true only for non-interrupting steering, so older
 clients never advertise an interrupt as **Steer**. The native canonical row
 uses **Steer** for direct delivery and **Send now** with the tooltip
@@ -129,12 +138,16 @@ uses **Steer** for direct delivery and **Send now** with the tooltip
 `clientRequestId`. Its promotion actions are:
 
 ```json
-{"type":"promoteToSteer","targetRunId":"run:chat:1"}
-{"type":"promoteToRestart","targetRunId":"run:chat:1"}
+{"type":"promoteToSteer","targetRunId":"run:chat:1","expectedSelection":null}
+{"type":"promoteToRestart","targetRunId":"run:chat:1","handoff":false,"expectedSelection":null}
 ```
 
-The host rechecks the observed delivery mode before consuming the row. A stale
-Steer click cannot become an interrupting restart. The pinned MCP
+`handoff` names `interrupt_restart_with_handoff`; `expectedSelection` is the
+`promotionSelection` the client displayed. The host rechecks both, plus the
+observed delivery mode, before consuming the row: a stale Steer click cannot
+become an interrupting restart, and a restart cannot retarget a selection other
+than the one shown. A restart that moves the run to a changed selection must
+carry `expectedSelection`. The pinned MCP
 `t3_queue_promote_to_steer` operation follows the current capability policy.
 Direct steering never falls back to a late send or restart.
 
@@ -150,7 +163,21 @@ The document queue also checks the canonical Starting state before draining:
 the brief idle-runtime gap between attempts cannot send or prematurely display
 another queued message.
 
-Provider-instance/model-selection transitions remain conservatively refused.
+Selection transitions follow the adapter's negotiated policy
+(`task::selection_transition`). A change the live native session absorbs
+restarts now on the new selection and keeps native resume; when the session
+cannot interrupt/restart the message is actively steered and the saved selection
+waits for the next turn. A different provider instance restarts into a new
+provider generation with a bounded handoff built from the pre-restart
+projection, including this run's partial output, under a per-generation
+`provider-handoff:{run}:attempt:{n}` identity. The host validates the saved
+selection through the live provider catalog and freezes it into the command, so
+a replay never consults a changed catalog. Teardown stays fenced to the old
+exact provider/process. A same-instance change that needs a handoff is refused
+for restart (sessions would auto-resume the instance's native session); it
+applies at the next turn. The thread's saved selection is the authority, so the
+desktop composer's chat config must be mirrored into it (today only the next
+admission or `thread.model-selection.set` does) before this mode appears mid-run.
 The native typed-row **Send now** still uses its existing document command/edit
 lease path; this is not a claim that every typed-row interaction uses canonical
 promotion. Context metadata is retained, but full native rendering of every
@@ -166,10 +193,9 @@ context record type is not implemented by this change.
   permits restart/late-steer follow-up; substituting it would duplicate the
   promoted message or dispatch after the target run dies. Runner dispatch uses
   the durable command receipt to keep ordinary send and promotion separate.
-  Provider selection-transition negotiation also belongs at that seam: cross-instance
-  promotion currently refuses, rather than silently steering the old instance.
-  Same-selection interrupt/restart promotion is now installed through the shared
-  canonical restart/control executor described above.
+  Provider selection-transition negotiation is installed in the promotion planner
+  (see the canonical queue promotion section) and shares the same restart/control
+  executor.
 - `QueueDomain::settle_for_host(thread, source, now)` exposes guarded `Auto`
   settlement for PR-watch/settings workers. Configured inactivity/PR sweeps are
   not installed by this slice; the PR-watch/settings integration must call it.

@@ -81,7 +81,7 @@ impersonated MCP session. Merge-back requires a live same-project direct
 parent on the same host, refuses a delegated target, and only prepares context
 for the next parent input. It neither starts nor interrupts an agent and never
 merges Git branches or writes working files. Pending queued/multiple-fork
-merge restrictions are preserved.
+merge restrictions are preserved (a waiting merge-back no longer blocks queueing).
 
 The Details audit distinguishes `Prepared` (logical consumption with no
 confirmed provider acceptance) from `Delivered` (native fork or an inline/
@@ -149,7 +149,7 @@ editors/Git processes do not participate.
   `refs/noches/checkpoints/...`, with separate-index `diff_sync` snapshots.
   Deterministic turn capture IDs and receipted publication recover a ref written
   before SQLite publication. Git objects/references are fsynced.
-- `transfer::ensure_start_allowed(transfers, thread, queued)` must run before
+- `transfer::ensure_start_allowed(transfers, thread)` must run before
   admission in the threads/queue planners. It is installed transactionally in
   `ThreadService`'s send planner and task/queue-drain paths, and in ordinary
   admission.
@@ -184,7 +184,10 @@ checkout or unavailable native coverage use full reconstruction. A stale
 caller resume cannot override a known selected provider handle. Imported
 runless history survives portable handoffs without duplicating the current
 input.
-Queued pending merges and competing forks retain T3's explicit refusals.
+Competing forks retain T3's explicit refusal. Unlike T3, a pending merge-back
+does not block queueing: the first non-automatic run to actually start consumes
+it exactly once (`prepare_run`); an automatic delivery leaves it pending, and a
+cancelled queued run never consumed it.
 
 Native hooks implemented: Codex `thread/fork` at `lastTurnId`; OpenCode 1.x
 `messageID` and 2.x `before` cut boundaries. Missing source/later cursors use

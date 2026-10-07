@@ -165,6 +165,9 @@ mod tests {
         assert!(state.active_run_id.is_none());
         assert!(state.background_run_id.is_none());
         assert!(state.promotion_mode.is_none());
+        assert!(state.promotion_selection.is_none());
+        assert!(!state.promotion_selection_deferred);
+        assert!(state.promotion_blocked.is_none());
     }
 
     #[test]
@@ -191,6 +194,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(super::SettleSource::User).unwrap(),
             "User"
+        );
+    }
+
+    #[test]
+    fn promotion_actions_default_to_unreviewed_and_name_the_handoff_mode() {
+        let steer: super::QueuedRunAction =
+            serde_json::from_str(r#"{"type":"promoteToSteer","targetRunId":"run"}"#).unwrap();
+        assert_eq!(
+            steer,
+            super::QueuedRunAction::PromoteToSteer {
+                target_run_id: "run".into(),
+                expected_selection: None,
+            }
+        );
+        let restart: super::QueuedRunAction = serde_json::from_str(
+            r#"{"type":"promoteToRestart","targetRunId":"run","handoff":true,
+                "expectedSelection":{"instanceId":"claude","model":"opus"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            restart,
+            super::QueuedRunAction::PromoteToRestart {
+                handoff: true,
+                expected_selection: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&super::QueuePromotionMode::InterruptRestartWithHandoff).unwrap(),
+            r#""interrupt_restart_with_handoff""#
         );
     }
 }

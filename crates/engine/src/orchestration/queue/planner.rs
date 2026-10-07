@@ -455,6 +455,14 @@ fn steering_target<'a>(
             SelectionTransition::ApplyOnNextTurn => {
                 return Err(refuse("Provider cannot steer or interrupt/restart."));
             }
+            // A new generation on the instance that owns the chat's live native
+            // session would be auto-resumed by the sessions engine, so a
+            // same-instance handoff cannot restart the running turn safely.
+            SelectionTransition::CreateWithHandoff if same_instance => {
+                return Err(refuse(
+                    "This model selection needs a provider handoff on the running provider instance, which cannot restart the running turn safely. Send it after the current run.",
+                ));
+            }
             SelectionTransition::CreateWithHandoff if can_restart => {
                 QueuePromotionMode::InterruptRestartWithHandoff
             }
