@@ -7,6 +7,7 @@ pub mod assembly;
 pub mod checkpoint;
 pub mod command;
 pub mod continuation;
+pub(crate) mod controls;
 #[cfg(test)]
 mod delegation_live_tests;
 #[cfg(test)]

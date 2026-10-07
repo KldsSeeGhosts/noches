@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     // Preserve dev's published migration 7; steering extends it at version 8.
     include_str!("schema_performance.sql"),
     include_str!("schema_steering.sql"),
+    include_str!("schema_controls.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,7 +745,7 @@ mod migration_tests {
                         [],
                         |row| row.get::<_, i64>(0),
                     )?,
-                    8
+                    MIGRATIONS.len() as i64
                 );
                 assert_eq!(
                     conn.query_row(
@@ -770,11 +771,12 @@ mod migration_tests {
                          WHERE name IN ('orchestration_effect_ready',
                                         'orchestration_steering_inputs',
                                         'orchestration_steering_acceptances',
-                                        'orchestration_runtime_targets')",
+                                        'orchestration_runtime_targets',
+                                        'orchestration_control_targets')",
                         [],
                         |row| row.get::<_, i64>(0),
                     )?,
-                    4,
+                    5,
                     "performance indexes and new steering tables must coexist"
                 );
                 assert_eq!(
@@ -785,6 +787,15 @@ mod migration_tests {
                     )?,
                     0,
                     "legacy steering must not acquire speculative receipt/replay contracts"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_control_targets",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0,
+                    "legacy controls must not acquire authority over replacement processes"
                 );
                 Ok(())
             })

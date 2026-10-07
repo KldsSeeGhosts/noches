@@ -64,6 +64,13 @@ pub(crate) enum CanonicalSteerOutcome {
     Uncertain,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalInterruptOutcome {
+    Requested(String),
+    Missing,
+    Replaced,
+}
+
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 type PendingPermissions = Arc<
     Mutex<
@@ -1483,6 +1490,39 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// Signal only the process admitted by the durable control. Keep the map
+    /// lock through signalling so a replacement can never inherit cancellation.
+    pub(crate) fn request_canonical_interrupt(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+    ) -> CanonicalInterruptOutcome {
+        let runs = lock(&self.inner.runs);
+        let Some(handle) = runs.get(chat_id) else {
+            return CanonicalInterruptOutcome::Missing;
+        };
+        if expected.runtime_id.is_none() || handle.canonical_target.as_ref() != Some(expected) {
+            return CanonicalInterruptOutcome::Replaced;
+        }
+        let _ = handle.cancel.send(true);
+        expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+        for (_, answer) in lock(&handle.pending_inputs).drain() {
+            let _ = answer.send(Vec::new());
+        }
+        handle.interrupt_token.cancel();
+        CanonicalInterruptOutcome::Requested(handle.run_id.clone())
+    }
+
+    pub(crate) async fn await_runtime_retirement(&self, chat_id: &str, runtime_id: &str) -> bool {
+        for _ in 0..500 {
+            if !self.is_live(chat_id, runtime_id) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        !self.is_live(chat_id, runtime_id)
     }
 
     /// Removing/replacing a configured instance retires only its live scope.
@@ -4317,6 +4357,84 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.await.unwrap(), CanonicalSteerOutcome::Accepted);
         core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_interrupt_rejects_every_replacement_and_unbound_runtime() {
+        use crate::orchestration::steering::RuntimeTarget;
+        let mailbox = Arc::new(Mutex::new(None));
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: mailbox.clone(),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        core.sessions
+            .dispatch("control-target", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        let original = RuntimeTarget {
+            run_id: "run".into(),
+            attempt_id: "attempt".into(),
+            root_node_id: "root".into(),
+            provider_thread_id: "provider".into(),
+            runtime_id: Some("process".into()),
+        };
+        let (token, runtime_id) = {
+            let mut runs = lock(&core.sessions.inner.runs);
+            let handle = runs.get_mut("control-target").unwrap();
+            handle.canonical_target = Some(original.clone());
+            (handle.interrupt_token.clone(), handle.run_id.clone())
+        };
+        let mut replacements = vec![];
+        let mut changed = original.clone();
+        changed.run_id = "new-run".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.attempt_id = "new-attempt".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.root_node_id = "new-root".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.provider_thread_id = "new-provider".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.runtime_id = Some("new-process".into());
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.runtime_id = None;
+        replacements.push(changed);
+        for changed in replacements {
+            assert_eq!(
+                core.sessions
+                    .request_canonical_interrupt("control-target", &changed),
+                CanonicalInterruptOutcome::Replaced
+            );
+            assert!(
+                !token.is_cancelled(),
+                "a stale control cannot cancel the live process"
+            );
+        }
+        assert_eq!(
+            core.sessions
+                .request_canonical_interrupt("control-target", &original),
+            CanonicalInterruptOutcome::Requested(runtime_id.clone())
+        );
+        assert!(token.is_cancelled());
+        assert!(
+            core.sessions
+                .await_runtime_retirement("control-target", &runtime_id)
+                .await
+        );
+        assert_eq!(
+            core.sessions
+                .request_canonical_interrupt("control-target", &original),
+            CanonicalInterruptOutcome::Missing
+        );
+        core.shutdown().await;
     }
 
     #[async_trait::async_trait]

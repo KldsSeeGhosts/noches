@@ -281,6 +281,9 @@ pub enum TaskOperation {
         event: AgentEvent,
         capabilities: Option<Box<OrchestrationV2ProviderCapabilities>>,
     },
+    ControlSettlement {
+        effect_id: String,
+    },
     Reconcile,
     Delivery(super::mailbox::DeliveryCommand),
     /// The runner only advances queued notification work when no active turn
@@ -333,6 +336,7 @@ impl TaskOperation {
             Self::WakePolicy { .. } => "delegated_task.wake-policy",
             Self::Cancel { .. } => "run.interrupt",
             Self::RunnerEvent { .. } => "kernel.runner.event",
+            Self::ControlSettlement { .. } => "kernel.control.settlement",
             Self::Reconcile => "delegated_task.reconcile",
             Self::Delivery(_) => "notification.delivery",
             Self::DrainQueue => "notification.queue.drain",
@@ -943,6 +947,16 @@ pub(crate) fn plan(
                 },
             ));
             super::mailbox::remove_member(&projection, task_id, command, &mut plan, now)?;
+        }
+        TaskOperation::ControlSettlement { effect_id } => {
+            super::controls::plan_settlement(
+                conn,
+                &projection,
+                command,
+                &mut plan,
+                effect_id,
+                now,
+            )?;
         }
         TaskOperation::RunnerEvent {
             run_id,

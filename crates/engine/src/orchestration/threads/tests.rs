@@ -647,6 +647,27 @@ async fn restart_supersedes_attempt_without_reopening_a_task() {
         .runs[0]
         .active_attempt_id
         .clone();
+    let original = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let runtime =
+        crate::orchestration::steering::RuntimeTarget::for_run(&original.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"parent".into(),
+                &runtime,
+                "old-process",
+            )
+        })
+        .unwrap();
     let restart = f.send(json!({"threadId":"parent","message":"new direction","mode":"restart","clientRequestId":"restart"})).await;
     assert_eq!(
         restart.delivery,
@@ -670,6 +691,57 @@ async fn restart_supersedes_attempt_without_reopening_a_task() {
         OrchestrationV2RunAttemptReason::SteeringRestart
     );
     assert_eq!(p.runs.len(), 1);
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.request,
+                crate::orchestration::effects::EffectRequest::ProviderTurnRestart { .. }
+            )
+        })
+        .unwrap();
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let json: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["attempt_id"], json!(old));
+    assert_eq!(
+        saved["runtime"]["root_node_id"],
+        json!(original.runs[0].root_node_id)
+    );
+    assert_eq!(saved["runtime"]["runtime_id"], "old-process");
+    assert_eq!(
+        saved["replacement_attempt_id"],
+        json!(p.runs[0].active_attempt_id)
+    );
+    f.service.kernel.store.rebuild().unwrap();
+    let after: String = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(saved, serde_json::from_str::<Value>(&after).unwrap());
 }
 
 #[tokio::test]
@@ -2255,6 +2327,99 @@ async fn running_interrupt_targets_the_provider_turn_and_refuses_unsupported_cap
         "Unable to interrupt thread parent: Failed to dispatch orchestration command run.interrupt (command:mcp:session%2Fparent%3A1:thread-interrupt:unsupported)."
     );
     assert_eq!(before, f.service.kernel.store.events().unwrap().len());
+}
+
+#[tokio::test]
+async fn control_settlement_is_transactionally_fenced_against_process_replacement_and_owner_cancel()
+{
+    use crate::orchestration::{
+        effects::EffectRequest, steering::RuntimeTarget, task::TaskOperation,
+    };
+    for cancelled in [false, true] {
+        let f = Fixture::new();
+        f.running(false);
+        let original = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let runtime = RuntimeTarget::for_run(&original.runs[0]).unwrap();
+        f.service
+            .kernel
+            .store
+            .write(|conn| {
+                crate::orchestration::steering::bind_runtime(
+                    conn,
+                    &"parent".into(),
+                    &runtime,
+                    "original-process",
+                )
+            })
+            .unwrap();
+        f.service
+            .interrupt(
+                f.caller.clone(),
+                serde_json::from_value(json!({"threadId":"parent","clientRequestId":"exact-stop"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let effect = f
+            .service
+            .kernel
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        if cancelled {
+            f.service
+                .kernel
+                .store
+                .cancel_effect(&effect.id, crate::now_ms())
+                .unwrap();
+        } else {
+            f.service
+                .kernel
+                .store
+                .write(|conn| {
+                    crate::orchestration::steering::bind_runtime(
+                        conn,
+                        &"parent".into(),
+                        &runtime,
+                        "replacement-process",
+                    )
+                })
+                .unwrap();
+        }
+        f.service
+            .kernel
+            .task_command(
+                &"parent".into(),
+                "stale-control-repair".into(),
+                TaskOperation::ControlSettlement {
+                    effect_id: effect.id,
+                },
+            )
+            .await
+            .unwrap();
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Running);
+        assert_eq!(
+            after.attempts[0].status,
+            OrchestrationV2RunAttemptStatus::Running
+        );
+        assert_eq!(records(&after, "provider-turn")[0]["status"], "running");
+    }
 }
 
 #[tokio::test]

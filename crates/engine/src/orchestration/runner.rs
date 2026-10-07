@@ -21,7 +21,7 @@ use super::service::{CallerScope, ToolError};
 use super::task::{TaskOperation, records};
 use super::{Error, Kernel, Result};
 use crate::doc_host::DocHost;
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{CanonicalSteerOutcome, SessionsEngine};
 use crate::workspace_host::WorkspaceHost;
 
 pub struct RunnerProvider {
@@ -218,7 +218,7 @@ impl RunnerBridge {
         Ok(())
     }
 
-    async fn start(
+    pub(crate) async fn start(
         &self,
         effect: &Effect,
         run_id: &RunId,
@@ -682,80 +682,10 @@ impl RunnerBridge {
             EffectRequest::ProviderTurnStart { run_id } => {
                 self.start(effect, run_id, cancellation).await
             }
-            EffectRequest::ManagedRunInterrupt { run_id } => {
-                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
-                let Some(run) = projection
-                    .runs
-                    .iter()
-                    .find(|run| &run.id == run_id && !run_terminal(&run.status))
-                else {
-                    return Ok(EffectOutcome::Succeeded);
-                };
-                let run = run.clone();
-                self.sessions
-                    .interrupt(&effect.thread_id.0)
-                    .await
-                    .map_err(|error| Error::Invariant(error.to_string()))?;
-                self.record_event(
-                    &effect.thread_id,
-                    &run,
-                    u64::MAX,
-                    AgentEvent::Done {
-                        status: DoneStatus::Interrupted,
-                        result: None,
-                        error: None,
-                        session_id: None,
-                    },
-                    None,
-                )
-                .await?;
-                self.settle(&effect.thread_id, &run).await?;
-                Ok(EffectOutcome::Succeeded)
-            }
-            EffectRequest::ProviderTurnInterrupt {
-                provider_turn_id, ..
-            } => {
-                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
-                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
-                let Some(turn) = records(&projection, "provider-turn")
-                    .iter()
-                    .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running")
-                else {
-                    return Ok(EffectOutcome::Succeeded);
-                };
-                let Some(run) = projection
-                    .runs
-                    .iter()
-                    .find(|r| {
-                        r.active_attempt_id
-                            .as_ref()
-                            .is_some_and(|a| turn["runAttemptId"] == a.0)
-                            && !run_terminal(&r.status)
-                    })
-                    .cloned()
-                else {
-                    return Ok(EffectOutcome::Succeeded);
-                };
-                self.sessions
-                    .interrupt(&effect.thread_id.0)
-                    .await
-                    .map_err(|e| Error::Invariant(e.to_string()))?;
-                drop(guards);
-                self.record_event(
-                    &effect.thread_id,
-                    &run,
-                    u64::MAX,
-                    AgentEvent::Done {
-                        status: DoneStatus::Interrupted,
-                        result: None,
-                        error: None,
-                        session_id: None,
-                    },
-                    None,
-                )
-                .await?;
-                self.settle(&effect.thread_id, &run).await?;
-                Ok(EffectOutcome::Succeeded)
+            EffectRequest::ManagedRunInterrupt { .. }
+            | EffectRequest::ProviderTurnInterrupt { .. }
+            | EffectRequest::ProviderTurnRestart { .. } => {
+                super::controls::execute(self, effect, cancellation).await
             }
             EffectRequest::ProviderTurnSteer { .. } => {
                 // Promotion consumes an existing queued message, and must
@@ -764,23 +694,6 @@ impl RunnerBridge {
                     return super::queue::effects::execute(self, effect).await;
                 }
                 super::steering::execute(self, effect, true).await
-            }
-            EffectRequest::ProviderTurnRestart { run_id, .. } => {
-                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
-                if !projection
-                    .runs
-                    .iter()
-                    .any(|r| &r.id == run_id && r.status == OrchestrationV2RunStatus::Starting)
-                {
-                    return Ok(EffectOutcome::Succeeded);
-                }
-                // The new attempt is already durable. The old observer's late
-                // terminal event is rejected by its attempt ownership guard.
-                self.sessions
-                    .interrupt(&effect.thread_id.0)
-                    .await
-                    .map_err(|e| Error::Invariant(e.to_string()))?;
-                self.start(effect, run_id, cancellation).await
             }
             EffectRequest::DelegatedCompletionContinue {
                 parent_run_id,
@@ -824,13 +737,29 @@ impl RunnerBridge {
                         .as_str()
                         .unwrap()
                         .to_owned();
-                    if self
+                    let Some(run) = super::task::active_run(&projection) else {
+                        return Ok(EffectOutcome::Succeeded);
+                    };
+                    let mut target =
+                        super::steering::RuntimeTarget::for_run(run).ok_or_else(|| {
+                            Error::Invariant("Notification execution target missing.".into())
+                        })?;
+                    target.runtime_id = self.kernel.store.read(|conn| {
+                        super::steering::runtime_id(conn, &effect.thread_id, &target)
+                    })?;
+                    let outcome = self
                         .sessions
-                        .steer_notification(&effect.thread_id.0, &text, message_id.0.clone())
+                        .steer_canonical(&effect.thread_id.0, &target, &text, message_id.0.clone())
                         .await
-                        .map_err(|error| Error::Invariant(error.to_string()))?
-                        == SteerOutcome::Accepted
-                    {
+                        .map_err(|error| Error::Invariant(error.to_string()))?;
+                    if outcome == CanonicalSteerOutcome::Uncertain {
+                        // Preserve the mailbox's existing uncertainty policy;
+                        // never reinterpret a lost ACK as definite rejection.
+                        return Err(Error::Invariant(
+                            "Notification provider acceptance is uncertain.".into(),
+                        ));
+                    }
+                    if outcome == CanonicalSteerOutcome::Accepted {
                         self.delivery_command(
                             &effect.thread_id,
                             effect,

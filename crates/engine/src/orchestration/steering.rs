@@ -12,7 +12,7 @@ use super::{
 
 /// The immutable host admission bound to a live runtime. MCP credential
 /// renewal/expiry does not change this identity; a replacement attempt does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RuntimeTarget {
     pub run_id: RunId,
     pub attempt_id: RunAttemptId,

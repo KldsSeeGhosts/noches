@@ -825,6 +825,255 @@ async fn attached_sessions(core: &EngineCore) -> Vec<zeron_proto::transfer::Prov
         .attached_provider_sessions
 }
 
+async fn running_canonical(
+    core: &EngineCore,
+) -> zeron_engine::orchestration::projection::ThreadProjection {
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .is_ok_and(|p| {
+                    p.is_some_and(|p| p.attempts.iter().any(|a| a.provider_turn_id.is_some()))
+                })
+        },
+        "canonical provider turn",
+    )
+    .await;
+    core.orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_stop_releases_ingestion_lane_and_terminalizes_the_exact_run() {
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    let (core, _, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "stop this", vec![])
+        .unwrap();
+    let p = running_canonical(&core).await;
+    let run = p.runs[0].clone();
+    let result = core
+        .orchestration
+        .dispatch(
+            &Command {
+                id: "exact-stop".into(),
+                thread_id: CHAT.into(),
+                operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                    run_id: run.id.clone(),
+                    reason: None,
+                })),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, ReceiptStatus::Accepted);
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .iter()
+                .any(|r| r.id == run.id && r.status == OrchestrationV2RunStatus::Interrupted)
+        },
+        "canonical stop ingestion",
+    )
+    .await;
+    assert!(!core.sessions.has_live_runtime(CHAT));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_stop_with_stale_sql_cannot_cancel_an_active_or_idle_replacement() {
+    use zeron_engine::orchestration::effects::{EffectExecutor, EffectOutcome, EffectRequest};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    for idle in [false, true] {
+        let (mut harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+        Arc::get_mut(&mut harness).unwrap().park_after_done = true;
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        core.doc_host
+            .queue_message(CHAT, "original", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        core.orchestration_host.as_ref().unwrap().shutdown().await;
+        let receipt = core
+            .orchestration
+            .dispatch(
+                &Command {
+                    id: "delayed-stop".into(),
+                    thread_id: CHAT.into(),
+                    operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                        run_id: original.runs[0].id.clone(),
+                        reason: None,
+                    })),
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let effect = core
+            .orchestration
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        core.sessions.interrupt(CHAT).await.unwrap();
+        let mut next = harness.requests.lock().unwrap()[0].clone();
+        next.prompt = "replacement".into();
+        next.resume = None;
+        core.sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Mock,
+                next,
+                Some("replacement-input".into()),
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || harness.requests.lock().unwrap().len() == 2,
+            "replacement started",
+        )
+        .await;
+        if idle {
+            let _ = harness.finish.send(());
+            wait_for(
+                || {
+                    core.sessions
+                        .session_status(CHAT)
+                        .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+                },
+                "replacement idle",
+            )
+            .await;
+        }
+        // Simulate delayed canonical observation/reconstruction while the
+        // runtime map already contains a replacement. Logical SQL alone must
+        // not authorize cancelling whichever process now occupies this chat.
+        core.orchestration.store.rebuild().unwrap();
+        let diagnostic_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+        for (table, payload) in [
+            (
+                "orchestration_projection_runs",
+                serde_json::to_value(&original.runs[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_attempts",
+                serde_json::to_value(&original.attempts[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_nodes",
+                serde_json::to_value(&original.nodes[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_records",
+                original.records["provider-turn"][0].clone(),
+            ),
+        ] {
+            diagnostic_store.with_connection(|conn| {
+                assert_eq!(conn.execute(
+                    &format!("UPDATE {table} SET status=?1,payload_json=?2 WHERE id=?3 AND thread_id=?4"),
+                    rusqlite::params![payload["status"].as_str(), payload.to_string(),
+                        payload["id"].as_str(), CHAT],
+                ).unwrap(), 1);
+            });
+        }
+        let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+        assert_eq!(
+            bridge
+                .execute(&effect, tokio_util::sync::CancellationToken::new())
+                .await,
+            EffectOutcome::Succeeded
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            core.sessions.has_live_runtime(CHAT),
+            "stale Stop must preserve replacement (idle={idle})"
+        );
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_restart_replaces_only_the_interrupted_attempt_and_keeps_one_run() {
+    use zeron_proto::orchestration::{OrchestrationV2RunAttemptStatus, OrchestrationV2RunStatus};
+    let (core, harness, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "original direction", vec![])
+        .unwrap();
+    let original = running_canonical(&core).await;
+    let run = canonical_message(
+        &core,
+        "new direction",
+        vec![],
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Restart,
+    )
+    .await;
+    assert_eq!(run, original.runs[0].id.0);
+    wait_for(
+        || harness.requests.lock().unwrap().len() == 2,
+        "replacement attempt start",
+    )
+    .await;
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .iter()
+                .any(|r| r.id.0 == run && r.status == OrchestrationV2RunStatus::Running)
+        },
+        "replacement canonical running",
+    )
+    .await;
+    let p = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.runs.len(), 1);
+    assert_ne!(
+        p.runs[0].active_attempt_id,
+        original.runs[0].active_attempt_id
+    );
+    assert_eq!(
+        p.attempts
+            .iter()
+            .find(|a| Some(&a.id) == original.runs[0].active_attempt_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2RunAttemptStatus::Superseded
+    );
+    core.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_disconnect_stops_the_observed_session_preserves_history_and_cannot_retarget_a_retry()
 {

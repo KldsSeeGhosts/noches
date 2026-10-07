@@ -305,6 +305,7 @@ pub(crate) fn enqueue(
             params![id, runtime_id],
         )?;
     }
+    super::controls::admit(conn, id, thread, request)?;
     Ok(())
 }
 
