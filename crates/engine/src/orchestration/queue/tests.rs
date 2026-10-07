@@ -220,6 +220,8 @@ async fn reset_plan_closes_started_conversations_and_moves_queued_runs_together(
     let fresh = threads[1]["payload"]["id"].as_str().unwrap().to_owned();
     assert_ne!(fresh, run.provider_thread_id.as_ref().unwrap().0);
     assert!(threads[1]["payload"]["nativeThreadRef"].is_null());
+    assert!(threads[1]["payload"]["contextUsage"].is_null());
+    assert!(threads[1]["payload"]["nativeMetadata"].is_null());
     let moved: Vec<_> = of("run.updated")
         .into_iter()
         .map(|e| {
@@ -3173,6 +3175,52 @@ async fn a_cancelled_loro_rows_files_are_cleaned_even_while_its_intent_lags() {
 }
 
 #[tokio::test]
+async fn agent_callers_cannot_edit_queued_attachments_but_can_edit_text() {
+    let f = Fixture::new();
+    let id = f.sync("first").await;
+    let edit = |command: &str, with_attachments: bool| {
+        let f = &f;
+        let command = CommandId(command.into());
+        let mut input = json!({"threadId":"target","queuedRunId":id,"text":"edited","expectedText":"first"});
+        if with_attachments {
+            input["attachments"] =
+                json!({"expected":"claims=|paths=","paths":["/uploads/x.png"],"removeIds":[]});
+        }
+        async move {
+            f.service
+                .mutate(
+                    Some(f.caller.clone()),
+                    "target".into(),
+                    "t3_queue_edit",
+                    input,
+                    command,
+                    NOW,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let refused = edit("agent-attachments", true).await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    assert!(
+        refused.error.as_deref().unwrap_or("").contains("Agents cannot"),
+        "{:?}",
+        refused.error
+    );
+    let named = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(named.is_empty(), "{named:?}");
+    let ok = edit("agent-text", false).await;
+    assert_eq!(ok.status, ReceiptStatus::Accepted, "{:?}", ok.error);
+}
+
+#[tokio::test]
 async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
     use crate::orchestration::effects::EffectRequest;
     let f = Fixture::new();
@@ -3211,20 +3259,20 @@ async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
         }
     };
     let refused = run(
-        edit("claims=other|paths=", json!([]), json!([])),
+        edit("claims=5:other|paths=", json!([]), json!([])),
         "edit-stale",
     )
     .await;
     assert_eq!(refused.status, ReceiptStatus::Rejected);
     let refused = run(
-        edit("claims=claimed|paths=", json!([]), json!(["nope"])),
+        edit("claims=7:claimed|paths=", json!([]), json!(["nope"])),
         "edit-unknown",
     )
     .await;
     assert_eq!(refused.status, ReceiptStatus::Rejected);
     let too_many: Vec<String> = (0..9).map(|n| format!("/uploads/{n}.png")).collect();
     let refused = run(
-        edit("claims=claimed|paths=", json!(too_many), json!([])),
+        edit("claims=7:claimed|paths=", json!(too_many), json!([])),
         "edit-many",
     )
     .await;
@@ -3233,7 +3281,7 @@ async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
     let before = f.service.kernel.store.projection_frontier().unwrap();
 
     let input = edit(
-        "claims=claimed|paths=",
+        "claims=7:claimed|paths=",
         json!(["/uploads/new.png"]),
         json!(["claimed"]),
     );

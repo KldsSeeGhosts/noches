@@ -651,8 +651,8 @@ pub(crate) fn plan(
                 plan.emit(command, "turn-item.updated", &item, now)?;
             } else {
                 let queued = active_run(&projection).is_some();
-                // T3 refuses a pending merge before resolving the queued
-                // provider/session. No input or unparking events may publish.
+                // A pending merge-back refuses a start here, before any input
+                // or unparking event publishes.
                 crate::orchestration::transfer::ensure_start_allowed(
                     &crate::orchestration::transfer::transfers(conn, &command.thread_id)?,
                     &command.thread_id,

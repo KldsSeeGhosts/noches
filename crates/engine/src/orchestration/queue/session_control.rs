@@ -232,6 +232,10 @@ pub(super) fn plan_reset(
         thread["ownerNodeId"] = json!(first.root_node_id);
         thread["firstRunOrdinal"] = json!(first.ordinal);
         thread["lastRunOrdinal"] = json!(first.ordinal);
+        // The old conversation's context meter and native state are not this
+        // generation's.
+        thread["contextUsage"] = Value::Null;
+        thread["nativeMetadata"] = Value::Null;
         thread["handoffIds"] = json!([]);
         thread["pendingBackgroundTasks"] = json!([]);
         thread["createdAt"] = json!(time);

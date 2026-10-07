@@ -547,7 +547,7 @@ async fn desktop_canonical_edit_replaces_attachments_and_cleans_dropped_files_on
             methods::MUTATE_QUEUED_RUN,
             edit(
                 "stale",
-                "claims=claimed|paths=".into(),
+                "claims=7:claimed|paths=".into(),
                 vec![second.clone()],
                 vec![],
             ),

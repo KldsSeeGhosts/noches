@@ -59,6 +59,7 @@ pub struct QueueUiState {
     pub can_promote_to_steer: bool,
     /// The UI names an interrupting restart explicitly. Host admission checks
     /// the observed mode again, so stale Steer clicks cannot become restarts.
+    #[serde(deserialize_with = "lenient_promotion_mode")]
     pub promotion_mode: Option<QueuePromotionMode>,
     /// The saved next-turn selection the promotion would run on (restart modes),
     /// or would leave waiting (`promotion_selection_deferred`). Clients echo it
@@ -77,6 +78,15 @@ pub enum QueuePromotionMode {
     InterruptRestart,
     /// The saved selection needs a new provider generation seeded with context.
     InterruptRestartWithHandoff,
+}
+
+/// A mode this build does not know (a newer host) reads as "no promotion
+/// hint" instead of failing the whole queue snapshot.
+fn lenient_promotion_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<QueuePromotionMode>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -178,7 +188,16 @@ pub fn queue_attachment_fingerprint(attachments: &[serde_json::Value], paths: &[
         .iter()
         .filter_map(|attachment| attachment["id"].as_str())
         .collect();
-    format!("claims={}|paths={}", ids.join(","), paths.join(","))
+    // Length-prefixed so a path containing a separator cannot collide with
+    // two paths.
+    let join = |items: &[&str]| -> String {
+        items
+            .iter()
+            .map(|item| format!("{}:{item}", item.len()))
+            .collect()
+    };
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    format!("claims={}|paths={}", join(&ids), join(&paths))
 }
 
 impl QueueUiEntry {
@@ -205,6 +224,32 @@ pub struct PendingQuestionUi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unknown_promotion_mode_does_not_drop_the_queue() {
+        let state: super::QueueUiState = serde_json::from_str(
+            r#"{"threadId":"t","promotionMode":"a_future_mode","queue":[{"messageId":"m","text":"work"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(state.promotion_mode, None);
+        assert_eq!(state.queue.len(), 1);
+        let known: super::QueueUiState =
+            serde_json::from_str(r#"{"promotionMode":"interrupt_restart_with_handoff"}"#).unwrap();
+        assert_eq!(
+            known.promotion_mode,
+            Some(super::QueuePromotionMode::InterruptRestartWithHandoff)
+        );
+    }
+
+    #[test]
+    fn attachment_fingerprints_do_not_collide_on_separators() {
+        let one = vec!["/a,b".to_string()];
+        let two = vec!["/a".to_string(), "b".to_string()];
+        assert_ne!(
+            super::queue_attachment_fingerprint(&[], &one),
+            super::queue_attachment_fingerprint(&[], &two)
+        );
+    }
+
     #[test]
     fn old_queue_snapshots_do_not_claim_document_provenance_or_steering() {
         let state: super::QueueUiState =

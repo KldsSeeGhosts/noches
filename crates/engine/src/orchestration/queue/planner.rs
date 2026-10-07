@@ -203,6 +203,10 @@ fn queue_mutation(
                     "This queued message changed; your edit was not applied.",
                 ));
             }
+            // Host-owned upload paths are validated for user callers only.
+            if op.caller.is_some() && op.input.get("attachments").is_some_and(|v| !v.is_null()) {
+                return Err(refuse("Agents cannot edit a queued message's attachments."));
+            }
             let attachments_changed = match op.input.get("attachments").filter(|v| !v.is_null()) {
                 Some(edit) => super::attachments::plan_edit(conn, plan, p, &mut message, edit)?,
                 None => false,
@@ -375,6 +379,28 @@ struct Promotion<'a> {
     deferred: bool,
 }
 
+/// Why a promotion is refused. Only a selection that needs a handoff the
+/// running provider cannot perform explains a disabled composer action.
+enum Refused {
+    NeedsHandoff(String),
+    Other(Error),
+}
+
+impl From<Error> for Refused {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<Refused> for Error {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::NeedsHandoff(message) => Error::Invariant(message),
+            Refused::Other(error) => error,
+        }
+    }
+}
+
 fn steering_target<'a>(
     p: &'a ThreadProjection,
     target: &str,
@@ -382,8 +408,19 @@ fn steering_target<'a>(
     resolution: Option<&Resolution>,
     strict: bool,
 ) -> Result<Promotion<'a>> {
+    classified_steering_target(p, target, message, resolution, strict).map_err(Error::from)
+}
+
+fn classified_steering_target<'a>(
+    p: &'a ThreadProjection,
+    target: &str,
+    message: &Value,
+    resolution: Option<&Resolution>,
+    strict: bool,
+) -> std::result::Result<Promotion<'a>, Refused> {
     use crate::orchestration::task::{SelectionTransition, selection_transition};
     use zeron_proto::QueuePromotionMode;
+    let refuse = |message: &str| Refused::Other(self::refuse(message));
     if p.thread.archived_at.is_some() {
         return Err(refuse("Thread is not active."));
     }
@@ -471,8 +508,8 @@ fn steering_target<'a>(
                 QueuePromotionMode::InterruptRestartWithHandoff
             }
             SelectionTransition::CreateWithHandoff => {
-                return Err(refuse(
-                    "This model selection needs a provider handoff, and the running provider cannot be interrupted and restarted. Send it after the current run.",
+                return Err(Refused::NeedsHandoff(
+                    "This model selection needs a provider handoff, and the running provider cannot be interrupted and restarted. Send it after the current run.".into(),
                 ));
             }
         };
@@ -641,7 +678,7 @@ pub(crate) fn promotion_hint(p: &ThreadProjection) -> PromotionHint {
     let Some(run) = task::active_run(p) else {
         return none(None);
     };
-    match steering_target(p, &run.id.0, &json!({"text":"message"}), None, false) {
+    match classified_steering_target(p, &run.id.0, &json!({"text":"message"}), None, false) {
         Ok(promotion) => PromotionHint {
             mode: Some(promotion.mode),
             selection: (promotion.rebind.is_some() || promotion.deferred)
@@ -651,10 +688,8 @@ pub(crate) fn promotion_hint(p: &ThreadProjection) -> PromotionHint {
         },
         // Only a refusal that is about the selection explains a disabled
         // action; the rest (not running yet, maintenance, ...) stay silent.
-        Err(Error::Invariant(message)) if message.contains("provider handoff") => {
-            none(Some(message))
-        }
-        Err(_) => none(None),
+        Err(Refused::NeedsHandoff(message)) => none(Some(message)),
+        Err(Refused::Other(_)) => none(None),
     }
 }
 
