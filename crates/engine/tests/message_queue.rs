@@ -1020,6 +1020,21 @@ async fn desktop_model_change_promotion_restarts_on_the_native_session_fences_st
     )
     .unwrap();
     create_chat(&core).await;
+    wait_for(
+        || {
+            core.registry
+                .provider_instances
+                .snapshot(&core.registry)
+                .iter()
+                .any(|p| p.harness_id == Some(HarnessId::Codex) && p.models.len() >= 2)
+        },
+        "startup provider discovery",
+    )
+    .await;
+    core.registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+    );
     let client = zeron_rpc::memory_client(core.rpc_service());
     core.doc_host
         .queue_message(CHAT, "original direction", vec![])
@@ -1277,7 +1292,21 @@ impl Harness for HeldHarness {
         &[ReasoningLevel::Medium]
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
+        // Fixtures standing in for a real driver advertise their own catalog,
+        // so selection tests never depend on this host's CPA enrollment.
+        if self.id == HarnessId::Mock {
+            return Ok(vec![]);
+        }
+        Ok(["held-model-a", "held-model-b", "held-model-c"]
+            .into_iter()
+            .map(|id| Model {
+                id: id.into(),
+                label: id.into(),
+                description: None,
+                reasoning_levels: vec![ReasoningLevel::Medium],
+                options: vec![],
+            })
+            .collect())
     }
     async fn run(
         &self,
@@ -4515,7 +4544,10 @@ async fn cross_instance_composer_switch_restarts_with_portable_history_and_a_to_
     }
     // Turn 1 completes on instance A and leaves its native conversation.
     core.workspace
-        .set_chat_config(CHAT, &composer_config(HarnessId::Grok, "a-model"))
+        .set_chat_config(
+            CHAT,
+            &composer_config(HarnessId::Grok, &first_model(HarnessId::Grok, "a-model")),
+        )
         .unwrap();
     core.doc_host
         .queue_message(CHAT, "first turn on a", vec![])
