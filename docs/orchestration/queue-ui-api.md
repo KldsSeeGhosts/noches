@@ -66,6 +66,7 @@ keep the rendered order and `sidebar_visible_order` in sync.
   "activeRunId": "run:chat:1",
   "backgroundRunId": null,
   "canPromoteToSteer": false,
+  "promotionMode": "interrupt_restart",
   "queue": [{
     "queuedRunId": "run:chat:2",
     "messageId": "queued-user-message",
@@ -115,6 +116,46 @@ preserves completed output, ends native work through that run's ordinal, and
 excludes independently owned delegated tasks, persistent monitors, rolled-back
 work and later runs. No background-only effect may cancel a replacement process.
 
+### Canonical queue promotion
+
+`promotionMode` is an additive passive hint: `active_steering`,
+`interrupt_restart`, or null. Older snapshots default it to null.
+`canPromoteToSteer` remains true only for non-interrupting steering, so older
+clients never advertise an interrupt as **Steer**. The native canonical row
+uses **Steer** for direct delivery and **Send now** with the tooltip
+“Send now (interrupt and restart)” for replacement.
+
+`MutateQueuedRun` retains the original queued run/message IDs and stable
+`clientRequestId`. Its promotion actions are:
+
+```json
+{"type":"promoteToSteer","targetRunId":"run:chat:1"}
+{"type":"promoteToRestart","targetRunId":"run:chat:1"}
+```
+
+The host rechecks the observed delivery mode before consuming the row. A stale
+Steer click cannot become an interrupting restart. The pinned MCP
+`t3_queue_promote_to_steer` operation follows the current capability policy.
+Direct steering never falls back to a late send or restart.
+
+Restart cancels the selected queued execution graph, supersedes the exact
+active attempt, and creates a replacement attempt/root inside the same logical
+run. It retains the selected message ID, attachments, context and provenance;
+other queued work is unchanged. The durable control admission pins the old
+physical runtime and replacement attempt. Actual acceptance binds the new turn,
+not merely session readiness. Native resume requires the accepted immediate
+predecessor, matching provider/native identity, model/options and checkout.
+Document-owned image paths remain transportable after removal of the Loro intent.
+The document queue also checks the canonical Starting state before draining:
+the brief idle-runtime gap between attempts cannot send or prematurely display
+another queued message.
+
+Provider-instance/model-selection transitions remain conservatively refused.
+The native typed-row **Send now** still uses its existing document command/edit
+lease path; this is not a claim that every typed-row interaction uses canonical
+promotion. Context metadata is retained, but full native rendering of every
+context record type is not implemented by this change.
+
 ## Merge seams and validation scope
 
 - `PullRequestLinks::update_metadata`: merged PR authority replaces the metadata link
@@ -126,8 +167,9 @@ work and later runs. No background-only effect may cancel a replacement process.
   promoted message or dispatch after the target run dies. Runner dispatch uses
   the durable command receipt to keep ordinary send and promotion separate.
   Provider selection-transition negotiation also belongs at that seam: cross-instance
-  promotion currently refuses, rather than silently steering the old instance;
-  session-restart promotion policies are not installed here.
+  promotion currently refuses, rather than silently steering the old instance.
+  Same-selection interrupt/restart promotion is now installed through the shared
+  canonical restart/control executor described above.
 - `QueueDomain::settle_for_host(thread, source, now)` exposes guarded `Auto`
   settlement for PR-watch/settings workers. Configured inactivity/PR sweeps are
   not installed by this slice; the PR-watch/settings integration must call it.

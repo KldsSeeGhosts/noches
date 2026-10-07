@@ -42,6 +42,17 @@ the stopped run's ordinal. Persistent monitors and rolled-back items are exclude
 Noches adapts this to its one-physical-runtime-per-app-thread model; it does not
 claim T3's simultaneous multiple-provider-process architecture.
 
+The final queue follow-up compares `dispatchQueuedMessagePromoteToSteer` and
+`dispatchSteerIntoRun` in that same pinned `Orchestrator`. T3 cancels the queued
+graph and passes its original message/metadata into the ordinary steering
+policy. Noches now supports same-selection direct steering or capability-gated
+interrupt/restart; restart retains one logical run and an accepted native
+predecessor. Provider/model selection-transition parity is still not claimed.
+A freshness check at
+[`10f39eb9`](https://github.com/pingdotgg/t3code/tree/10f39eb9ac80c9a4b7f5097575dd2addc3b6f631)
+found only hosted-agent MCP sign-in changes since `365aa879`; the compared
+queue/control services are unchanged.
+
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
 context transfer and file checkpoint. Correctness depends on their ownership
@@ -71,7 +82,7 @@ it is not alone evidence that a feature works in either application.
 | Disconnect agent session | `ThreadRelationshipsControl.stopSession`, client-runtime `stopThreadSession`, `Orchestrator.dispatchProviderSessionDetach`, `ProviderSessionManager` | **Added:** passive attachment revisions, owner-routed user RPC, atomic detach plan and durable exact-run teardown. Conversation/native history and app-owned child threads are preserved. Reattachment, changed attempts/generations and active or idle replacement runtimes fence delayed effects. |
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
-| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering and capability-fenced active steering. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Interrupt/restart promotion and queued merge-back remain gaps. |
+| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering, capability-fenced active steering and same-selection interrupt/restart promotion. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Provider/model promotion transitions and queued merge-back remain gaps. |
 | Stop after foreground completion | Current `Orchestrator` background settlement and shared pending-work selector | **Added:** completed-root background Stop through user composer/Escape→durable command→canonical admission→exact runtime teardown→bounded settlement. Completed reply/attempt/timestamps survive; later work, app-owned tasks and persistent monitors are not terminated. Background-only queue-watch changes now reach the composer. |
 | Scheduler | server scheduler and launch/intake dispatch | `scheduler`, Settings Automations: persistent claims, recurring/manual/webhook work, bound/unbound dispatch, restart/deduplication. Existing. |
 | PR association and settlement | `PullRequestWatchReactor`, `PullRequestSyncReactor`, `ThreadSettlementService` | `pull_requests`, `git_actions`, Details/lifecycle: authenticated linking, stable watch receipts, wake/settlement fences. Some environment/project settlement policy UI remains incomplete. |
@@ -137,8 +148,20 @@ is not an acceptable substitute.
   automatic drain retains both the edit and the composer's previous draft.
 - Typed rows retain explicit interrupting **Send now** and their host edit leases.
   SQL-only rows advertise **Steer** only when the running provider attempt/turn
-  supports active steering. A passive UI hint and the actual mutation share the
-  same steering fences; delayed effects cannot become a late send or restart.
+  supports active steering, or **Send now** for an explicitly interrupting,
+  capability-gated restart. A passive UI hint and the actual mutation share the
+  same fences; stale non-interrupting clicks cannot become restarts. Canonical
+  restart supersedes the original attempt/root inside the same logical run,
+  retains the queued message and metadata, and pins the old physical process
+  plus its committed replacement attempt. Other rows remain queued.
+  The new root has no provider turn until real acceptance. Native resume requires
+  the exact accepted immediate predecessor and unchanged provider/model/options/
+  checkout. Host-owned document images are transported, not merely displayed.
+  Document draining respects a canonical Starting run even while its old
+  physical runtime is retiring; another queued input cannot be taken and
+  presented as sent during that gap.
+  The typed-row command path remains distinct; full context-record rendering and
+  provider/model-selection transitions are not claimed.
 - Disconnect is distinct from archive, conversation reset and ordinary turn
   interruption. It uses the exact observed attachment set and attachment-local
   revisions, not changing token usage or a guessed provider generation. Stable
@@ -280,7 +303,10 @@ is not an acceptable substitute.
    session disconnect is implemented; it preserves rather than resets history.
 3. Canonical queue edits are text-only (existing attachment metadata is shown and
    preserved, not replaced). Native active-steering promotion is implemented;
-   interrupt/restart promotion and queued merge-back consumption remain unsupported.
+   same-selection interrupt/restart promotion is implemented. Provider/model
+   promotion transitions and queued merge-back consumption remain unsupported.
+   Typed-row Send now retains its document-command path; full native rendering
+   of all retained context record types remains a gap.
    Codex/OpenCode mailbox recovery now retires only at an exact native input
    receipt. Other legacy adapters retain boundary-based retirement.
    Canonical active steering has durable per-input receipts/recovery and exact
@@ -311,6 +337,49 @@ is not an acceptable substitute.
 
 ## Verification
 
+### Final queue-restart follow-up
+
+Queue-restart production source is committed at `446c9aa1`. Fresh logs are under
+`/tmp/noches-queue-restart.tuVRPD`; final separate native launches use
+`/tmp/noches-queue-restart-final-visual.NJwIPZ`.
+
+| Final-source check (`446c9aa1`) | Result |
+| --- | --- |
+| Full default-parallel message queue integration suite | 37 passed, 0 failed |
+| Restart/resume integration suite | 8 passed, 0 failed, 1 ignored |
+| Production thread-transfer RPC integration suite | 6 passed, 0 failed |
+| Full desktop library, including pane/sidebar regressions | 1,517 passed, 0 failed, 2 ignored |
+| Production desktop build (`--locked`, no fixture feature) | Passed |
+| Separate native dark/light orchestration workflows | Both passed; per-mode PASS files checked |
+| Four fresh restart-ready/restarted screenshots | Inspected; selected input delivered, other row remains queue-only |
+| Scoped Rust formatting and `git diff --check` | Passed |
+
+The production regression exercises both SQL-only and document-backed queued
+input with a real temporary image. It checks original message identity,
+same logical run, superseded attempt, accepted predecessor native resume,
+attachment transport, stale Steer refusal, revoked agent credentials, stable
+request replay and untouched SQL/typed follow-ups. The native fixture additionally
+asserts that a pending follow-up has not appeared in the transcript.
+
+The exploratory native captures exposed an inter-attempt queue-drain race:
+the old physical runtime became idle before the replacement started, causing
+another typed row to appear sent before its refused dispatch was requeued.
+The final source gates document draining on canonical Starting state. Exploratory
+captures are not final visual evidence.
+
+Before that final drain guard, the full engine library ran 677 passing tests,
+one failure and four ignored tests. The failure was
+`captures_tracked_ignored_files_and_refuse_ignored_collision`, with `git read-tree`
+reporting an existing temporary-index lock. Its isolated same-binary repeat
+passed (1/1). This is a recorded parallel-batch failure, not an all-green
+engine run; the checkpoint implementation is unchanged by this follow-up.
+The new queue-restart and 17-case accepted-predecessor regressions passed in
+that batch. No full post-guard engine/harness/session-sync batch is claimed.
+The complete earlier checks below remain evidence of their explicitly named
+earlier source, not substitutes for final-source verification.
+
+### Earlier completed-background Stop verification
+
 The task uses an isolated worktree and build target; the other performance
 worktree and the main checkout's untracked files are untouched. The final
 library/integration batches and separate queue repeat use default test
@@ -336,7 +405,7 @@ were visually inspected. The earlier `337371ed` batch and its logs under
 `/tmp/noches-parity-final.aSdcwl` remain historical evidence, not coverage of
 these new changes.
 
-| Final local check | Result |
+| Earlier local check (`4d6feeca`) | Result |
 | --- | --- |
 | Engine library | 675 passed, 0 failed, 4 ignored |
 | Selected engine integration suites | 97 passed, 0 failed, 3 ignored |
@@ -579,8 +648,9 @@ context is Pending, and the message explicitly states that no files were merged.
 ![Pending merge-back at narrow width](evidence/t3-parity-2026-10-06/merge-back-dark-960.png)
 
 Unified queue with a live running-status subscription: SQL-only agent work and
-automation work surround a typed follow-up. Unsupported active steering stays
-disabled; typed **Send now** remains explicitly interrupting.
+automation work surround a typed follow-up. These earlier captures predate
+canonical interrupt/restart promotion; typed **Send now** remains explicitly
+interrupting.
 
 ![Unified native queue in dark appearance](evidence/t3-parity-2026-10-06/unified-queue-dark-960.png)
 
@@ -623,3 +693,24 @@ without in-process appearance switching.
 ![Completed reply with background Stop in light appearance](evidence/t3-parity-2026-10-07/background-stop-ready-light.png)
 
 ![Retained completed reply after background Stop in light appearance](evidence/t3-parity-2026-10-07/background-stopped-light.png)
+
+Final same-selection canonical promotion at `446c9aa1`: the SQL-only row now
+offers an explicitly interrupting **Send now** instead of disabled Steer. The
+same composer action is used by pointer activation and the latest-row shortcut.
+The frontend-design review preserves Noches' neutral, compact control-plane
+layout and names the action by its user-visible behavior.
+
+![Canonical queued Send now in dark appearance](evidence/t3-parity-2026-10-07/queue-restart-ready-dark.png)
+
+After promotion, the selected original message owns the replacement attempt.
+The typed follow-up remains only in the queue, not as a prematurely sent
+transcript bubble. The old request/reply remain visible.
+
+![Restarted response with the other input still queued](evidence/t3-parity-2026-10-07/queue-restarted-dark.png)
+
+The separate light launch verifies the same behavior without switching
+appearance inside a running window.
+
+![Canonical queued Send now in light appearance](evidence/t3-parity-2026-10-07/queue-restart-ready-light.png)
+
+![Restarted response with the other input queue-only in light appearance](evidence/t3-parity-2026-10-07/queue-restarted-light.png)
