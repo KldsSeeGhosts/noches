@@ -376,6 +376,9 @@ impl Harness for ClaudeHarness {
     fn confirms_steered_inputs(&self) -> bool {
         true
     }
+    fn model_context_window(&self, model: &str, options: &serde_json::Map<String, Value>) -> Option<u64> {
+        catalog::declared_context_window(model, options)
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[
             ReasoningLevel::Low,
@@ -1267,6 +1270,28 @@ mod tests {
                 .unwrap()
         );
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn declared_context_window_follows_the_catalog_option() {
+        let harness = ClaudeHarness::new();
+        let mut options = serde_json::Map::new();
+        assert_eq!(
+            harness.model_context_window("claude-opus-5-5", &options),
+            Some(200_000)
+        );
+        options.insert("contextWindow".into(), "1m".into());
+        assert_eq!(
+            harness.model_context_window("claude-opus-5-5", &options),
+            Some(1_000_000)
+        );
+        // No selectable window: the option cannot widen it. Custom IDs are
+        // never guessed.
+        assert_eq!(
+            harness.model_context_window("claude-opus-4-8", &options),
+            Some(200_000)
+        );
+        assert_eq!(harness.model_context_window("my-proxy-model", &options), None);
     }
 
     #[test]

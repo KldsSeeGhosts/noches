@@ -68,6 +68,36 @@ if has "$line" '"method":"model/list"'; then
   emit "{\"id\":$(rid "$line"),\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":false}}"
   exec sleep 30
 fi
+if has "$line" '"method":"thread/fork"' && has "$line" '"threadId":"legacy-'; then
+  # Legacy source: no lastTurnId (head fork), then the paginated revert dance.
+  has "$line" '"lastTurnId"' && exit 1
+  case "$line" in
+    *legacy-history-source*) fork_id=legacy-history-fork; mode=legacy ;;
+    *legacy-short-source*) fork_id=legacy-short-fork; mode=paginated ;;
+    *) fork_id=legacy-fork; mode=paginated ;;
+  esac
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$fork_id\"}}}"
+  read -r line || exit 1
+  has "$line" '"method":"thread/read"' || exit 1
+  has "$line" "\"threadId\":\"$fork_id\"" || exit 1
+  has "$line" '"includeTurns":false' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$fork_id\",\"historyMode\":\"$mode\"}}}"
+  [ "$mode" = legacy ] && exec sleep 30
+  read -r line || exit 1
+  has "$line" '"method":"thread/turns/list"' || exit 1
+  has "$line" '"sortDirection":"desc"' || exit 1
+  if [ "$fork_id" = legacy-short-fork ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"}],\"nextCursor\":null}}"
+    exec sleep 30
+  fi
+  has "$line" '"limit":2' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"},{\"id\":\"t2\"}],\"nextCursor\":\"more\"}}"
+  read -r line || exit 1
+  has "$line" '"method":"thread/revert"' || exit 1
+  has "$line" '"beforeTurnId":"t2"' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"legacy-fork-reverted\"}}}"
+  exec sleep 30
+fi
 if has "$line" '"method":"thread/fork"'; then
   has "$line" '"threadId":"native-source"' || exit 1
   has "$line" '"lastTurnId":"stable-turn"' || exit 1

@@ -104,6 +104,23 @@ pub(crate) fn context_window() -> ModelOption {
     }
 }
 
+/// Context window of a catalog model under the selected `contextWindow`
+/// option (`1m` → the `[1m]` model-id suffix). Models outside the curated
+/// catalog (custom IDs) are not guessed.
+pub(crate) fn declared_context_window(
+    model: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    let known = static_models().into_iter().find(|m| m.id == model)?;
+    let selectable = known.options.iter().any(|o| o.id == "contextWindow");
+    let one_m = options.get("contextWindow").and_then(|v| v.as_str()) == Some("1m");
+    Some(if selectable && one_m {
+        1_000_000
+    } else {
+        200_000
+    })
+}
+
 const FULL_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,

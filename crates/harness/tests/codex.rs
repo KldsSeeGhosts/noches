@@ -64,6 +64,7 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
             source_thread_id: "native-source".into(),
             source_turn_id: Some("stable-turn".into()),
             source_next_turn_id: None,
+            rollback_turns: None,
             cwd: cwd.path().to_string_lossy().into_owned(),
             model: "gpt-5.6-sol".into(),
             runtime_mode: Default::default(),
@@ -78,6 +79,7 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
             source_thread_id: "native-source".into(),
             source_turn_id: None,
             source_next_turn_id: None,
+            rollback_turns: None,
             cwd: cwd.path().to_string_lossy().into_owned(),
             model: "gpt-5.6-sol".into(),
             runtime_mode: Default::default(),
@@ -90,6 +92,53 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
         refused
             .to_string()
             .contains("without a native turn reference")
+    );
+}
+
+#[tokio::test]
+async fn legacy_fork_forks_at_head_then_reverts_the_counted_paginated_turns() {
+    use zeron_harness::session_lifecycle::{NativeForkRequest, SessionLifecycle};
+    let cwd = tempfile::tempdir().unwrap();
+    let harness = harness();
+    let request = |source: &str, turns| NativeForkRequest {
+        source_thread_id: source.into(),
+        source_turn_id: None,
+        source_next_turn_id: None,
+        rollback_turns: turns,
+        cwd: cwd.path().to_string_lossy().into_owned(),
+        model: "gpt-5.6-sol".into(),
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
+        mcp: Default::default(),
+    };
+    assert!(harness.supports_fork_rollback());
+    // Two later turns are dropped; the oldest of them is the revert boundary.
+    assert_eq!(
+        harness
+            .fork_thread(request("legacy-source", Some(2)))
+            .await
+            .unwrap(),
+        "legacy-fork-reverted"
+    );
+    // A forked thread still on legacy history cannot be trimmed: the fork is
+    // reported uncertain rather than silently left at head.
+    let legacy = harness
+        .fork_thread(request("legacy-history-source", Some(1)))
+        .await
+        .unwrap_err();
+    assert!(legacy.to_string().contains("legacy history"), "{legacy}");
+    // Asking for more turns than the fork has is a mismatch, never a guess.
+    let short = harness
+        .fork_thread(request("legacy-short-source", Some(3)))
+        .await
+        .unwrap_err();
+    assert!(short.to_string().contains("fewer turns"), "{short}");
+    // No counted boundary at all still refuses to fork a moving head.
+    assert!(
+        harness
+            .fork_thread(request("legacy-source", None))
+            .await
+            .is_err()
     );
 }
 

@@ -311,6 +311,18 @@ pub trait Harness: Send + Sync {
     fn session_lifecycle(&self) -> Option<&dyn session_lifecycle::SessionLifecycle> {
         None
     }
+    /// The context window (tokens) this adapter's catalog declares for a
+    /// model and its selected options, for bounding handoff context before a
+    /// provider has reported its own occupancy. None = not declared; callers
+    /// fall back to provider telemetry, then a conservative default. Pure
+    /// catalog lookup: never spawns a process.
+    fn model_context_window(
+        &self,
+        _model: &str,
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<u64> {
+        None
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. A filesystem probe, never a spawn.

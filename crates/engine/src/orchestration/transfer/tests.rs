@@ -2596,3 +2596,5 @@ async fn same_instance_selection_change_keeps_the_native_session_unless_the_driv
         }
     }
 }
+
+mod native_policy;
