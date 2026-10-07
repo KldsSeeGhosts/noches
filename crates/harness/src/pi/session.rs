@@ -829,6 +829,22 @@ impl Runner {
         })
     }
 
+    /// A correlated request made from the main loop. Until an interrupt has
+    /// been acted on it gives way to one (`None`), so a slow Pi cannot hold a
+    /// Stop behind its probe timeouts; afterwards it is bounded tightly.
+    async fn request_unless_interrupted(
+        &self,
+        record: Value,
+        timeout: Duration,
+    ) -> Option<Result<Value, HarnessError>> {
+        let timeout = if self.interrupt_sent { timeout.min(QUICK_TIMEOUT) } else { timeout };
+        tokio::select! {
+            biased;
+            _ = self.interrupt.cancelled(), if !self.interrupt_sent => None,
+            result = self.rpc.request(record, timeout) => Some(result),
+        }
+    }
+
     /// Expand `$skill` references and inline image attachments.
     async fn payload(&self, text: &str, attachments: &[String]) -> (String, Vec<Value>) {
         let message = if text.contains('$') && !self.skills.is_empty() {
@@ -1092,6 +1108,22 @@ impl Runner {
                 Flow::Continue
             }
             "compaction_end" => self.on_compaction_end(&record).await,
+            "auto_retry_start" => {
+                let number = |key: &str| record.get(key).and_then(Value::as_u64).unwrap_or(0);
+                let reason = record
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("a provider error");
+                self.emit_flow(AgentEvent::Error {
+                    message: format!(
+                        "Pi is retrying after an error (attempt {} of {}, in {}s): {reason}",
+                        number("attempt"),
+                        number("maxAttempts"),
+                        number("delayMs").div_ceil(1000),
+                    ),
+                })
+                .await
+            }
             "auto_retry_end" => {
                 if record.get("success").and_then(Value::as_bool) == Some(true) {
                     // Pi emits the erroring message_end before retrying, so a
@@ -1458,6 +1490,22 @@ impl Runner {
 
     async fn on_compaction_end(&mut self, record: &Value) -> Flow {
         self.compacting = false;
+        // A manual compaction reports its own outcome; an automatic one that
+        // failed would otherwise look like a stall.
+        if record.get("reason").and_then(Value::as_str) != Some("manual")
+            && record.get("aborted").and_then(Value::as_bool) != Some(true)
+            && let Some(reason) = record
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+            && !self
+                .emit(AgentEvent::Error {
+                    message: format!("Pi could not compact the conversation: {reason}"),
+                })
+                .await
+        {
+            return Flow::Stop;
+        }
         // A successful overflow recovery retries the prompt: the model error
         // that triggered it is no longer the turn's outcome.
         if record.get("willRetry").and_then(Value::as_bool) == Some(true) {
@@ -1489,11 +1537,15 @@ impl Runner {
     /// compaction or a queued run as `agent_settled` unwinds.
     async fn probe_idle(&mut self) -> Flow {
         for attempt in 1..=SETTLE_PROBE_ATTEMPTS {
-            match self
-                .rpc
-                .request(json!({"type": "get_state"}), QUICK_TIMEOUT)
+            let Some(reply) = self
+                .request_unless_interrupted(json!({"type": "get_state"}), QUICK_TIMEOUT)
                 .await
-            {
+            else {
+                // Stopped while checking: the turn did settle, so it ends as
+                // it was; the interrupt is handled by the loop right after.
+                return self.finish_turn().await;
+            };
+            match reply {
                 Ok(state) => {
                     let busy = ["isStreaming", "isCompacting"]
                         .iter()
@@ -1568,9 +1620,8 @@ impl Runner {
     /// right after compaction until a fresh response; that is a real state
     /// ("waiting"), not an absent one.
     async fn emit_usage(&mut self) {
-        let Ok(stats) = self
-            .rpc
-            .request(json!({"type": "get_session_stats"}), QUICK_TIMEOUT)
+        let Some(Ok(stats)) = self
+            .request_unless_interrupted(json!({"type": "get_session_stats"}), QUICK_TIMEOUT)
             .await
         else {
             return;
@@ -1615,7 +1666,7 @@ impl Runner {
             }
             // Bounded by this turn: the cursor is where the previous one ended
             // (and an unset cursor means the session was empty).
-            if let Ok(data) = self.rpc.request(record, TREE_TIMEOUT).await {
+            if let Some(Ok(data)) = self.request_unless_interrupted(record, TREE_TIMEOUT).await {
                 self.leaf_cursor = data
                     .get("leafId")
                     .and_then(Value::as_str)

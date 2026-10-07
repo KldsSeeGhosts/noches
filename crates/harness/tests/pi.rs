@@ -401,6 +401,63 @@ async fn a_recovered_retry_does_not_settle_as_failed() {
 }
 
 #[tokio::test]
+async fn retries_and_failed_automatic_compactions_are_visible_while_the_turn_runs() {
+    let env = Env::new();
+    let errors = |events: &[AgentEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let retried = collect(&env, "retry-ok").await;
+    assert_eq!(
+        errors(&retried),
+        ["Pi is retrying after an error (attempt 1 of 3, in 1s): Connection error."]
+    );
+    // The retry notice is not the outcome: the turn still completes.
+    assert_eq!(done(&retried).0, &DoneStatus::Completed);
+    let compacting = collect(&env, "compact-fail").await;
+    assert_eq!(
+        errors(&compacting),
+        ["Pi could not compact the conversation: summarizer unavailable"]
+    );
+    assert_eq!(done(&compacting).0, &DoneStatus::Completed);
+    assert_eq!(text(&compacting), "carried on\n\n");
+}
+
+#[tokio::test]
+async fn a_stop_is_not_held_behind_a_pi_that_stopped_answering_its_settle_probe() {
+    // Pi answers `get_state` once (startup), then never again: the settle
+    // probe would otherwise sit on its timeouts for ~15 s.
+    let env = Env::new().with("FAKE_PI_STALL_STATE", "1");
+    let (controls, handles) = default_controls();
+    let mut stream = start(&env.harness(), request(&env, "hello"), controls).await;
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let streamed = matches!(event, AgentEvent::TextDelta { .. });
+        events.push(event);
+        if streamed {
+            break;
+        }
+    }
+    // The turn has settled and the probe is waiting on Pi.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let stopped = std::time::Instant::now();
+    handles.interrupt.cancel();
+    events.extend(until_done(&mut stream, 1).await);
+    assert!(
+        stopped.elapsed() < Duration::from_secs(4),
+        "the stop waited {:?} behind the probe",
+        stopped.elapsed()
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
+}
+
+#[tokio::test]
 async fn a_rejected_prompt_is_reported_and_a_crash_carries_stderr() {
     let env = Env::new();
     let rejected = collect(&env, "reject").await;

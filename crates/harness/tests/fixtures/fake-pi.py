@@ -373,6 +373,14 @@ def agent(prompt):
             {"type": "agent_end", "messages": [], "willRetry": False},
             {"type": "auto_retry_end", "success": False, "attempt": 2, "finalError": "Connection error."}], 0
         return
+    if prompt == "compact-fail":
+        # An automatic compaction that fails before the reply.
+        yield [{"type": "compaction_start", "reason": "threshold"},
+               {"type": "compaction_end", "reason": "threshold", "aborted": False, "willRetry": False,
+                "errorMessage": "summarizer unavailable"}], 0
+        yield assistant_events("carried on"), 0
+        yield [{"type": "turn_end"}, {"type": "agent_end", "messages": [], "willRetry": False}], 0
+        return
     if prompt == "retry-ok":
         yield assistant_events("", "error", "Connection error.", total=0) + [
             {"type": "agent_end", "messages": [], "willRetry": True},
@@ -437,6 +445,9 @@ def handle(cmd):
     log("command", **{k: v for k, v in cmd.items() if k not in ("images",)},
         has_images=bool(cmd.get("images")))
     if kind == "get_state":
+        state["state_calls"] = state.get("state_calls", 0) + 1
+        if os.environ.get("FAKE_PI_STALL_STATE") and state["state_calls"] > 1:
+            return  # a Pi that stopped answering after startup
         respond(cid, kind, data={
             "model": model_state(), "thinkingLevel": state["thinking"],
             "isStreaming": run is not None, "isCompacting": False,
