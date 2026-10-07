@@ -18,6 +18,22 @@ pub const DEFAULT_WORKER_CONCURRENCY: usize = 4;
 pub const DEFAULT_LEASE_MS: i64 = 30_000;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
+// Both the claim and the wake deadline use exactly the same FIFO/uncertainty
+// barriers. State-first covering indexes keep retained terminal history out
+// of these probes; a blocked ready follower must not create a zero-delay loop.
+const NEXT_PENDING_EFFECT: &str =
+    "SELECT candidate.effect_id,candidate.available_at FROM orchestration_effect_outbox candidate
+     WHERE candidate.status='pending'
+       AND NOT EXISTS (
+         SELECT 1 FROM orchestration_effect_outbox active
+         WHERE active.thread_id=candidate.thread_id AND active.lane=candidate.lane
+           AND active.status IN ('running','uncertain'))
+       AND NOT EXISTS (
+         SELECT 1 FROM orchestration_effect_outbox earlier
+         WHERE earlier.thread_id=candidate.thread_id AND earlier.lane=candidate.lane
+           AND earlier.status='pending' AND earlier.ordinal<candidate.ordinal)
+     ORDER BY candidate.available_at,candidate.ordinal LIMIT 1";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum EffectRequest {
@@ -340,17 +356,10 @@ impl Store {
                 [now],
             )?;
             self.boundary(WriteBoundary::EffectExpired)?;
-            let id: Option<String> = tx.query_row(
-                "SELECT candidate.effect_id FROM orchestration_effect_outbox candidate
-                 WHERE candidate.status='pending' AND candidate.available_at<=?1
-                   AND NOT EXISTS (
-                     SELECT 1 FROM orchestration_effect_outbox active
-                     WHERE active.thread_id=candidate.thread_id AND active.lane=candidate.lane
-                       AND (active.status IN ('running','uncertain')
-                         OR (active.status='pending' AND active.ordinal<candidate.ordinal)))
-                 ORDER BY candidate.available_at,candidate.ordinal LIMIT 1",
-                [now], |row| row.get(0),
+            let next: Option<(String, i64)> = tx.query_row(
+                NEXT_PENDING_EFFECT, [], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
+            let id = next.filter(|(_, at)| *at <= now).map(|(id, _)| id);
             if let Some(id) = &id {
                 tx.execute(
                     "UPDATE orchestration_effect_outbox SET status='running',
@@ -361,6 +370,20 @@ impl Store {
                 self.boundary(WriteBoundary::EffectClaim)?;
             }
             id.map(|id| get(tx, &id)?.ok_or_else(|| Error::Invariant("claim disappeared".into()))).transpose()
+        })
+    }
+
+    pub(crate) fn next_effect_wake(&self) -> Result<Option<i64>> {
+        self.read(|conn| {
+            let pending: Option<i64> = conn
+                .query_row(NEXT_PENDING_EFFECT, [], |row| row.get(1))
+                .optional()?;
+            let expiry: Option<i64> = conn.query_row(
+                "SELECT MIN(lease_expires_at) FROM orchestration_effect_outbox WHERE status='running'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(pending.into_iter().chain(expiry).min())
         })
     }
 
@@ -532,7 +555,44 @@ impl EffectWorker {
         }
     }
 
-    /// One bounded claim; the daemon will own scheduling in the runner slice.
+    pub fn spawn(self, stop: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut changes = self.store.subscribe_writes();
+            loop {
+                changes.borrow_and_update();
+                let step = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    result = self.step(crate::now_ms()) => result,
+                };
+                let delay = match step {
+                    Ok(true) => continue,
+                    Ok(false) => match self.store.next_effect_wake() {
+                        Ok(deadline) => super::wake::effect_delay(deadline, crate::now_ms()),
+                        Err(error) => {
+                            tracing::error!(%error, "orchestration effect deadline failed");
+                            super::wake::ERROR_BACKOFF
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!(%error, "orchestration effect worker failed");
+                        // A failed operation may have committed. Back off
+                        // even if that commit notified this receiver.
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(super::wake::ERROR_BACKOFF) => {}
+                        }
+                        continue;
+                    }
+                };
+                if !super::wake::wait(&mut changes, &stop, delay).await {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// One bounded claim, also available for deterministic recovery tests.
     pub async fn step(&self, now: i64) -> Result<bool> {
         let started_at = std::time::Instant::now();
         let Some(effect) = self

@@ -1659,6 +1659,7 @@ impl AppState {
         }
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
+        let text_only = is_text_append(&frame);
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if is_reset {
             self.transcript_replayed = true;
@@ -1671,7 +1672,11 @@ impl AppState {
         }
         self.ack_pending_send_from_transcript();
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.refresh_subagents(&chat_id);
+            if text_only {
+                self.refresh_subagents_after_text(&chat_id);
+            } else {
+                self.refresh_subagents(&chat_id);
+            }
         }
         Ok(())
     }
@@ -1763,6 +1768,37 @@ impl AppState {
             .get(doc_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The pane/subagent watch reducer. Like the primary reducer, pure text
+    /// updates keep this doc's spawn presentation and only refresh parents.
+    pub(crate) fn apply_sub_transcript_frame(
+        &mut self,
+        doc_id: &str,
+        frame: TranscriptFrame,
+    ) -> Result<(), TranscriptDesync> {
+        let text_only = is_text_append(&frame);
+        let rows = self
+            .sub_transcripts
+            .get_mut(doc_id)
+            .ok_or_else(|| TranscriptDesync(format!("unwatched doc {doc_id}")))?;
+        self.prepared_transcripts.remove(doc_id);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        zeron_doc::apply_transcript_frame(rows, frame)?;
+        if let Some(echoes) = self.echoes.get_mut(doc_id) {
+            echoes.retain(|echo| !rows.iter().any(|e| e.id == echo.id));
+        }
+        if let Some(pending) = self.pending_sends.get(doc_id)
+            && rows.iter().any(|e| e.id == pending.message_id)
+        {
+            self.pending_sends.remove(doc_id);
+        }
+        if text_only {
+            self.refresh_subagents_after_text(doc_id);
+        } else {
+            self.refresh_subagents(doc_id);
+        }
+        Ok(())
     }
 
     pub(crate) fn subagent_source_retained(&self, doc_id: &str) -> bool {
@@ -3636,35 +3672,20 @@ fn spawn_subagent_watch(
                 let mut desync = false;
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
-                    if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                    if state.sub_transcripts.contains_key(&doc_id) {
                         let frame = update.frame;
                         let text_only = is_text_append(&frame);
-                        state.transcript_revision = state.transcript_revision.wrapping_add(1);
-                        if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
+                        if let Err(err) = state.apply_sub_transcript_frame(&doc_id, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
                         }
                         if !desync {
-                            // Mirror the primary transcript's optimistic
-                            // bookkeeping (apply_transcript_frame) for the
-                            // pane-owned surfaces reading this doc: the frame
-                            // confirms echoes by id and acks a pending send by
-                            // materializing its message.
-                            if let Some(echoes) = state.echoes.get_mut(&doc_id) {
-                                echoes.retain(|echo| !rows.iter().any(|e| e.id == echo.id));
-                            }
-                            if let Some(pending) = state.pending_sends.get(&doc_id)
-                                && rows.iter().any(|e| e.id == pending.message_id)
-                            {
-                                state.pending_sends.remove(&doc_id);
-                            }
                             state.prepared_transcripts.insert(doc_id.clone(), prepared);
                             if let Some(baseline) = update.replay_baseline {
                                 state
                                     .transcript_baselines
                                     .insert(doc_id.clone(), Arc::new(baseline));
                             }
-                            state.refresh_subagents(&doc_id);
                         }
                         if text_only && !desync {
                             cx.emit(TranscriptTextChanged {

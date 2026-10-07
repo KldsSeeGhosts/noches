@@ -1,0 +1,163 @@
+{
+  "scope": "Headed native CPU draw/dirty-to-draw; not physical input, GPU presentation, or FPS",
+  "baseline_commit": "96d524ce2f4ff2f9592c8a953102fafd22508d8d",
+  "baseline_binary_sha256": "86860d492caa4034f6442c0e9c460c5e880246ad50e0fc419b9ff80a06850ebb",
+  "changed_binary_sha256": "ab4b289f0d9c3c619317356fe951510121181582619375079109e34441f0346d",
+  "turns": 1800,
+  "virtual_rows": 14400,
+  "sidebar_sessions": 40,
+  "logical_window": [1320, 880],
+  "panel_ms_both": 200,
+  "events_per_phase": 180,
+  "nominal_interval_ms": 16,
+  "allocator": "system (distributed macOS app uses mimalloc)",
+  "notes": [
+    "Two sequential baseline/changed pairs. No active Rust compilers at sampled points; desktop workload not isolated.",
+    "Cold and panel phases are not used for headline latency claims; native callback frame counts differ.",
+    "First pair does not have identical endpoints. Second pair does.",
+    "Raw response hashes preserve the provenance of these extracted summaries."
+  ],
+  "runs": [
+    {
+      "pair": 1,
+      "label": "baseline",
+      "response_sha256": "bb8851379fd5a2a235059210ef1a99cd7f882cfe953f97dc683db093fcdd13ad",
+      "exit_code": 0,
+      "compiler_samples": 23,
+      "compiler_contaminated": false,
+      "runtime_error": false,
+      "end_both_phases": {"row": 7199, "offset": 0, "distance": 1735.5, "pinned": false, "jump": true},
+      "phases": [
+        {
+          "phase": "warm-down",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 13993, "p95_us": 14874, "max_us": 15580},
+          "dirty_to_draw": {"p50_us": 14003, "p95_us": 14891, "max_us": 15591},
+          "rail_builds": 180,
+          "rail_build_us": 1978072
+        },
+        {
+          "phase": "reversals",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 14095, "p95_us": 15311, "max_us": 15942},
+          "dirty_to_draw": {"p50_us": 14112, "p95_us": 15319, "max_us": 15961},
+          "rail_builds": 180,
+          "rail_build_us": 1967998
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "label": "changed",
+      "response_sha256": "5939865ac486975cdce1a7c966bd5fad656ed20c349cf904992f025174917fc2",
+      "exit_code": 0,
+      "compiler_samples": 18,
+      "compiler_contaminated": false,
+      "runtime_error": false,
+      "end_both_phases": {"row": 7198, "offset": 30, "distance": 1738.5, "pinned": false, "jump": true, "navigation": false},
+      "phases": [
+        {
+          "phase": "warm-down",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 2964, "p95_us": 4348, "max_us": 5841},
+          "dirty_to_draw": {"p50_us": 2985, "p95_us": 4362, "max_us": 5860},
+          "rail_builds": 0,
+          "rail_build_us": 0
+        },
+        {
+          "phase": "reversals",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 3389, "p95_us": 4811, "max_us": 5261},
+          "dirty_to_draw": {"p50_us": 3401, "p95_us": 4826, "max_us": 5277},
+          "rail_builds": 0,
+          "rail_build_us": 0
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "label": "baseline",
+      "response_sha256": "ead557c86ced124ee74e8e389a893922ae7fe06ccffb38fd849da1186ec07ed4",
+      "exit_code": 0,
+      "compiler_samples": 24,
+      "compiler_contaminated": false,
+      "runtime_error": false,
+      "end_both_phases": {"row": 7199, "offset": 0, "distance": 1735.5, "pinned": false, "jump": true},
+      "phases": [
+        {
+          "phase": "warm-down",
+          "frames": 181,
+          "cpu_draw": {"p50_us": 13831, "p95_us": 14913, "max_us": 15549},
+          "dirty_to_draw": {"p50_us": 13842, "p95_us": 14924, "max_us": 15565},
+          "rail_builds": 180,
+          "rail_build_us": 1912340
+        },
+        {
+          "phase": "reversals",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 14387, "p95_us": 15408, "max_us": 16133},
+          "dirty_to_draw": {"p50_us": 14396, "p95_us": 15421, "max_us": 16150},
+          "rail_builds": 180,
+          "rail_build_us": 1959476
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "label": "changed",
+      "response_sha256": "d280be455133a6c37c069bc1162e0a3ed745c7dce51fbd290aeddeaaeca138d0",
+      "exit_code": 0,
+      "compiler_samples": 18,
+      "compiler_contaminated": false,
+      "runtime_error": false,
+      "end_both_phases": {"row": 7199, "offset": 0, "distance": 1735.5, "pinned": false, "jump": true, "navigation": false},
+      "phases": [
+        {
+          "phase": "warm-down",
+          "frames": 180,
+          "cpu_draw": {"p50_us": 3424, "p95_us": 5612, "max_us": 6527},
+          "dirty_to_draw": {"p50_us": 3440, "p95_us": 5634, "max_us": 6556},
+          "rail_builds": 0,
+          "rail_build_us": 0
+        },
+        {
+          "phase": "reversals",
+          "frames": 196,
+          "cpu_draw": {"p50_us": 3687, "p95_us": 6017, "max_us": 6782},
+          "dirty_to_draw": {"p50_us": 3701, "p95_us": 6039, "max_us": 6807},
+          "rail_builds": 0,
+          "rail_build_us": 0
+        }
+      ]
+    }
+  ],
+  "fresh_process_native_qa": {
+    "appearances": ["dark", "light"],
+    "exit_code_both": 0,
+    "runtime_errors_both": false,
+    "passed": ["wheel cancels rail", "streaming preserves ownership", "interrupted panel reversal", "reduced and instant snaps"],
+    "endpoint_readbacks_inspected": ["settled transcript", "left collapsed", "right open"],
+    "physical_input": "See connected_desktop_smoke below; hardware trackpad latency/momentum remains unverified",
+    "unverified": ["Linux native", "Windows native", "macOS split-view manual input"],
+    "known_preexisting": "Live macOS theme switching re-enters GPUI via synchronous AppKit appearance callback and logs an App borrow warning; fresh-process appearance runs avoid that path."
+  },
+  "connected_desktop_smoke": {
+    "transport": "connected node_repl + @oai/sky; not a terminal-only MCP connection",
+    "binary_sha256": "9de76692b8b282ae435c7a94e4984cae63c69d13782f205b92d2351baf39941c",
+    "appearance": "dark",
+    "profile": "temporary generated history, no installed app data",
+    "macos_permissions_changed": false,
+    "observed": [
+      "OS-level scroll actions updated the transcript in both directions",
+      "Cmd+B closed and reopened the left sidebar",
+      "Visible right-sidebar control opened and closed the right sidebar",
+      "OS endpoint screenshots inspected after actions"
+    ],
+    "not_verified": [
+      "exact scroll displacement",
+      "continuous visual animation recording",
+      "physical trackpad momentum or latency",
+      "split-view manual input"
+    ]
+  }
+}

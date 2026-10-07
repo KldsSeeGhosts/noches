@@ -950,6 +950,9 @@ const MIN_WALL: Duration = Duration::from_millis(1);
 
 /// Upper bound of the panel-animation setting.
 pub const PANEL_ANIMATION_MAX_MS: u16 = 400;
+/// Authored open/close motion for new profiles and missing settings fields.
+/// Persisted explicit zero remains an opt-out.
+pub const PANEL_ANIMATION_DEFAULT_MS: u16 = 200;
 /// The duration the panel specs were authored at: a setting of 200 reproduces
 /// their catalog timings exactly.
 const PANEL_ANIMATION_REFERENCE_MS: f32 = 200.0;
@@ -960,7 +963,7 @@ static PANEL_ANIMATION_MS: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(PANEL_ANIMATION_REFERENCE_MS as u16);
 
 /// Set the panel open/close duration in milliseconds (0 = instant, capped at
-/// [`PANEL_ANIMATION_MAX_MS`]). T3 ships 0 by default.
+/// [`PANEL_ANIMATION_MAX_MS`]).
 pub fn set_panel_animation_ms(ms: u16) {
     PANEL_ANIMATION_MS.store(
         ms.min(PANEL_ANIMATION_MAX_MS),

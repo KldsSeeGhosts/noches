@@ -16,6 +16,11 @@ use super::projection;
 use super::sync_publish::*;
 use super::*;
 
+#[path = "performance_tests.rs"]
+mod performance;
+#[path = "responsiveness_tests.rs"]
+mod responsiveness;
+
 const NOW: i64 = 1_800_000_000_000;
 
 struct Fixture {

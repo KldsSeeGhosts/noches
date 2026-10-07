@@ -15351,6 +15351,41 @@ mod shortcut_focus_regressions {
 }
 
 /// Native visual QA uses the production shell with isolated fixture data.
+#[cfg(feature = "ui-response-fixture")]
+impl Shell {
+    pub fn fixture_response_transcript(&self) -> Entity<Transcript> {
+        self.transcript.clone()
+    }
+
+    pub fn fixture_response_toggle(&mut self, right: bool, cx: &mut Context<Self>) {
+        if right {
+            self.toggle_right_pane(cx);
+        } else {
+            self.toggle_sidebar(cx);
+        }
+    }
+
+    pub fn fixture_response_reverse(&mut self, right: bool, cx: &mut Context<Self>) -> (f32, f32) {
+        let before = if right { self.right_now(cx) } else { self.sidebar_now() };
+        self.fixture_response_toggle(right, cx);
+        let from = if right { self.right_tween } else { self.sidebar_tween }.unwrap().from;
+        (before, from)
+    }
+
+    pub fn fixture_response_panels(&self, cx: &App) -> serde_json::Value {
+        serde_json::json!({
+            "left": self.sidebar_now(),
+            "right": self.right_now(cx),
+            "left_target": self.sidebar_target(),
+            "right_target": self.right_target(cx),
+        })
+    }
+
+    pub fn fixture_response_counters(&self) -> serde_json::Value {
+        serde_json::to_value(crate::perf_trace::snapshot()).unwrap()
+    }
+}
+
 #[cfg(feature = "appshots-fixture")]
 impl Shell {
     pub fn fixture_appshots_settings(&mut self, open: bool, cx: &mut Context<Self>) {

@@ -15,6 +15,11 @@ windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 orchestration-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
+ui-response-fixture = ["gpui_platform/test-support"]
+
+[[example]]
+name = "ui-response-fixture"
+required-features = ["ui-response-fixture"]
 
 [[example]]
 name = "voice-fixture"

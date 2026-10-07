@@ -18,6 +18,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_launch.sql"),
     include_str!("schema_transfer.sql"),
     include_str!("schema_queue.sql"),
+    // Preserve dev's published migration 7; steering extends it at version 8.
+    include_str!("schema_performance.sql"),
     include_str!("schema_steering.sql"),
 ];
 
@@ -83,6 +85,9 @@ pub struct Store {
     pub(crate) publication_lane: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<Mutex<Option<(WriteBoundary, usize)>>>,
     admission: Arc<OnceLock<super::adoption::RegistryAdmission>>,
+    writes_committed: tokio::sync::watch::Sender<()>,
+    #[cfg(test)]
+    accesses: Arc<[std::sync::atomic::AtomicUsize; 2]>,
 }
 
 impl Store {
@@ -144,7 +149,25 @@ impl Store {
             publication_lane: Arc::default(),
             failure: Arc::default(),
             admission: Arc::default(),
+            writes_committed: tokio::sync::watch::channel(()).0,
+            #[cfg(test)]
+            accesses: Arc::default(),
         })
+    }
+
+    /// Subscribe before inspecting work, and mark the current version seen
+    /// before each inspection. A commit racing the check-to-wait transition
+    /// then remains observable. Diagnostic Store handles have their own
+    /// channel, so workers also keep a bounded repair timer.
+    pub(crate) fn subscribe_writes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.writes_committed.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn access_counts(&self) -> [usize; 2] {
+        self.accesses
+            .each_ref()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Deterministic one-shot crash seam. `occurrence=2`, for example, targets
@@ -169,6 +192,8 @@ impl Store {
     }
 
     pub(crate) fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        self.accesses[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.docs.with_connection(|conn| {
             // One consistent frontier even if a diagnostic handle has opened
             // another connection to the same profile.
@@ -180,7 +205,10 @@ impl Store {
     }
 
     pub(crate) fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        self.accesses[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.docs.with_connection(|conn| {
+            let before = conn.total_changes();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let owner: String = tx.query_row(
                 "SELECT host_id FROM orchestration_host WHERE singleton=1",
@@ -193,6 +221,12 @@ impl Store {
             let value = f(&tx)?;
             self.boundary(WriteBoundary::BeforeCommit)?;
             tx.commit()?;
+            if conn.total_changes() != before {
+                // Empty claims and fenced-out acknowledgements must not wake the
+                // workers themselves. Notify after durability, even when the
+                // AfterCommit seam loses the response to the caller.
+                self.writes_committed.send_replace(());
+            }
             self.boundary(WriteBoundary::AfterCommit)?;
             Ok(value)
         })
@@ -659,4 +693,105 @@ fn put_receipt(conn: &Connection, receipt: &CommandReceipt) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn steering_upgrades_dev_version_seven_without_rewriting_history_or_legacy_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Arc::new(DocsStore::open(dir.path()).unwrap());
+        docs.with_connection(|conn| -> Result<()> {
+            conn.execute_batch(
+                "CREATE TABLE orchestration_schema_migrations
+                 (version INTEGER PRIMARY KEY,applied_at INTEGER NOT NULL) STRICT",
+            )?;
+            for (index, sql) in MIGRATIONS.iter().take(7).enumerate() {
+                conn.execute_batch(sql)?;
+                conn.execute(
+                    "INSERT INTO orchestration_schema_migrations VALUES(?1,777)",
+                    [index as i64 + 1],
+                )?;
+            }
+            conn.execute("INSERT INTO orchestration_host VALUES(1,'host',4)", [])?;
+            conn.execute(
+                "INSERT INTO orchestration_effect_outbox
+                 (effect_id,command_id,thread_id,effect_type,lane,payload_json,
+                  process_bound,status,available_at,created_at)
+                 VALUES('legacy-steer','legacy-command','legacy-thread',
+                        'provider-turn.steer','provider',?1,1,'succeeded',0,0)",
+                [serde_json::json!({
+                    "type":"provider-turn.steer",
+                    "providerSessionId":"old-session",
+                    "providerThreadId":"old-provider",
+                    "providerTurnId":"old-turn",
+                    "messageId":"old-message"
+                })
+                .to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let store = Store::open(docs, "host").unwrap();
+        store
+            .read(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT MAX(version) FROM orchestration_schema_migrations",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    8
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_schema_migrations
+                         WHERE version<=7 AND applied_at=777",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    7,
+                    "the existing dev migration history must remain unchanged"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT epoch FROM orchestration_host WHERE singleton=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    4
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE name IN ('orchestration_effect_ready',
+                                        'orchestration_steering_inputs',
+                                        'orchestration_steering_acceptances',
+                                        'orchestration_runtime_targets')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    4,
+                    "performance indexes and new steering tables must coexist"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_steering_inputs",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0,
+                    "legacy steering must not acquire speculative receipt/replay contracts"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.effect("legacy-steer").unwrap().unwrap().status,
+            effects::EffectStatus::Succeeded
+        );
+    }
 }

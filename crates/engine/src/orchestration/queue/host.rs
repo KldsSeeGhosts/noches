@@ -147,6 +147,13 @@ impl HostQueue {
                 continue;
             }
             let thread = ThreadId(handle.chat_id().into());
+            let _guard = handle.orchestration_queue_lock().await;
+            // The idle repair lane usually sees an unchanged queue. Compare
+            // the small intent view before admitting/loading all of the
+            // thread's retained runs, messages, and auxiliary records.
+            if !self.queue_changed(&thread, &handle)? {
+                continue;
+            }
             if let Some(p) = self
                 .domain
                 .kernel
@@ -157,11 +164,25 @@ impl HostQueue {
                 if p.thread.deleted_at.is_some() || p.thread.archived_at.is_some() {
                     continue;
                 }
-                let _guard = handle.orchestration_queue_lock().await;
                 self.synchronize(&p, &handle).await?;
             }
         }
         Ok(())
+    }
+
+    fn queue_changed(
+        &self,
+        thread: &ThreadId,
+        handle: &Arc<crate::ChatDocHandle>,
+    ) -> Result<bool, ToolError> {
+        let rows = handle.doc().read_queue().map_err(|_| unavailable())?;
+        let previous = self
+            .domain
+            .kernel
+            .store
+            .read(|conn| crate::orchestration::ui_queue::loro_intents(conn, thread))
+            .map_err(|_| unavailable())?;
+        Ok(rows != previous)
     }
 
     pub(crate) async fn synchronize(

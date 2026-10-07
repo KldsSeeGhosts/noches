@@ -18,12 +18,12 @@ pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod automations;
-pub mod import;
 pub mod composer;
 pub mod connections;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod import;
 pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
@@ -674,7 +674,7 @@ pub struct UiSettings {
     /// Queue or steer a message sent while the agent is working.
     pub follow_up_behavior: FollowUpBehavior,
     /// How long sidebar, right-pane, terminal and disclosure open/close
-    /// animations run, 0-400ms. 0 (the default, T3's) makes them instant;
+    /// animations run, 0-400ms. Defaults to 200ms; explicit 0 makes them instant;
     /// popovers, dialogs and hover fades keep their own smooth timing.
     pub panel_animation_ms: u16,
     pub sidebar_width: f32,
@@ -859,7 +859,7 @@ impl Default for UiSettings {
             settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             follow_up_behavior: FollowUpBehavior::default(),
-            panel_animation_ms: 0,
+            panel_animation_ms: crate::motion::PANEL_ANIMATION_DEFAULT_MS,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -2098,6 +2098,24 @@ mod tests {
                 .get("activeTurnSendBehavior")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn panel_motion_defaults_to_authored_timing_without_overwriting_opt_outs() {
+        assert_eq!(UiSettings::default().panel_animation_ms, 200);
+        let missing: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(missing.panel_animation_ms, 200);
+        for ms in [0, 100, 200, 400] {
+            let explicit: UiSettings = serde_json::from_value(
+                serde_json::json!({"panelAnimationMs": ms, "sidebarWidth": 300}),
+            )
+            .unwrap();
+            assert_eq!(explicit.panel_animation_ms, ms);
+            assert_eq!(explicit.sidebar_width, 300.);
+            let round_trip: UiSettings =
+                serde_json::from_value(serde_json::to_value(explicit).unwrap()).unwrap();
+            assert_eq!(round_trip.panel_animation_ms, ms);
+        }
     }
 
     #[test]

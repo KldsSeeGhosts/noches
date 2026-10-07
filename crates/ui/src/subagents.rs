@@ -544,6 +544,23 @@ impl AppState {
         }
     }
 
+    /// Text/reasoning appends cannot change this doc's spawn inventory or
+    /// lifecycle. Keep its shared presentation, but refresh referencing
+    /// parents whose child preview may have changed (including self-links).
+    pub(crate) fn refresh_subagents_after_text(&mut self, doc_id: &str) {
+        if self.delegation.has_parent(doc_id) || self.delegation.is_delegated_child(doc_id) {
+            self.nudge_delegation();
+        }
+        let parents = self
+            .subagent_parents
+            .get(doc_id)
+            .cloned()
+            .unwrap_or_default();
+        for parent in parents {
+            self.prepare_subagents(&parent);
+        }
+    }
+
     /// Replace the delegation read model and rebuild only the presentations
     /// whose tasks or links changed. Returns whether anything did, so the
     /// caller notifies exactly once. Runs from the sync loop, never render.
@@ -2258,6 +2275,220 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "comparative optimized-test benchmark; run without concurrent builds"]
+    fn profile_streaming_subagent_projection() {
+        for agents in [false, true] {
+            let mut state = AppState::new();
+            state.selected_chat = Some("c".into());
+            let text = "x".repeat(2_160);
+            let mut entries: Vec<_> = (0..10_000)
+                .map(|ix| {
+                    entry(
+                        &format!("m{ix}"),
+                        MessageRole::Assistant,
+                        vec![MessagePart::Text {
+                            id: format!("t{ix}"),
+                            text: text.clone(),
+                        }],
+                    )
+                })
+                .collect();
+            if agents {
+                entries.push(entry(
+                    "spawns",
+                    MessageRole::Assistant,
+                    vec![
+                        spawn("live", false, Some(SubagentStatus::Running)),
+                        spawn("finished", true, Some(SubagentStatus::Done)),
+                    ],
+                ));
+            }
+            let mut tail = entry(
+                "tail",
+                MessageRole::Assistant,
+                vec![MessagePart::Text {
+                    id: "text".into(),
+                    text: String::new(),
+                }],
+            );
+            tail.status = Some(MessageStatus::Streaming);
+            entries.push(tail);
+            let count = entries.len();
+            state.apply_transcript(entries);
+            let before = crate::perf_trace::snapshot();
+            let start = std::time::Instant::now();
+            for len in 1..=500 {
+                state
+                    .apply_transcript_frame(zeron_doc::TranscriptFrame::Delta {
+                        upsert: vec![],
+                        append: vec![zeron_doc::TextAppend {
+                            entry: "tail".into(),
+                            part: "text".into(),
+                            text: "x".into(),
+                            len,
+                        }],
+                        remove: vec![],
+                        count,
+                    })
+                    .unwrap();
+            }
+            let elapsed_us = start.elapsed().as_micros();
+            let scans = crate::perf_trace::snapshot().subagent_scans - before.subagent_scans;
+            eprintln!(
+                "stream_projection_profile agents={agents} history_entries=10000 \
+                 history_bytes=21600000 appends=500 elapsed_us={elapsed_us} subagent_scans={scans}"
+            );
+        }
+    }
+
+    fn text_append(
+        entry: &str,
+        part: &str,
+        text: &str,
+        len: usize,
+        count: usize,
+    ) -> zeron_doc::TranscriptFrame {
+        zeron_doc::TranscriptFrame::Delta {
+            upsert: vec![],
+            append: vec![zeron_doc::TextAppend {
+                entry: entry.into(),
+                part: part.into(),
+                text: text.into(),
+                len,
+            }],
+            remove: vec![],
+            count,
+        }
+    }
+
+    #[test]
+    fn pure_text_and_reasoning_keep_shared_spawn_presentations_in_both_reducers() {
+        for agents in [false, true] {
+            let mut state = AppState::new();
+            state.selected_chat = Some("c".into());
+            let mut parts = vec![
+                MessagePart::Text {
+                    id: "text".into(),
+                    text: String::new(),
+                },
+                MessagePart::Reasoning {
+                    id: "thought".into(),
+                    text: String::new(),
+                },
+            ];
+            if agents {
+                parts.push(spawn("live", false, Some(SubagentStatus::Running)));
+                parts.push(spawn("done", true, Some(SubagentStatus::Done)));
+            }
+            let entries = vec![entry("m", MessageRole::Assistant, parts)];
+            state.apply_transcript(entries.clone());
+            state.set_subagent_snapshot("pane".into(), entries);
+            let primary = subagents_for(&state, "c");
+            let pane = subagents_for(&state, "pane");
+            let before = crate::perf_trace::snapshot().subagent_scans;
+            for part in ["text", "thought"] {
+                state
+                    .apply_transcript_frame(text_append("m", part, "x", 1, 1))
+                    .unwrap();
+                state
+                    .apply_sub_transcript_frame("pane", text_append("m", part, "x", 1, 1))
+                    .unwrap();
+            }
+            assert_eq!(crate::perf_trace::snapshot().subagent_scans, before);
+            assert!(Arc::ptr_eq(&primary, &subagents_for(&state, "c")));
+            assert!(Arc::ptr_eq(&pane, &subagents_for(&state, "pane")));
+
+            // A structural/status update still rebuilds the inventory.
+            state
+                .apply_transcript_frame(zeron_doc::TranscriptFrame::Delta {
+                    upsert: vec![zeron_doc::TranscriptUpsert {
+                        after: None,
+                        entry: entry(
+                            "m",
+                            MessageRole::Assistant,
+                            vec![spawn("new", true, Some(SubagentStatus::Failed))],
+                        ),
+                    }],
+                    append: vec![],
+                    remove: vec![],
+                    count: 1,
+                })
+                .unwrap();
+            assert!(!Arc::ptr_eq(&primary, &subagents_for(&state, "c")));
+            assert_eq!(subagents_for(&state, "c")[0].status, SubagentPhase::Failed);
+        }
+    }
+
+    #[test]
+    fn child_text_refreshes_just_its_referencing_parents_not_its_own_inventory() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("parent".into());
+        state.apply_transcript(vec![entry(
+            "spawn",
+            MessageRole::Assistant,
+            vec![spawn("a", true, Some(SubagentStatus::Done))],
+        )]);
+        state.set_subagent_snapshot("unrelated".into(), vec![]);
+        state.set_subagent_snapshot(
+            "doc-1".into(),
+            vec![entry(
+                "child",
+                MessageRole::Assistant,
+                vec![MessagePart::Text {
+                    id: "result".into(),
+                    text: "Child".into(),
+                }],
+            )],
+        );
+        let parent = subagents_for(&state, "parent");
+        let child = subagents_for(&state, "doc-1");
+        let unrelated = subagents_for(&state, "unrelated");
+        let before = crate::perf_trace::snapshot().subagent_scans;
+        state
+            .apply_sub_transcript_frame(
+                "doc-1",
+                text_append("child", "result", " finished.", 15, 1),
+            )
+            .unwrap();
+        assert_eq!(crate::perf_trace::snapshot().subagent_scans - before, 1);
+        let after = subagents_for(&state, "parent");
+        assert!(!Arc::ptr_eq(&parent, &after));
+        assert_eq!(after[0].summary.as_deref(), Some("Child finished."));
+        assert!(Arc::ptr_eq(&child, &subagents_for(&state, "doc-1")));
+        assert!(Arc::ptr_eq(&unrelated, &subagents_for(&state, "unrelated")));
+    }
+
+    #[test]
+    fn self_referencing_spawn_preview_still_refreshes_after_text() {
+        let mut state = AppState::new();
+        let mut self_spawn = spawn("self", true, Some(SubagentStatus::Done));
+        if let MessagePart::Tool { subagent_ref, .. } = &mut self_spawn {
+            *subagent_ref = Some("self-doc".into());
+        }
+        state.set_subagent_snapshot(
+            "self-doc".into(),
+            vec![entry(
+                "m",
+                MessageRole::Assistant,
+                vec![
+                    self_spawn,
+                    MessagePart::Text {
+                        id: "text".into(),
+                        text: String::new(),
+                    },
+                ],
+            )],
+        );
+        state
+            .apply_sub_transcript_frame("self-doc", text_append("m", "text", "result", 6, 1))
+            .unwrap();
+        assert_eq!(
+            subagents_for(&state, "self-doc")[0].summary.as_deref(),
+            Some("result")
+        );
+    }
+
+    #[test]
     fn only_referenced_child_updates_invalidate_parent_presentation() {
         let mut state = AppState::new();
         state.selected_chat = Some("c".into());
@@ -2493,6 +2724,12 @@ mod tests {
         state.refresh_subagents("p2");
         assert!(nudged(&mut nudges));
         state.refresh_subagents("unrelated");
+        assert!(!nudged(&mut nudges));
+        state.refresh_subagents_after_text("child-a");
+        assert!(nudged(&mut nudges));
+        state.refresh_subagents_after_text("p2");
+        assert!(nudged(&mut nudges));
+        state.refresh_subagents_after_text("unrelated");
         assert!(!nudged(&mut nudges));
         // Settled: no heartbeat, nothing to force-read.
         state.apply_delegation_snapshot(snapshot(vec![delegated(
