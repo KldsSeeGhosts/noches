@@ -18,6 +18,19 @@ pub struct HostQueue {
 }
 
 impl HostQueue {
+    /// The runtime can be briefly idle between admitted restart attempts.
+    /// That gap does not authorize draining another document-owned input.
+    pub(crate) fn has_starting_turn(&self, chat: &str) -> super::super::Result<bool> {
+        self.domain.kernel.store.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orchestration_projection_runs
+                 WHERE thread_id=?1 AND status='starting')",
+                [chat],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     pub(crate) async fn prepare_locked(
         &self,
         handle: &Arc<crate::ChatDocHandle>,
@@ -286,7 +299,11 @@ impl HostQueue {
             }
             QueuedRunAction::PromoteToSteer { target_run_id } => (
                 "t3_queue_promote_to_steer",
-                json!({"targetRunId":target_run_id}),
+                json!({"targetRunId":target_run_id,"expectedExecution":"active_steering"}),
+            ),
+            QueuedRunAction::PromoteToRestart { target_run_id } => (
+                "t3_queue_promote_to_steer",
+                json!({"targetRunId":target_run_id,"expectedExecution":"interrupt_restart"}),
             ),
         };
         input["threadId"] = json!(request.chat_id);

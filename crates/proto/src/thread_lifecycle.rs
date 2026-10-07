@@ -55,8 +55,18 @@ pub struct QueueUiState {
     /// Completed foreground output can still own native background work.
     /// This is a passive hint; Stop rechecks ownership on the host.
     pub background_run_id: Option<String>,
-    /// A passive hint only. The owner rechecks the exact run/attempt/turn.
+    /// Legacy hint for non-interrupting promotion only.
     pub can_promote_to_steer: bool,
+    /// The UI names an interrupting restart explicitly. Host admission checks
+    /// the observed mode again, so stale Steer clicks cannot become restarts.
+    pub promotion_mode: Option<QueuePromotionMode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuePromotionMode {
+    ActiveSteering,
+    InterruptRestart,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +115,9 @@ pub enum QueuedRunAction {
     PromoteToSteer {
         target_run_id: String,
     },
+    PromoteToRestart {
+        target_run_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +147,7 @@ mod tests {
         assert!(!state.can_promote_to_steer);
         assert!(state.active_run_id.is_none());
         assert!(state.background_run_id.is_none());
+        assert!(state.promotion_mode.is_none());
     }
 
     #[test]

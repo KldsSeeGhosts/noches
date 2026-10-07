@@ -54,7 +54,10 @@ impl Harness for FixtureHarness {
         request: RunRequest,
         _: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let native = uuid::Uuid::new_v4().to_string();
+        let native = request
+            .resume
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if request
             .prompt
             .ends_with("Leave native background work running after this reply.")
@@ -87,9 +90,13 @@ impl Harness for FixtureHarness {
                 }),
             ]).chain(stream::pending()).boxed());
         }
-        if request
+        let promoted = request
             .prompt
-            .ends_with("Hold this response while I arrange the queue.")
+            .ends_with("Review the accepted native handoff and its coverage.");
+        if promoted
+            || request
+                .prompt
+                .ends_with("Hold this response while I arrange the queue.")
         {
             return Ok(stream::iter([
                 Ok(AgentEvent::SessionStarted {
@@ -102,9 +109,11 @@ impl Harness for FixtureHarness {
                     assistant_message_id: uuid::Uuid::new_v4().to_string(),
                 }),
                 Ok(AgentEvent::TextDelta {
-                    text:
+                    text: if promoted {
+                        "The queued instruction now owns the replacement attempt. Your other queued work is unchanged."
+                    } else {
                         "Working on the current request. Queued instructions remain editable below."
-                            .into(),
+                    }.into(),
                 }),
             ])
             .chain(stream::pending())
@@ -477,6 +486,45 @@ fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(rows.len() == 2 && rows.iter().all(|row| row.id != "message:automation-queue"), "Canonical cancellation did not reach the tray");
                 anyhow::ensure!(renderer_core.doc_host.open("fixture-queue")?.doc().read_queue()?.len() == 1, "Synthetic rows leaked into Loro");
                 capture(window.into(), cx, &output, &format!("queue-managed-{mode}-960"))?;
+                let before = renderer_core.orchestration.store.thread(&"fixture-queue".into())?.unwrap();
+                let active = before.runs.iter().find(|run| run.status == OrchestrationV2RunStatus::Running).unwrap().clone();
+                anyhow::ensure!(renderer_core.orchestration.store.queue_ui_state(&"fixture-queue".into())?
+                    .promotion_mode == Some(zeron_proto::QueuePromotionMode::InterruptRestart),
+                    "Queue must advertise its interrupting restart action");
+                capture(window.into(), cx, &output, &format!("queue-restart-ready-{mode}-960"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_queue_restart("message:agent-queue".into(), cx))?;
+                let queue_core = renderer_core.clone();
+                let original_attempt = active.active_attempt_id.clone();
+                let active_id = active.id.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let p = queue_core.orchestration.store.thread(&"fixture-queue".into())?.unwrap();
+                            if p.runs.iter().any(|run| run.id == active_id
+                                && run.status == OrchestrationV2RunStatus::Running
+                                && run.active_attempt_id != original_attempt
+                                && run.user_message_id.0 == "message:agent-queue") {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }).await??;
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                pause(cx, 800).await;
+                let after = renderer_core.orchestration.store.thread(&"fixture-queue".into())?.unwrap();
+                anyhow::ensure!(after.runs.len() == before.runs.len(), "Queue promotion created another logical run");
+                anyhow::ensure!(after.attempts.iter().find(|attempt| Some(&attempt.id) == active.active_attempt_id.as_ref())
+                    .unwrap().status == zeron_proto::orchestration::OrchestrationV2RunAttemptStatus::Superseded,
+                    "Queue promotion did not supersede its exact original attempt");
+                let rows = window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?;
+                anyhow::ensure!(rows.len() == 1 && rows[0].text == "Typed follow-up: verify the retry boundary.",
+                    "Restart promotion changed the other queued instruction");
+                anyhow::ensure!(!renderer_core.doc_host.open("fixture-queue")?.doc().read_entries()?
+                    .iter().any(|entry| entry.id == rows[0].id),
+                    "Another queued instruction appeared as sent during restart");
+                capture(window.into(), cx, &output, &format!("queue-restarted-{mode}-960"))?;
                 for row in rows {
                     window.update(cx, |shell, _, cx| shell.fixture_queue_remove(row.id.clone(), cx))?;
                 }
@@ -570,7 +618,8 @@ fn main() -> anyhow::Result<()> {
                     format!("PASS ({mode}): production UI fork/merge handlers and RPCs; idle fork; \
                         inherited lineage/text; continued fork; context-only merge; native GPUI \
                         regular/narrow render; live mixed document/canonical queue; composer text edit; \
-                        reorder and cancel; owner-fenced session disconnect; completed-root native background Stop \
+                        reorder and cancel; exact-attempt queued interrupt/restart promotion with native continuity; \
+                        owner-fenced session disconnect; completed-root native background Stop \
                         through production composer/RPC/kernel/runtime handlers, preserving the completed reply. \
                         Mock provider only; no live-provider or physical-device claims.\n"))?;
                 Ok(())

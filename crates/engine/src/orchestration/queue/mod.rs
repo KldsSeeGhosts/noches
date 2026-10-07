@@ -25,7 +25,7 @@ use super::queue_service::QueueService;
 use super::service::{CallerScope, ToolError};
 use super::{Error, Kernel, ReceiptStatus, Result, task};
 
-pub(crate) use planner::can_promote_to_steer;
+pub(crate) use planner::{can_promote_to_steer, promotion_mode};
 pub(crate) use planner::plan;
 
 #[derive(Clone)]

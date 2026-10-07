@@ -775,6 +775,126 @@ fn request(cwd: &std::path::Path) -> zeron_proto::RunRequest {
 }
 
 #[tokio::test]
+async fn steering_restart_resume_requires_the_exact_accepted_immediate_predecessor() {
+    let cwd = tempfile::tempdir().unwrap();
+    let other_cwd = tempfile::tempdir().unwrap();
+    let (_, kernel, _) = fixture(cwd.path());
+    let original = start(&kernel, "source", "original").await;
+    accept(&kernel, &original, cwd.path(), "accepted-restart-native").await;
+    kernel.store.rebuild().unwrap();
+    let accepted = kernel.store.thread(&original.thread_id).unwrap().unwrap();
+    for fence in [
+        "exact",
+        "no-acceptance",
+        "turn-id",
+        "turn-root",
+        "turn-provider",
+        "native-id",
+        "not-superseded",
+        "not-immediate",
+        "not-restart",
+        "current-run",
+        "current-root",
+        "current-provider",
+        "current-instance",
+        "previous-instance",
+        "model",
+        "options",
+        "cwd",
+    ] {
+        let mut p = accepted.clone();
+        let previous_index = p
+            .attempts
+            .iter()
+            .position(|attempt| Some(&attempt.id) == original.active_attempt_id.as_ref())
+            .unwrap();
+        let mut current = p.attempts[previous_index].clone();
+        p.attempts[previous_index].status = OrchestrationV2RunAttemptStatus::Superseded;
+        current.id = "attempt:replacement".into();
+        current.root_node_id = "node:replacement".into();
+        current.attempt_ordinal += 1;
+        current.reason = OrchestrationV2RunAttemptReason::SteeringRestart;
+        current.status = OrchestrationV2RunAttemptStatus::Pending;
+        current.native_thread_id = Optional::Absent;
+        current.provider_turn_id = None;
+        let mut run = p
+            .runs
+            .iter()
+            .find(|run| run.id == original.id)
+            .unwrap()
+            .clone();
+        run.status = OrchestrationV2RunStatus::Starting;
+        run.active_attempt_id = Some(current.id.clone());
+        run.root_node_id = Some(current.root_node_id.clone());
+        match fence {
+            "no-acceptance" => p.records.get_mut("provider-turn").unwrap().clear(),
+            "turn-id" | "turn-root" | "turn-provider" => {
+                let key = match fence {
+                    "turn-id" => "id",
+                    "turn-root" => "nodeId",
+                    _ => "providerThreadId",
+                };
+                let turn = p
+                    .records
+                    .get_mut("provider-turn")
+                    .unwrap()
+                    .iter_mut()
+                    .find(|turn| turn["runAttemptId"] == p.attempts[previous_index].id.0)
+                    .unwrap();
+                turn[key] = json!("unrelated");
+            }
+            "native-id" => {
+                p.attempts[previous_index].native_thread_id = Optional::Present("unrelated".into())
+            }
+            "not-superseded" => {
+                p.attempts[previous_index].status = OrchestrationV2RunAttemptStatus::Completed
+            }
+            "not-immediate" => current.attempt_ordinal += 1,
+            "not-restart" => current.reason = OrchestrationV2RunAttemptReason::Initial,
+            "current-run" => current.run_id = "unrelated".into(),
+            "current-root" => current.root_node_id = "unrelated".into(),
+            "current-provider" => current.provider_thread_id = "unrelated".into(),
+            "current-instance" => current.provider_instance_id = "unrelated".into(),
+            "previous-instance" => {
+                p.attempts[previous_index].provider_instance_id = "unrelated".into()
+            }
+            "model" => run.model_selection.model = "different-model".into(),
+            "options" => {
+                run.model_selection.options =
+                    serde_json::from_value(json!([{"id":"reasoningEffort","value":"high"}]))
+                        .unwrap()
+            }
+            _ => {}
+        }
+        p.attempts.push(current);
+        // Keep the original accepted run's saved selection as the comparison
+        // point; a caller cannot authorize resume by changing only its request.
+        let saved = p.runs.iter_mut().find(|saved| saved.id == run.id).unwrap();
+        saved.active_attempt_id = run.active_attempt_id.clone();
+        saved.root_node_id = run.root_node_id.clone();
+        saved.status = run.status.clone();
+        let resume = resumable_native(
+            &kernel,
+            &p,
+            &run,
+            if fence == "cwd" {
+                other_cwd.path()
+            } else {
+                cwd.path()
+            }
+            .to_str()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resume.as_deref(),
+            (fence == "exact").then_some("accepted-restart-native"),
+            "{fence}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn restart_recovers_only_unconfirmed_steering_not_the_accepted_root_or_other_steers() {
     use crate::orchestration::{
         command::{Command, Operation},

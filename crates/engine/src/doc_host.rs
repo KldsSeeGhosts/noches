@@ -565,6 +565,7 @@ impl PartialEq for QueueSnapshot {
                         && a.active_run_id == b.active_run_id
                         && a.background_run_id == b.background_run_id
                         && a.can_promote_to_steer == b.can_promote_to_steer
+                        && a.promotion_mode == b.promotion_mode
                 }
                 _ => false,
             }
@@ -691,6 +692,10 @@ mod queue_snapshot_tests {
         let mut cleared = next.clone();
         cleared.canonical.as_mut().unwrap().background_run_id = None;
         assert!(next != cleared, "background Stop clearance must publish");
+        next = first.clone();
+        next.canonical.as_mut().unwrap().promotion_mode =
+            Some(zeron_proto::QueuePromotionMode::InterruptRestart);
+        assert!(first != next, "interrupting queue action changes must publish");
     }
 }
 
@@ -4348,7 +4353,17 @@ impl DocHost {
             // the turn too, and the composer queues on the same reading. Taking
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
             // and abandon the question.
-            if sessions.turn_in_flight(&handle.chat_id) {
+            let starting_turn = self
+                .inner
+                .orchestration_queue
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|service| {
+                    service
+                        .has_starting_turn(&handle.chat_id)
+                        .unwrap_or(true)
+                });
+            if sessions.turn_in_flight(&handle.chat_id) || starting_turn {
                 return; // All queued messages wait, including rows from older clients.
             }
             let send = QueueSend::NextTurn;

@@ -368,12 +368,30 @@ impl RunnerBridge {
             .cloned()
             .ok_or_else(|| Error::Invariant("Run input missing.".into()))?;
         let mut prompt = input["text"].as_str().unwrap_or("").to_owned();
-        let mut attachment_paths = vec![];
+        // A document-backed queue promotion retains its host-owned uploads
+        // after the Loro intent is removed. Restart must transport those paths
+        // too, rather than preserving them only in the presentation snapshot.
+        let mut attachment_paths = self.kernel.store.read(|conn| {
+            super::ui_queue::attachment_paths(conn, &effect.thread_id, &run.user_message_id.0)
+        })?;
+        if !attachment_paths.is_empty() {
+            prompt.push_str("\n\nAttached images (local files — open them to view):\n");
+            prompt.push_str(
+                &attachment_paths
+                    .iter()
+                    .map(|path| format!("- {path}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
         for attachment in input["attachments"].as_array().into_iter().flatten() {
             if let Some(path) = self.kernel.store.launch_attachment_path(
                 attachment["id"].as_str().unwrap_or(""),
                 &effect.thread_id.0,
             )? {
+                if attachment_paths.contains(&path) {
+                    continue;
+                }
                 if attachment["type"] == "image" {
                     attachment_paths.push(path.clone());
                 }

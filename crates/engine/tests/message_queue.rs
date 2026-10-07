@@ -555,6 +555,229 @@ async fn desktop_canonical_promotion_targets_the_running_attempt_without_restart
     core.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_restart_promotion_preserves_identity_native_history_attachments_and_other_queue_rows()
+ {
+    use serde_json::json;
+    use zeron_proto::{QueuePromotionMode, orchestration::*};
+    use zeron_rpc::methods;
+    for document_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let (harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        core.doc_host
+            .queue_message(CHAT, "original direction", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        let active = original.runs[0].id.clone();
+        let image = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            image.path(),
+            include_bytes!("../../ui/assets/file-icons/files/nuxt.png"),
+        )
+        .unwrap();
+        let path = image.path().to_string_lossy().into_owned();
+        let attachments = vec![
+            json!({"type":"image","id":"restart-upload","name":"diagram.png",
+            "mimeType":"image/png","sizeBytes":image.as_file().metadata().unwrap().len()}),
+        ];
+        let (selected, message_id) = if document_backed {
+            let id = core
+                .doc_host
+                .queue_message(CHAT, "new direction", vec![path.clone()])
+                .unwrap();
+            let mut watch = client
+                .subscribe_checked(
+                    methods::WATCH_QUEUE,
+                    json!({"chatId":CHAT,"includeCanonical":true}),
+                )
+                .await
+                .unwrap();
+            let state = canonical_frame(&mut watch, |state| {
+                state.queue.iter().any(|row| row.message_id == id)
+            })
+            .await;
+            let queued = state
+                .queue
+                .iter()
+                .find(|row| row.message_id == id)
+                .unwrap()
+                .queued_run_id
+                .clone();
+            (queued, id)
+        } else {
+            let fixture_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+            fixture_store
+                .with_connection(|conn| {
+                    conn.execute(
+                        "INSERT INTO orchestration_launch_claims VALUES(?1,?2)",
+                        rusqlite::params![
+                            "restart-upload",
+                            json!({"threadId":CHAT,"path":path,"attachment":attachments[0]})
+                                .to_string()
+                        ],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .unwrap();
+            (
+                canonical_input_with_attachments(&core, "new direction", attachments.clone()).await,
+                "message:new direction".to_string(),
+            )
+        };
+        let other = canonical_input(&core, "later SQL work").await;
+        let typed = core
+            .doc_host
+            .queue_message(CHAT, "later typed work", vec![])
+            .unwrap();
+        let mut watch = client
+            .subscribe_checked(
+                methods::WATCH_QUEUE,
+                json!({"chatId":CHAT,"includeCanonical":true}),
+            )
+            .await
+            .unwrap();
+        let snapshot = canonical_frame(&mut watch, |state| {
+            state.queue.len() == 3
+                && state.promotion_mode == Some(QueuePromotionMode::InterruptRestart)
+        })
+        .await;
+        assert!(!snapshot.can_promote_to_steer);
+        // The host refuses a stale non-interrupting action before consuming input.
+        let stale = client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,
+            "queuedRunId":selected,"clientRequestId":"stale-steer",
+            "action":{"type":"promoteToSteer","targetRunId":active}}),
+            )
+            .await
+            .unwrap();
+        assert!(stale["refusal"].is_string());
+        assert_eq!(harness.requests.lock().unwrap().len(), 1);
+        core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+        let request = json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"restart-once",
+            "action":{"type":"promoteToRestart","targetRunId":active}});
+        let reply = client
+            .call(methods::MUTATE_QUEUED_RUN, request.clone())
+            .await
+            .unwrap();
+        assert!(reply["refusal"].is_null(), "{reply}");
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .thread(&CHAT.into())
+                    .is_ok_and(|p| {
+                        p.is_some_and(|p| {
+                            p.runs.iter().any(|r| {
+                                r.id == active
+                                    && r.status == OrchestrationV2RunStatus::Running
+                                    && r.active_attempt_id != original.runs[0].active_attempt_id
+                            })
+                        })
+                    })
+                    && harness.requests.lock().unwrap().len() == 2
+                    && user_message_id(&core, "new direction").as_deref()
+                        == Some(message_id.as_str())
+            },
+            "replacement acceptance and original-message transcript materialization",
+        )
+        .await;
+        assert_eq!(
+            client
+                .call(methods::MUTATE_QUEUED_RUN, request)
+                .await
+                .unwrap(),
+            reply,
+            "response-loss retry must not restart the replacement"
+        );
+        let remaining = canonical_frame(&mut watch, |state| state.queue.len() == 2).await;
+        assert!(remaining.queue.iter().any(|row| row.queued_run_id == other));
+        assert!(remaining.queue.iter().any(|row| row.message_id == typed));
+        assert!(
+            !remaining
+                .queue
+                .iter()
+                .any(|row| row.message_id == message_id)
+        );
+        assert_eq!(queue_texts(&core), vec!["later typed work"]);
+        assert!(
+            user_message_id(&core, "later typed work").is_none(),
+            "retiring the old process cannot present another queued input as sent"
+        );
+        let after = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.len(),
+            4,
+            "one existing run and three originally queued runs only"
+        );
+        let restarted = after.runs.iter().find(|r| r.id == active).unwrap();
+        assert_eq!(restarted.user_message_id.0, message_id);
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .find(|r| r.id.0 == selected)
+                .unwrap()
+                .status,
+            OrchestrationV2RunStatus::Cancelled
+        );
+        assert_eq!(
+            after
+                .attempts
+                .iter()
+                .find(|a| Some(&a.id) == original.runs[0].active_attempt_id.as_ref())
+                .unwrap()
+                .status,
+            OrchestrationV2RunAttemptStatus::Superseded
+        );
+        let promoted = after.records["message"]
+            .iter()
+            .find(|m| m["id"] == message_id)
+            .unwrap();
+        assert_eq!(promoted["runId"], active.0);
+        if !document_backed {
+            assert_eq!(promoted["attachments"], json!(attachments));
+            assert_eq!(promoted["createdBy"], "agent");
+            assert_eq!(promoted["creationSource"], "mcp");
+        }
+        let requests = harness.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests[1].resume.as_deref(),
+            Some("sess-queue"),
+            "restart must resume the exact accepted predecessor conversation"
+        );
+        assert_eq!(requests[1].attachments, vec![path.clone()]);
+        assert!(requests[1].prompt.starts_with("new direction"));
+        assert!(
+            requests[1].prompt.contains(&path),
+            "promoted attachments must reach native input"
+        );
+        assert_eq!(
+            user_message_id(&core, "new direction").as_deref(),
+            Some(message_id.as_str())
+        );
+        assert_eq!(prompts.lock().unwrap().len(), 2);
+        assert!(core.orchestration.store.verify_projections().unwrap());
+        core.shutdown().await;
+    }
+}
+
 /// A turn that does not end until the test says so, so "the agent is busy" is
 /// a state the test controls rather than races.
 struct HeldHarness {

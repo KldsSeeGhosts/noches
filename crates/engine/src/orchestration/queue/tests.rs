@@ -1245,6 +1245,316 @@ async fn successful_promotion_preserves_attachments_and_only_enqueues_steering()
     assert_eq!(paths, vec!["/fixture/promoted.png"]);
 }
 
+fn set_promotion_capabilities(f: &Fixture, active: bool, interrupt: bool, restart: bool) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut session = task::records(&p, "provider-session")[0].clone();
+    session["capabilities"]["turns"]["supportsActiveSteering"] = json!(active);
+    session["capabilities"]["turns"]["supportsInterrupt"] = json!(interrupt);
+    session["capabilities"]["turns"]["supportsSteeringByInterruptRestart"] = json!(restart);
+    f.seed("target", "provider-session.attached", session);
+}
+
+#[tokio::test]
+async fn queued_promotion_restarts_one_logical_run_with_original_message_and_exact_control_target()
+{
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    use zeron_proto::QueuePromotionMode;
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_promotion_capabilities(&f, false, true, true);
+    let queued = f.sync("restart direction").await;
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let hint = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"target".into())
+        .unwrap();
+    assert_eq!(
+        hint.promotion_mode,
+        Some(QueuePromotionMode::InterruptRestart)
+    );
+    assert!(
+        !hint.can_promote_to_steer,
+        "older UIs must not call an interrupting action Steer"
+    );
+    let mut message = task::records(&before, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    message["attachments"] = json!([{"type":"file","id":"upload","name":"notes.txt","mimeType":"text/plain","sizeBytes":12}]);
+    message["context"] = json!({"version":1,"records":[{"version":1,"contextId":"attached",
+        "label":"Context","kind":"thread","environmentId":"host","threadId":"parent","title":"Parent"}]});
+    message["scheduledTaskId"] = json!("schedule");
+    message["senderThreadId"] = json!("parent");
+    f.seed("target", "message.updated", message.clone());
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,"expectedExecution":"interrupt_restart"});
+    let id: CommandId = "promote-restart-once".into();
+    let first = f
+        .service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input.clone(),
+            id.clone(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.runs.len(),
+        before.runs.len(),
+        "promotion must not create another logical run"
+    );
+    let restarted = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(restarted.status, OrchestrationV2RunStatus::Starting);
+    assert_eq!(restarted.user_message_id.0, "queue-one");
+    assert_ne!(restarted.active_attempt_id, active.active_attempt_id);
+    let new_attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == restarted.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(
+        new_attempt.reason,
+        OrchestrationV2RunAttemptReason::SteeringRestart
+    );
+    assert_eq!(new_attempt.status, OrchestrationV2RunAttemptStatus::Pending);
+    assert_eq!(new_attempt.attempt_ordinal, 2);
+    assert_eq!(
+        after
+            .attempts
+            .iter()
+            .find(|a| Some(&a.id) == active.active_attempt_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2RunAttemptStatus::Superseded
+    );
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .find(|n| Some(&n.id) == active.root_node_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2ExecutionNodeStatus::Interrupted
+    );
+    assert_eq!(
+        after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+        OrchestrationV2RunStatus::Cancelled
+    );
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    let promoted = task::records(&after, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap();
+    assert_eq!(promoted["runId"], active.id.0);
+    assert_eq!(promoted["nodeId"], json!(restarted.root_node_id));
+    for field in [
+        "text",
+        "attachments",
+        "context",
+        "createdBy",
+        "creationSource",
+        "scheduledTaskId",
+        "senderThreadId",
+    ] {
+        assert_eq!(promoted[field], message[field], "{field}");
+    }
+    let item = task::records(&after, "turn-item")
+        .iter()
+        .find(|i| i["messageId"] == "queue-one")
+        .unwrap();
+    assert_eq!(item["inputIntent"], "promoted_queued_to_steer");
+    assert_eq!(item["nodeId"], json!(restarted.root_node_id));
+    assert!(
+        item["providerTurnId"].is_null(),
+        "the new attempt has not accepted input"
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects.iter().find(|e| e.command_id == id).unwrap();
+    assert!(
+        matches!(&effect.request, EffectRequest::ProviderTurnRestart { interrupted_attempt_id, run_id, .. }
+        if Some(interrupted_attempt_id) == active.active_attempt_id.as_ref() && run_id == &active.id)
+    );
+    assert!(!effects.iter().any(
+        |e| e.command_id == id && matches!(e.request, EffectRequest::ProviderTurnSteer { .. })
+    ));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(
+        saved["runtime"]["attempt_id"],
+        json!(active.active_attempt_id)
+    );
+    assert_eq!(
+        saved["replacement_attempt_id"],
+        json!(restarted.active_attempt_id)
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let replay = f
+        .service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input,
+            id,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn restart_promotion_refuses_stale_modes_capabilities_bindings_and_maintenance_atomically() {
+    for fence in [
+        "steer-click",
+        "no-interrupt",
+        "no-restart",
+        "completed",
+        "turn-root",
+        "provider-ordinal",
+        "provider-instance",
+        "selection",
+        "maintenance",
+    ] {
+        let f = Fixture::new();
+        let active = f.start_target().await;
+        set_promotion_capabilities(&f, false, fence != "no-interrupt", fence != "no-restart");
+        let queued = f
+            .sync(if fence == "maintenance" {
+                "/compact"
+            } else {
+                "queued direction"
+            })
+            .await;
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        match fence {
+            "completed" => {
+                let mut run = json!(p.runs[0]);
+                run["status"] = json!("completed");
+                f.seed("target", "run.updated", run);
+            }
+            "turn-root" => {
+                let mut turn = task::records(&p, "provider-turn")[0].clone();
+                turn["nodeId"] = json!("different-root");
+                f.seed("target", "provider-turn.updated", turn);
+            }
+            "provider-ordinal" | "provider-instance" => {
+                let mut provider = task::records(&p, "provider-thread")[0].clone();
+                if fence == "provider-ordinal" {
+                    provider["lastRunOrdinal"] = json!(999);
+                } else {
+                    provider["providerInstanceId"] = json!("different-instance");
+                }
+                f.seed("target", "provider-thread.updated", provider);
+            }
+            "selection" => {
+                let mut thread = json!(p.thread);
+                thread["modelSelection"]["model"] = json!("changed-model");
+                f.seed("target", "thread.model-selection-updated", thread);
+            }
+            _ => {}
+        }
+        let frontier = f.service.kernel.store.projection_frontier().unwrap();
+        let result = f.service.mutate(None, "target".into(), "t3_queue_promote_to_steer",
+            json!({"queuedRunId":queued,"targetRunId":active.id,
+                "expectedExecution":if fence == "steer-click" {"active_steering"} else {"interrupt_restart"}}),
+            format!("refused-{fence}").into(), NOW).await.unwrap();
+        assert_eq!(
+            result.status,
+            ReceiptStatus::Rejected,
+            "{fence}: {:?}",
+            result.error
+        );
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            frontier,
+            "{fence}"
+        );
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+            OrchestrationV2RunStatus::Queued,
+            "{fence}"
+        );
+        assert_eq!(
+            after.runs[0].active_attempt_id, active.active_attempt_id,
+            "{fence}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn postcommit_crash_repairs_intent_patch_without_duplicate_delivery() {
     let f = Fixture::new();

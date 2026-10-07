@@ -1,4 +1,5 @@
-//! Queue-only effect adapters. No fallback dispatch, restart, or interruption.
+//! Queue-only effect adapters. Direct steering never falls back to dispatch.
+//! An admitted interrupt/restart promotion uses the shared control executor.
 use serde_json::json;
 use zeron_proto::orchestration::*;
 

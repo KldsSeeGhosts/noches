@@ -15454,6 +15454,11 @@ impl Shell {
             .update(cx, |composer, cx| composer.move_queued(from, to, cx));
     }
 
+    pub fn fixture_queue_restart(&self, id: String, cx: &mut Context<Self>) {
+        self.active_composer()
+            .update(cx, |composer, cx| composer.fixture_restart_queued(id, cx));
+    }
+
     pub fn fixture_orchestration_fork(&mut self, chat: String, cx: &mut Context<Self>) {
         self.fork_conversation(chat, None, cx);
     }

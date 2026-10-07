@@ -5,7 +5,8 @@
 //! synthetic intents. Every mutation is routed to its actual authority.
 //!
 //! Typed rows retain `Send now` and their host edit leases. Canonical work can
-//! steer a compatible active attempt; text edits preserve attachments/context
+//! steer a compatible active attempt or explicitly interrupt/restart it;
+//! text edits preserve attachments/context
 //! and retain the draft if another editor or automatic drain wins the race.
 
 use gpui::{
@@ -70,6 +71,7 @@ const QUEUE_ICON_SIZE: f32 = 13.0;
 enum QueuePrimaryAction {
     SendNow,
     Steer,
+    Restart,
 }
 
 impl QueuePrimaryAction {
@@ -77,7 +79,18 @@ impl QueuePrimaryAction {
         match self {
             Self::SendNow => "Send now (interrupt)",
             Self::Steer => "Steer active response",
+            Self::Restart => "Send now (interrupt and restart)",
         }
+    }
+}
+
+fn canonical_primary_action(queue: &zeron_proto::QueueUiState) -> Option<QueuePrimaryAction> {
+    use zeron_proto::QueuePromotionMode;
+    match queue.promotion_mode {
+        Some(QueuePromotionMode::ActiveSteering) => Some(QueuePrimaryAction::Steer),
+        Some(QueuePromotionMode::InterruptRestart) => Some(QueuePrimaryAction::Restart),
+        None if queue.can_promote_to_steer => Some(QueuePrimaryAction::Steer),
+        None => None,
     }
 }
 
@@ -540,13 +553,14 @@ impl Composer {
             }),
         );
         let resolved_primary = if canonical.is_some() {
-            (!interaction_blocked
-                && canonical_supported
-                && state
-                    .canonical_queues
-                    .get(chat_id)
-                    .is_some_and(|queue| queue.can_promote_to_steer))
-            .then_some(QueuePrimaryAction::Steer)
+            (!interaction_blocked && canonical_supported)
+                .then(|| {
+                    state
+                        .canonical_queues
+                        .get(chat_id)
+                        .and_then(canonical_primary_action)
+                })
+                .flatten()
         } else {
             available_queue_primary_action(interaction_blocked, host_supports_actions)
         };
@@ -1154,7 +1168,7 @@ impl Composer {
             } else {
                 div()
                     .child(match action {
-                        QueuePrimaryAction::SendNow => "Send now",
+                        QueuePrimaryAction::SendNow | QueuePrimaryAction::Restart => "Send now",
                         QueuePrimaryAction::Steer => "Steer",
                     })
                     .into_any_element()
@@ -1417,7 +1431,7 @@ impl Composer {
     ) {
         match action {
             QueuePrimaryAction::SendNow => self.send_queued_now(id, cx),
-            QueuePrimaryAction::Steer => {
+            QueuePrimaryAction::Steer | QueuePrimaryAction::Restart => {
                 let state = self.state.read(cx);
                 let Some(entry) = self.canonical_queue_entry(&id, state) else {
                     return;
@@ -1426,7 +1440,7 @@ impl Composer {
                     .target
                     .chat_id(state)
                     .and_then(|id| state.canonical_queues.get(id))
-                    .filter(|queue| queue.can_promote_to_steer)
+                    .filter(|queue| canonical_primary_action(queue) == Some(action))
                     .and_then(|queue| queue.active_run_id.clone())
                 else {
                     return;
@@ -1435,15 +1449,33 @@ impl Composer {
                 self.canonical_queue_action(
                     id,
                     run_id,
-                    zeron_proto::QueuedRunAction::PromoteToSteer { target_run_id },
+                    if action == QueuePrimaryAction::Restart {
+                        zeron_proto::QueuedRunAction::PromoteToRestart { target_run_id }
+                    } else {
+                        zeron_proto::QueuedRunAction::PromoteToSteer { target_run_id }
+                    },
                     cx,
                 );
             }
         }
     }
 
+    #[cfg(feature = "orchestration-fixture")]
+    pub(crate) fn fixture_restart_queued(&mut self, id: String, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        assert!(self.canonical_queue_entry(&id, state).is_some());
+        assert_eq!(
+            self.target
+                .chat_id(state)
+                .and_then(|chat| state.canonical_queues.get(chat))
+                .and_then(canonical_primary_action),
+            Some(QueuePrimaryAction::Restart),
+        );
+        self.activate_queued_primary(id, QueuePrimaryAction::Restart, cx);
+    }
+
     /// Cmd/Ctrl+Enter activates the most recent row's advertised action:
-    /// interrupt for typed intents, or exact-attempt steering for canonical work.
+    /// interrupt for typed intents, or the advertised exact-attempt promotion.
     /// Unsupported capabilities and edit/review gates remain a no-op.
     pub(crate) fn activate_latest_queued(&mut self, cx: &mut Context<Self>) {
         if self.editing_queued.is_some() {
@@ -1454,7 +1486,14 @@ impl Composer {
             && self.canonical_queue_entry(&row.id, state).is_some()
         {
             let id = row.id.clone();
-            self.activate_queued_primary(id, QueuePrimaryAction::Steer, cx);
+            let action = self
+                .target
+                .chat_id(state)
+                .and_then(|chat| state.canonical_queues.get(chat))
+                .and_then(canonical_primary_action);
+            if let Some(action) = action {
+                self.activate_queued_primary(id, action, cx);
+            }
             return;
         }
         let (id, delivery_blocked, host_supports_actions) = {
@@ -2229,9 +2268,9 @@ mod tests {
 
     use super::{
         PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
-        latest_queued_message, one_line, queue_action_needs_host, queue_drag_offsets,
-        queue_drop_index, queue_latest_shortcut_visible, queue_mutation_acknowledged,
-        queue_visible_text, visible_queue_rows,
+        canonical_primary_action, latest_queued_message, one_line, queue_action_needs_host,
+        queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible,
+        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
 
     #[test]
@@ -2388,6 +2427,35 @@ mod tests {
         );
         assert_eq!(available_queue_primary_action(true, true), None);
         assert_eq!(available_queue_primary_action(false, false), None);
+    }
+
+    #[test]
+    fn canonical_primary_action_names_interrupting_delivery_and_retains_old_host_fallback() {
+        use zeron_proto::{QueuePromotionMode, QueueUiState};
+        let mut queue = QueueUiState::default();
+        assert_eq!(canonical_primary_action(&queue), None);
+        queue.can_promote_to_steer = true;
+        assert_eq!(
+            canonical_primary_action(&queue),
+            Some(QueuePrimaryAction::Steer)
+        );
+        queue.promotion_mode = Some(QueuePromotionMode::InterruptRestart);
+        assert_eq!(
+            canonical_primary_action(&queue),
+            Some(QueuePrimaryAction::Restart)
+        );
+        assert_eq!(
+            QueuePrimaryAction::Restart.tooltip(),
+            "Send now (interrupt and restart)"
+        );
+        queue.can_promote_to_steer = false;
+        queue.promotion_mode = Some(QueuePromotionMode::ActiveSteering);
+        assert_eq!(
+            canonical_primary_action(&queue),
+            Some(QueuePrimaryAction::Steer)
+        );
+        queue.promotion_mode = None;
+        assert_eq!(canonical_primary_action(&queue), None);
     }
 
     #[test]

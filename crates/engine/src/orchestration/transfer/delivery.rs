@@ -132,7 +132,7 @@ pub fn native_fork_eligible(
 /// Native resume is authorized by the *selected* provider handle's accepted
 /// root, not the last session on the app chat. Retired process records can be
 /// recovered from the event log after restart without reviving a process.
-fn resumable_native(
+pub(super) fn resumable_native(
     kernel: &Kernel,
     projection: &ThreadProjection,
     run: &OrchestrationV2Run,
@@ -157,13 +157,34 @@ fn resumable_native(
             && (previous.id == run.id || super::forkable(&previous.status))
             && projection.attempts.iter().any(|attempt| {
                 attempt.run_id == previous.id
-                    && previous.active_attempt_id.as_ref() == Some(&attempt.id)
+                    && Some(&attempt.provider_thread_id) == previous.provider_thread_id.as_ref()
+                    && attempt.provider_instance_id == previous.provider_instance_id
+                    && (previous.active_attempt_id.as_ref() == Some(&attempt.id)
+                        // Restart preserves the native conversation's accepted
+                        // predecessor, not a fabricated turn on its new root.
+                        || (previous.id == run.id
+                            && attempt.status == OrchestrationV2RunAttemptStatus::Superseded
+                            && projection.attempts.iter().any(|current| {
+                                Some(&current.id) == run.active_attempt_id.as_ref()
+                                    && current.run_id == run.id
+                                    && Some(&current.root_node_id) == run.root_node_id.as_ref()
+                                    && current.reason
+                                        == OrchestrationV2RunAttemptReason::SteeringRestart
+                                    && current.attempt_ordinal == attempt.attempt_ordinal + 1
+                                    && current.provider_thread_id == attempt.provider_thread_id
+                                    && current.provider_instance_id == attempt.provider_instance_id
+                            })))
                     && attempt.native_thread_id.as_ref().map(String::as_str) == Some(native)
                     && super::super::task::records(projection, "provider-turn")
                         .iter()
                         .any(|turn| {
                             turn["runAttemptId"] == attempt.id.0
                                 && turn["nodeId"] == attempt.root_node_id.0
+                                && turn["providerThreadId"] == attempt.provider_thread_id.0
+                                && attempt
+                                    .provider_turn_id
+                                    .as_ref()
+                                    .is_some_and(|id| turn["id"] == id.0)
                         })
             })
     });
