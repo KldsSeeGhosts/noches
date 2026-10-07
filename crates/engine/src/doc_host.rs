@@ -6936,7 +6936,7 @@ mod steer_image_tests {
             "look\n\n{ATTACHMENT_PROMPT_HEADER}\n- {}\n- {}\n- {}\n- {}/missing.png\n- {}/../secret.png",
             owned.display(),
             outside.display(),
-            "/etc/passwd.png",
+            dir.path().join("elsewhere").join("passwd.png").display(),
             uploads.dir().display(),
             uploads.dir().display(),
         );
