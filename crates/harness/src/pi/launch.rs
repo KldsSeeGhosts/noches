@@ -493,6 +493,179 @@ pub(crate) fn parse_compact_command(text: &str) -> Option<Option<String>> {
     Some((!instructions.is_empty()).then(|| instructions.to_owned()))
 }
 
+/// Pi's terminal-only built-in commands. RPC mode does not run them: `prompt`
+/// would hand the text to the model, so Noches refuses what it cannot map.
+const TERMINAL_COMMANDS: &[&str] = &[
+    "settings", "model", "tree", "thinking", "scoped-models", "export", "import", "share", "bug",
+    "copy", "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login",
+    "logout", "new", "resume", "reload", "quit",
+];
+
+/// Commands the old pi-acp adapter offered that map to a single Pi RPC call.
+pub(crate) const MAPPED_COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("name", "Set the session display name", Some("New name")),
+    ("session", "Show session info and token stats", None),
+    ("autocompact", "Turn automatic compaction on or off", Some("on | off")),
+    ("steering", "How steering messages are delivered", Some("all | one-at-a-time")),
+    ("follow-up", "How follow-up messages are delivered", Some("all | one-at-a-time")),
+    ("export", "Export the session as an HTML file", Some("Optional output path")),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Builtin {
+    Name(String),
+    Session,
+    /// `None` reports the current setting.
+    AutoCompact(Option<bool>),
+    Steering(Option<String>),
+    FollowUp(Option<String>),
+    Export(Option<String>),
+}
+
+fn queue_mode(argument: &str) -> Option<String> {
+    matches!(argument, "all" | "one-at-a-time").then(|| argument.to_owned())
+}
+
+/// Classify a prompt that starts with `/`. `Ok(None)` goes to Pi as it is
+/// (ordinary text, a path, or a command Pi itself listed: skills, prompt
+/// templates, extension commands); `Err` is a refusal shown to the user.
+pub(crate) fn parse_builtin(
+    text: &str,
+    pi_commands: &std::collections::HashSet<String>,
+) -> Result<Option<Builtin>, String> {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (name, argument) = match rest.split_once(char::is_whitespace) {
+        Some((name, argument)) => (name, argument.trim()),
+        None => (rest, ""),
+    };
+    if name.is_empty() || name.contains('/') || pi_commands.contains(name) || name == "compact" {
+        return Ok(None);
+    }
+    let usage = |hint: &str| Err(format!("Usage: /{name} {hint}"));
+    let argument_opt = (!argument.is_empty()).then(|| argument.to_owned());
+    match name {
+        "name" => match argument_opt {
+            Some(argument) => Ok(Some(Builtin::Name(argument))),
+            None => usage("<new session name>"),
+        },
+        "session" => Ok(Some(Builtin::Session)),
+        "autocompact" => match argument {
+            "" => Ok(Some(Builtin::AutoCompact(None))),
+            "on" => Ok(Some(Builtin::AutoCompact(Some(true)))),
+            "off" => Ok(Some(Builtin::AutoCompact(Some(false)))),
+            _ => usage("on | off"),
+        },
+        "steering" | "follow-up" => {
+            let mode = match argument {
+                "" => None,
+                other => match queue_mode(other) {
+                    Some(mode) => Some(mode),
+                    None => return usage("all | one-at-a-time"),
+                },
+            };
+            Ok(Some(if name == "steering" {
+                Builtin::Steering(mode)
+            } else {
+                Builtin::FollowUp(mode)
+            }))
+        }
+        "export" => Ok(Some(Builtin::Export(argument_opt))),
+        _ if TERMINAL_COMMANDS.contains(&name) => Err(format!(
+            "/{name} is a Pi terminal command that is not available in Noches chats. \
+             Available here: /compact, /name, /session, /autocompact, /steering, /follow-up, \
+             /export."
+        )),
+        _ => Ok(None),
+    }
+}
+
+impl Builtin {
+    /// The RPC command that carries it out.
+    pub(crate) fn record(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Self::Name(name) => json!({"type": "set_session_name", "name": name}),
+            Self::Session => json!({"type": "get_session_stats"}),
+            Self::AutoCompact(Some(enabled)) => {
+                json!({"type": "set_auto_compaction", "enabled": enabled})
+            }
+            Self::Steering(Some(mode)) => json!({"type": "set_steering_mode", "mode": mode}),
+            Self::FollowUp(Some(mode)) => json!({"type": "set_follow_up_mode", "mode": mode}),
+            Self::AutoCompact(None) | Self::Steering(None) | Self::FollowUp(None) => {
+                json!({"type": "get_state"})
+            }
+            Self::Export(Some(path)) => json!({"type": "export_html", "outputPath": path}),
+            Self::Export(None) => json!({"type": "export_html"}),
+        }
+    }
+
+    /// What the user sees once Pi has answered.
+    pub(crate) fn render(&self, data: &serde_json::Value) -> String {
+        let text = |pointer: &str| data.pointer(pointer).and_then(serde_json::Value::as_str);
+        let number = |pointer: &str| data.pointer(pointer).and_then(serde_json::Value::as_u64);
+        match self {
+            Self::Name(name) => format!("Session renamed to \"{name}\"."),
+            Self::Session => {
+                let mut lines = vec![format!("Session {}", text("/sessionId").unwrap_or("?"))];
+                lines.push(format!(
+                    "{} messages: {} from you, {} from Pi, {} tool calls",
+                    number("/totalMessages").unwrap_or(0),
+                    number("/userMessages").unwrap_or(0),
+                    number("/assistantMessages").unwrap_or(0),
+                    number("/toolCalls").unwrap_or(0),
+                ));
+                lines.push(format!(
+                    "Tokens: {} in, {} out, {} cached, {} total",
+                    number("/tokens/input").unwrap_or(0),
+                    number("/tokens/output").unwrap_or(0),
+                    number("/tokens/cacheRead").unwrap_or(0),
+                    number("/tokens/total").unwrap_or(0),
+                ));
+                if let Some(cost) = data.get("cost").and_then(serde_json::Value::as_f64) {
+                    lines.push(format!("Cost: ${cost:.4}"));
+                }
+                if let Some(tokens) = number("/contextUsage/tokens") {
+                    let window = number("/contextUsage/contextWindow");
+                    lines.push(match window {
+                        Some(window) => format!("Context: {tokens} of {window} tokens"),
+                        None => format!("Context: {tokens} tokens"),
+                    });
+                }
+                lines.join("\n")
+            }
+            Self::AutoCompact(Some(enabled)) => format!(
+                "Automatic compaction is {}.",
+                if *enabled { "on" } else { "off" }
+            ),
+            Self::AutoCompact(None) => format!(
+                "Automatic compaction is {}. Use /autocompact on or /autocompact off.",
+                match data.get("autoCompactionEnabled").and_then(serde_json::Value::as_bool) {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unknown",
+                }
+            ),
+            Self::Steering(Some(mode)) => format!("Steering messages are delivered {mode}."),
+            Self::FollowUp(Some(mode)) => format!("Follow-up messages are delivered {mode}."),
+            Self::Steering(None) => format!(
+                "Steering messages are delivered {}. Use /steering all or /steering one-at-a-time.",
+                text("/steeringMode").unwrap_or("unknown")
+            ),
+            Self::FollowUp(None) => format!(
+                "Follow-up messages are delivered {}. Use /follow-up all or /follow-up one-at-a-time.",
+                text("/followUpMode").unwrap_or("unknown")
+            ),
+            Self::Export(_) => match text("/path") {
+                Some(path) => format!("Exported the session to {path}."),
+                None => "Exported the session.".into(),
+            },
+        }
+    }
+}
+
 /// Hoist `$skill` references to Pi's native leading `/skill:name` position,
 /// preserving the rest of the prompt. Only skills Pi reported are rewritten.
 pub(crate) fn expand_skill_references(
@@ -701,6 +874,58 @@ mod tests {
         assert_eq!(resolve_resume(Some("deadbeef"), &roots, None), Resume::Missing);
         // Ids that are not hex cannot walk the store.
         assert_eq!(find_session_file(&roots, "../../etc"), None);
+    }
+
+    #[test]
+    fn builtins_map_to_rpc_and_unmapped_terminal_commands_are_refused() {
+        let none = std::collections::HashSet::new();
+        let parsed = |text: &str| parse_builtin(text, &none);
+        assert_eq!(parsed("/name  My chat "), Ok(Some(Builtin::Name("My chat".into()))));
+        assert_eq!(parsed("/session"), Ok(Some(Builtin::Session)));
+        assert_eq!(parsed("/autocompact off"), Ok(Some(Builtin::AutoCompact(Some(false)))));
+        assert_eq!(parsed("/steering"), Ok(Some(Builtin::Steering(None))));
+        assert_eq!(
+            parsed("/follow-up one-at-a-time"),
+            Ok(Some(Builtin::FollowUp(Some("one-at-a-time".into()))))
+        );
+        assert_eq!(parsed("/export /tmp/x.html"), Ok(Some(Builtin::Export(Some("/tmp/x.html".into())))));
+        assert!(parsed("/name").unwrap_err().starts_with("Usage: /name"));
+        assert!(parsed("/steering sideways").unwrap_err().contains("one-at-a-time"));
+        assert!(parsed("/autocompact maybe").is_err());
+        // Terminal commands Pi RPC cannot run would otherwise reach the model.
+        for name in ["model", "settings", "login", "tree", "changelog", "new", "quit"] {
+            let error = parsed(&format!("/{name}")).unwrap_err();
+            assert!(error.contains("not available in Noches"), "{name}: {error}");
+        }
+        // Everything else goes to Pi unchanged: text, paths, unknown commands,
+        // `/compact` (its own path) and anything Pi itself listed.
+        for text in ["hello", "/path/to/file explain", "/unknown thing", "/compact", "/"] {
+            assert_eq!(parsed(text), Ok(None), "{text}");
+        }
+        let listed = std::collections::HashSet::from(["share".to_owned(), "name".to_owned()]);
+        assert_eq!(parse_builtin("/share now", &listed), Ok(None));
+        assert_eq!(parse_builtin("/name x", &listed), Ok(None));
+    }
+
+    #[test]
+    fn builtin_results_read_as_plain_lines() {
+        use serde_json::json;
+        assert_eq!(
+            Builtin::Steering(None).render(&json!({"steeringMode": "all"})),
+            "Steering messages are delivered all. Use /steering all or /steering one-at-a-time."
+        );
+        assert_eq!(
+            Builtin::Export(None).render(&json!({"path": "/tmp/s.html"})),
+            "Exported the session to /tmp/s.html."
+        );
+        let stats = Builtin::Session.render(&json!({
+            "sessionId": "abc", "totalMessages": 4, "userMessages": 2, "assistantMessages": 2,
+            "toolCalls": 1, "tokens": {"input": 10, "output": 5, "cacheRead": 1, "total": 16},
+            "cost": 0.5, "contextUsage": {"tokens": 100, "contextWindow": 1000}
+        }));
+        assert!(stats.contains("Session abc") && stats.contains("Context: 100 of 1000 tokens"), "{stats}");
+        assert_eq!(Builtin::AutoCompact(Some(true)).record()["enabled"], true);
+        assert_eq!(Builtin::Export(Some("p".into())).record()["outputPath"], "p");
     }
 
     #[test]

@@ -970,6 +970,73 @@ async fn compact_cannot_interrupt_a_running_turn_and_runs_as_an_idle_steer() {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal commands pi-acp used to offer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mapped_terminal_commands_run_as_rpc_calls_never_as_prompts() {
+    let env = Env::new();
+    let named = collect(&env, "/name My refactor").await;
+    assert_eq!(text(&named), "Session renamed to \"My refactor\".");
+    assert_eq!(env.commands("set_session_name")[0]["name"], "My refactor");
+    assert!(named.iter().any(|e| matches!(e, AgentEvent::InputAccepted)));
+    assert_eq!(done(&named).0, &DoneStatus::Completed);
+
+    let steering = collect(&env, "/steering one-at-a-time").await;
+    assert_eq!(text(&steering), "Steering messages are delivered one-at-a-time.");
+    assert_eq!(env.commands("set_steering_mode")[0]["mode"], "one-at-a-time");
+    assert!(text(&collect(&env, "/follow-up all").await).contains("delivered all"));
+    assert_eq!(env.commands("set_follow_up_mode")[0]["mode"], "all");
+    assert_eq!(
+        text(&collect(&env, "/autocompact off").await),
+        "Automatic compaction is off."
+    );
+    assert_eq!(env.commands("set_auto_compaction")[0]["enabled"], false);
+    // Without an argument they report Pi's current setting.
+    assert!(text(&collect(&env, "/steering").await).starts_with("Steering messages are delivered all."));
+    let stats = text(&collect(&env, "/session").await);
+    assert!(stats.contains("Session ") && stats.contains("Tokens: 11259 in"), "{stats}");
+    let exported = text(&collect(&env, "/export out.html").await);
+    assert_eq!(exported, "Exported the session to out.html.");
+    assert_eq!(env.commands("export_html")[0]["outputPath"], "out.html");
+    assert!(env.commands("prompt").is_empty(), "no mapped command reaches the model");
+}
+
+#[tokio::test]
+async fn unmapped_terminal_commands_are_refused_but_ordinary_slash_text_is_sent() {
+    let env = Env::new();
+    for command in ["/model cpa/x", "/login", "/changelog", "/name"] {
+        let events = collect(&env, command).await;
+        let (status, error, _) = done(&events);
+        assert_eq!(*status, DoneStatus::Errored, "{command}");
+        assert!(error.is_some_and(|e| e.contains("/")), "{command}");
+    }
+    assert!(env.commands("prompt").is_empty(), "nothing was sent to the model");
+    // Paths, unknown names and Pi's own commands are plain prompts.
+    for text_in in ["/tmp/file.rs what is this", "/unknown thing"] {
+        let events = collect(&env, text_in).await;
+        assert_eq!(done(&events).0, &DoneStatus::Completed);
+        assert_eq!(text(&events), format!("reply:{text_in}\n\n"));
+    }
+    assert_eq!(env.commands("prompt").len(), 2);
+
+    // Mid-turn they are refused without disturbing the running turn.
+    let env = Env::new();
+    let (controls, handles) = default_controls();
+    let mut stream = start(&env.harness(), request(&env, "slow"), controls).await;
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::ToolCall { .. }) {
+            break;
+        }
+    }
+    let receipt = steer(&handles, "/name later", "m-name", true).await.unwrap();
+    assert!(!receipt.await.unwrap());
+    assert!(env.commands("set_session_name").is_empty());
+    handles.interrupt.cancel();
+    until_done(&mut stream, 1).await;
+}
+
+// ---------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------
 

@@ -113,6 +113,9 @@ state = {
     "model": args.get("model") or default_model(),
     "thinking": args.get("thinking") or "medium",
     "name": None,
+    "steering": "all",
+    "follow_up": "one-at-a-time",
+    "auto_compaction": True,
 }
 entries = []  # session tree, append order
 header = None
@@ -431,8 +434,9 @@ def handle(cmd):
         respond(cid, kind, data={
             "model": model_state(), "thinkingLevel": state["thinking"],
             "isStreaming": run is not None, "isCompacting": False,
-            "steeringMode": "all", "followUpMode": "one-at-a-time",
-            "sessionFile": session_file, "sessionId": header["id"], "autoCompactionEnabled": True,
+            "steeringMode": state["steering"], "followUpMode": state["follow_up"],
+            "sessionFile": session_file, "sessionId": header["id"],
+            "autoCompactionEnabled": state["auto_compaction"],
             "messageCount": len(entries), "pendingMessageCount": len(steer_queue)})
     elif kind == "get_commands":
         respond(cid, kind, data={"commands": [
@@ -460,6 +464,17 @@ def handle(cmd):
         state["name"] = cmd["name"]
         emit({"type": "session_info_changed", "name": cmd["name"]})
         respond(cid, kind)
+    elif kind == "set_auto_compaction":
+        state["auto_compaction"] = bool(cmd["enabled"])
+        respond(cid, kind)
+    elif kind == "set_steering_mode":
+        state["steering"] = cmd["mode"]
+        respond(cid, kind)
+    elif kind == "set_follow_up_mode":
+        state["follow_up"] = cmd["mode"]
+        respond(cid, kind)
+    elif kind == "export_html":
+        respond(cid, kind, data={"path": cmd.get("outputPath") or os.path.join(SESSIONS, "export.html")})
     elif kind == "get_entries":
         since = cmd.get("since")
         if since is None and os.environ.get("FAKE_PI_NO_FULL_ENTRIES"):

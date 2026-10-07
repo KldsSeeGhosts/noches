@@ -151,14 +151,21 @@ impl Extensions {
 // Slash commands
 // ---------------------------------------------------------------------------
 
-/// `get_commands` entries as composer commands, behind the TUI built-in that
-/// Pi's RPC `get_commands` omits but this driver maps to the `compact` RPC.
+/// `get_commands` entries as composer commands, behind the TUI built-ins that
+/// Pi's RPC `get_commands` omits but this driver maps to RPC calls.
 pub(super) fn commands_from(data: &Value) -> Vec<SlashCommand> {
     let mut commands = vec![SlashCommand {
         name: "compact".into(),
         description: "Summarize the conversation and reduce context usage".into(),
         input_hint: Some("Optional instructions".into()),
     }];
+    commands.extend(launch::MAPPED_COMMANDS.iter().map(|(name, description, hint)| {
+        SlashCommand {
+            name: (*name).into(),
+            description: (*description).into(),
+            input_hint: hint.map(str::to_owned),
+        }
+    }));
     for entry in data
         .get("commands")
         .and_then(Value::as_array)
@@ -168,7 +175,7 @@ pub(super) fn commands_from(data: &Value) -> Vec<SlashCommand> {
         let Some(name) = entry
             .get("name")
             .and_then(Value::as_str)
-            .filter(|n| !n.is_empty() && *n != "compact")
+            .filter(|n| !n.is_empty() && !commands.iter().any(|c| c.name == *n))
         else {
             continue;
         };
@@ -183,6 +190,17 @@ pub(super) fn commands_from(data: &Value) -> Vec<SlashCommand> {
         });
     }
     commands
+}
+
+/// Every command name Pi itself reported (skills, templates, extensions).
+fn command_names(data: &Value) -> HashSet<String> {
+    data.get("commands")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn skill_names(data: &Value) -> HashSet<String> {
@@ -368,6 +386,11 @@ enum Tag {
     Steer(Ticket),
     /// A manual compaction (root `/compact` or an idle steer).
     Compact { ticket: Option<Ticket> },
+    /// A Pi terminal command mapped to one RPC call (`/name`, `/session`, ...).
+    Builtin {
+        command: launch::Builtin,
+        ticket: Option<Ticket>,
+    },
     /// `abort`: answered once Pi is idle.
     Abort,
     /// Responses nobody needs (`clear_queue`).
@@ -390,6 +413,7 @@ struct Started {
     model: String,
     window: Option<u64>,
     skills: HashSet<String>,
+    pi_commands: HashSet<String>,
     commands: Vec<SlashCommand>,
     leaf: Option<String>,
     leaf_trusted: bool,
@@ -418,6 +442,8 @@ pub(super) struct Runner {
     model: String,
     window: Option<u64>,
     skills: HashSet<String>,
+    /// Command names Pi reported; they reach Pi as typed.
+    pi_commands: HashSet<String>,
     assistant_message_id: String,
     leaf_cursor: Option<String>,
     leaf_trusted: bool,
@@ -514,6 +540,7 @@ impl Runner {
             model: String::new(),
             window: None,
             skills: HashSet::new(),
+            pi_commands: HashSet::new(),
             assistant_message_id: new_message_id(),
             leaf_cursor: None,
             leaf_trusted: false,
@@ -759,6 +786,7 @@ impl Runner {
                 .unwrap_or_else(|| catalog::DEFAULT_MODEL.into()),
             window: model.as_ref().and_then(catalog::context_window),
             skills: skill_names(&commands),
+            pi_commands: command_names(&commands),
             commands: commands_from(&commands),
             leaf: match &baseline {
                 Leaf::Entry(id) => Some(id.clone()),
@@ -783,6 +811,7 @@ impl Runner {
             }
         }
         self.skills = started.skills;
+        self.pi_commands = started.pi_commands;
         self.leaf_cursor = started.leaf;
         self.leaf_trusted = started.leaf_trusted;
         started.commands
@@ -812,9 +841,19 @@ impl Runner {
 
     async fn send_root(&mut self, prompt: &str, attachments: &[String]) -> bool {
         self.turn_open = true;
+        let builtin = match launch::parse_builtin(prompt, &self.pi_commands) {
+            Ok(builtin) => builtin,
+            Err(refusal) => {
+                self.fail_turn(refusal).await;
+                return false;
+            }
+        };
         let sent = if let Some(instructions) = launch::parse_compact_command(prompt) {
             self.manual_compact = true;
             self.fire(compact_record(instructions), Tag::Compact { ticket: None })
+        } else if let Some(command) = builtin {
+            let record = command.record();
+            self.fire(record, Tag::Builtin { command, ticket: None })
         } else {
             let (message, images) = self.payload(prompt, attachments).await;
             self.expect_root_user = true;
@@ -871,6 +910,37 @@ impl Runner {
                 },
             );
             return Flow::Continue;
+        }
+        match launch::parse_builtin(&prompt, &self.pi_commands) {
+            Ok(None) => {}
+            Ok(Some(command)) => {
+                if self.turn_open {
+                    ticket.reject();
+                    return self
+                        .emit_flow(AgentEvent::Error {
+                            message: "Pi terminal commands run between turns; send it again when \
+                                      the turn has finished."
+                                .into(),
+                        })
+                        .await;
+                }
+                self.turn_open = true;
+                let record = command.record();
+                let _ = self.fire(
+                    record,
+                    Tag::Builtin {
+                        command,
+                        ticket: Some(ticket),
+                    },
+                );
+                return Flow::Continue;
+            }
+            Err(refusal) => {
+                ticket.reject();
+                return self
+                    .emit_flow(AgentEvent::Error { message: refusal })
+                    .await;
+            }
         }
         // `streamingBehavior: steer` is atomic on Pi's side: it queues during
         // a run and starts a new run if the turn settled first. A bare `steer`
@@ -1149,28 +1219,8 @@ impl Runner {
                     }
                     return self.fail_turn(error).await;
                 }
-                match ticket {
-                    Some(ticket) => {
-                        let (prev, next) = rotate(&mut self.assistant_message_id);
-                        let message_id = ticket.message_id.clone();
-                        ticket.accept();
-                        for event in [
-                            AgentEvent::Steered {
-                                assistant_message_id: Some(prev),
-                                next_assistant_message_id: Some(next),
-                            },
-                            crate::input_accepted_event(message_id),
-                        ] {
-                            if !self.emit(event).await {
-                                return Flow::Stop;
-                            }
-                        }
-                    }
-                    None => {
-                        if !self.emit(AgentEvent::InputAccepted).await {
-                            return Flow::Stop;
-                        }
-                    }
+                if !self.accept_local_input(ticket).await {
+                    return Flow::Stop;
                 }
                 if !self
                     .emit(AgentEvent::TextDelta {
@@ -1182,6 +1232,22 @@ impl Runner {
                 }
                 self.finish_turn().await
             }
+            Tag::Builtin { command, ticket } => {
+                // The message is consumed either way; a failure is the reply.
+                if !self.accept_local_input(ticket).await {
+                    return Flow::Stop;
+                }
+                let text = if ok {
+                    command.render(&data)
+                } else {
+                    self.turn_error = Some(error.clone());
+                    error
+                };
+                if !self.emit(AgentEvent::TextDelta { text }).await {
+                    return Flow::Stop;
+                }
+                self.finish_turn().await
+            }
             Tag::Abort => {
                 if !ok {
                     tracing::debug!(target: "zeron_harness::pi", "abort rejected: {error}");
@@ -1189,6 +1255,32 @@ impl Runner {
                 Flow::Continue
             }
             Tag::Ignore => Flow::Continue,
+        }
+    }
+
+    /// Acknowledge an input Pi answered without starting an agent run (a
+    /// compaction or a mapped terminal command): the root prompt is accepted,
+    /// a steer is accepted at a fresh assistant-message boundary.
+    async fn accept_local_input(&mut self, ticket: Option<Ticket>) -> bool {
+        match ticket {
+            Some(ticket) => {
+                let (prev, next) = rotate(&mut self.assistant_message_id);
+                let message_id = ticket.message_id.clone();
+                ticket.accept();
+                for event in [
+                    AgentEvent::Steered {
+                        assistant_message_id: Some(prev),
+                        next_assistant_message_id: Some(next),
+                    },
+                    crate::input_accepted_event(message_id),
+                ] {
+                    if !self.emit(event).await {
+                        return false;
+                    }
+                }
+                true
+            }
+            None => self.emit(AgentEvent::InputAccepted).await,
         }
     }
 
@@ -1695,10 +1787,17 @@ mod tests {
         ]});
         let commands = commands_from(&data);
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["compact", "skill:review", "cc-theme"]);
+        assert_eq!(
+            names,
+            [
+                "compact", "name", "session", "autocompact", "steering", "follow-up", "export",
+                "skill:review", "cc-theme"
+            ]
+        );
         assert_eq!(commands[0].input_hint.as_deref(), Some("Optional instructions"));
         assert_eq!(skill_names(&data), HashSet::from(["review".to_owned()]));
-        assert_eq!(commands_from(&Value::Null).len(), 1);
+        assert!(command_names(&data).contains("skill:review"));
+        assert_eq!(commands_from(&Value::Null).len(), 1 + launch::MAPPED_COMMANDS.len());
     }
 
     #[test]
