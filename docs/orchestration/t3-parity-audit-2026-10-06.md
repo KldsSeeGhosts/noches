@@ -66,8 +66,11 @@ continuity regression is:
 A / native-a → B / native-b + full A context → A / native-a + missed B delta
 ```
 
-The last step is allowed only with accepted native coverage and compatible
-model/options/checkout. Otherwise A gets a fresh generation and full portable
+The last step is allowed only with accepted native coverage, the same checkout
+and a selection change the driver applies on the next turn
+(`task::selection_transition`, a port of T3 `ProviderSelectionTransition`:
+Claude, Codex, Cursor and OpenCode carry model/effort per turn; ACP agents only
+options; Antigravity and unknown drivers hand off). Otherwise A gets a fresh generation and full portable
 context. A queued message must retain its original logical run identity while
 all execution bindings move together; preparing another queued run's history
 is not an acceptable substitute.
@@ -110,8 +113,8 @@ is not an acceptable substitute.
   retains the queued message and metadata, and pins the old physical process
   plus its committed replacement attempt. Other rows remain queued.
   The new root has no provider turn until real acceptance. Native resume requires
-  the exact accepted immediate predecessor and unchanged provider/model/options/
-  checkout. Host-owned document images are transported, not merely displayed.
+  the exact accepted immediate predecessor, the same instance and checkout,
+  and a turn-scoped selection change. Host-owned document images are transported, not merely displayed.
   Document draining respects a canonical Starting run even while its old
   physical runtime is retiring; another queued input cannot be taken and
   presented as sent during that gap.
