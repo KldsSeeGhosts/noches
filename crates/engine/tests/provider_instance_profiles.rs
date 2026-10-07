@@ -282,6 +282,25 @@ async fn legacy_harness_toggle_only_changes_the_canonical_instance() {
         None,
     )
     .unwrap();
+    // Startup discovery applies this host's account state last; let it finish,
+    // then sign the fixture in so the toggle is the only constraint under test.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !core
+            .registry
+            .provider_instances
+            .snapshot(&core.registry)
+            .iter()
+            .any(|p| p.harness_id == Some(HarnessId::Codex) && p.model_count > 0)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup provider discovery");
+    core.registry.provider_instances.set_authentication(
+        HarnessId::Codex,
+        zeron_engine::provider_instances::Authentication::Authenticated,
+    );
     let client = zeron_rpc::memory_client(core.rpc_service());
     let input: WriteProviderInstance = serde_json::from_value(json!({
         "instanceId":"proxy","instance":{"driver":"codex","config":{"binaryPath":fixture()}}
