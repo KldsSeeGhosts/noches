@@ -629,6 +629,33 @@ async fn lost_response_retry_materializes_exactly_one_fork_and_preserves_config_
 }
 
 #[tokio::test]
+async fn replaying_a_refused_transfer_returns_the_same_refusal_not_a_transport_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, client, _) = setup(root.path()).await;
+    let first = send(&core, "source", "goal").await;
+    core.orchestration_host.as_ref().unwrap().shutdown().await;
+    let params = MergeThreadBackParams {
+        chat_id: "source".into(),
+        command_id: "refused-merge".into(),
+        target_chat_id: "source".into(),
+        source_point: ThreadSourcePoint::Run { run_id: first.id.0 },
+    };
+    let refused = client
+        .merge_thread_back(params.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(refused.refusal.as_deref().unwrap().contains("not a fork"));
+    // A lost response is retried with the same identity.
+    let replayed = client
+        .merge_thread_back(params, &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(replayed.refusal, refused.refusal);
+    assert!(replayed.chat.is_none());
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn desktop_transfer_refuses_foreign_owner_identity_collision_and_non_parent_merge() {
     let root = tempfile::tempdir().unwrap();
     let (core, client, _) = setup(root.path()).await;

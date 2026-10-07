@@ -215,7 +215,21 @@ pub(crate) async fn rpc(
                 super::event::encode_component(&chat),
                 super::event::encode_component(&key)
             ));
-            let replay = store.receipt(&command).map_err(error)?.is_some();
+            let prior = store.receipt(&command).map_err(error)?;
+            // A stored refusal replays as the same refusal, never as a transport
+            // failure that would pin the client's retry forever.
+            if let Some(prior) = prior
+                .as_ref()
+                .filter(|r| r.status != super::ReceiptStatus::Accepted)
+            {
+                return RpcReply::value(&zeron_proto::transfer::ThreadTransferResult {
+                    target_chat_id: target,
+                    sequence: prior.result_sequence,
+                    refusal: Some(prior.error.clone().unwrap_or_else(|| "Transfer refused.".into())),
+                    chat: None,
+                });
+            }
+            let replay = prior.is_some();
             if !merging
                 && !replay
                 && workspace
@@ -238,8 +252,7 @@ pub(crate) async fn rpc(
                     })
             {
                 return Err(RpcError::Failed(
-                    "This request identity already belongs to a different or rejected transfer."
-                        .into(),
+                    "This request identity already belongs to a different transfer.".into(),
                 ));
             }
             let receipt = service

@@ -1642,6 +1642,9 @@ impl RpcService for EngineRpc {
                 | methods::ACKNOWLEDGE_THREAD_WOKE
                 | methods::MUTATE_QUEUED_RUN
                 | methods::DISCONNECT_THREAD_SESSION
+                | methods::FORK_THREAD
+                | methods::MERGE_THREAD_BACK
+                | methods::GET_THREAD_TRANSFER_STATE
         ) && params.get("targetDeviceId").is_none()
             && let Some(chat) = params["chatId"]
                 .as_str()
