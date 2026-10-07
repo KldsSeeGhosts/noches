@@ -279,6 +279,9 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// chat_id → fence serializing run registration against a retired-runtime
+    /// settlement, so that commit never holds the global `runs` map.
+    run_fences: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -348,6 +351,7 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                run_fences: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -1318,6 +1322,8 @@ impl SessionsEngine {
             .transpose()?
             .flatten();
 
+        let fence = self.run_fence(chat_id);
+        let registering = lock(&fence);
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
@@ -1338,6 +1344,7 @@ impl SessionsEngine {
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
+        drop(registering);
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -1492,11 +1499,20 @@ impl SessionsEngine {
         chat_id: &str,
         settle: impl FnOnce() -> T,
     ) -> Option<T> {
-        let runs = lock(&self.inner.runs);
-        if runs.contains_key(chat_id) {
+        // Only this chat's run registration waits on the settlement commit.
+        let fence = self.run_fence(chat_id);
+        let _settling = lock(&fence);
+        if lock(&self.inner.runs).contains_key(chat_id) {
             return None;
         }
         Some(settle())
+    }
+
+    fn run_fence(&self, chat_id: &str) -> Arc<Mutex<()>> {
+        lock(&self.inner.run_fences)
+            .entry(chat_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Interrupt the live run, if any. The run settles with a synthetic
@@ -4403,6 +4419,52 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.await.unwrap(), CanonicalSteerOutcome::Accepted);
         core.sessions.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_runtime_settlement_fences_only_its_own_chat() {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: Arc::new(Mutex::new(None)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let sessions = core.sessions.clone();
+        let settling = std::thread::spawn(move || {
+            sessions.with_retired_runtime("settling", || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The settlement transaction no longer holds the global run map.
+        core.sessions
+            .dispatch("other", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        assert!(core.sessions.has_live_runtime("other"));
+        // A replacement for the settling chat still cannot register meanwhile.
+        let sessions = core.sessions.clone();
+        let replacement = tokio::spawn(async move {
+            sessions
+                .dispatch("settling", HarnessId::Mock, request(), None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!core.sessions.has_live_runtime("settling"));
+        release_tx.send(()).unwrap();
+        assert!(settling.join().unwrap().is_some());
+        replacement.await.unwrap().unwrap();
+        assert!(core.sessions.has_live_runtime("settling"));
+        core.shutdown().await;
     }
 
     #[tokio::test]
