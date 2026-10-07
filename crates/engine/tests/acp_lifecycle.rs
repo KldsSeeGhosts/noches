@@ -32,6 +32,19 @@ async fn quiet_acp_prompt_stays_working_until_response() {
         .join("../harness/tests/fixtures/acp-lifecycle.py");
     registry.register(Arc::new(AcpHarness::pi().with_executable(fixture)));
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
+    // The fixture stands in for a signed-in Pi. An explicit instance keeps the
+    // run independent of this host's Pi login and of account discovery.
+    core.registry
+        .provider_instances
+        .configure(vec![
+            serde_json::from_value(serde_json::json!({
+                "providerInstanceId": "pi", "driverKind": "pi", "harnessId": "pi",
+                "displayName": "Pi", "enabled": true, "installed": true,
+                "authentication": "authenticated", "adapterRegistered": true
+            }))
+            .unwrap(),
+        ])
+        .unwrap();
     let chat = "acp-quiet-regression";
     let handle = core.doc_host.open(chat).unwrap();
     let doc = handle.doc();
