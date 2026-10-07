@@ -18,21 +18,27 @@ use serde_json::Value;
 /// `agent_settled`, `streamingBehavior`, `fork`/`switch_session`).
 pub(crate) const MINIMUM_VERSION: (u64, u64, u64) = (0, 80, 5);
 
+/// The version `pi --version` printed: the last word of the last non-empty
+/// line, so a banner or shim line printed before it cannot be mistaken for it.
 pub(crate) fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
-    text.split_whitespace().find_map(|word| {
-        let mut parts = word.trim_start_matches('v').split('.');
-        let version = (
-            parts.next()?.parse().ok()?,
-            parts.next()?.parse().ok()?,
-            parts
-                .next()?
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()?,
-        );
-        Some(version)
-    })
+    let word = text
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())?
+        .split_whitespace()
+        .next_back()?;
+    let mut parts = word.trim_start_matches('v').split('.');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?,
+    ))
 }
 
 pub(crate) fn version_error(found: Option<(u64, u64, u64)>) -> Option<String> {
@@ -734,6 +740,8 @@ mod tests {
         assert_eq!(parse_version("pi v0.80.5\n"), Some((0, 80, 5)));
         assert_eq!(parse_version("1.2.3-beta.1"), Some((1, 2, 3)));
         assert_eq!(parse_version("no version"), None);
+        // A banner or shim line before the version is not the version.
+        assert_eq!(parse_version("node v20.1.0\npi 1.0.4\n\n"), Some((1, 0, 4)));
         assert!(version_error(Some((1, 0, 0))).is_none());
         assert!(version_error(Some((0, 80, 5))).is_none());
         assert!(version_error(Some((0, 79, 9))).unwrap().contains("pi update self"));

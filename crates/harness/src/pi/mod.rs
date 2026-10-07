@@ -81,8 +81,9 @@ pub struct PiHarness {
     /// from each run's model.
     windows: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     discovery: tokio::sync::Mutex<Option<(Instant, Discovery)>>,
-    /// Versions that already passed the minimum-version gate, by executable.
-    verified: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Versions that already passed the minimum-version gate, by executable
+    /// and its modification time (an in-place downgrade is checked again).
+    verified: Mutex<std::collections::HashSet<(PathBuf, Option<std::time::SystemTime>)>>,
 }
 
 impl Default for PiHarness {
@@ -154,11 +155,15 @@ impl PiHarness {
     /// Refuse a Pi too old for this driver, once per executable. A probe that
     /// cannot run is not a verdict: the real launch reports its own failure.
     async fn check_version(&self, exe: &Path) -> Result<(), HarnessError> {
+        let stamp = (
+            exe.to_path_buf(),
+            std::fs::metadata(exe).and_then(|meta| meta.modified()).ok(),
+        );
         if self
             .verified
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(exe)
+            .contains(&stamp)
         {
             return Ok(());
         }
@@ -168,15 +173,17 @@ impl PiHarness {
         command
             .arg("--version")
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let Ok(Ok(output)) = tokio::time::timeout(VERSION_PROBE_TIMEOUT, command.output()).await
         else {
             return Ok(());
         };
-        // Older Pi printed the version on stderr; both are scanned.
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        match launch::parse_version(&text) {
+        // Older Pi printed the version on stderr; stdout wins when both do.
+        let found = launch::parse_version(&String::from_utf8_lossy(&output.stdout))
+            .or_else(|| launch::parse_version(&String::from_utf8_lossy(&output.stderr)));
+        match found {
             Some(version) => {
                 if let Some(error) = launch::version_error(Some(version)) {
                     return Err(HarnessError::Protocol(error));
@@ -192,7 +199,7 @@ impl PiHarness {
         self.verified
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(exe.to_path_buf());
+            .insert(stamp);
         Ok(())
     }
 

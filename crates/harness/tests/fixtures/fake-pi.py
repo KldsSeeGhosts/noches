@@ -47,7 +47,13 @@ def emit(record):
 
 argv = sys.argv[1:]
 if "--version" in argv or "-v" in argv:
-    print(VERSION)
+    version = VERSION
+    if os.environ.get("FAKE_PI_VERSION_FILE"):
+        version = open(os.environ["FAKE_PI_VERSION_FILE"]).read().strip()
+    if os.environ.get("FAKE_PI_VERSION_BANNER"):
+        print("node v20.1.0 shim")  # a wrapper's banner before the version
+    # Older Pi printed the version on stderr only.
+    print(version, file=sys.stderr if os.environ.get("FAKE_PI_VERSION_STDERR") else sys.stdout)
     sys.exit(0)
 
 args = {"extensions": []}

@@ -66,6 +66,9 @@ impl Env {
         self.path("sessions")
     }
     fn harness(&self) -> PiHarness {
+        self.harness_for(fixture_path())
+    }
+    fn harness_for(&self, executable: PathBuf) -> PiHarness {
         let mut environment = BTreeMap::from([
             ("FAKE_PI_LOG".to_owned(), self.path("log.jsonl").display().to_string()),
             ("FAKE_PI_SESSIONS".to_owned(), self.sessions().display().to_string()),
@@ -74,7 +77,7 @@ impl Env {
         ]);
         environment.extend(self.extra.clone());
         PiHarness::new()
-            .with_executable(fixture_path())
+            .with_executable(executable)
             .with_graces(Duration::from_millis(200), Duration::from_millis(500))
             .with_instance_launch(InstanceLaunch::new(environment, self.args.clone()))
     }
@@ -475,6 +478,40 @@ async fn unsupported_launch_args_and_old_versions_fail_before_a_prompt() {
     let error = old.harness().run(request(&old, "hello"), controls).await.err().unwrap();
     assert!(error.to_string().contains("too old") && error.to_string().contains("0.80.5"), "{error}");
     assert!(old.commands("prompt").is_empty());
+}
+
+#[tokio::test]
+async fn the_version_gate_reads_the_last_line_of_either_stream_and_rechecks_a_replaced_binary() {
+    // A banner before the version and a version printed only on stderr.
+    let env = Env::new()
+        .with("FAKE_PI_VERSION_BANNER", "1")
+        .with("FAKE_PI_VERSION_STDERR", "1");
+    assert_eq!(done(&collect(&env, "hello").await).0, &DoneStatus::Completed);
+
+    // The verdict is cached per executable *file*: replacing it in place with
+    // an older Pi is caught on the next run of the same harness.
+    let env = Env::new();
+    let exe = env.path("pi");
+    let version = env.path("version");
+    let env = env.with("FAKE_PI_VERSION_FILE", &version.display().to_string());
+    std::fs::copy(fixture_path(), &exe).unwrap();
+    std::fs::write(&version, "1.0.4\n").unwrap();
+    let harness = env.harness_for(exe.clone());
+    let (controls, _h) = default_controls();
+    let mut stream = start(&harness, request(&env, "one"), controls).await;
+    until_done(&mut stream, 1).await;
+    std::fs::write(&version, "0.70.1\n").unwrap();
+    // Same file: the cached verdict stands.
+    let (controls, _h) = default_controls();
+    let mut stream = start(&harness, request(&env, "two"), controls).await;
+    until_done(&mut stream, 1).await;
+    // A replaced file (new mtime) is probed again.
+    std::thread::sleep(Duration::from_millis(1100));
+    let contents = std::fs::read(&exe).unwrap();
+    std::fs::write(&exe, contents).unwrap();
+    let (controls, _h) = default_controls();
+    let error = harness.run(request(&env, "three"), controls).await.err().unwrap();
+    assert!(error.to_string().contains("too old"), "{error}");
 }
 
 #[tokio::test]
