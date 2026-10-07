@@ -281,6 +281,9 @@ pub enum TaskOperation {
         event: AgentEvent,
         capabilities: Option<Box<OrchestrationV2ProviderCapabilities>>,
     },
+    ControlSettlement {
+        effect_id: String,
+    },
     Reconcile,
     Delivery(super::mailbox::DeliveryCommand),
     /// The runner only advances queued notification work when no active turn
@@ -333,6 +336,7 @@ impl TaskOperation {
             Self::WakePolicy { .. } => "delegated_task.wake-policy",
             Self::Cancel { .. } => "run.interrupt",
             Self::RunnerEvent { .. } => "kernel.runner.event",
+            Self::ControlSettlement { .. } => "kernel.control.settlement",
             Self::Reconcile => "delegated_task.reconcile",
             Self::Delivery(_) => "notification.delivery",
             Self::DrainQueue => "notification.queue.drain",
@@ -523,7 +527,13 @@ pub(crate) fn execution_seed(
     let run = format!("run:{}:{ordinal}", encode_component(&thread.id.0));
     let attempt = format!("run-attempt:{}:1", encode_component(&run));
     let root = format!("node:{}:1", encode_component(&run));
-    let provider = format!("provider-thread:app:{}", encode_component(&thread.id.0));
+    // Provider handles are backing conversations, not the app conversation.
+    // A fresh generation must never overwrite another instance's native refs.
+    let provider = format!(
+        "provider-thread:app:{}:{}:{ordinal}",
+        encode_component(&thread.id.0),
+        encode_component(&thread.provider_instance_id.0)
+    );
     let time = iso(now)?;
     Ok(ExecutionSeed {
         run: serde_json::from_value(json!({
@@ -546,10 +556,97 @@ pub(crate) fn execution_seed(
         provider_thread: serde_json::from_value(json!({
             "id":provider,"driver":driver,"providerInstanceId":thread.provider_instance_id,
             "providerSessionId":null,"appThreadId":thread.id,"ownerNodeId":root,"nativeThreadRef":null,
-            "nativeConversationHeadRef":null,"status":"not_loaded","firstRunOrdinal":1,"lastRunOrdinal":ordinal,
+            "nativeConversationHeadRef":null,"status":"not_loaded","firstRunOrdinal":ordinal,"lastRunOrdinal":ordinal,
             "handoffIds":[],"forkedFrom":null,"pendingBackgroundTasks":[],"createdAt":time,"updatedAt":time
         }))?,
     })
+}
+
+/// How a same-instance model/options change reaches the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionTransition {
+    /// The new selection rides the next turn on the existing native session.
+    ApplyOnNextTurn,
+    /// Start a new provider-thread generation seeded with portable context.
+    CreateWithHandoff,
+}
+
+/// Port of T3 `ProviderSelectionTransition.ts`. Session capabilities are all
+/// advertised false (`assembly::capabilities`), so the driver is the capability
+/// source. Drivers not listed (including test mocks) hand off, the conservative choice.
+pub(crate) fn selection_transition(
+    driver: &str,
+    current: &ModelSelection,
+    target: &ModelSelection,
+) -> SelectionTransition {
+    if current == target {
+        return SelectionTransition::ApplyOnNextTurn;
+    }
+    match driver {
+        // Resume spawns/turns carry `--model`/`--effort`, `turn/start`
+        // model+effort, per-run shim model options, per-prompt model.
+        "claudeAgent" | "codex" | "cursor" | "opencode" => {
+            SelectionTransition::ApplyOnNextTurn
+        }
+        // ACP agents expose no negotiated in-session model switch (T3 rejects it),
+        // so only option changes ride along. Antigravity folds effort into the
+        // model id, so any change there is a model change and hands off.
+        "grok" | "devin" | "hermes" | "pi" if current.model == target.model => {
+            SelectionTransition::ApplyOnNextTurn
+        }
+        _ => SelectionTransition::CreateWithHandoff,
+    }
+}
+
+/// Keep the provider's native identity, context usage, fork provenance and
+/// handoff coverage across turns. Old single-handle records are reusable only
+/// when their recorded instance/driver actually agrees with the selected run.
+/// Turn-scoped model/options changes keep the generation; others get a new one
+/// and portable reconstruction (see `selection_transition`).
+pub(crate) fn execution_seed_for(
+    projection: &ThreadProjection,
+    thread: &OrchestrationV2AppThread,
+    ordinal: i64,
+    message_id: &str,
+    status: &str,
+    driver: &str,
+    now: i64,
+) -> Result<ExecutionSeed> {
+    let mut seed = execution_seed(thread, ordinal, message_id, status, driver, now)?;
+    let previous = projection
+        .runs
+        .iter()
+        .rev()
+        .filter(|run| {
+            run.ordinal < ordinal
+                && run.provider_instance_id == thread.provider_instance_id
+                && run.status != OrchestrationV2RunStatus::RolledBack
+        })
+        .find_map(|run| {
+            let id = run.provider_thread_id.as_ref()?;
+            let provider = records(projection, "provider-thread").iter().find(|p| {
+                p["id"] == id.0
+                    && p["providerInstanceId"] == thread.provider_instance_id.0
+                    && p["driver"] == driver
+                    && !matches!(p["status"].as_str(), Some("closed" | "archived" | "error"))
+            })?;
+            Some((run, provider))
+        });
+    if let Some((run, provider)) = previous
+        && selection_transition(driver, &run.model_selection, &thread.model_selection)
+            == SelectionTransition::ApplyOnNextTurn
+    {
+        seed.provider_thread = serde_json::from_value(provider.clone())?;
+        seed.run.provider_thread_id = Some(seed.provider_thread.id.clone());
+        seed.attempt.provider_thread_id = seed.provider_thread.id.clone();
+        seed.root.provider_thread_id = Some(seed.provider_thread.id.clone());
+        if status != "queued" {
+            seed.provider_thread.owner_node_id = Some(seed.root.id.clone());
+            seed.provider_thread.last_run_ordinal = Some(ordinal);
+            seed.provider_thread.updated_at = iso(now)?;
+        }
+    }
+    Ok(seed)
 }
 
 pub(crate) fn emit_execution(
@@ -889,6 +986,16 @@ pub(crate) fn plan(
             ));
             super::mailbox::remove_member(&projection, task_id, command, &mut plan, now)?;
         }
+        TaskOperation::ControlSettlement { effect_id } => {
+            super::controls::plan_settlement(
+                conn,
+                &projection,
+                command,
+                &mut plan,
+                effect_id,
+                now,
+            )?;
+        }
         TaskOperation::RunnerEvent {
             run_id,
             attempt_id,
@@ -964,7 +1071,8 @@ pub(crate) fn plan(
                 .max()
                 .unwrap_or(0)
                 + 1;
-            let mut seed = execution_seed(
+            let seed = execution_seed_for(
+                &projection,
                 &projection.thread,
                 ordinal,
                 &message_id.0,
@@ -972,17 +1080,6 @@ pub(crate) fn plan(
                 &driver.0,
                 now,
             )?;
-            if matches!(operation, TaskOperation::ExternalMessage { .. })
-                && let Some(previous) = records(&projection, "provider-thread").iter().find(|p| {
-                    p["id"] == seed.provider_thread.id.0
-                        && p["providerInstanceId"] == seed.run.provider_instance_id.0
-                })
-            {
-                seed.provider_thread.provider_session_id =
-                    serde_json::from_value(previous["providerSessionId"].clone())?;
-                seed.provider_thread.native_thread_ref =
-                    serde_json::from_value(previous["nativeThreadRef"].clone())?;
-            }
             emit_execution(&mut plan, command, &command.thread_id, &seed, now)?;
             if matches!(operation, TaskOperation::ExternalMessage { .. }) {
                 plan.routed_effects.clear();

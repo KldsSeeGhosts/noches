@@ -11,6 +11,69 @@ use crate::orchestration::queue_service::QueueService;
 
 const NOW: i64 = 1_800_000_000_000;
 
+#[tokio::test]
+async fn disconnect_fences_cover_reattachment_attempt_and_generation() {
+    use crate::orchestration::effects::EffectRequest;
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    p.records.remove("provider-session");
+    let provider = run.provider_thread_id.clone().unwrap();
+    let session = format!(
+        "provider-session:{}",
+        crate::orchestration::event::encode_component(&run.id.0)
+    );
+    let request = EffectRequest::ProviderSessionDisconnect {
+        provider_session_id: session.clone().into(),
+        run_id: run.id.clone(),
+        run_attempt_id: run.active_attempt_id.clone().unwrap(),
+        provider_thread_id: provider.clone(),
+    };
+    assert!(super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.records
+        .insert("provider-session".into(), vec![json!({"id":session})]);
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.records.remove("provider-session");
+    let index = p
+        .runs
+        .iter()
+        .position(|candidate| candidate.id == run.id)
+        .unwrap();
+    p.runs[index].active_attempt_id = Some("replacement-attempt".into());
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.runs[index].active_attempt_id = run.active_attempt_id;
+    let mut replacement = p.runs[index].clone();
+    replacement.id = "replacement-run".into();
+    p.runs.push(replacement);
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.runs.pop();
+    let row = p
+        .records
+        .get_mut("provider-thread")
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["id"] == provider.0)
+        .unwrap();
+    row["id"] = json!("replacement-provider-generation");
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     service: QueueDomain,
@@ -176,6 +239,20 @@ impl Fixture {
                         assistant_message_id: "assistant".into(),
                     },
                     capabilities: Some(Box::new(serde_json::from_value(capabilities).unwrap())),
+                },
+            )
+            .await
+            .unwrap();
+        self.service
+            .kernel
+            .task_command(
+                &thread,
+                CommandId("input-accepted".into()),
+                super::super::task::TaskOperation::RunnerEvent {
+                    run_id: run.id.clone(),
+                    attempt_id: run.active_attempt_id.clone().unwrap(),
+                    event: zeron_proto::AgentEvent::InputAccepted,
+                    capabilities: None,
                 },
             )
             .await
@@ -610,6 +687,143 @@ async fn nonresumable_question_is_readable_but_cannot_be_answered() {
 }
 
 #[tokio::test]
+async fn pre_attachment_runtime_requests_do_not_brick_observation_or_invent_authority() {
+    use crate::orchestration::task::TaskOperation;
+    use zeron_proto::{AgentEvent, DoneStatus, HarnessId, PermissionRequest, UserInputQuestion};
+
+    for approval in [false, true] {
+        for attach in [false, true] {
+            let f = Fixture::new();
+            let thread = &f.caller.thread_id;
+            let p = f.service.kernel.store.thread(thread).unwrap().unwrap();
+            let run = &p.runs[0];
+            let capabilities: Value = serde_json::from_str::<Value>(include_str!(
+                "../../../../proto/tests/t3_oracle/fixtures/serde-cases.json"
+            ))
+            .unwrap()["OrchestrationV2ProviderCapabilities"][0]
+                .clone();
+            let mut permission = PermissionRequest::standard("Exec", "cargo test", true);
+            permission.id = "early".into();
+            let incoming = if approval {
+                AgentEvent::PermissionRequested {
+                    request: permission,
+                }
+            } else {
+                AgentEvent::InputRequested {
+                    request_id: "early".into(),
+                    questions: vec![UserInputQuestion {
+                        id: "q".into(),
+                        header: "Question".into(),
+                        question: "Proceed?".into(),
+                        options: vec!["yes".into()],
+                        multi_select: false,
+                    }],
+                }
+            };
+            for (index, event) in [
+                Some(incoming),
+                attach.then(|| AgentEvent::SessionStarted {
+                    instance_id: None,
+                    session_id: "real-native".into(),
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/fixture".into(),
+                    assistant_message_id: "assistant".into(),
+                }),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some(event) = event else { continue };
+                f.service
+                    .kernel
+                    .task_command(
+                        thread,
+                        CommandId(format!("early-event:{index}")),
+                        TaskOperation::RunnerEvent {
+                            run_id: run.id.clone(),
+                            attempt_id: run.active_attempt_id.clone().unwrap(),
+                            event,
+                            capabilities: Some(Box::new(
+                                serde_json::from_value(capabilities.clone()).unwrap(),
+                            )),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let current = f.service.kernel.store.thread(thread).unwrap().unwrap();
+                let request = &current.records["runtime-request"][0];
+                if index == 0 {
+                    assert_eq!(current.runs[0].status, OrchestrationV2RunStatus::Waiting);
+                    assert_eq!(
+                        request["responseCapability"]["type"], "not_resumable",
+                        "a callback with no native binding cannot manufacture live authority"
+                    );
+                    assert!(current.records["provider-session"].is_empty());
+                } else if index == 1 {
+                    assert_eq!(current.runs[0].status, OrchestrationV2RunStatus::Waiting);
+                    assert_eq!(request["responseCapability"]["type"], "live");
+                    assert_eq!(
+                        request["responseCapability"]["providerSessionId"],
+                        current.records["provider-session"][0]["id"]
+                    );
+                } else {
+                    assert_eq!(
+                        current.runs[0].status,
+                        OrchestrationV2RunStatus::Interrupted
+                    );
+                    assert_eq!(request["status"], "expired");
+                }
+                assert!(
+                    current.records["provider-turn"].is_empty(),
+                    "a callback, attachment or interruption is not root-input acceptance"
+                );
+                assert!(current.attempts[0].provider_turn_id.is_none());
+            }
+            // A stale late attachment cannot make an expired request live.
+            let receipt = f
+                .service
+                .kernel
+                .task_command(
+                    thread,
+                    CommandId("late-attachment".into()),
+                    TaskOperation::RunnerEvent {
+                        run_id: run.id.clone(),
+                        attempt_id: run.active_attempt_id.clone().unwrap(),
+                        event: AgentEvent::SessionStarted {
+                            instance_id: None,
+                            session_id: "stale-native".into(),
+                            harness: HarnessId::Mock,
+                            model: "mock-1".into(),
+                            tools: vec![],
+                            cwd: "/fixture".into(),
+                            assistant_message_id: "late-assistant".into(),
+                        },
+                        capabilities: Some(Box::new(
+                            serde_json::from_value(capabilities.clone()).unwrap(),
+                        )),
+                    },
+                )
+                .await;
+            receipt.unwrap();
+            let current = f.service.kernel.store.thread(thread).unwrap().unwrap();
+            assert_eq!(current.records["runtime-request"][0]["status"], "expired");
+            assert_eq!(
+                current.runs[0].status,
+                OrchestrationV2RunStatus::Interrupted
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn live_question_dispatch_and_runtime_projection_preserve_capability() {
     let f = Fixture::new();
     let p = f
@@ -848,6 +1062,14 @@ async fn loro_queue_has_one_drainer_and_cancelled_intents_do_not_resurrect() {
 async fn successful_promotion_preserves_attachments_and_only_enqueues_steering() {
     let f = Fixture::new();
     let active = f.start_target().await;
+    assert!(super::can_promote_to_steer(
+        &f.service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap()
+    ));
     let queued = f.sync("steering").await;
     let mut intents = f
         .service
@@ -1021,6 +1243,316 @@ async fn successful_promotion_preserves_attachments_and_only_enqueues_steering()
         })
         .unwrap();
     assert_eq!(paths, vec!["/fixture/promoted.png"]);
+}
+
+fn set_promotion_capabilities(f: &Fixture, active: bool, interrupt: bool, restart: bool) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut session = task::records(&p, "provider-session")[0].clone();
+    session["capabilities"]["turns"]["supportsActiveSteering"] = json!(active);
+    session["capabilities"]["turns"]["supportsInterrupt"] = json!(interrupt);
+    session["capabilities"]["turns"]["supportsSteeringByInterruptRestart"] = json!(restart);
+    f.seed("target", "provider-session.attached", session);
+}
+
+#[tokio::test]
+async fn queued_promotion_restarts_one_logical_run_with_original_message_and_exact_control_target()
+{
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    use zeron_proto::QueuePromotionMode;
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_promotion_capabilities(&f, false, true, true);
+    let queued = f.sync("restart direction").await;
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let hint = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"target".into())
+        .unwrap();
+    assert_eq!(
+        hint.promotion_mode,
+        Some(QueuePromotionMode::InterruptRestart)
+    );
+    assert!(
+        !hint.can_promote_to_steer,
+        "older UIs must not call an interrupting action Steer"
+    );
+    let mut message = task::records(&before, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    message["attachments"] = json!([{"type":"file","id":"upload","name":"notes.txt","mimeType":"text/plain","sizeBytes":12}]);
+    message["context"] = json!({"version":1,"records":[{"version":1,"contextId":"attached",
+        "label":"Context","kind":"thread","environmentId":"host","threadId":"parent","title":"Parent"}]});
+    message["scheduledTaskId"] = json!("schedule");
+    message["senderThreadId"] = json!("parent");
+    f.seed("target", "message.updated", message.clone());
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,"expectedExecution":"interrupt_restart"});
+    let id: CommandId = "promote-restart-once".into();
+    let first = f
+        .service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input.clone(),
+            id.clone(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.runs.len(),
+        before.runs.len(),
+        "promotion must not create another logical run"
+    );
+    let restarted = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(restarted.status, OrchestrationV2RunStatus::Starting);
+    assert_eq!(restarted.user_message_id.0, "queue-one");
+    assert_ne!(restarted.active_attempt_id, active.active_attempt_id);
+    let new_attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == restarted.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(
+        new_attempt.reason,
+        OrchestrationV2RunAttemptReason::SteeringRestart
+    );
+    assert_eq!(new_attempt.status, OrchestrationV2RunAttemptStatus::Pending);
+    assert_eq!(new_attempt.attempt_ordinal, 2);
+    assert_eq!(
+        after
+            .attempts
+            .iter()
+            .find(|a| Some(&a.id) == active.active_attempt_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2RunAttemptStatus::Superseded
+    );
+    assert_eq!(
+        after
+            .nodes
+            .iter()
+            .find(|n| Some(&n.id) == active.root_node_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2ExecutionNodeStatus::Interrupted
+    );
+    assert_eq!(
+        after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+        OrchestrationV2RunStatus::Cancelled
+    );
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    let promoted = task::records(&after, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap();
+    assert_eq!(promoted["runId"], active.id.0);
+    assert_eq!(promoted["nodeId"], json!(restarted.root_node_id));
+    for field in [
+        "text",
+        "attachments",
+        "context",
+        "createdBy",
+        "creationSource",
+        "scheduledTaskId",
+        "senderThreadId",
+    ] {
+        assert_eq!(promoted[field], message[field], "{field}");
+    }
+    let item = task::records(&after, "turn-item")
+        .iter()
+        .find(|i| i["messageId"] == "queue-one")
+        .unwrap();
+    assert_eq!(item["inputIntent"], "promoted_queued_to_steer");
+    assert_eq!(item["nodeId"], json!(restarted.root_node_id));
+    assert!(
+        item["providerTurnId"].is_null(),
+        "the new attempt has not accepted input"
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects.iter().find(|e| e.command_id == id).unwrap();
+    assert!(
+        matches!(&effect.request, EffectRequest::ProviderTurnRestart { interrupted_attempt_id, run_id, .. }
+        if Some(interrupted_attempt_id) == active.active_attempt_id.as_ref() && run_id == &active.id)
+    );
+    assert!(!effects.iter().any(
+        |e| e.command_id == id && matches!(e.request, EffectRequest::ProviderTurnSteer { .. })
+    ));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(
+        saved["runtime"]["attempt_id"],
+        json!(active.active_attempt_id)
+    );
+    assert_eq!(
+        saved["replacement_attempt_id"],
+        json!(restarted.active_attempt_id)
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let replay = f
+        .service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input,
+            id,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn restart_promotion_refuses_stale_modes_capabilities_bindings_and_maintenance_atomically() {
+    for fence in [
+        "steer-click",
+        "no-interrupt",
+        "no-restart",
+        "completed",
+        "turn-root",
+        "provider-ordinal",
+        "provider-instance",
+        "selection",
+        "maintenance",
+    ] {
+        let f = Fixture::new();
+        let active = f.start_target().await;
+        set_promotion_capabilities(&f, false, fence != "no-interrupt", fence != "no-restart");
+        let queued = f
+            .sync(if fence == "maintenance" {
+                "/compact"
+            } else {
+                "queued direction"
+            })
+            .await;
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        match fence {
+            "completed" => {
+                let mut run = json!(p.runs[0]);
+                run["status"] = json!("completed");
+                f.seed("target", "run.updated", run);
+            }
+            "turn-root" => {
+                let mut turn = task::records(&p, "provider-turn")[0].clone();
+                turn["nodeId"] = json!("different-root");
+                f.seed("target", "provider-turn.updated", turn);
+            }
+            "provider-ordinal" | "provider-instance" => {
+                let mut provider = task::records(&p, "provider-thread")[0].clone();
+                if fence == "provider-ordinal" {
+                    provider["lastRunOrdinal"] = json!(999);
+                } else {
+                    provider["providerInstanceId"] = json!("different-instance");
+                }
+                f.seed("target", "provider-thread.updated", provider);
+            }
+            "selection" => {
+                let mut thread = json!(p.thread);
+                thread["modelSelection"]["model"] = json!("changed-model");
+                f.seed("target", "thread.model-selection-updated", thread);
+            }
+            _ => {}
+        }
+        let frontier = f.service.kernel.store.projection_frontier().unwrap();
+        let result = f.service.mutate(None, "target".into(), "t3_queue_promote_to_steer",
+            json!({"queuedRunId":queued,"targetRunId":active.id,
+                "expectedExecution":if fence == "steer-click" {"active_steering"} else {"interrupt_restart"}}),
+            format!("refused-{fence}").into(), NOW).await.unwrap();
+        assert_eq!(
+            result.status,
+            ReceiptStatus::Rejected,
+            "{fence}: {:?}",
+            result.error
+        );
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            frontier,
+            "{fence}"
+        );
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+            OrchestrationV2RunStatus::Queued,
+            "{fence}"
+        );
+        assert_eq!(
+            after.runs[0].active_attempt_id, active.active_attempt_id,
+            "{fence}"
+        );
+    }
 }
 
 #[tokio::test]

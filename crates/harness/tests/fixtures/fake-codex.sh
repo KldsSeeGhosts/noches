@@ -76,10 +76,17 @@ if has "$line" '"method":"thread/fork"'; then
   exec sleep 30
 fi
 if has "$line" '"method":"thread/resume"'; then
-  if has "$line" '"threadId":"resume-with-child-v1"'; then
-    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-alpha\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-alpha\"]}]}]}}}"
-  elif has "$line" '"threadId":"resume-with-child-v2"'; then
-    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"subAgentActivity\",\"id\":\"spawn-alpha\",\"kind\":\"started\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"},{\"type\":\"subAgentActivity\",\"id\":\"subagent-completed-old\",\"kind\":\"completed\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}]}]}}}"
+  resumed_root=th-resumed
+  if [ -n "$NOCHES_TEST_CODEX_CHILD_PROTOCOL" ]; then
+    # Engine persistence fixtures resume the root returned by thread/start,
+    # rather than replacing its accepted native identity with a magic handle.
+    has "$line" '"threadId":"th-1"' || exit 1
+    resumed_root=th-1
+  fi
+  if has "$line" '"threadId":"resume-with-child-v1"' || [ "$NOCHES_TEST_CODEX_CHILD_PROTOCOL" = "v1" ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$resumed_root\",\"turns\":[{\"items\":[{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-alpha\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-alpha\"]}]}]}}}"
+  elif has "$line" '"threadId":"resume-with-child-v2"' || [ "$NOCHES_TEST_CODEX_CHILD_PROTOCOL" = "v2" ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$resumed_root\",\"turns\":[{\"items\":[{\"type\":\"subAgentActivity\",\"id\":\"spawn-alpha\",\"kind\":\"started\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"},{\"type\":\"subAgentActivity\",\"id\":\"subagent-completed-old\",\"kind\":\"completed\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}]}]}}}"
   elif has "$line" '"threadId":"resume-fail"'; then
     # Missing/foreign rollout: reject, expect the fresh-start fallback.
     emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32600,\"message\":\"rollout not found\"}}"
@@ -100,6 +107,10 @@ read -r turnline || exit 1
 tid=$(rid "$turnline")
 
 case "$turnline" in
+
+*scenario:turn-start-rejected*)
+  emit "{\"id\":$tid,\"error\":{\"code\":-32600,\"message\":\"turn/start rejected before input acceptance\"}}"
+  ;;
 
 *scenario:instance*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-instance\"}}}"
@@ -244,6 +255,14 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
   ;;
 
+# The app-server dies while handling turn/steer: transport loss, not a rejection.
+*scenario:steer-exit*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  exit 1
+  ;;
+
 # NOTE: steer-race before steer — `case` takes the first matching glob.
 *scenario:steer-race*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
@@ -348,10 +367,10 @@ case "$turnline" in
 *scenario:resumed-child*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
   emit '{"method":"turn/started","params":{"threadId":"child-alpha","turn":{"id":"alpha-resumed"}}}'
-  emit '{"method":"item/completed","params":{"threadId":"th-resumed","item":{"type":"subAgentActivity","id":"resumed-interaction","kind":"interacted","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}'
+  emit "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"$resumed_root\",\"item\":{\"type\":\"subAgentActivity\",\"id\":\"resumed-interaction\",\"kind\":\"interacted\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}}}"
   emit '{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"agentMessage","id":"resumed-answer","text":"resumed alpha"}}}'
   emit '{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-resumed","status":"completed"}}}'
-  emit '{"method":"turn/completed","params":{"threadId":"th-resumed","turn":{"id":"t-2","status":"completed"}}}'
+  emit "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"$resumed_root\",\"turn\":{\"id\":\"t-2\",\"status\":\"completed\"}}}"
   ;;
 
 *scenario:resumed*)

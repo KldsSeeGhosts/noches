@@ -357,6 +357,9 @@ impl Harness for OpencodeHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::TurnBoundary
     }
+    fn confirms_steered_inputs(&self) -> bool {
+        true
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         REASONING_LEVELS
     }
@@ -1387,17 +1390,20 @@ enum BusMsg {
     /// re-syncs from `GET /session/status`.
     Connected,
     Event(Value),
-    /// A detached prompt POST was accepted (any HTTP status): the session
+    /// A detached prompt POST succeeded: the session
     /// status surface now reflects this turn, so a polled idle can settle
     /// it. Until this arrives, an idle/absent poll answers for the
     /// pre-prompt state and must not end the turn.
-    PromptAck,
+    PromptAck(uuid::Uuid),
     /// The stream is gone past the reconnect budget (or the reader saw the
     /// consumer close).
     Disconnected,
     /// A detached prompt/command POST failed on the wire. The bus owns turn
     /// completion, so the loop settles the turn from here.
-    CommandFailed(String),
+    CommandFailed {
+        submission_id: uuid::Uuid,
+        message: String,
+    },
 }
 
 /// Per-part streaming state (dedup between full-part snapshots and deltas).
@@ -1437,6 +1443,12 @@ struct PendingSpawn {
 }
 
 struct TurnState {
+    /// The app input associated with this exact prompt POST, if it came from
+    /// the mailbox. Retained across the detached HTTP response's lifetime.
+    message_id: Option<String>,
+    /// Detached HTTP results belong only to this exact submitted input. A
+    /// blocking command can acknowledge after its SSE turn already settled.
+    submission_id: uuid::Uuid,
     /// A prompt is in flight (busy expected/observed; idle settles it).
     active: bool,
     /// An idle belongs to this prompt only after its busy/retry transition,
@@ -1468,6 +1480,8 @@ struct TurnState {
 impl TurnState {
     fn begin(stall: Option<Duration>) -> Self {
         Self {
+            message_id: None,
+            submission_id: uuid::Uuid::new_v4(),
             active: true,
             idle_ready: false,
             idle_confirmations: 0,
@@ -1483,9 +1497,42 @@ impl TurnState {
         }
     }
 
+    fn accept_submission(&mut self, submission_id: uuid::Uuid) -> bool {
+        if !self.active || self.submission_id != submission_id || !self.post_pending {
+            return false;
+        }
+        self.post_pending = false;
+        true
+    }
+
     fn note_activity(&mut self) {
         self.saw_activity = true;
         self.stall_deadline = None;
+    }
+}
+
+/// Submissions whose blocking POST (a slash command runs for the whole turn)
+/// had not returned when their turn settled or was replaced. A late ack must
+/// still produce the receipt, or the engine redispatches an executed input.
+#[derive(Default)]
+struct UnackedSubmissions(VecDeque<(uuid::Uuid, String)>);
+
+impl UnackedSubmissions {
+    const CAP: usize = 64;
+
+    fn track(&mut self, turn: &TurnState) {
+        let Some(message_id) = turn.message_id.clone().filter(|_| turn.post_pending) else {
+            return;
+        };
+        if self.0.len() == Self::CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back((turn.submission_id, message_id));
+    }
+
+    fn take(&mut self, submission_id: uuid::Uuid) -> Option<String> {
+        let at = self.0.iter().position(|(id, _)| *id == submission_id)?;
+        self.0.remove(at).map(|(_, message_id)| message_id)
     }
 }
 
@@ -1690,6 +1737,7 @@ async fn run_session(session: Session) {
         );
     }
     let stall = stall_bound();
+    let mut turn = TurnState::begin(stall);
     if let Err(e) = post_prompt(
         &server,
         &bus_tx,
@@ -1698,6 +1746,7 @@ async fn run_session(session: Session) {
         &commands,
         &request.prompt,
         TurnSpec {
+            submission_id: turn.submission_id,
             model: model.as_ref(),
             variant: variant.as_deref(),
             attachments: &request.attachments,
@@ -1726,7 +1775,6 @@ async fn run_session(session: Session) {
         server.shutdown(kill_grace).await;
         return;
     }
-    let mut turn = TurnState::begin(stall);
 
     // ---- main loop --------------------------------------------------------
     let mut main_feed = SessionFeed::default();
@@ -1734,7 +1782,8 @@ async fn run_session(session: Session) {
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    let mut queued_steers: VecDeque<crate::SteerMessage> = VecDeque::new();
+    let mut unacked = UnackedSubmissions::default();
     let mut steering_open = true;
     let mut interrupt_requested = false;
     let mut pending_usage: Option<AgentEvent> = None;
@@ -1755,6 +1804,18 @@ async fn run_session(session: Session) {
                 continue $label;
             }
             turn.active = false;
+            // Session activity after the prompt proves the server accepted it
+            // even though a blocking command POST is still open.
+            if turn.post_pending
+                && turn.saw_activity
+                && !interrupt_requested
+                && let Some(message_id) = turn.message_id.clone()
+            {
+                turn.post_pending = false;
+                if !send(&event_tx, crate::input_accepted_event(Some(message_id))).await {
+                    break $label;
+                }
+            }
             if let Some(usage) = pending_usage.take()
                 && !interrupt_requested
                 && !send(&event_tx, usage).await
@@ -1780,14 +1841,17 @@ async fn run_session(session: Session) {
                 }).await {
                     break $label;
                 }
+                let mut next_turn = TurnState::begin(stall);
+                next_turn.message_id = steer.message_id;
                 match post_prompt(
                     &server,
                     &bus_tx,
                     &session_id,
                     dir,
                     &commands,
-                    &steer,
+                    &steer.prompt,
                     TurnSpec {
+                        submission_id: next_turn.submission_id,
                         model: model.as_ref(),
                         variant: variant.as_deref(),
                         attachments: &[],
@@ -1796,7 +1860,8 @@ async fn run_session(session: Session) {
                 .await
                 {
                     Ok(()) => {
-                        turn = TurnState::begin(stall);
+                        unacked.track(&turn);
+                        turn = next_turn;
                         continue $label;
                     }
                     Err(e) => {
@@ -1892,7 +1957,7 @@ async fn run_session(session: Session) {
                 match steer {
                     Some(steer) => {
                         if turn.active {
-                            queued_steers.push_back(steer.prompt);
+                            queued_steers.push_back(steer);
                         } else {
                             // Between turns (shouldn't happen — the engine
                             // steers live runs — but deliver, don't drop).
@@ -1901,6 +1966,8 @@ async fn run_session(session: Session) {
                                 assistant_message_id: Some(prev),
                                 next_assistant_message_id: Some(next),
                             }).await;
+                            let mut next_turn = TurnState::begin(stall);
+                            next_turn.message_id = steer.message_id;
                             if post_prompt(
                                 &server,
                                 &bus_tx,
@@ -1909,6 +1976,7 @@ async fn run_session(session: Session) {
                                 &commands,
                                 &steer.prompt,
                                 TurnSpec {
+                                    submission_id: next_turn.submission_id,
                                     model: model.as_ref(),
                                     variant: variant.as_deref(),
                                     attachments: &[],
@@ -1917,7 +1985,8 @@ async fn run_session(session: Session) {
                             .await
                             .is_ok()
                             {
-                                turn = TurnState::begin(stall);
+                                unacked.track(&turn);
+                                turn = next_turn;
                             }
                         }
                     }
@@ -1977,11 +2046,24 @@ async fn run_session(session: Session) {
             msg = bus_rx.recv() => {
                 let Some(msg) = msg else { break 'main };
                 match msg {
-                    BusMsg::PromptAck => {
-                        turn.post_pending = false;
+                    BusMsg::PromptAck(submission_id) => {
+                        if turn.accept_submission(submission_id) {
+                            let _ = send(
+                                &event_tx,
+                                crate::input_accepted_event(turn.message_id.clone()),
+                            ).await;
+                        } else if let Some(message_id) = unacked.take(submission_id) {
+                            let _ = send(
+                                &event_tx,
+                                crate::input_accepted_event(Some(message_id)),
+                            ).await;
+                        }
                     }
-                    BusMsg::CommandFailed(_) if interrupt_requested => {}
-                    BusMsg::CommandFailed(message) => {
+                    BusMsg::CommandFailed { submission_id, .. }
+                        if interrupt_requested || !turn.active || submission_id != turn.submission_id => {
+                        unacked.take(submission_id);
+                    }
+                    BusMsg::CommandFailed { message, .. } => {
                         let _ = send(&event_tx, AgentEvent::Done {
                             status: DoneStatus::Errored, result: None,
                             error: Some(message), session_id: Some(session_id.clone()),
@@ -2280,6 +2362,7 @@ fn mime_for(path: &str) -> &'static str {
 /// What a posted turn carries besides its text (1.x folds model/variant
 /// into the prompt body; 2.x ignores them there — set on the session).
 struct TurnSpec<'a> {
+    submission_id: uuid::Uuid,
     model: Option<&'a (String, String)>,
     variant: Option<&'a str>,
     attachments: &'a [String],
@@ -2330,6 +2413,7 @@ async fn post_prompt(
     spec: TurnSpec<'_>,
 ) -> Result<(), HarnessError> {
     let TurnSpec {
+        submission_id,
         model,
         variant,
         attachments,
@@ -2381,7 +2465,7 @@ async fn post_prompt(
                 req = server.scoped(req, dir_owned.as_deref()).await;
                 let error = match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        let _ = bus_tx.send(BusMsg::PromptAck).await;
+                        let _ = bus_tx.send(BusMsg::PromptAck(submission_id)).await;
                         None
                     }
                     Ok(resp) => {
@@ -2392,7 +2476,12 @@ async fn post_prompt(
                     Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
                 };
                 if let Some(error) = error {
-                    let _ = bus_tx.send(BusMsg::CommandFailed(error)).await;
+                    let _ = bus_tx
+                        .send(BusMsg::CommandFailed {
+                            submission_id,
+                            message: error,
+                        })
+                        .await;
                 }
             });
             return Ok(());
@@ -2436,17 +2525,23 @@ async fn post_prompt(
     tokio::spawn(async move {
         match server.post_json_raw(&path, dir.as_deref(), &body).await {
             Ok((status, _)) if status.is_success() => {
-                let _ = bus_tx.send(BusMsg::PromptAck).await;
+                let _ = bus_tx.send(BusMsg::PromptAck(submission_id)).await;
             }
             Ok((status, text)) => {
                 let _ = bus_tx
-                    .send(BusMsg::CommandFailed(post_error_message(
-                        &path, status, &text,
-                    )))
+                    .send(BusMsg::CommandFailed {
+                        submission_id,
+                        message: post_error_message(&path, status, &text),
+                    })
                     .await;
             }
             Err(error) => {
-                let _ = bus_tx.send(BusMsg::CommandFailed(error.to_string())).await;
+                let _ = bus_tx
+                    .send(BusMsg::CommandFailed {
+                        submission_id,
+                        message: error.to_string(),
+                    })
+                    .await;
             }
         }
     });

@@ -1278,6 +1278,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CHANGE_THREAD_PULL_REQUEST
             | methods::HANDOFF_THREAD_WORKTREE
             | methods::GET_THREAD_TRANSFER_STATE
+            | methods::FORK_THREAD
+            | methods::MERGE_THREAD_BACK
+            | methods::DISCONNECT_THREAD_SESSION
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
@@ -1291,6 +1294,7 @@ fn forwardable(method: &str) -> bool {
             | methods::ORGANIZE_THREAD
             | methods::ACKNOWLEDGE_THREAD_WOKE
             | methods::GET_QUEUE_STATE
+            | methods::MUTATE_QUEUED_RUN
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
@@ -1634,7 +1638,13 @@ impl RpcService for EngineRpc {
         // the registry selects the owner, just as the queue UI does explicitly.
         if matches!(
             method,
-            methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE
+            methods::ORGANIZE_THREAD
+                | methods::ACKNOWLEDGE_THREAD_WOKE
+                | methods::MUTATE_QUEUED_RUN
+                | methods::DISCONNECT_THREAD_SESSION
+                | methods::FORK_THREAD
+                | methods::MERGE_THREAD_BACK
+                | methods::GET_THREAD_TRANSFER_STATE
         ) && params.get("targetDeviceId").is_none()
             && let Some(chat) = params["chatId"]
                 .as_str()
@@ -1668,6 +1678,7 @@ impl RpcService for EngineRpc {
                 methods::QUEUE_MESSAGE
                     | methods::SEND_QUEUED_MESSAGE_NOW
                     | methods::STEER_QUEUED_MESSAGE_NOW
+                    | methods::MUTATE_QUEUED_RUN
             ) {
                 chat_id
                     .and_then(|id| self.doc_host.request_from_chat_row(id, ""))
@@ -1746,14 +1757,52 @@ impl RpcService for EngineRpc {
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                 } else {
-                    self.doc_host
-                        .open(&p.chat_id)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?
-                        .doc()
-                        .orchestration()["projection"]["uiState"]["queueState"]
-                        .clone()
+                    serde_json::to_value(
+                        self.doc_host
+                            .open(&p.chat_id)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?
+                            .doc()
+                            .orchestration_queue_state(),
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
                 };
                 RpcReply::value(&state)
+            }
+            methods::DISCONNECT_THREAD_SESSION => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::DisconnectThreadSessionParams =
+                    parse_params(params)?;
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Provider session control is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                RpcReply::value(&domain.disconnect_for_user(&self.doc_host, request).await?)
+            }
+            methods::MUTATE_QUEUED_RUN => {
+                let request: zeron_proto::MutateQueuedRunParams = parse_params(params)?;
+                if !self.doc_host.is_host(&request.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Queue mutations require the owning host.".into(),
+                    ));
+                }
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Canonical queue management is unavailable.".into())
+                })?;
+                let host = crate::orchestration::queue::host::HostQueue {
+                    domain: std::sync::Arc::new(crate::orchestration::queue::QueueDomain::new(
+                        service.kernel.clone(),
+                    )),
+                    docs: self.doc_host.clone(),
+                    registry: self.registry.clone(),
+                };
+                let result = host
+                    .mutate_for_user(request)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.message))?;
+                RpcReply::value(&result)
             }
             methods::ORGANIZE_THREAD | methods::ACKNOWLEDGE_THREAD_WOKE => {
                 #[derive(Deserialize)]
@@ -1800,6 +1849,8 @@ impl RpcService for EngineRpc {
             }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::GET_THREAD_TRANSFER_STATE
+            | methods::FORK_THREAD
+            | methods::MERGE_THREAD_BACK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT => {
                 crate::orchestration::ui_transfer::rpc(
@@ -1807,6 +1858,8 @@ impl RpcService for EngineRpc {
                     method,
                     params,
                     &self.sessions,
+                    &self.workspace,
+                    &self.registry,
                 )
                 .await
             }
@@ -2166,11 +2219,23 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::WATCH_QUEUE => {
-                let p: ChatParams = parse_params(params)?;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct QueueWatchParams {
+                    chat_id: String,
+                    #[serde(default)]
+                    include_canonical: bool,
+                }
+                let p: QueueWatchParams = parse_params(params)?;
                 let handle = self
                     .doc_host
                     .open(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if p.include_canonical {
+                    return Ok(RpcReply::Stream(watch_stream(
+                        handle.watch_canonical_queue(),
+                    )));
+                }
                 let rx = handle.watch_queue();
                 Ok(RpcReply::Stream(
                     futures::stream::unfold((rx, true), |(mut rx, first)| async move {
@@ -3686,6 +3751,8 @@ mod tests {
             methods::GET_THREAD_TRANSFER_STATE,
             methods::PREVIEW_FILE_CHECKPOINT_RESTORE,
             methods::RESTORE_FILE_CHECKPOINT,
+            methods::MUTATE_QUEUED_RUN,
+            methods::DISCONNECT_THREAD_SESSION,
         ] {
             assert!(forwardable(method), "{method}");
             assert!(!is_stream_method(method), "{method}");

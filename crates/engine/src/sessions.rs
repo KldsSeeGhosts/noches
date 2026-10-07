@@ -55,6 +55,22 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
+/// Strict app-owned steering never enters the legacy mailbox/fresh-turn
+/// fallback. Success means an adapter acknowledgement, not local enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalSteerOutcome {
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalInterruptOutcome {
+    Requested(String),
+    Missing,
+    Replaced,
+}
+
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 type PendingPermissions = Arc<
     Mutex<
@@ -207,8 +223,12 @@ impl RuntimeConfig {
 
 struct RunHandle {
     run_id: String,
+    /// Host-owned lifecycle identity, independent of MCP credential expiry.
+    canonical_run_id: Option<zeron_proto::orchestration::RunId>,
+    canonical_target: Option<crate::orchestration::steering::RuntimeTarget>,
     steerable: bool,
     steering_mode: zeron_proto::SteeringMode,
+    confirms_steered_inputs: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Shared handle to the live run's computer-use bridge (Pi only). The run
@@ -226,8 +246,9 @@ struct RunHandle {
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
     pending_permissions: PendingPermissions,
-    /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
-    /// event — the at-least-once ledger. A run can die with accepted steers
+    /// Steers accepted into the mailbox but not yet confirmed by the adapter's
+    /// input receipt (or a legacy `Steered` boundary) — the at-least-once ledger.
+    /// A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
     /// discarding queued boundary steers): the run task drains this at exit
     /// and re-dispatches each entry as a fresh turn, so an accepted message
@@ -258,6 +279,11 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// chat_id → fence serializing run registration against a retired-runtime
+    /// settlement, so that commit never holds the global `runs` map.
+    run_fences: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Fired whenever a run leaves or replaces its `runs` entry.
+    run_retired: tokio::sync::Notify,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -327,6 +353,8 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                run_fences: Mutex::new(HashMap::new()),
+                run_retired: tokio::sync::Notify::new(),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -593,6 +621,100 @@ impl SessionsEngine {
         }
     }
 
+    fn canonical_target(
+        &self,
+        chat_id: &str,
+        run_id: &zeron_proto::orchestration::RunId,
+        runtime_id: &str,
+    ) -> Result<Option<crate::orchestration::steering::RuntimeTarget>, EngineError> {
+        let Some(store) = lock(&self.inner.orchestration_store).clone() else {
+            return Ok(None);
+        };
+        let projection = store
+            .thread(&chat_id.into())
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let mut target = projection.as_ref().and_then(|p| {
+            p.runs
+                .iter()
+                .find(|run| &run.id == run_id)
+                .and_then(crate::orchestration::steering::RuntimeTarget::for_run)
+        });
+        if let Some(target) = &mut target {
+            store
+                .write(|conn| {
+                    crate::orchestration::steering::bind_runtime(
+                        conn,
+                        &chat_id.into(),
+                        target,
+                        runtime_id,
+                    )
+                })
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            target.runtime_id = Some(runtime_id.into());
+        }
+        Ok(target)
+    }
+
+    /// Pin the private live runtime under its map lock: a stale canonical
+    /// projection must never steer an ordinary-session replacement or a newer
+    /// attempt. The caller must not hold the kernel lane across the ACK wait.
+    pub(crate) async fn steer_canonical(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+        prompt: &str,
+        message_id: String,
+    ) -> Result<CanonicalSteerOutcome, EngineError> {
+        let _admission = self.admit_work()?;
+        let handle = self.doc_handle(chat_id)?;
+        let admissible = |run: &RunHandle, statuses: &HashMap<String, Session>| {
+            run.canonical_target.as_ref() == Some(expected)
+                && run.steerable
+                && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
+                && statuses
+                    .get(chat_id)
+                    .is_some_and(|s| s.status == SessionStatus::Working)
+        };
+        // Check before the transcript write so a rejected steer leaves no row.
+        {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            if !runs.get(chat_id).is_some_and(|run| admissible(run, &statuses)) {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            }
+        }
+        handle.write_user_message(&message_id, prompt, now_ms())?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            let Some(run) = runs
+                .get(chat_id)
+                .filter(|run| admissible(run, &statuses))
+            else {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            };
+            if run
+                .steer_tx
+                .try_send(SteerMessage {
+                    prompt: prompt.into(),
+                    message_id: Some(message_id.clone()),
+                    notification_acceptance: Some(accepted_tx),
+                })
+                .is_err()
+            {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            }
+        }
+        // The canonical effect/receipt owns recovery, never routed_steers'
+        // detached legacy redispatch (which can select a replacement config).
+        match tokio::time::timeout(std::time::Duration::from_secs(10), accepted_rx).await {
+            Ok(Ok(true)) => Ok(CanonicalSteerOutcome::Accepted),
+            Ok(Ok(false)) => Ok(CanonicalSteerOutcome::Rejected),
+            _ => Ok(CanonicalSteerOutcome::Uncertain),
+        }
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
         self.inner.mcp_server.credentials.touch(chat_id);
         if let Some(listener) = self.inner.turn_listener.get() {
@@ -651,6 +773,12 @@ impl SessionsEngine {
     /// visible Working/AwaitingInput states.
     pub(crate) fn has_live_harnesses(&self) -> bool {
         !lock(&self.inner.runs).is_empty()
+    }
+
+    /// Runtime presence includes an idle, parked adapter. Unlike visible turn
+    /// status, this can verify session teardown without spawning or polling it.
+    pub fn has_live_runtime(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -851,14 +979,35 @@ impl SessionsEngine {
                 if let Some(runner) = runner
                     && let Some(mut scope) = self.bound_mcp_scope(chat_id)
                     && runner.kernel.store.thread(&chat_id.into()).map_err(|e| EngineError::Other(e.to_string()))?
-                        .is_some_and(|thread| thread.runs.last().is_none_or(|run|
-                            run.status != zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
+                        .is_some_and(|thread| !thread.runs.iter().any(|run|
+                            run.user_message_id.0 == user_id
+                                && run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting)) {
                     scope.caller = runner.admit_parent(scope.caller, scope.selection.clone(), &mut request, &user_id, harness.as_ref())
                         .await.map_err(|error| EngineError::Other(error.to_string()))?;
+                    let canonical_run = scope.caller.run_id.clone();
                     self.inner.mcp_server.credentials.advance_session(scope);
-                    runner.prepare_external_turn(&chat_id.into(),&mut request,harness.as_ref())
+                    runner.prepare_external_turn(&chat_id.into(), &canonical_run, &mut request, harness.as_ref())
                         .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
+            }
+            let canonical = self
+                .bound_mcp_scope(chat_id)
+                .map(|scope| scope.caller.run_id);
+            let canonical_target = canonical
+                .as_ref()
+                .map(|id| self.canonical_target(chat_id, id, &run_id))
+                .transpose()?
+                .flatten();
+            if steerable
+                && same_runtime
+                && let Some(canonical) = canonical
+                && let Some(handle) = lock(&self.inner.runs).get_mut(chat_id)
+                && handle.run_id == run_id
+            {
+                // Includes a pre-admitted queue turn on the same process,
+                // not only a turn admitted by the ordinary-session bridge.
+                handle.canonical_run_id = Some(canonical);
+                handle.canonical_target = canonical_target;
             }
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
@@ -989,8 +1138,10 @@ impl SessionsEngine {
                 .ok()
                 .flatten()
                 .is_none_or(|thread| {
-                    !thread.runs.last().is_some_and(|run| {
-                        run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
+                    !thread.runs.iter().any(|run| {
+                        run.user_message_id.0 == user_id
+                            && run.status
+                                == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
                     })
                 })
         });
@@ -1041,11 +1192,7 @@ impl SessionsEngine {
                 }
             }
             if let Some(reasoning) = request.reasoning {
-                let option_id = match harness_id {
-                    HarnessId::ClaudeCode => "effort",
-                    HarnessId::Pi => "thinking",
-                    _ => "reasoningEffort",
-                };
+                let option_id = crate::provider_instances::reasoning_option_key(harness_id);
                 inherited_options
                     .entry(option_id)
                     .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));
@@ -1086,6 +1233,7 @@ impl SessionsEngine {
                     .await
                     .map_err(|error| EngineError::Other(error.to_string()))?;
             }
+            let canonical_run = scope.caller.run_id.clone();
             if lock(&self.inner.session_mcp).contains_key(chat_id) {
                 // A warm runtime retains its secret/config; only trusted host
                 // admission advances the token's logical run scope.
@@ -1098,7 +1246,12 @@ impl SessionsEngine {
             }
             if ordinary && let Some(runner) = runner.as_ref() {
                 runner
-                    .prepare_external_turn(&chat_id.into(), &mut request, harness.as_ref())
+                    .prepare_external_turn(
+                        &chat_id.into(),
+                        &canonical_run,
+                        &mut request,
+                        harness.as_ref(),
+                    )
                     .await
                     .map_err(|e| EngineError::Other(e.to_string()))?;
             }
@@ -1159,13 +1312,26 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
             computer_use_socket: cua_socket,
         };
+        let canonical_run_id = self
+            .bound_mcp_scope(chat_id)
+            .map(|scope| scope.caller.run_id);
+        let canonical_target = canonical_run_id
+            .as_ref()
+            .map(|id| self.canonical_target(chat_id, id, &run_id))
+            .transpose()?
+            .flatten();
 
+        let fence = self.run_fence(chat_id);
+        let registering = lock(&fence);
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
+                canonical_run_id,
+                canonical_target,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
+                confirms_steered_inputs: harness.confirms_steered_inputs(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 cua_bridge: cua_bridge.clone(),
@@ -1177,6 +1343,8 @@ impl SessionsEngine {
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
+        drop(registering);
+        self.inner.run_retired.notify_waiters();
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -1304,6 +1472,49 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
+    /// User Stop uses host authority, never a fabricated agent credential.
+    /// The durable session-command identity keeps retries on their first
+    /// admitted target. None denotes a legacy session without kernel ownership.
+    pub(crate) async fn interrupt_owned(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+    ) -> Result<Option<bool>, EngineError> {
+        let runner = lock(&self.inner.orchestration_runner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let Some(runner) = runner else {
+            return Ok(None);
+        };
+        self.refuse_readonly_child(chat_id)?;
+        crate::orchestration::controls::interrupt_for_user(&runner, &chat_id.into(), command_id)
+            .await
+            .map_err(|error| EngineError::Other(error.to_string()))
+    }
+
+    /// No replacement, including an unbound warm runtime, may inherit a
+    /// retired process's projection cleanup. The callback is synchronous.
+    pub(crate) fn with_retired_runtime<T>(
+        &self,
+        chat_id: &str,
+        settle: impl FnOnce() -> T,
+    ) -> Option<T> {
+        // Only this chat's run registration waits on the settlement commit.
+        let fence = self.run_fence(chat_id);
+        let _settling = lock(&fence);
+        if lock(&self.inner.runs).contains_key(chat_id) {
+            return None;
+        }
+        Some(settle())
+    }
+
+    fn run_fence(&self, chat_id: &str) -> Arc<Mutex<()>> {
+        lock(&self.inner.run_fences)
+            .entry(chat_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Interrupt the live run, if any. The run settles with a synthetic
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
@@ -1334,13 +1545,53 @@ impl SessionsEngine {
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
-        for _ in 0..500 {
-            if !self.is_live(chat_id, &run_id) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        self.wait_until_not_live(chat_id, &run_id).await;
         Ok(true)
+    }
+
+    /// Signal only the process admitted by the durable control. Keep the map
+    /// lock through signalling so a replacement can never inherit cancellation.
+    pub(crate) fn request_canonical_interrupt(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+    ) -> CanonicalInterruptOutcome {
+        let runs = lock(&self.inner.runs);
+        let Some(handle) = runs.get(chat_id) else {
+            return CanonicalInterruptOutcome::Missing;
+        };
+        if expected.runtime_id.is_none() || handle.canonical_target.as_ref() != Some(expected) {
+            return CanonicalInterruptOutcome::Replaced;
+        }
+        let _ = handle.cancel.send(true);
+        expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+        for (_, answer) in lock(&handle.pending_inputs).drain() {
+            let _ = answer.send(Vec::new());
+        }
+        handle.interrupt_token.cancel();
+        CanonicalInterruptOutcome::Requested(handle.run_id.clone())
+    }
+
+    pub(crate) async fn await_runtime_retirement(&self, chat_id: &str, runtime_id: &str) -> bool {
+        self.wait_until_not_live(chat_id, runtime_id).await
+    }
+
+    /// Wait (5s, as the former 500x10ms poll) for a run to leave `runs`,
+    /// woken by `remove_run`/registration rather than a timer.
+    async fn wait_until_not_live(&self, chat_id: &str, run_id: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retired = self.inner.run_retired.notified();
+            tokio::pin!(retired);
+            // Register before checking so a retirement between the two is seen.
+            retired.as_mut().enable();
+            if !self.is_live(chat_id, run_id) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, retired).await.is_err() {
+                return !self.is_live(chat_id, run_id);
+            }
+        }
     }
 
     /// Removing/replacing a configured instance retires only its live scope.
@@ -1376,6 +1627,33 @@ impl SessionsEngine {
             }
             handle.interrupt_token.cancel();
         }
+    }
+
+    /// Called under the kernel ownership lane. A stale outbox effect cannot
+    /// cancel a replacement runtime, even if that replacement is already idle.
+    /// Like T3's nonterminal detach, keep the native handle and MCP credential
+    /// so the next user input can resume the conversation normally.
+    pub(crate) fn request_orchestration_disconnect(
+        &self,
+        chat_id: &str,
+        expected_run: &zeron_proto::orchestration::RunId,
+    ) -> bool {
+        let runs = lock(&self.inner.runs);
+        let Some(handle) = runs
+            .get(chat_id)
+            .filter(|handle| handle.canonical_run_id.as_ref() == Some(expected_run))
+        else {
+            return false;
+        };
+        // Signal the exact handle while retaining the map lock: a concurrent
+        // replacement can never receive the old session's cancellation.
+        let _ = handle.cancel.send(true);
+        expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+        for (_, answer) in lock(&handle.pending_inputs).drain() {
+            let _ = answer.send(Vec::new());
+        }
+        handle.interrupt_token.cancel();
+        true
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -2014,6 +2292,8 @@ impl Inner {
             if let Some(handle) = runs.remove(chat_id) {
                 expire_permissions(&handle.pending_permissions, &handle.engine_tx);
             }
+            drop(runs);
+            self.run_retired.notify_waiters();
         }
     }
 }
@@ -2830,6 +3110,26 @@ async fn drive_run(
             *instance_id = run_instance.clone();
         }
 
+        // A provider receipt identifies the submitted input, not whichever
+        // steer happens to be first today. Handle it even while parked without
+        // waking the turn or changing transcript boundaries. A stale/duplicate
+        // receipt cannot consume a different pending message.
+        if let AgentEvent::InputAcceptedFor { message_id } = &event {
+            let live = {
+                let runs = lock(&inner.runs);
+                if let Some(handle) = runs.get(&chat_id).filter(|handle| handle.run_id == run_id) {
+                    lock(&handle.routed_steers).retain(|steer| &steer.message_id != message_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if live {
+                inner.publish(&chat_id, &event);
+            }
+            continue;
+        }
+
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
         // into the subagent's own doc, and the parent keeps only the spawn
@@ -3266,11 +3566,12 @@ async fn drive_run(
             // steer boundary restarts it (matches the parked-resume path and
             // the composer's optimistic overlay, which already reads 0:00).
             inner.set_status(&chat_id, SessionStatus::Working, true);
-            // The boundary confirms delivery of the oldest accepted steer —
-            // retire its at-least-once ledger entry.
+            // Legacy adapters expose only this boundary. Receipt-capable
+            // adapters retain the input until its exact native acknowledgement;
+            // an OpenCode local boundary precedes the HTTP response.
             if let Some(h) = lock(&inner.runs)
                 .get(&chat_id)
-                .filter(|h| h.run_id == run_id)
+                .filter(|h| h.run_id == run_id && !h.confirms_steered_inputs)
             {
                 lock(&h.routed_steers).pop_front();
             }
@@ -3481,7 +3782,7 @@ async fn drive_run(
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
-        // Steered boundary (idle-reaper race, a mid-turn error discarding
+        // native acknowledgement (idle-reaper race, a mid-turn error discarding
         // queued boundary steers, a parked child death). Their user entries
         // are already in the transcript — a message that shows as sent must
         // never silently not run. Re-dispatch each as a fresh turn
@@ -3985,6 +4286,305 @@ mod tests {
     /// and decides when the stream ends.
     struct FeedHarness {
         feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+    }
+
+    struct CapturingSteerHarness {
+        mailbox: Arc<Mutex<Option<mpsc::Receiver<SteerMessage>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for CapturingSteerHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Steering identity fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            *lock(&self.mailbox) = Some(controls.steering);
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_steer_cannot_target_a_replacement_attempt_even_with_the_same_run() {
+        use crate::orchestration::steering::RuntimeTarget;
+        let mailbox = Arc::new(Mutex::new(None));
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: mailbox.clone(),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        core.sessions
+            .dispatch("canonical-target", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lock(&mailbox).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let original = RuntimeTarget {
+            run_id: "same-run".into(),
+            attempt_id: "old-attempt".into(),
+            root_node_id: "old-root".into(),
+            provider_thread_id: "same-provider".into(),
+            runtime_id: Some("old-runtime".into()),
+        };
+        let mut replacement = original.clone();
+        replacement.attempt_id = "replacement-attempt".into();
+        replacement.root_node_id = "replacement-root".into();
+        lock(&core.sessions.inner.runs)
+            .get_mut("canonical-target")
+            .unwrap()
+            .canonical_target = Some(replacement.clone());
+        let mut mailbox = lock(&mailbox).take().unwrap();
+        assert_eq!(
+            core.sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &original,
+                    "stale input",
+                    "stale-message".into()
+                )
+                .await
+                .unwrap(),
+            CanonicalSteerOutcome::Rejected
+        );
+        assert!(
+            matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "replacement mailbox must remain untouched"
+        );
+        let entries = core
+            .sessions
+            .doc_handle("canonical-target")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.id != "stale-message" && e.id != "stale-process-message"),
+            "a rejected steer must not leave a transcript row"
+        );
+        // A process replacement may even reuse the canonical attempt/root.
+        // Only its private incarnation differs.
+        replacement = original.clone();
+        replacement.runtime_id = Some("replacement-runtime".into());
+        lock(&core.sessions.inner.runs)
+            .get_mut("canonical-target")
+            .unwrap()
+            .canonical_target = Some(replacement.clone());
+        assert_eq!(
+            core.sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &original,
+                    "stale process input",
+                    "stale-process-message".into()
+                )
+                .await
+                .unwrap(),
+            CanonicalSteerOutcome::Rejected
+        );
+        assert!(matches!(
+            mailbox.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let sessions = core.sessions.clone();
+        let accepted = tokio::spawn(async move {
+            sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &replacement,
+                    "current input",
+                    "current-message".into(),
+                )
+                .await
+                .unwrap()
+        });
+        let mut submitted = tokio::time::timeout(std::time::Duration::from_secs(2), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(submitted.prompt, "current input");
+        submitted
+            .notification_acceptance
+            .take()
+            .unwrap()
+            .send(true)
+            .unwrap();
+        assert_eq!(accepted.await.unwrap(), CanonicalSteerOutcome::Accepted);
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_runtime_settlement_fences_only_its_own_chat() {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: Arc::new(Mutex::new(None)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let sessions = core.sessions.clone();
+        let settling = std::thread::spawn(move || {
+            sessions.with_retired_runtime("settling", || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The settlement transaction no longer holds the global run map.
+        core.sessions
+            .dispatch("other", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        assert!(core.sessions.has_live_runtime("other"));
+        // A replacement for the settling chat still cannot register meanwhile.
+        let sessions = core.sessions.clone();
+        let replacement = tokio::spawn(async move {
+            sessions
+                .dispatch("settling", HarnessId::Mock, request(), None)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!core.sessions.has_live_runtime("settling"));
+        release_tx.send(()).unwrap();
+        assert!(settling.join().unwrap().is_some());
+        replacement.await.unwrap().unwrap();
+        assert!(core.sessions.has_live_runtime("settling"));
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_interrupt_rejects_every_replacement_and_unbound_runtime() {
+        use crate::orchestration::steering::RuntimeTarget;
+        let mailbox = Arc::new(Mutex::new(None));
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: mailbox.clone(),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        core.sessions
+            .dispatch("control-target", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        let original = RuntimeTarget {
+            run_id: "run".into(),
+            attempt_id: "attempt".into(),
+            root_node_id: "root".into(),
+            provider_thread_id: "provider".into(),
+            runtime_id: Some("process".into()),
+        };
+        let (token, runtime_id) = {
+            let mut runs = lock(&core.sessions.inner.runs);
+            let handle = runs.get_mut("control-target").unwrap();
+            handle.canonical_target = Some(original.clone());
+            (handle.interrupt_token.clone(), handle.run_id.clone())
+        };
+        let mut replacements = vec![];
+        let mut changed = original.clone();
+        changed.run_id = "new-run".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.attempt_id = "new-attempt".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.root_node_id = "new-root".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.provider_thread_id = "new-provider".into();
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.runtime_id = Some("new-process".into());
+        replacements.push(changed);
+        let mut changed = original.clone();
+        changed.runtime_id = None;
+        replacements.push(changed);
+        for changed in replacements {
+            assert_eq!(
+                core.sessions
+                    .request_canonical_interrupt("control-target", &changed),
+                CanonicalInterruptOutcome::Replaced
+            );
+            assert!(
+                !token.is_cancelled(),
+                "a stale control cannot cancel the live process"
+            );
+        }
+        let mut repaired = false;
+        assert!(
+            core.sessions
+                .with_retired_runtime("control-target", || {
+                    repaired = true;
+                })
+                .is_none()
+        );
+        assert!(
+            !repaired,
+            "a live replacement must fence projection cleanup"
+        );
+        assert_eq!(
+            core.sessions
+                .request_canonical_interrupt("control-target", &original),
+            CanonicalInterruptOutcome::Requested(runtime_id.clone())
+        );
+        assert!(token.is_cancelled());
+        assert!(
+            core.sessions
+                .await_runtime_retirement("control-target", &runtime_id)
+                .await
+        );
+        assert_eq!(
+            core.sessions
+                .request_canonical_interrupt("control-target", &original),
+            CanonicalInterruptOutcome::Missing
+        );
+        assert!(
+            core.sessions
+                .with_retired_runtime("control-target", || {
+                    repaired = true;
+                })
+                .is_some()
+        );
+        assert!(repaired, "retired runtime cleanup must remain usable");
+        core.shutdown().await;
     }
 
     #[async_trait::async_trait]

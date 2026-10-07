@@ -12,11 +12,21 @@ use zeron_proto::{HarnessId, RunRequest, SandboxLevel, SessionStatus};
 
 const CHAT: &str = "codex-subagents";
 
-async fn assemble(dir: &Path) -> (EngineCore, EngineProfile) {
+async fn assemble(dir: &Path, protocol: &str) -> (EngineCore, EngineProfile) {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness/tests/fixtures/fake-codex.sh");
     let registry = Arc::new(HarnessRegistry::new());
-    registry.register(Arc::new(CodexHarness::new().with_executable(fixture)));
+    registry.register(Arc::new(
+        CodexHarness::new()
+            .with_executable(fixture)
+            .with_instance_launch(zeron_harness::instance::InstanceLaunch::new(
+                std::collections::BTreeMap::from([(
+                    "NOCHES_TEST_CODEX_CHILD_PROTOCOL".into(),
+                    protocol.into(),
+                )]),
+                vec![],
+            )),
+    ));
     let profile = EngineProfile::development(dir, "test-org", "test-user");
     let core = EngineCore::assemble_with_profile(
         profile.clone(),
@@ -71,7 +81,8 @@ async fn check_persistence(
     alpha_users: &str,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let (core, profile) = assemble(dir.path()).await;
+    let protocol = if scenario.starts_with("v1") { "v1" } else { "v2" };
+    let (core, profile) = assemble(dir.path(), protocol).await;
     let request = RunRequest {
         instance_id: None,
         prompt: format!("scenario:{scenario}"),
@@ -179,19 +190,15 @@ async fn check_persistence(
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(ids, [alpha_doc.clone(), beta_doc.clone()]);
     drop(db);
-    let (reopened, _) = assemble(dir.path()).await;
+    let (reopened, _) = assemble(dir.path(), protocol).await;
     assert_eq!(entries(&reopened, &alpha_doc), alpha);
     assert_eq!(entries(&reopened, &beta_doc), beta);
     let mut request = request;
     request.prompt = "scenario:resumed-child".into();
-    request.resume = Some(
-        if scenario.starts_with("v1") {
-            "resume-with-child-v1"
-        } else {
-            "resume-with-child-v2"
-        }
-        .into(),
-    );
+    // Resume the accepted root conversation, not a different native thread
+    // chosen by the fixture. The app-owned provider identity takes precedence
+    // over stale caller handles; discovery must return this root's children.
+    request.resume = None;
     reopened
         .sessions
         .dispatch(

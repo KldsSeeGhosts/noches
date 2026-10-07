@@ -357,6 +357,18 @@ impl SessionDoc {
             .get_deep_value()
             .to_json_value()
     }
+
+    /// Read only the small queue projection. Expanding the complete immutable
+    /// projection on each token would also copy transcripts and tool output.
+    pub fn orchestration_queue_state(&self) -> Option<zeron_proto::QueueUiState> {
+        let loro::ValueOrContainer::Value(projection) =
+            self.doc.get_map("orchestration").get("projection")?
+        else {
+            return None;
+        };
+        let queue = projection.get_by_key("uiState")?.get_by_key("queueState")?;
+        serde_json::from_value(queue.to_json_value()).ok()
+    }
     /// Wrap an existing doc (e.g. imported from a snapshot).
     pub fn from_doc(doc: LoroDoc) -> Self {
         Self { doc }
@@ -1428,6 +1440,29 @@ pub fn materialize_tail(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_projection_accessor_is_additive_and_does_not_need_transcript_fields() {
+        let doc = super::SessionDoc::init("queue-accessor").unwrap();
+        assert!(doc.orchestration_queue_state().is_none());
+        let queue = zeron_proto::QueueUiState {
+            thread_id: "queue-accessor".into(),
+            version: 12,
+            active_run_id: Some("running".into()),
+            queue: vec![zeron_proto::QueueUiEntry {
+                queued_run_id: "queued".into(),
+                message_id: "message".into(),
+                text: "work".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        doc.publish_orchestration(
+            "owner", 1, 12, "batch", &serde_json::json!([]),
+            &serde_json::json!({"uiState":{"queueState":queue},"messages":[{"unrelated":"tool transcript"}]}),
+        ).unwrap();
+        assert_eq!(doc.orchestration_queue_state(), Some(queue));
+    }
+
     use super::*;
     use crate::parts::fold_event_into_parts;
     use zeron_proto::{AgentEvent, ToolCall};

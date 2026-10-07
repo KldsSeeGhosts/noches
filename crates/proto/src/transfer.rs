@@ -79,6 +79,13 @@ pub struct ThreadTransferState {
     pub checkpoints: Vec<FileCheckpoint>,
     #[serde(default)]
     pub inherited_items: Vec<Value>,
+    #[serde(default)]
+    pub latest_forkable_run_id: Option<String>,
+    #[serde(default)]
+    pub latest_mergeable_run_id: Option<String>,
+    /// Passive identities only: no credentials or native provider payload.
+    #[serde(default)]
+    pub attached_provider_sessions: Vec<ProviderSessionRef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -86,6 +93,80 @@ pub struct ThreadTransferState {
 pub struct TransferStateParams {
     #[serde(default)]
     pub chat_id: String,
+}
+
+/// Stable conversation boundary; choosing a fork never starts an agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThreadSourcePoint {
+    #[default]
+    LatestStable,
+    Run {
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
+    Checkpoint {
+        #[serde(rename = "checkpointId")]
+        checkpoint_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkThreadParams {
+    pub chat_id: String,
+    pub command_id: String,
+    /// Client-minted, so retrying an uncertain response cannot create twins.
+    pub target_chat_id: String,
+    #[serde(default)]
+    pub source_point: ThreadSourcePoint,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeThreadBackParams {
+    pub chat_id: String,
+    pub command_id: String,
+    pub target_chat_id: String,
+    #[serde(default)]
+    pub source_point: ThreadSourcePoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectThreadSessionParams {
+    pub chat_id: String,
+    pub client_request_id: String,
+    /// Pin the observed sessions. Retrying must never target a replacement.
+    pub provider_sessions: Vec<ProviderSessionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSessionRef {
+    pub id: String,
+    /// Attachment-local revision, unaffected by transcript token updates.
+    pub attachment_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectThreadSessionResult {
+    pub sequence: i64,
+    pub refusal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTransferResult {
+    pub target_chat_id: String,
+    pub sequence: i64,
+    /// A definite planner refusal, as distinct from an uncertain RPC failure.
+    #[serde(default)]
+    pub refusal: Option<String>,
+    #[serde(default)]
+    pub chat: Option<crate::Chat>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

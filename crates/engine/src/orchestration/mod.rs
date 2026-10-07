@@ -4,9 +4,11 @@
 
 pub(crate) mod adoption;
 pub mod assembly;
+mod background;
 pub mod checkpoint;
 pub mod command;
 pub mod continuation;
+pub(crate) mod controls;
 #[cfg(test)]
 mod delegation_live_tests;
 #[cfg(test)]
@@ -25,6 +27,7 @@ pub mod recovery;
 pub mod runner;
 pub mod scheduler;
 pub mod service;
+pub(crate) mod steering;
 pub mod store;
 pub mod sync_publish;
 pub mod task;

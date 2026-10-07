@@ -172,6 +172,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
                     .flatten(),
                 automatic: message.get("delegatedCompletion").is_some()
                     || message.get("notification").is_some(),
+                document_backed: intent.is_some(),
             })
         })
         .collect();
@@ -212,11 +213,16 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
         woke_at: time(&marker["wokeAt"]),
     };
     Ok(QueueUiState {
+        schema_version: 1,
         thread_id: id.0.clone(),
         version: p.through_sequence,
         queue,
         pending_questions,
         lifecycle,
+        active_run_id: task::active_run(&p).map(|run| run.id.0.clone()),
+        background_run_id: super::background::settled_run(&p).map(|run| run.id.0.clone()),
+        can_promote_to_steer: queue::can_promote_to_steer(&p),
+        promotion_mode: queue::promotion_mode(&p),
     })
 }
 

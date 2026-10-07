@@ -2,19 +2,24 @@
 
 Host-owned SQLite authority; replicas and read calls never execute providers,
 consume a transfer, acknowledge delegated work, or restore files. MCP contracts
-remain the generated T3 contracts. No gpui UI is implemented in this slice.
+remain the generated T3 contracts. The desktop exposes conversation fork,
+merge-back, lineage navigation and delivery audit in Thread details, with a
+fork shortcut in the sidebar context menu. See the
+[2026-10-06 parity audit](t3-parity-audit-2026-10-06.md).
 
 ## Designer contract
 
 Types live in `zeron_proto::transfer`. RPC method strings are in
 `zeron_rpc::methods`. These names and camelCase fields are stable.
 Typed desktop clients are `RpcClient::{thread_transfer_state,
-preview_file_checkpoint_restore, restore_file_checkpoint}`, each requiring
+fork_thread, merge_thread_back, preview_file_checkpoint_restore, restore_file_checkpoint}`, each requiring
 the chat's owner device and sending `targetDeviceId`.
 
 | RPC | Params | Result |
 | --- | --- | --- |
 | `GetThreadTransferState` | `{chatId}` | `ThreadTransferState` |
+| `ForkThread` | `{chatId, commandId, targetChatId, sourcePoint, title?}` | `ThreadTransferResult` |
+| `MergeThreadBack` | `{chatId, commandId, targetChatId, sourcePoint}` | `ThreadTransferResult` |
 | `PreviewFileCheckpointRestore` | `{chatId, checkpointId}` | `RestorePreview` |
 | `RestoreFileCheckpoint` | `{chatId, checkpointId, expectedHeadSha, expectedChecksum}` | `RestoreResult` |
 
@@ -33,7 +38,9 @@ Example passive response (collections abbreviated):
   "transfers": [],
   "handoffs": [],
   "checkpoints": [],
-  "inheritedItems": []
+  "inheritedItems": [],
+  "latestForkableRunId": "run:child:1",
+  "latestMergeableRunId": "run:child:1"
 }
 ```
 
@@ -51,6 +58,41 @@ Example passive response (collections abbreviated):
   are `started`, `completed`, and `backup`.
 - `GetOrchestrationState` also includes `forkedFrom`, `transfers`, and
   `checkpoints`, alongside its existing delegation state.
+
+### User conversation transfers
+
+`sourcePoint` is `{"type":"run","runId":"..."}`,
+`{"type":"checkpoint","checkpointId":"..."}`, or `{"type":"latest_stable"}`.
+The desktop pins the explicit eligible run before submitting. A fork is lazy:
+it does not discover a provider, start a process, or copy transcript messages
+into the child document. Its registry chat immediately inherits the project,
+checkout, branch and model selection. The first input resolves native fork or
+bounded portable history using the selected adapter's actual capabilities.
+
+Use a client-minted `commandId` and `targetChatId`, and retain the entire request
+until its outcome is known. The kernel scopes receipts by source/action/key;
+an after-commit response loss must be retried with the same request. Acceptance
+returns `{targetChatId, sequence, refusal:null, chat}`. A definite planner
+rejection returns `refusal` with `chat:null`; it is not an uncertain transport
+failure. Reusing an accepted request key with another target is refused.
+
+Writes route to the source's owning host and use user/web provenance, not an
+impersonated MCP session. Merge-back requires a live same-project direct
+parent on the same host, refuses a delegated target, and only prepares context
+for the next parent input. It neither starts nor interrupts an agent and never
+merges Git branches or writes working files. Pending queued/multiple-fork
+merge restrictions are preserved.
+
+The Details audit distinguishes `Prepared` (logical consumption with no
+confirmed provider acceptance) from `Delivered` (native fork or an inline/
+injected receipt). It displays strategy, run coverage, omissions and provider
+identities, not private handoff text. Fork transcripts prepend an immutable
+text preview plus a visible fork boundary. Preview limits are 100 messages/
+10,000 Unicode scalars per message with explicit omission/shortening notices;
+historical tools, approvals and reasoning do not become live controls. Source
+history remains pinned and accessible through parent navigation.
+
+### Files-only restore
 
 Preview then submit the exact observed HEAD/checksum, never infer either:
 
@@ -135,7 +177,13 @@ input/attachment/occupancy reservation, coverage, whole-item omission, and
 pending/injected/inline receipts. Failed/interrupted starts carry ready handoffs
 forward without changing the original consumed transfer's target run. Pending
 native delivery is uncertain; it cannot be blindly re-injected. Provider-instance
-changes use full/delta handoffs and never blindly resume another instance's ID.
+changes retain independent backing provider handles. Returning to a compatible
+instance resumes its own accepted root-native identity and sends only the
+off-provider delta, including after restart. Changed model/options, a changed
+checkout or unavailable native coverage use full reconstruction. A stale
+caller resume cannot override a known selected provider handle. Imported
+runless history survives portable handoffs without duplicating the current
+input.
 Queued pending merges and competing forks retain T3's explicit refusals.
 
 Native hooks implemented: Codex `thread/fork` at `lastTurnId`; OpenCode 1.x
@@ -185,4 +233,6 @@ on macOS, with `LINUX_TARGET=target-w3-transfer` (no SSH).
 The initial merged compile exposed six missing provider-instance fields in
 struct/event literals; these were fixed before the successful runs. The only
 remaining compiler warning is the pre-existing test-only `thread_local!` doc
-comment in `sessions.rs`. No desktop UI was changed.
+comment in `sessions.rs`. No desktop UI was changed in that historical wave-3
+validation. Current desktop and RPC validation is recorded in the parity audit
+linked above.

@@ -542,6 +542,163 @@ pub struct TranscriptSnapshot {
     pub replay_baseline: Arc<zeron_doc::TranscriptBaseline>,
 }
 
+#[derive(Clone, Default, Serialize)]
+pub struct QueueSnapshot {
+    pub items: Vec<QueuedMessage>,
+    pub canonical: Option<zeron_proto::QueueUiState>,
+}
+
+impl PartialEq for QueueSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+            && match (&self.canonical, &other.canonical) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    // Transcript token publications advance the SQL sequence, but
+                    // do not change queue controls. Do not repaint the composer
+                    // merely because unrelated conversation content grew.
+                    a.schema_version == b.schema_version
+                        && a.thread_id == b.thread_id
+                        && a.queue == b.queue
+                        && a.pending_questions == b.pending_questions
+                        && a.lifecycle == b.lifecycle
+                        && a.active_run_id == b.active_run_id
+                        && a.background_run_id == b.background_run_id
+                        && a.can_promote_to_steer == b.can_promote_to_steer
+                        && a.promotion_mode == b.promotion_mode
+                }
+                _ => false,
+            }
+    }
+}
+
+#[cfg(test)]
+mod queue_snapshot_tests {
+    #[tokio::test]
+    async fn queue_durability_is_not_invalidated_by_a_later_transcript_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = super::DocHost::new(
+            store.clone(),
+            super::DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("queue-durability").unwrap();
+        for id in ["a", "b"] {
+            handle
+                .doc
+                .push_queued(&zeron_doc::QueuedMessage::new(id, id, "host"))
+                .unwrap();
+        }
+        handle.doc.move_queued("b", 0).unwrap();
+        let persistence = handle.persistence.as_ref().unwrap();
+        let changed_doc = handle.doc.clone();
+        persistence.before_next_export(move || {
+            changed_doc
+                .doc()
+                .get_text("unrelated-transcript")
+                .insert(0, "arrived while saving")
+                .unwrap();
+            changed_doc.doc().commit();
+        });
+        let result = host.persist_orchestration_queue(&handle);
+        assert!(
+            !persistence.is_clean(),
+            "the later change must remain pending for its own snapshot"
+        );
+        let raw = loro::LoroDoc::new();
+        raw.import(&store.load_snapshot("queue-durability").unwrap().unwrap())
+            .unwrap();
+        let restored = zeron_doc::SessionDoc::from_doc(raw);
+        assert_eq!(
+            restored
+                .read_queue()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert!(
+            result.is_ok(),
+            "the required queue patch was durably saved: {result:?}"
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn queue_durability_still_requires_a_successful_snapshot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = super::DocHost::new(
+            store.clone(),
+            super::DocHostConfig {
+                device_id: "host".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("queue-write-failure").unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_queue_snapshot BEFORE INSERT ON snapshots
+             BEGIN SELECT RAISE(FAIL,'queue snapshot unavailable'); END;",
+        )
+        .unwrap();
+        handle
+            .doc
+            .push_queued(&zeron_doc::QueuedMessage::new("a", "unsaved", "host"))
+            .unwrap();
+        assert!(host.persist_orchestration_queue(&handle).is_err());
+        assert!(!handle.persistence.as_ref().unwrap().is_clean());
+        db.execute_batch("DROP TRIGGER fail_queue_snapshot;")
+            .unwrap();
+        host.persist_orchestration_queue(&handle).unwrap();
+        let raw = loro::LoroDoc::new();
+        raw.import(&store.load_snapshot("queue-write-failure").unwrap().unwrap())
+            .unwrap();
+        assert_eq!(
+            zeron_doc::SessionDoc::from_doc(raw).read_queue().unwrap()[0].text,
+            "unsaved"
+        );
+        host.shutdown_workers().await;
+    }
+
+    #[test]
+    fn unrelated_projection_sequences_do_not_repaint_queue_controls() {
+        let first = super::QueueSnapshot {
+            canonical: Some(zeron_proto::QueueUiState {
+                schema_version: 1,
+                thread_id: "chat".into(),
+                version: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut next = first.clone();
+        next.canonical.as_mut().unwrap().version = 100;
+        assert!(first == next);
+        next.canonical.as_mut().unwrap().active_run_id = Some("active".into());
+        assert!(first != next);
+        next = first.clone();
+        next.canonical.as_mut().unwrap().can_promote_to_steer = true;
+        assert!(first != next);
+        next = first.clone();
+        next.canonical.as_mut().unwrap().background_run_id = Some("completed".into());
+        assert!(first != next, "background Stop availability must publish");
+        let mut cleared = next.clone();
+        cleared.canonical.as_mut().unwrap().background_run_id = None;
+        assert!(next != cleared, "background Stop clearance must publish");
+        next = first.clone();
+        next.canonical.as_mut().unwrap().promotion_mode =
+            Some(zeron_proto::QueuePromotionMode::InterruptRestart);
+        assert!(first != next, "interrupting queue action changes must publish");
+    }
+}
+
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
 pub struct ChatDocHandle {
     chat_id: String,
@@ -556,6 +713,8 @@ pub struct ChatDocHandle {
     /// of short rows — so unlike the transcript mirror it publishes on every
     /// change without a dirty flag.
     queue_tx: watch::Sender<Vec<QueuedMessage>>,
+    /// Additive desktop view. Only watched queues expand the queue projection.
+    canonical_queue_tx: watch::Sender<QueueSnapshot>,
     /// Serializes everything that TAKES from the queue. Both the doc-change
     /// task and the turn-end status watcher call `drain_queue`, and nothing
     /// keeps those two apart: without this they interleave across the
@@ -661,6 +820,7 @@ impl ChatDocHandle {
     fn sync_protected(&self) -> bool {
         self.messages_tx.receiver_count() > 0
             || self.queue_tx.receiver_count() > 0
+            || self.canonical_queue_tx.receiver_count() > 0
             || self.writers.load(Ordering::Acquire) > 0
     }
 
@@ -724,6 +884,13 @@ impl ChatDocHandle {
         rx
     }
 
+    pub fn watch_canonical_queue(&self) -> watch::Receiver<QueueSnapshot> {
+        self.touch();
+        let rx = self.canonical_queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
     /// V2 mutations and the legacy drainer share this owner lane. Callers must
     /// keep the guard through source commit and the Loro intent patch.
     pub(crate) async fn orchestration_queue_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -737,6 +904,20 @@ impl ChatDocHandle {
     fn publish_queue(&self) {
         match self.doc.read_queue() {
             Ok(items) => {
+                if self.canonical_queue_tx.receiver_count() > 0 {
+                    let snapshot = QueueSnapshot {
+                        items: items.clone(),
+                        canonical: self.doc.orchestration_queue_state(),
+                    };
+                    self.canonical_queue_tx.send_if_modified(|slot| {
+                        if *slot == snapshot {
+                            false
+                        } else {
+                            *slot = snapshot;
+                            true
+                        }
+                    });
+                }
                 self.queue_tx.send_if_modified(|slot| {
                     if *slot == items {
                         false
@@ -1576,6 +1757,7 @@ impl DocHost {
         // appended after the handle exists retain the normal automatic drain.
         let recovered_queue_pending = !initial_queue.is_empty();
         let (queue_tx, _) = watch::channel(initial_queue);
+        let (canonical_queue_tx, _) = watch::channel(QueueSnapshot::default());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -1585,6 +1767,7 @@ impl DocHost {
             transcript_import: Mutex::default(),
             transcript_history,
             queue_tx,
+            canonical_queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
@@ -3061,7 +3244,10 @@ impl DocHost {
         if handle.publication_failed.load(Ordering::Acquire) {
             return true;
         }
-        if handle.messages_tx.receiver_count() > 0 || handle.queue_tx.receiver_count() > 0 {
+        if handle.messages_tx.receiver_count() > 0
+            || handle.queue_tx.receiver_count() > 0
+            || handle.canonical_queue_tx.receiver_count() > 0
+        {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -3314,7 +3500,10 @@ impl DocHost {
         let mut waiting = 0usize;
         let mut oldest = 0i64;
         for h in handles.values() {
-            if h.messages_tx.receiver_count() > 0 || h.queue_tx.receiver_count() > 0 {
+            if h.messages_tx.receiver_count() > 0
+                || h.queue_tx.receiver_count() > 0
+                || h.canonical_queue_tx.receiver_count() > 0
+            {
                 reasons["views"] = (reasons["views"].as_u64().unwrap() + 1).into();
             }
             if h.writers.load(Ordering::Acquire) > 0 {
@@ -3583,18 +3772,18 @@ impl DocHost {
         &self,
         handle: &Arc<ChatDocHandle>,
     ) -> Result<(), EngineError> {
+        if handle.retired.load(Ordering::Acquire) {
+            return Err(EngineError::Other("Queue document was retired.".into()));
+        }
         handle.publish_queue();
         // Do not acknowledge the SQL repair outbox on a failed snapshot write.
         if let Some(persistence) = &handle.persistence {
-            persistence.dirty(true);
+            let required = persistence.dirty(true);
             persistence.flush_sync();
-            if !persistence.is_clean() {
+            if !persistence.durable_through(required) {
                 return Err(EngineError::Other("Queue snapshot is not durable.".into()));
             }
         } else {
-            if handle.retired.load(Ordering::Relaxed) {
-                return Err(EngineError::Other("Queue document was retired.".into()));
-            }
             let bytes = handle.doc.export_snapshot()?;
             self.inner
                 .store
@@ -4164,7 +4353,17 @@ impl DocHost {
             // the turn too, and the composer queues on the same reading. Taking
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
             // and abandon the question.
-            if sessions.turn_in_flight(&handle.chat_id) {
+            let starting_turn = self
+                .inner
+                .orchestration_queue
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|service| {
+                    service
+                        .has_starting_turn(&handle.chat_id)
+                        .unwrap_or(true)
+                });
+            if sessions.turn_in_flight(&handle.chat_id) || starting_turn {
                 return; // All queued messages wait, including rows from older clients.
             }
             let send = QueueSend::NextTurn;
@@ -4191,20 +4390,31 @@ impl DocHost {
         &self,
         sessions: &SessionsEngine,
         handle: &Arc<ChatDocHandle>,
+        command_id: &str,
     ) -> Result<bool, EngineError> {
         let _drain = handle.drain_lock.lock().await;
-        if !sessions.turn_in_flight(&handle.chat_id) {
-            return Ok(false);
-        }
-        handle.queue_paused.store(true, Ordering::Release);
-        match sessions.interrupt(&handle.chat_id).await {
+        self.prepare_orchestration_queue(handle).await?;
+        let previously_paused = handle.queue_paused.swap(true, Ordering::AcqRel);
+        let outcome = match sessions.interrupt_owned(&handle.chat_id, command_id).await {
+            Ok(Some(stopped)) => Ok(stopped),
+            Ok(None) if sessions.turn_in_flight(&handle.chat_id) => {
+                sessions.interrupt(&handle.chat_id).await
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(true) => Ok(true),
             Ok(false) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle
+                    .queue_paused
+                    .store(previously_paused, Ordering::Release);
                 Ok(false)
             }
             Err(err) => {
-                handle.queue_paused.store(false, Ordering::Release);
+                handle
+                    .queue_paused
+                    .store(previously_paused, Ordering::Release);
                 Err(err)
             }
         }
@@ -5378,7 +5588,8 @@ impl DocHost {
                 .await
             }
             SessionCommandPayload::Interrupt {} => {
-                self.interrupt_and_pause_queue(sessions, handle).await?;
+                self.interrupt_and_pause_queue(sessions, handle, &entry.id)
+                    .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondPermission {

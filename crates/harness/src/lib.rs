@@ -190,6 +190,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {}", crate::redact::redact_registered(.0))]
     Protocol(String),
+    /// The peer process went away before answering, so whether it applied the
+    /// request is unknown (unlike a `Protocol` rejection, which is definite).
+    #[error("harness protocol error: {}", crate::redact::redact_registered(.0))]
+    Transport(String),
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
     #[error("adapter install failed: {}", crate::redact::redact_registered(.0))]
@@ -212,6 +216,15 @@ pub struct SteerMessage {
     /// active steer must return false, not silently start a new native turn;
     /// the durable orchestration continuation owns that fallback.
     pub notification_acceptance: Option<oneshot::Sender<bool>>,
+}
+
+/// An uncorrelated legacy submission can confirm a root input, but cannot
+/// retire an arbitrary message from the host's steering recovery ledger.
+pub(crate) fn input_accepted_event(message_id: Option<String>) -> AgentEvent {
+    match message_id {
+        Some(message_id) => AgentEvent::InputAcceptedFor { message_id },
+        None => AgentEvent::InputAccepted,
+    }
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
@@ -287,6 +300,14 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// This adapter preserves mailbox message identity through its native
+    /// submission/fallback paths and emits InputAcceptedFor only after native
+    /// acceptance. Its local Steered boundary cannot retire a pending input.
+    /// Legacy adapters retain boundary-based recovery until they implement
+    /// this explicit contract.
+    fn confirms_steered_inputs(&self) -> bool {
+        false
+    }
     fn session_lifecycle(&self) -> Option<&dyn session_lifecycle::SessionLifecycle> {
         None
     }

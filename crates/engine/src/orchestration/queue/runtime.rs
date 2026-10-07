@@ -9,6 +9,35 @@ use crate::orchestration::event::{encode_component, iso};
 use crate::orchestration::projection::ThreadProjection;
 use crate::orchestration::{Result, task};
 
+const SESSION_NOT_ATTACHED: &str = "The provider session has not been attached.";
+
+/// A host callback may precede the provider's native-session metadata. Do not
+/// invent live authority or fail observation while that binding is unavailable.
+/// Upgrade only pending requests owned by this exact run when a real attachment
+/// arrives; expired/recovered requests must never become answerable again.
+pub(crate) fn session_attached(
+    p: &ThreadProjection,
+    command: &Command,
+    plan: &mut Plan,
+    run_id: &RunId,
+    session_id: &str,
+    now: i64,
+) -> Result<()> {
+    for request in task::records(p, "runtime-request").iter().filter(|r| {
+        r["status"] == "pending"
+            && r["responseCapability"]["type"] == "not_resumable"
+            && r["responseCapability"]["reason"] == SESSION_NOT_ATTACHED
+            && p.nodes
+                .iter()
+                .any(|n| r_node(r) == Some(n.id.0.as_str()) && n.run_id.as_ref() == Some(run_id))
+    }) {
+        let mut request = request.clone();
+        request["responseCapability"] = json!({"type":"live","providerSessionId":session_id});
+        plan.emit(command, "runtime-request.updated", &request, now)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn observe(
     p: &ThreadProjection,
     command: &Command,
@@ -31,8 +60,15 @@ pub(crate) fn observe(
     };
     if let Some((id, kind, questions)) = incoming {
         let node_id = format!("node:request:{}", encode_component(id));
+        let response_capability = match provider["providerSessionId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+        {
+            Some(session_id) => json!({"type":"live","providerSessionId":session_id}),
+            None => json!({"type":"not_resumable","reason":SESSION_NOT_ATTACHED}),
+        };
         let request = json!({"id":id,"nodeId":node_id,"providerTurnId":null,"nativeRequestRef":null,
-            "kind":kind,"status":"pending","responseCapability":{"type":"live","providerSessionId":provider["providerSessionId"]},
+            "kind":kind,"status":"pending","responseCapability":response_capability,
             "createdAt":iso(now)?,"resolvedAt":null});
         plan.emit(command, "runtime-request.updated", &request, now)?;
         let node = json!({"id":node_id,"threadId":p.thread.id,"runId":run.id,"rootNodeId":run.root_node_id,

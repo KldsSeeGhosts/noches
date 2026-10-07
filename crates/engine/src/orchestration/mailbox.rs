@@ -7,7 +7,7 @@ use super::command::{Command, Plan};
 use super::effects::EffectRequest;
 use super::event::{encode_component, iso};
 use super::projection::ThreadProjection;
-use super::task::{active_run, emit_execution, execution_seed, message, records};
+use super::task::{active_run, emit_execution, message, records};
 
 #[derive(Debug, Clone)]
 pub enum DeliveryAction {
@@ -313,7 +313,11 @@ pub(crate) fn plan_delivery(
             thread.model_selection = original.model_selection.clone();
             thread.provider_instance_id = original.provider_instance_id.clone();
             let driver = records(projection, "provider-thread")
-                .first()
+                .iter()
+                .find(|provider| {
+                    provider["id"].as_str()
+                        == original.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                })
                 .and_then(|provider| provider["driver"].as_str())
                 .unwrap_or("unknown");
             let ordinal = projection
@@ -328,8 +332,15 @@ pub(crate) fn plan_delivery(
             } else {
                 "starting"
             };
-            let mut seed =
-                execution_seed(&thread, ordinal, &input.message_id.0, status, driver, now)?;
+            let mut seed = super::task::execution_seed_for(
+                projection,
+                &thread,
+                ordinal,
+                &input.message_id.0,
+                status,
+                driver,
+                now,
+            )?;
             if status == "queued" {
                 seed.run.queue_position = Optional::Present(Some(ordinal));
                 seed.run.queue_held = Optional::Present(false);

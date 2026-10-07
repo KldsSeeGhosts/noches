@@ -1465,7 +1465,7 @@ fn resolve_shell_escape(
     escape_stops_active_agent: bool,
     route: Route,
     selected_chat: Option<&str>,
-    indicator: Indicator,
+    stop_available: bool,
     interrupting: bool,
 ) -> ShellEscapeOutcome {
     if key != "escape" {
@@ -1474,7 +1474,7 @@ fn resolve_shell_escape(
         ShellEscapeOutcome::Blocked
     } else if !escape_stops_active_agent || !matches!(route, Route::Chat) || interrupting {
         ShellEscapeOutcome::Ignored
-    } else if matches!(indicator, Indicator::Working | Indicator::AwaitingInput) {
+    } else if stop_available {
         selected_chat
             .map(|chat_id| ShellEscapeOutcome::InterruptChat(chat_id.to_owned()))
             .unwrap_or(ShellEscapeOutcome::Ignored)
@@ -1730,6 +1730,48 @@ enum PendingExit {
     InstallUpdate(PathBuf),
 }
 
+#[derive(Clone)]
+pub(super) struct SidebarNotice {
+    text: SharedString,
+    failed: bool,
+}
+
+impl SidebarNotice {
+    fn information(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            failed: false,
+        }
+    }
+
+    /// An action that did not happen. The only notice painted in the danger
+    /// hue: colour encodes state, so plain text converts to the neutral style.
+    fn failure(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            failed: true,
+        }
+    }
+}
+
+impl From<SharedString> for SidebarNotice {
+    fn from(text: SharedString) -> Self {
+        Self::information(text)
+    }
+}
+
+impl From<String> for SidebarNotice {
+    fn from(text: String) -> Self {
+        SharedString::from(text).into()
+    }
+}
+
+impl From<&str> for SidebarNotice {
+    fn from(text: &str) -> Self {
+        SharedString::from(text.to_owned()).into()
+    }
+}
+
 pub struct Shell {
     voice: voice::VoiceUi,
     state: Entity<AppState>,
@@ -1971,8 +2013,8 @@ pub struct Shell {
     /// failures and connectivity degradation produce one attention sound.
     attention_sound_gate: crate::sound::AttentionSoundGate,
     user_menu: popover::Popup<()>,
-    /// Inline sidebar error strip (mutation failures); click dismisses.
-    sidebar_notice: Option<SharedString>,
+    /// Inline action feedback; only failures use the danger palette.
+    sidebar_notice: Option<SidebarNotice>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -2624,7 +2666,7 @@ impl Shell {
         self.sidebar_source_dirty.set(true);
         self.sync_voice_context(cx);
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(notice.into());
+            self.sidebar_notice = Some(SidebarNotice::failure(notice));
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -4777,7 +4819,9 @@ impl Shell {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
             self.sidebar_notice = Some("Zeron conversation link copied".into());
         } else {
-            self.sidebar_notice = Some("Conversation link is not ready yet".into());
+            self.sidebar_notice = Some(SidebarNotice::failure(
+                "Conversation link is not ready yet",
+            ));
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5215,14 +5259,14 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
                     cx.notify();
                 })
                 .ok();
@@ -5527,8 +5571,9 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.sidebar_notice = Some(SidebarNotice::failure(format!(
+                            "Could not cancel sign-in: {err}"
+                        )));
                     }
                 }
                 cx.notify();
@@ -5863,7 +5908,8 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.sidebar_notice =
+                        Some(SidebarNotice::failure(format!("Sign in failed: {err}")));
                     cx.notify();
                 }
             })
@@ -7917,7 +7963,7 @@ impl Shell {
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
-            // Inline mutation-failure notice.
+            // Quiet successful actions and explicit mutation failures.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
                     div()
@@ -7928,15 +7974,23 @@ impl Shell {
                         .py(px(4.0))
                         .rounded(px(Theme::CONTROL_RADIUS))
                         .border_1()
-                        .border_color(theme.danger)
+                        .border_color(if notice.failed {
+                            theme.danger
+                        } else {
+                            theme.border
+                        })
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                        .text_color(if notice.failed {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        })
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
+                        .child(notice.text),
                 )
             })
             .child(
@@ -8700,6 +8754,10 @@ impl Shell {
             .as_deref()
             .is_some_and(|chat_id| self.active_composer().read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
+        let stop_available = matches!(indicator, Indicator::Working | Indicator::AwaitingInput)
+            || selected_chat
+                .as_deref()
+                .is_some_and(|chat_id| self.state.read(cx).native_background_pending(chat_id));
 
         match resolve_shell_escape(
             &event.keystroke.key,
@@ -8707,7 +8765,7 @@ impl Shell {
             escape_stops_active_agent,
             self.route,
             selected_chat.as_deref(),
-            indicator,
+            stop_available,
             interrupting,
         ) {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
@@ -8737,6 +8795,11 @@ impl Shell {
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let details_id = chat_id.clone();
+            let fork_id = chat_id.clone();
+            let can_transfer = self
+                .state
+                .read(cx)
+                .chat_host_supports(&chat_id, zeron_proto::capabilities::THREAD_TRANSFERS_V1);
             let lifecycle = self
                 .state
                 .read(cx)
@@ -8861,6 +8924,22 @@ impl Shell {
                             )
                             .child(SharedString::from("Thread details")),
                     )
+                    .when(can_transfer, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-fork-{chat_id}"))
+                                .id("chat-menu-fork")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_chat_menu(cx);
+                                    this.fork_conversation(fork_id.clone(), None, cx);
+                                }))
+                                .child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Fork conversation")),
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
@@ -10270,7 +10349,8 @@ impl Shell {
                         .state
                         .update(cx, |state, _| state.details.notice.take())
                     {
-                        self.sidebar_notice = Some(notice.into());
+                        // Only failed watch/setup actions set this notice.
+                        self.sidebar_notice = Some(SidebarNotice::failure(notice));
                     }
                     let pull_space = self
                         .state
@@ -12826,7 +12906,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::InterruptChat("chat-a".to_owned())
@@ -12838,7 +12918,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-b"),
-                Indicator::AwaitingInput,
+                true,
                 false,
             ),
             ShellEscapeOutcome::InterruptChat("chat-b".to_owned())
@@ -12854,19 +12934,19 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::Blocked
         );
-        for (route, selected, indicator, interrupting) in [
-            (Route::Chat, Some("chat-a"), Indicator::None, false),
-            (Route::Chat, None, Indicator::Working, false),
-            (Route::Chat, Some("chat-a"), Indicator::Working, true),
+        for (route, selected, stop_available, interrupting) in [
+            (Route::Chat, Some("chat-a"), false, false),
+            (Route::Chat, None, true, false),
+            (Route::Chat, Some("chat-a"), true, true),
             (
                 Route::Settings(SettingsSection::Devices),
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
         ] {
@@ -12877,7 +12957,7 @@ mod tests {
                     true,
                     route,
                     selected,
-                    indicator,
+                    stop_available,
                     interrupting,
                 ),
                 ShellEscapeOutcome::Ignored
@@ -12890,7 +12970,7 @@ mod tests {
                 true,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::OtherKey
@@ -12906,7 +12986,7 @@ mod tests {
                 false,
                 Route::Chat,
                 Some("chat-a"),
-                Indicator::Working,
+                true,
                 false,
             ),
             ShellEscapeOutcome::Ignored
@@ -15329,6 +15409,79 @@ impl Shell {
     pub fn fixture_appshots_transcript_start(&self, cx: &mut Context<Self>) {
         self.transcript
             .update(cx, |t, cx| t.fixture_appshots_start(cx));
+    }
+}
+
+/// Native renderer verification; never injects global mouse/keyboard events.
+#[cfg(feature = "orchestration-fixture")]
+impl Shell {
+    pub fn fixture_orchestration_open(&mut self, chat: String, cx: &mut Context<Self>) {
+        self.open_chat(chat, cx);
+        self.open_details_panel(cx);
+    }
+
+    pub fn fixture_queue_rows(&self, cx: &Context<Self>) -> Vec<zeron_doc::QueuedMessage> {
+        let composer = self.composer.read(cx);
+        Composer::target_queue_rows(&composer.target, self.state.read(cx))
+    }
+
+    pub fn fixture_queue_edit(&self, id: String, text: String, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.begin_queue_edit(id, cx);
+            assert!(
+                composer.canonical_queue_edit.is_some(),
+                "fixture must edit a real SQL-only row"
+            );
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text(text, cx));
+        });
+    }
+
+    pub fn fixture_queue_save(&self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            assert!(composer.commit_queue_edit(cx));
+        });
+    }
+
+    pub fn fixture_queue_remove(&self, id: String, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.remove_queued(id, cx));
+    }
+
+    pub fn fixture_queue_move(&self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.move_queued(from, to, cx));
+    }
+
+    pub fn fixture_queue_restart(&self, id: String, cx: &mut Context<Self>) {
+        self.active_composer()
+            .update(cx, |composer, cx| composer.fixture_restart_queued(id, cx));
+    }
+
+    pub fn fixture_orchestration_fork(&mut self, chat: String, cx: &mut Context<Self>) {
+        self.fork_conversation(chat, None, cx);
+    }
+
+    pub fn fixture_orchestration_merge(&mut self, chat: String, cx: &mut Context<Self>) {
+        let actions = self.live_details_actions(chat);
+        (actions.merge_back)(self, (), cx);
+    }
+
+    pub fn fixture_orchestration_disconnect(&mut self, chat: String, cx: &mut Context<Self>) {
+        let actions = self.live_details_actions(chat);
+        (actions.disconnect_session)(self, (), cx);
+    }
+
+    pub fn fixture_orchestration_stop_background(&self, cx: &mut Context<Self>) {
+        self.active_composer()
+            .update(cx, |composer, cx| composer.fixture_stop_background(cx));
+    }
+
+    pub fn fixture_orchestration_transcript_start(&self, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.fixture_appshots_start(cx);
+        });
     }
 }
 

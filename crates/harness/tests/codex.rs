@@ -152,6 +152,34 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn initialized_thread_is_not_input_acceptance_when_turn_start_is_rejected() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:turn-start-rejected"),
+        controls,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::InputAccepted
+            | AgentEvent::NativeReference {
+                turn_id: Some(_),
+                ..
+            }
+    )));
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. })
+        if error.contains("turn/start rejected before input acceptance"))
+    );
+}
+
+#[tokio::test]
 async fn reasoning_preserves_summary_parts_and_item_boundaries_per_thread() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(&harness(), request("scenario:reasoning"), controls).await;
@@ -378,7 +406,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
     steer
         .send(SteerMessage {
             prompt: "redirect please".into(),
-            message_id: None,
+            message_id: Some("direct-steer-message".into()),
             notification_acceptance: None,
         })
         .await
@@ -400,6 +428,9 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
         .expect("Steered emitted: {events:?}");
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "direct-steer-message".into(),
+    }));
 
     // The fake only emits this delta after verifying expectedTurnId + text.
     assert!(events.contains(&AgentEvent::TextDelta {
@@ -430,6 +461,9 @@ async fn notification_steer_receipts_native_acceptance() {
         .unwrap();
     let events = run_to_end(&harness(), request("scenario:steer"), controls).await;
     assert!(response.await.unwrap());
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "stable-completion-message".into(),
+    }));
     assert!(
         events
             .iter()
@@ -460,6 +494,7 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
             .unwrap()
             .unwrap();
         assert!(!matches!(event, AgentEvent::Steered { .. }));
+        assert!(!matches!(event, AgentEvent::InputAcceptedFor { .. }));
         if matches!(event, AgentEvent::Done { .. }) {
             break;
         }
@@ -477,17 +512,45 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
 }
 
 #[tokio::test]
+async fn app_server_exit_during_steer_is_uncertain_not_a_rejection() {
+    let (controls, steer, _token) = controls("Yes");
+    let (receipt, response) = oneshot::channel();
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: Some("lost-transport-message".into()),
+            notification_acceptance: Some(receipt),
+        })
+        .await
+        .unwrap();
+    let _ = run_to_end(&harness(), request("scenario:steer-exit"), controls).await;
+    // The receipt is dropped unanswered; `false` would claim a definite rejection.
+    assert!(response.await.is_err());
+}
+
+#[tokio::test]
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
     steer
         .send(SteerMessage {
             prompt: "redirect please".into(),
-            message_id: None,
+            message_id: Some("fallback-steer-message".into()),
             notification_acceptance: None,
         })
         .await
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer-race"), controls).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event
+                == AgentEvent::InputAcceptedFor {
+                    message_id: "fallback-steer-message".into(),
+                })
+            .count(),
+        1,
+        "native fallback must acknowledge the original message exactly once"
+    );
 
     // Two turns: the raced one completes, then the fallback carries the steer.
     let dones: Vec<_> = events

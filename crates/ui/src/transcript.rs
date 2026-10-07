@@ -1024,6 +1024,11 @@ pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
 
 #[derive(Clone)]
 pub enum RowKind {
+    /// Non-executable boundary between frozen inherited text and this chat.
+    ForkBoundary {
+        label: SharedString,
+        source_chat_id: String,
+    },
     GeneratedImage {
         owner: String,
         path: String,
@@ -4522,7 +4527,11 @@ impl Transcript {
                 None => {
                     let replay = if !s.transcript_replayed {
                         TranscriptReplayState::Pending
-                    } else if s.transcript.is_empty() {
+                    } else if s.transcript.is_empty()
+                        && s.selected_chat_row()
+                            .and_then(|chat| s.details.inherited_rows(chat))
+                            .is_none()
+                    {
                         TranscriptReplayState::Empty
                     } else {
                         TranscriptReplayState::Populated
@@ -4644,6 +4653,14 @@ impl Transcript {
                 .chat_id
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
+            let inherited = self
+                .chat_id
+                .as_deref()
+                .and_then(|id| state.chats.iter().find(|c| c.id == id))
+                .and_then(|chat| state.details.inherited_rows(chat));
+            if let Some(rows) = inherited {
+                new_rows.extend(rows.iter().cloned());
+            }
             for entry in entries {
                 if let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id)) {
                     new_rows.extend(rows.iter().cloned());
@@ -4668,7 +4685,7 @@ impl Transcript {
                 _ => {}
             }
             (
-                entries.is_empty(),
+                entries.is_empty() && inherited.is_none(),
                 entries
                     .last()
                     .is_some_and(|e| e.status == Some(MessageStatus::Streaming)),
@@ -6448,6 +6465,23 @@ impl Transcript {
             .flatten();
 
         let inner: AnyElement = match &row.kind {
+            RowKind::ForkBoundary {
+                label,
+                source_chat_id,
+            } => div()
+                .id(SharedString::from(format!("{}-context", row.id)))
+                .w_full()
+                .py(px(8.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .font_family(theme.font_mono.clone())
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_faint)
+                .child(label.clone())
+                .tooltip(crate::tooltip::text(format!(
+                    "Inherited from {source_chat_id}. Open the parent in Thread details for the full history."
+                )))
+                .into_any_element(),
             RowKind::User {
                 text,
                 mentions,
@@ -14879,7 +14913,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "appshots-fixture")]
+#[cfg(any(feature = "appshots-fixture", feature = "orchestration-fixture"))]
 impl Transcript {
     pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
         self.list.scroll_to(gpui::ListOffset::default());

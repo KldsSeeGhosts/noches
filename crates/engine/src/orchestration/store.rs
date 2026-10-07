@@ -18,7 +18,10 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_launch.sql"),
     include_str!("schema_transfer.sql"),
     include_str!("schema_queue.sql"),
+    // Preserve dev's published migration 7; steering extends it at version 8.
     include_str!("schema_performance.sql"),
+    include_str!("schema_steering.sql"),
+    include_str!("schema_controls.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,4 +694,132 @@ fn put_receipt(conn: &Connection, receipt: &CommandReceipt) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn steering_upgrades_dev_version_seven_without_rewriting_history_or_legacy_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Arc::new(DocsStore::open(dir.path()).unwrap());
+        docs.with_connection(|conn| -> Result<()> {
+            conn.execute_batch(
+                "CREATE TABLE orchestration_schema_migrations
+                 (version INTEGER PRIMARY KEY,applied_at INTEGER NOT NULL) STRICT",
+            )?;
+            for (index, sql) in MIGRATIONS.iter().take(7).enumerate() {
+                conn.execute_batch(sql)?;
+                conn.execute(
+                    "INSERT INTO orchestration_schema_migrations VALUES(?1,777)",
+                    [index as i64 + 1],
+                )?;
+            }
+            // The dev copy of migration 6 predates the user-request tables; they
+            // exist here only because `MIGRATIONS` was edited in place.
+            conn.execute_batch(
+                "DROP TABLE orchestration_queue_user_requests;
+                 DROP TABLE orchestration_session_user_requests;",
+            )?;
+            conn.execute("INSERT INTO orchestration_host VALUES(1,'host',4)", [])?;
+            conn.execute(
+                "INSERT INTO orchestration_effect_outbox
+                 (effect_id,command_id,thread_id,effect_type,lane,payload_json,
+                  process_bound,status,available_at,created_at)
+                 VALUES('legacy-steer','legacy-command','legacy-thread',
+                        'provider-turn.steer','provider',?1,1,'succeeded',0,0)",
+                [serde_json::json!({
+                    "type":"provider-turn.steer",
+                    "providerSessionId":"old-session",
+                    "providerThreadId":"old-provider",
+                    "providerTurnId":"old-turn",
+                    "messageId":"old-message"
+                })
+                .to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let store = Store::open(docs, "host").unwrap();
+        store
+            .read(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT MAX(version) FROM orchestration_schema_migrations",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    MIGRATIONS.len() as i64
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_schema_migrations
+                         WHERE version<=7 AND applied_at=777",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    7,
+                    "the existing dev migration history must remain unchanged"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT epoch FROM orchestration_host WHERE singleton=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    4
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE name IN ('orchestration_effect_ready',
+                                        'orchestration_steering_inputs',
+                                        'orchestration_steering_acceptances',
+                                        'orchestration_runtime_targets',
+                                        'orchestration_control_targets')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    5,
+                    "performance indexes and new steering tables must coexist"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE name IN ('orchestration_queue_user_requests',
+                                        'orchestration_session_user_requests')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    2,
+                    "opening a dev v7 database must recreate the request-identity tables"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_steering_inputs",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0,
+                    "legacy steering must not acquire speculative receipt/replay contracts"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchestration_control_targets",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0,
+                    "legacy controls must not acquire authority over replacement processes"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.effect("legacy-steer").unwrap().unwrap().status,
+            effects::EffectStatus::Succeeded
+        );
+    }
 }

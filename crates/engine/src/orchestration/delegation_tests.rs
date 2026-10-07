@@ -1228,13 +1228,33 @@ struct TestMcp;
 impl RunnerMcp for TestMcp {
     async fn bind(
         &self,
-        _scope: CallerScope,
+        scope: CallerScope,
         sessions: &crate::sessions::SessionsEngine,
     ) -> std::result::Result<(), ToolError> {
+        let credential = sessions
+            .mcp_server()
+            .credentials
+            .issue(crate::mcp::auth::InvocationScope {
+                environment_id: "test".into(),
+                selection: serde_json::from_value(json!({
+                    "instanceId": scope.provider_instance_id, "model": "mock-1"
+                }))
+                .unwrap(),
+                caller: scope.clone(),
+                capabilities: Default::default(),
+                issued_at: 0,
+                task_id: None,
+            })
+            .unwrap();
+        let entry = zeron_harness::mcp::McpServerEntry::http(
+            crate::mcp::SERVER_NAME,
+            "http://127.0.0.1:1/mcp",
+            [("Authorization".into(), credential.authorization)].into(),
+        );
         sessions
             .register_session_mcp(
-                &_scope.thread_id.0,
-                vec![],
+                &scope.thread_id.0,
+                vec![entry],
                 "Test orchestration session.".into(),
             )
             .map_err(|error| {
@@ -1452,6 +1472,11 @@ async fn live_parent_steer_is_noninterrupting_and_acceptance_does_not_acknowledg
         )
         .unwrap();
     let parent = fixture.parent();
+    bridge
+        .mcp
+        .bind(fixture.caller.clone(), &core.sessions)
+        .await
+        .unwrap();
     core.sessions.dispatch("parent",HarnessId::Mock,serde_json::from_value(json!({
         "prompt":"Parent is still busy.","model":"mock-1","reasoning":null,"cwd":fixture.dir.path(),"sandbox":"workspace-write","resume":null
     })).unwrap(),Some("live-parent-input".into())).await.unwrap();
@@ -1475,6 +1500,13 @@ async fn live_parent_steer_is_noninterrupting_and_acceptance_does_not_acknowledg
                 session_id: "steering-parent".into(),
                 assistant_message_id: "parent-assistant".into(),
             },
+        )
+        .await;
+    fixture
+        .event(
+            &parent.thread.id,
+            &parent.runs[0],
+            AgentEvent::InputAccepted,
         )
         .await;
     let delivery = fixture.delivery(DeliveryAction::Queue);
@@ -1936,6 +1968,13 @@ async fn steering_requires_always_wake_live_turn_capability_and_not_maintenance(
                 session_id: "live".into(),
                 assistant_message_id: "assistant".into(),
             },
+        )
+        .await;
+    fixture
+        .event(
+            &parent.thread.id,
+            &parent.runs[0],
+            AgentEvent::InputAccepted,
         )
         .await;
     fixture.complete(&task, "done").await;

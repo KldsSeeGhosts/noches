@@ -100,7 +100,7 @@ impl RpcClient {
             // Check under the same lock as EOF cleanup: a request racing the
             // reader exit must either be rejected here or cleared by it.
             if self.is_closed() {
-                return Err(HarnessError::Protocol(format!(
+                return Err(HarnessError::Transport(format!(
                     "{method}: app-server exited before responding"
                 )));
             }
@@ -109,7 +109,7 @@ impl RpcClient {
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
-            return Err(HarnessError::Protocol(format!(
+            return Err(HarnessError::Transport(format!(
                 "{method}: app-server stdin closed"
             )));
         }
@@ -117,7 +117,7 @@ impl RpcClient {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
             // Sender dropped: the reader hit EOF and failed all pending.
-            Err(_) => Err(HarnessError::Protocol(format!(
+            Err(_) => Err(HarnessError::Transport(format!(
                 "{method}: app-server exited before responding"
             ))),
         }

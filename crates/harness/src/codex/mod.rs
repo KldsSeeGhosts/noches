@@ -567,6 +567,9 @@ impl Harness for CodexHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
     }
+    fn confirms_steered_inputs(&self) -> bool {
+        true
+    }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         REASONING_LEVELS
     }
@@ -1093,6 +1096,7 @@ async fn run_session(session: Session) {
     let mut router = TurnRouter::default();
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => {
+            let _ = send(&event_tx, AgentEvent::InputAccepted).await;
             if !id.is_empty() {
                 let _ = send(
                     &event_tx,
@@ -1128,7 +1132,7 @@ async fn run_session(session: Session) {
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    let mut queued_steers: VecDeque<(String, Option<String>)> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -1317,10 +1321,11 @@ async fn run_session(session: Session) {
                         // Persistent session: a steer that lost the race with
                         // this turn's end becomes the next turn now; otherwise
                         // stay alive for the mailbox — the caller owns teardown.
-                        if let Some(text) = queued_steers.pop_front() {
+                        if let Some((text, message_id)) = queued_steers.pop_front() {
                             if !steer_as_new_turn(
                                 &client,
                                 turn_params(&text),
+                                message_id,
                                 &mut router,
                                 &event_tx,
                                 &mut assistant_message_id,
@@ -1433,6 +1438,7 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let text = msg.prompt;
+                    let message_id = msg.message_id;
                     let notification = msg.notification_acceptance;
                     if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
@@ -1455,6 +1461,7 @@ async fn run_session(session: Session) {
                                 {
                                     break 'main;
                                 }
+                                let _ = send(&event_tx, crate::input_accepted_event(message_id)).await;
                             }
                             // A failed `turn/steer` does NOT mean the text is
                             // bad: most commonly the active turn finished
@@ -1464,7 +1471,11 @@ async fn run_session(session: Session) {
                             // fallback for older Codex without steering).
                             Err(e) => {
                                 if let Some(receipt) = notification {
-                                    let _ = receipt.send(false);
+                                    // A dead transport may still have applied the steer:
+                                    // drop the receipt (uncertain), never claim rejection.
+                                    if !matches!(e, HarnessError::Transport(_)) {
+                                        let _ = receipt.send(false);
+                                    }
                                     continue 'main; // V2 queues using its original message ID
                                 }
                                 tracing::debug!(
@@ -1474,10 +1485,11 @@ async fn run_session(session: Session) {
                                 if router.active.as_deref() == Some(expected.as_str())
                                     && !router.is_completed(&expected)
                                 {
-                                    queued_steers.push_back(text);
+                                    queued_steers.push_back((text, message_id));
                                 } else if !steer_as_new_turn(
                                     &client,
                                     turn_params(&text),
+                                    message_id,
                                     &mut router,
                                     &event_tx,
                                     &mut assistant_message_id,
@@ -1494,6 +1506,7 @@ async fn run_session(session: Session) {
                     } else if !steer_as_new_turn(
                         &client,
                         turn_params(&text),
+                        message_id,
                         &mut router,
                         &event_tx,
                         &mut assistant_message_id,
@@ -1597,6 +1610,7 @@ async fn run_session(session: Session) {
 async fn steer_as_new_turn(
     client: &RpcClient,
     params: Value,
+    message_id: Option<String>,
     router: &mut TurnRouter,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     assistant_message_id: &mut String,
@@ -1607,7 +1621,7 @@ async fn steer_as_new_turn(
             router.adopt_started(id);
             *done_current = false;
             let (prev, next) = rotate(assistant_message_id);
-            send(
+            if !send(
                 event_tx,
                 AgentEvent::Steered {
                     assistant_message_id: Some(prev),
@@ -1615,6 +1629,10 @@ async fn steer_as_new_turn(
                 },
             )
             .await
+            {
+                return false;
+            }
+            send(event_tx, crate::input_accepted_event(message_id)).await
         }
         Err(e) => {
             let _ = send(

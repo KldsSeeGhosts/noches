@@ -30,6 +30,754 @@ use zeron_proto::{
 
 const CHAT: &str = "chat-queue";
 
+async fn canonical_input(core: &EngineCore, key: &str) -> String {
+    canonical_input_with_attachments(core, key, vec![]).await
+}
+
+async fn canonical_input_with_attachments(
+    core: &EngineCore,
+    key: &str,
+    attachments: Vec<serde_json::Value>,
+) -> String {
+    canonical_message(
+        core,
+        key,
+        attachments,
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Queue,
+    )
+    .await
+}
+
+async fn canonical_message(
+    core: &EngineCore,
+    key: &str,
+    attachments: Vec<serde_json::Value>,
+    mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode,
+) -> String {
+    use zeron_engine::orchestration::thread_service::ThreadSendRequest;
+    use zeron_proto::orchestration::{OrchestrationV2Actor, OrchestrationV2CreationSource};
+    let thread = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    core.orchestration_host
+        .as_ref()
+        .unwrap()
+        .threads
+        .send_to_thread(ThreadSendRequest {
+            project_id: thread.thread.project_id,
+            thread_id: CHAT.into(),
+            command_id: format!("canonical:{key}").into(),
+            message_id: format!("message:{key}").into(),
+            scheduled_task_id: None,
+            sender_thread_id: None,
+            text: key.into(),
+            attachments,
+            model_selection: None,
+            mode,
+            created_by: OrchestrationV2Actor::Agent,
+            creation_source: OrchestrationV2CreationSource::Mcp,
+        })
+        .await
+        .unwrap()
+        .run_id
+        .0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_steering_waits_for_adapter_confirmation_and_recovers_only_unconfirmed_input() {
+    use zeron_engine::orchestration::effects::{EffectRequest, EffectStatus};
+    for response in [Some(true), Some(false), None] {
+        let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+        *harness.steering_receipt.lock().unwrap() = response;
+        core.doc_host
+            .queue_message(CHAT, "opening", vec![])
+            .unwrap();
+        // Attachment is projected at SessionStarted, before InputAccepted
+        // binds the running provider turn. Wait for the actual admission
+        // predicate rather than racing that later provider observation.
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .queue_ui_state(&CHAT.into())
+                    .is_ok_and(|state| state.can_promote_to_steer)
+            },
+            "running, steerable canonical turn",
+        )
+        .await;
+        let original_run = core
+            .orchestration
+            .store
+            .queue_ui_state(&CHAT.into())
+            .unwrap()
+            .active_run_id
+            .unwrap();
+        let key = format!("canonical-steer-{response:?}");
+        canonical_message(
+            &core,
+            &key,
+            vec![],
+            zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+        )
+        .await;
+        let effect = core.orchestration.store.effects().unwrap().into_iter().find(|effect| matches!(&effect.request,
+            EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == format!("message:{key}"))).unwrap();
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .effect(&effect.id)
+                    .unwrap()
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect.status,
+                            EffectStatus::Succeeded
+                                | EffectStatus::Failed
+                                | EffectStatus::Uncertain
+                        )
+                    })
+            },
+            "canonical steering receipt outcome",
+        )
+        .await;
+        assert_eq!(
+            core.orchestration
+                .store
+                .effect(&effect.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            match response {
+                Some(true) => EffectStatus::Succeeded,
+                Some(false) => EffectStatus::Failed,
+                None => EffectStatus::Uncertain,
+            }
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "canonical steering must not start a second provider"
+        );
+        let _ = harness.finish.send(());
+        wait_for(
+            || {
+                !core.sessions.turn_in_flight(CHAT)
+                    && core
+                        .orchestration
+                        .store
+                        .thread(&CHAT.into())
+                        .unwrap()
+                        .unwrap()
+                        .runs
+                        .iter()
+                        .any(|run| {
+                            run.id.0 == original_run
+                                && run.status
+                                    == zeron_proto::orchestration::OrchestrationV2RunStatus::Completed
+                        })
+            },
+            "original turn runtime and canonical completion",
+        )
+        .await;
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "failed or uncertain input cannot auto-redispatch through the legacy ledger"
+        );
+        core.doc_host
+            .queue_message(CHAT, "explicit next turn", vec![])
+            .unwrap();
+        wait_for(
+            || prompts.lock().unwrap().len() == 2,
+            "explicit next turn after steering",
+        )
+        .await;
+        let prompt = prompts.lock().unwrap()[1].clone();
+        assert_eq!(prompt.contains(&key), response != Some(true), "{prompt}");
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
+}
+
+async fn canonical_frame(
+    rx: &mut zeron_rpc::RpcSubscription,
+    predicate: impl Fn(&zeron_proto::QueueUiState) -> bool,
+) -> zeron_proto::QueueUiState {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let value = rx.recv().await.expect("queue watch remains open");
+            if let Ok(queue) =
+                serde_json::from_value::<zeron_proto::QueueUiState>(value["canonical"].clone())
+                && predicate(&queue)
+            {
+                return queue;
+            }
+        }
+    })
+    .await
+    .expect("canonical queue snapshot must arrive without polling")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_canonical_queue_is_live_editable_idempotent_and_owner_authoritative() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut legacy = client
+        .subscribe_checked(methods::WATCH_QUEUE, json!({"chatId":CHAT}))
+        .await
+        .unwrap();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        legacy.recv().await.unwrap().get("canonical").is_none(),
+        "old watch contracts are unchanged"
+    );
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let attachments = vec![
+        json!({"type":"image","id":"upload","name":"diagram.png","mimeType":"image/png","sizeBytes":12}),
+    ];
+    let run =
+        canonical_input_with_attachments(&core, "agent queued work", attachments.clone()).await;
+    let state = canonical_frame(&mut watch, |queue| {
+        queue.queue.iter().any(|entry| entry.queued_run_id == run)
+    })
+    .await;
+    assert!(
+        !state
+            .queue
+            .iter()
+            .find(|entry| entry.queued_run_id == run)
+            .unwrap()
+            .document_backed
+    );
+    assert!(
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_queue()
+            .unwrap()
+            .is_empty(),
+        "SQL-only work is not inserted into Loro"
+    );
+    let edit = json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":"edit-identity",
+        "action":{"type":"edit","text":"edited agent work","expectedText":"agent queued work"}});
+    let first = client
+        .call(methods::MUTATE_QUEUED_RUN, edit.clone())
+        .await
+        .unwrap();
+    assert!(first["refusal"].is_null(), "{first}");
+    let sequence = core.orchestration.store.projection_frontier().unwrap();
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, edit.clone())
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        core.orchestration.store.projection_frontier().unwrap(),
+        sequence,
+        "response-loss retry emits no second edit"
+    );
+    let mut collision = edit.clone();
+    collision["action"]["text"] = json!("different payload");
+    assert!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, collision)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("identity")
+    );
+    let mut stale = edit;
+    stale["clientRequestId"] = json!("stale-editor");
+    stale["action"]["text"] = json!("overwrite");
+    let refusal = client
+        .call(methods::MUTATE_QUEUED_RUN, stale)
+        .await
+        .unwrap();
+    assert!(refusal["refusal"].as_str().unwrap().contains("changed"));
+    let updated = canonical_frame(&mut watch, |queue| {
+        queue
+            .queue
+            .iter()
+            .any(|entry| entry.text == "edited agent work")
+    })
+    .await;
+    assert_eq!(
+        updated
+            .queue
+            .iter()
+            .find(|entry| entry.queued_run_id == run)
+            .unwrap()
+            .attachments,
+        attachments
+    );
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    let message = projection.records["message"]
+        .iter()
+        .find(|message| message["id"] == "message:agent queued work")
+        .unwrap();
+    assert_eq!(
+        message["createdBy"], "agent",
+        "user edits must preserve original provenance"
+    );
+    assert_eq!(message["creationSource"], "mcp");
+    let cancel = json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":"cancel-identity","action":{"type":"cancel"}});
+    let first = client
+        .call(methods::MUTATE_QUEUED_RUN, cancel.clone())
+        .await
+        .unwrap();
+    assert!(first["refusal"].is_null());
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, cancel)
+            .await
+            .unwrap(),
+        first
+    );
+    canonical_frame(&mut watch, |queue| {
+        !queue.queue.iter().any(|entry| entry.queued_run_id == run)
+    })
+    .await;
+    core.workspace
+        .create_chat("replica", None, Some("foreign-owner"), None, None)
+        .unwrap();
+    assert!(client.call(methods::MUTATE_QUEUED_RUN,
+        json!({"chatId":"replica","queuedRunId":run,"clientRequestId":"foreign","action":{"type":"cancel"}})).await.is_err());
+    assert!(
+        core.orchestration
+            .store
+            .thread(&"replica".into())
+            .unwrap()
+            .is_none()
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_mixed_queue_reorder_preserves_intents_and_edit_leases() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let sql = canonical_input(&core, "SQL work").await;
+    let a = core
+        .doc_host
+        .queue_message(CHAT, "typed a", vec![])
+        .unwrap();
+    let b = core
+        .doc_host
+        .queue_message(CHAT, "typed b", vec![])
+        .unwrap();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let snapshot = canonical_frame(&mut watch, |queue| queue.queue.len() == 3).await;
+    let ra = snapshot
+        .queue
+        .iter()
+        .find(|entry| entry.message_id == a)
+        .unwrap()
+        .queued_run_id
+        .clone();
+    let rb = snapshot
+        .queue
+        .iter()
+        .find(|entry| entry.message_id == b)
+        .unwrap()
+        .queued_run_id
+        .clone();
+    for (key, run, before) in [("b-before-sql", &rb, &sql), ("sql-before-a", &sql, &ra)] {
+        let result = client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,"queuedRunId":run,
+            "clientRequestId":key,"action":{"type":"reorder","beforeRunId":before}}),
+            )
+            .await
+            .unwrap();
+        assert!(result["refusal"].is_null(), "{result}");
+    }
+    assert_eq!(
+        queue_texts(&core),
+        ["typed b", "typed a"],
+        "SQL-only positions never corrupt Loro order"
+    );
+    let lease = client.call(methods::BEGIN_QUEUED_MESSAGE_EDIT,
+        json!({"chatId":CHAT,"id":a,"editorDeviceId":core.device_id,"editorInstanceId":"lease-test"})).await.unwrap();
+    assert_eq!(lease["outcome"], "acquired");
+    assert!(
+        client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,"queuedRunId":ra,"clientRequestId":"bypass-lease",
+        "action":{"type":"edit","text":"unsafe","expectedText":"typed a"}})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("protected")
+    );
+    assert_eq!(queue_texts(&core), ["typed b", "typed a"]);
+    let stale = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            json!({"chatId":CHAT,"queuedRunId":sql,"clientRequestId":"wrong-active",
+        "action":{"type":"promoteToSteer","targetRunId":"stale-run"}}),
+        )
+        .await
+        .unwrap();
+    assert!(stale["refusal"].is_string());
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "refused steering never starts or interrupts a provider"
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_canonical_promotion_targets_the_running_attempt_without_restart() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let queued = canonical_input(&core, "queued steering").await;
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let snapshot = canonical_frame(&mut watch, |queue| queue.can_promote_to_steer).await;
+    let active = snapshot.active_run_id.unwrap();
+    let request = json!({"chatId":CHAT,"queuedRunId":queued,"clientRequestId":"promote-identity",
+        "action":{"type":"promoteToSteer","targetRunId":active}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, request.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    assert_eq!(
+        client
+            .call(methods::MUTATE_QUEUED_RUN, request)
+            .await
+            .unwrap(),
+        reply
+    );
+    canonical_frame(&mut watch, |queue| queue.queue.is_empty()).await;
+    wait_for(
+        || {
+            user_messages(&core)
+                .iter()
+                .any(|text| text == "queued steering")
+        },
+        "steering effect delivery",
+    )
+    .await;
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "promotion never starts a second provider"
+    );
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection
+            .runs
+            .iter()
+            .find(|run| run.id.0 == queued)
+            .unwrap()
+            .status,
+        zeron_proto::orchestration::OrchestrationV2RunStatus::Cancelled
+    );
+    assert_eq!(
+        projection
+            .runs
+            .iter()
+            .find(|run| run.id.0 == active)
+            .unwrap()
+            .status,
+        zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_restart_promotion_preserves_identity_native_history_attachments_and_other_queue_rows()
+ {
+    use serde_json::json;
+    use zeron_proto::{QueuePromotionMode, orchestration::*};
+    use zeron_rpc::methods;
+    for document_backed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let (harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        core.doc_host
+            .queue_message(CHAT, "original direction", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        let active = original.runs[0].id.clone();
+        let image = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            image.path(),
+            include_bytes!("../../ui/assets/file-icons/files/nuxt.png"),
+        )
+        .unwrap();
+        let path = image.path().to_string_lossy().into_owned();
+        let attachments = vec![
+            json!({"type":"image","id":"restart-upload","name":"diagram.png",
+            "mimeType":"image/png","sizeBytes":image.as_file().metadata().unwrap().len()}),
+        ];
+        let (selected, message_id) = if document_backed {
+            let id = core
+                .doc_host
+                .queue_message(CHAT, "new direction", vec![path.clone()])
+                .unwrap();
+            let mut watch = client
+                .subscribe_checked(
+                    methods::WATCH_QUEUE,
+                    json!({"chatId":CHAT,"includeCanonical":true}),
+                )
+                .await
+                .unwrap();
+            let state = canonical_frame(&mut watch, |state| {
+                state.queue.iter().any(|row| row.message_id == id)
+            })
+            .await;
+            let queued = state
+                .queue
+                .iter()
+                .find(|row| row.message_id == id)
+                .unwrap()
+                .queued_run_id
+                .clone();
+            (queued, id)
+        } else {
+            let fixture_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+            fixture_store
+                .with_connection(|conn| {
+                    conn.execute(
+                        "INSERT INTO orchestration_launch_claims VALUES(?1,?2)",
+                        rusqlite::params![
+                            "restart-upload",
+                            json!({"threadId":CHAT,"path":path,"attachment":attachments[0]})
+                                .to_string()
+                        ],
+                    )?;
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .unwrap();
+            (
+                canonical_input_with_attachments(&core, "new direction", attachments.clone()).await,
+                "message:new direction".to_string(),
+            )
+        };
+        let other = canonical_input(&core, "later SQL work").await;
+        let typed = core
+            .doc_host
+            .queue_message(CHAT, "later typed work", vec![])
+            .unwrap();
+        let mut watch = client
+            .subscribe_checked(
+                methods::WATCH_QUEUE,
+                json!({"chatId":CHAT,"includeCanonical":true}),
+            )
+            .await
+            .unwrap();
+        let snapshot = canonical_frame(&mut watch, |state| {
+            state.queue.len() == 3
+                && state.promotion_mode == Some(QueuePromotionMode::InterruptRestart)
+        })
+        .await;
+        assert!(!snapshot.can_promote_to_steer);
+        // The host refuses a stale non-interrupting action before consuming input.
+        let stale = client
+            .call(
+                methods::MUTATE_QUEUED_RUN,
+                json!({"chatId":CHAT,
+            "queuedRunId":selected,"clientRequestId":"stale-steer",
+            "action":{"type":"promoteToSteer","targetRunId":active}}),
+            )
+            .await
+            .unwrap();
+        assert!(stale["refusal"].is_string());
+        assert_eq!(harness.requests.lock().unwrap().len(), 1);
+        core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+        let request = json!({"chatId":CHAT,"queuedRunId":selected,"clientRequestId":"restart-once",
+            "action":{"type":"promoteToRestart","targetRunId":active}});
+        let reply = client
+            .call(methods::MUTATE_QUEUED_RUN, request.clone())
+            .await
+            .unwrap();
+        assert!(reply["refusal"].is_null(), "{reply}");
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .thread(&CHAT.into())
+                    .is_ok_and(|p| {
+                        p.is_some_and(|p| {
+                            p.runs.iter().any(|r| {
+                                r.id == active
+                                    && r.status == OrchestrationV2RunStatus::Running
+                                    && r.active_attempt_id != original.runs[0].active_attempt_id
+                            })
+                        })
+                    })
+                    && harness.requests.lock().unwrap().len() == 2
+                    && user_message_id(&core, "new direction").as_deref()
+                        == Some(message_id.as_str())
+            },
+            "replacement acceptance and original-message transcript materialization",
+        )
+        .await;
+        assert_eq!(
+            client
+                .call(methods::MUTATE_QUEUED_RUN, request)
+                .await
+                .unwrap(),
+            reply,
+            "response-loss retry must not restart the replacement"
+        );
+        let remaining = canonical_frame(&mut watch, |state| state.queue.len() == 2).await;
+        assert!(remaining.queue.iter().any(|row| row.queued_run_id == other));
+        assert!(remaining.queue.iter().any(|row| row.message_id == typed));
+        assert!(
+            !remaining
+                .queue
+                .iter()
+                .any(|row| row.message_id == message_id)
+        );
+        assert_eq!(queue_texts(&core), vec!["later typed work"]);
+        assert!(
+            user_message_id(&core, "later typed work").is_none(),
+            "retiring the old process cannot present another queued input as sent"
+        );
+        let after = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.len(),
+            4,
+            "one existing run and three originally queued runs only"
+        );
+        let restarted = after.runs.iter().find(|r| r.id == active).unwrap();
+        assert_eq!(restarted.user_message_id.0, message_id);
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .find(|r| r.id.0 == selected)
+                .unwrap()
+                .status,
+            OrchestrationV2RunStatus::Cancelled
+        );
+        assert_eq!(
+            after
+                .attempts
+                .iter()
+                .find(|a| Some(&a.id) == original.runs[0].active_attempt_id.as_ref())
+                .unwrap()
+                .status,
+            OrchestrationV2RunAttemptStatus::Superseded
+        );
+        let promoted = after.records["message"]
+            .iter()
+            .find(|m| m["id"] == message_id)
+            .unwrap();
+        assert_eq!(promoted["runId"], active.0);
+        if !document_backed {
+            assert_eq!(promoted["attachments"], json!(attachments));
+            assert_eq!(promoted["createdBy"], "agent");
+            assert_eq!(promoted["creationSource"], "mcp");
+        }
+        let requests = harness.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests[1].resume.as_deref(),
+            Some("sess-queue"),
+            "restart must resume the exact accepted predecessor conversation"
+        );
+        assert_eq!(requests[1].attachments, vec![path.clone()]);
+        assert!(requests[1].prompt.starts_with("new direction"));
+        assert!(
+            requests[1].prompt.contains(&path),
+            "promoted attachments must reach native input"
+        );
+        assert_eq!(
+            user_message_id(&core, "new direction").as_deref(),
+            Some(message_id.as_str())
+        );
+        assert_eq!(prompts.lock().unwrap().len(), 2);
+        assert!(core.orchestration.store.verify_projections().unwrap());
+        core.shutdown().await;
+    }
+}
+
 /// A turn that does not end until the test says so, so "the agent is busy" is
 /// a state the test controls rather than races.
 struct HeldHarness {
@@ -40,6 +788,12 @@ struct HeldHarness {
     /// Park the first turn on a question instead of just hanging, so the chat
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
+    park_after_done: bool,
+    native_background: bool,
+    steering_receipt: Arc<Mutex<Option<bool>>>,
+    /// Keep each steer's ACK sender alive and unanswered (a hung adapter),
+    /// instead of dropping it, which reads as an immediate uncertain result.
+    held_receipts: Arc<Mutex<Option<Vec<tokio::sync::oneshot::Sender<bool>>>>>,
 }
 
 impl HeldHarness {
@@ -61,6 +815,10 @@ impl HeldHarness {
                 prompts: prompts.clone(),
                 requests: Mutex::new(Vec::new()),
                 asks,
+                park_after_done: false,
+                native_background: false,
+                steering_receipt: Arc::new(Mutex::new(Some(true))),
+                held_receipts: Arc::new(Mutex::new(None)),
             }),
             prompts,
         )
@@ -109,31 +867,56 @@ impl Harness for HeldHarness {
             }]);
         }
         let mut steering = controls.steering;
-        let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
-            instance_id: None,
-            harness: HarnessId::Mock,
-            model: "mock-1".into(),
-            tools: vec![],
-            cwd: request.cwd.clone(),
-            session_id: "sess-queue".into(),
-            assistant_message_id: format!("a-{}", request.prompt),
-        })]);
+        let steering_receipt = self.steering_receipt.clone();
+        let held_receipts = self.held_receipts.clone();
+        let mut opening = vec![
+            Ok(AgentEvent::SessionStarted {
+                instance_id: None,
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: request.cwd.clone(),
+                session_id: "sess-queue".into(),
+                assistant_message_id: format!("a-{}", request.prompt),
+            }),
+            Ok(AgentEvent::InputAccepted),
+        ];
+        if self.native_background {
+            opening.push(Ok(AgentEvent::Subagent {
+                parent_tool_use_id: "background-child".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "Working in background".into(),
+                }),
+            }));
+        }
+        let started = futures::stream::iter(opening);
+        let result = self
+            .native_background
+            .then(|| "Finished main reply".to_owned());
         let done = futures::stream::once(async move {
             loop {
                 tokio::select! {
                     _ = finish.recv() => {
                         return Ok(AgentEvent::Done {
                             status: DoneStatus::Completed,
-                            result: None,
+                            result: result.clone(),
                             error: None,
                             session_id: Some("sess-queue".into()),
                         });
                     }
                     steer = steering.recv() => {
-                        if steer.is_none() {
+                        if let Some(mut steer) = steer {
+                            if let Some(receipt) = steer.notification_acceptance.take() {
+                                if let Some(held) = held_receipts.lock().unwrap().as_mut() {
+                                    held.push(receipt);
+                                } else if let Some(accepted) = *steering_receipt.lock().unwrap() {
+                                    let _ = receipt.send(accepted);
+                                }
+                            }
+                        } else {
                             return Ok(AgentEvent::Done {
                                 status: DoneStatus::Completed,
-                                result: None,
+                                result: result.clone(),
                                 error: None,
                                 session_id: Some("sess-queue".into()),
                             });
@@ -142,7 +925,14 @@ impl Harness for HeldHarness {
                 }
             }
         });
-        Ok(started.chain(done).boxed())
+        if self.park_after_done {
+            Ok(started
+                .chain(done)
+                .chain(futures::stream::pending())
+                .boxed())
+        } else {
+            Ok(started.chain(done).boxed())
+        }
     }
 }
 
@@ -157,6 +947,24 @@ where
             "timed out waiting for {what}"
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+/// Occurrence-counted write injection needs a quiet store: the first turn's
+/// settlement commits can otherwise land after injection on a slow runner.
+async fn settled_store(core: &EngineCore) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = core.orchestration.store.projection_frontier().unwrap();
+    let mut quiet = 0;
+    while quiet < 10 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for a quiet orchestration store"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let frontier = core.orchestration.store.projection_frontier().unwrap();
+        quiet = if frontier == last { quiet + 1 } else { 0 };
+        last = frontier;
     }
 }
 
@@ -261,6 +1069,682 @@ async fn create_chat(core: &EngineCore) {
         .expect("rename chat");
 }
 
+async fn attached_sessions(core: &EngineCore) -> Vec<zeron_proto::transfer::ProviderSessionRef> {
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .transfer_ui_state(&CHAT.into())
+                .is_ok_and(|state| !state.attached_provider_sessions.is_empty())
+        },
+        "accepted session attachment",
+    )
+    .await;
+    core.orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .attached_provider_sessions
+}
+
+async fn running_canonical(
+    core: &EngineCore,
+) -> zeron_engine::orchestration::projection::ThreadProjection {
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .is_ok_and(|p| {
+                    p.is_some_and(|p| p.attempts.iter().any(|a| a.provider_turn_id.is_some()))
+                })
+        },
+        "canonical provider turn",
+    )
+    .await;
+    core.orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_stop_releases_ingestion_lane_and_terminalizes_the_exact_run() {
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    let (core, _, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "stop this", vec![])
+        .unwrap();
+    let p = running_canonical(&core).await;
+    let run = p.runs[0].clone();
+    let result = core
+        .orchestration
+        .dispatch(
+            &Command {
+                id: "exact-stop".into(),
+                thread_id: CHAT.into(),
+                operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                    run_id: run.id.clone(),
+                    reason: None,
+                })),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, ReceiptStatus::Accepted);
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .iter()
+                .any(|r| r.id == run.id && r.status == OrchestrationV2RunStatus::Interrupted)
+        },
+        "canonical stop ingestion",
+    )
+    .await;
+    assert!(!core.sessions.has_live_runtime(CHAT));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_steer_ack_does_not_hold_the_thread_lane_against_stop() {
+    use zeron_engine::orchestration::effects::{EffectRequest, EffectStatus};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    let (core, harness, _) = setup(SteeringMode::StepBoundary).await;
+    *harness.held_receipts.lock().unwrap() = Some(vec![]);
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .queue_ui_state(&CHAT.into())
+                .is_ok_and(|state| state.can_promote_to_steer)
+        },
+        "running, steerable canonical turn",
+    )
+    .await;
+    let run_id = core
+        .orchestration
+        .store
+        .queue_ui_state(&CHAT.into())
+        .unwrap()
+        .active_run_id
+        .unwrap();
+    canonical_message(
+        &core,
+        "unanswered-steer",
+        vec![],
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+    )
+    .await;
+    let effect = core.orchestration.store.effects().unwrap().into_iter().find(|effect| matches!(&effect.request,
+        EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == "message:unanswered-steer")).unwrap();
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .effect(&effect.id)
+                .unwrap()
+                .is_some_and(|effect| effect.status == EffectStatus::Running)
+        },
+        "steer effect waiting on its adapter ACK",
+    )
+    .await;
+    wait_for(
+        || harness.held_receipts.lock().unwrap().as_ref().is_some_and(|held| !held.is_empty()),
+        "adapter holding the steer ACK",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The steer ACK wait is 10s; Stop must not queue behind it.
+    let stop = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        core.orchestration.dispatch(
+            &Command {
+                id: "stop-during-steer".into(),
+                thread_id: CHAT.into(),
+                operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                    run_id: run_id.into(),
+                    reason: None,
+                })),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        ),
+    )
+    .await
+    .expect("Stop waited behind the steer ACK")
+    .unwrap();
+    assert_eq!(stop.status, ReceiptStatus::Accepted);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_stop_with_stale_sql_cannot_cancel_an_active_or_idle_replacement() {
+    use zeron_engine::orchestration::effects::{EffectExecutor, EffectOutcome, EffectRequest};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    for idle in [false, true] {
+        let (mut harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+        Arc::get_mut(&mut harness).unwrap().park_after_done = true;
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        core.doc_host
+            .queue_message(CHAT, "original", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        core.orchestration_host.as_ref().unwrap().shutdown().await;
+        let receipt = core
+            .orchestration
+            .dispatch(
+                &Command {
+                    id: "delayed-stop".into(),
+                    thread_id: CHAT.into(),
+                    operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                        run_id: original.runs[0].id.clone(),
+                        reason: None,
+                    })),
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let effect = core
+            .orchestration
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        core.sessions.interrupt(CHAT).await.unwrap();
+        let mut next = harness.requests.lock().unwrap()[0].clone();
+        next.prompt = "replacement".into();
+        next.resume = None;
+        core.sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Mock,
+                next,
+                Some("replacement-input".into()),
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || harness.requests.lock().unwrap().len() == 2,
+            "replacement started",
+        )
+        .await;
+        if idle {
+            let _ = harness.finish.send(());
+            wait_for(
+                || {
+                    core.sessions
+                        .session_status(CHAT)
+                        .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+                },
+                "replacement idle",
+            )
+            .await;
+        }
+        // Simulate delayed canonical observation/reconstruction while the
+        // runtime map already contains a replacement. Logical SQL alone must
+        // not authorize cancelling whichever process now occupies this chat.
+        core.orchestration.store.rebuild().unwrap();
+        let diagnostic_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+        for (table, payload) in [
+            (
+                "orchestration_projection_runs",
+                serde_json::to_value(&original.runs[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_attempts",
+                serde_json::to_value(&original.attempts[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_nodes",
+                serde_json::to_value(&original.nodes[0]).unwrap(),
+            ),
+            (
+                "orchestration_projection_records",
+                original.records["provider-turn"][0].clone(),
+            ),
+        ] {
+            diagnostic_store.with_connection(|conn| {
+                assert_eq!(conn.execute(
+                    &format!("UPDATE {table} SET status=?1,payload_json=?2 WHERE id=?3 AND thread_id=?4"),
+                    rusqlite::params![payload["status"].as_str(), payload.to_string(),
+                        payload["id"].as_str(), CHAT],
+                ).unwrap(), 1);
+            });
+        }
+        let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+        assert_eq!(
+            bridge
+                .execute(&effect, tokio_util::sync::CancellationToken::new())
+                .await,
+            EffectOutcome::Succeeded
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            core.sessions.has_live_runtime(CHAT),
+            "stale Stop must preserve replacement (idle={idle})"
+        );
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_admitted_without_a_frozen_target_fails_but_a_legacy_row_still_succeeds() {
+    use zeron_engine::orchestration::effects::{EffectExecutor, EffectOutcome, EffectRequest};
+    use zeron_engine::orchestration::threads::planner::ThreadOperation;
+    use zeron_engine::orchestration::{Command, Operation, ReceiptStatus};
+    for legacy in [false, true] {
+        let (harness, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            zeron_engine::profile::EngineProfile::development(dir.path(), "test-org", "test-user");
+        let store_root = profile.store_root().to_path_buf();
+        let registry = HarnessRegistry::new();
+        registry.register(harness.clone());
+        let core =
+            EngineCore::assemble_with_profile(profile, Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        create_chat(&core).await;
+        core.doc_host
+            .queue_message(CHAT, "original", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        core.orchestration_host.as_ref().unwrap().shutdown().await;
+        let receipt = core
+            .orchestration
+            .dispatch(
+                &Command {
+                    id: "untargeted-stop".into(),
+                    thread_id: CHAT.into(),
+                    operation: Operation::Thread(Box::new(ThreadOperation::Interrupt {
+                        run_id: original.runs[0].id.clone(),
+                        reason: None,
+                    })),
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let effect = core
+            .orchestration
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        let diagnostic_store = zeron_sync::DocsStore::open(&store_root).unwrap();
+        diagnostic_store.with_connection(|conn| {
+            let sql = if legacy {
+                "DELETE FROM orchestration_control_targets WHERE effect_id=?1"
+            } else {
+                "UPDATE orchestration_control_targets SET target_json=NULL WHERE effect_id=?1"
+            };
+            assert_eq!(conn.execute(sql, [&effect.id]).unwrap(), 1);
+        });
+        let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+        assert_eq!(
+            bridge
+                .execute(&effect, tokio_util::sync::CancellationToken::new())
+                .await,
+            if legacy {
+                EffectOutcome::Succeeded
+            } else {
+                EffectOutcome::Failed
+            },
+            "legacy={legacy}"
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_restart_replaces_only_the_interrupted_attempt_and_keeps_one_run() {
+    use zeron_proto::orchestration::{OrchestrationV2RunAttemptStatus, OrchestrationV2RunStatus};
+    let (core, harness, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "original direction", vec![])
+        .unwrap();
+    let original = running_canonical(&core).await;
+    let run = canonical_message(
+        &core,
+        "new direction",
+        vec![],
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Restart,
+    )
+    .await;
+    assert_eq!(run, original.runs[0].id.0);
+    wait_for(
+        || harness.requests.lock().unwrap().len() == 2,
+        "replacement attempt start",
+    )
+    .await;
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .iter()
+                .any(|r| r.id.0 == run && r.status == OrchestrationV2RunStatus::Running)
+        },
+        "replacement canonical running",
+    )
+    .await;
+    let p = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.runs.len(), 1);
+    assert_ne!(
+        p.runs[0].active_attempt_id,
+        original.runs[0].active_attempt_id
+    );
+    assert_eq!(
+        p.attempts
+            .iter()
+            .find(|a| Some(&a.id) == original.runs[0].active_attempt_id.as_ref())
+            .unwrap()
+            .status,
+        OrchestrationV2RunAttemptStatus::Superseded
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_disconnect_stops_the_observed_session_preserves_history_and_cannot_retarget_a_retry()
+{
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    let sessions = attached_sessions(&core).await;
+    assert_eq!(sessions.len(), 1);
+    let request = DisconnectThreadSessionParams {
+        chat_id: CHAT.into(),
+        client_request_id: "disconnect-once".into(),
+        provider_sessions: sessions.clone(),
+    };
+    let mut stale_revision = request.clone();
+    stale_revision.client_request_id = "stale-attachment-revision".into();
+    stale_revision.provider_sessions[0].attachment_sequence += 1;
+    assert!(
+        client
+            .disconnect_thread_session(stale_revision, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("changed")
+    );
+    assert!(core.sessions.has_live_runtime(CHAT));
+    let first = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(first.refusal.is_none(), "{:?}", first.refusal);
+    wait_for(
+        || !core.sessions.has_live_runtime(CHAT),
+        "disconnected runtime teardown",
+    )
+    .await;
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "disconnect must not start another provider"
+    );
+    assert!(
+        core.orchestration
+            .store
+            .transfer_ui_state(&CHAT.into())
+            .unwrap()
+            .attached_provider_sessions
+            .is_empty()
+    );
+    let p = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        p.records["provider-thread"]
+            .iter()
+            .any(|provider| provider["nativeThreadRef"]["nativeId"] == "sess-queue"),
+        "disconnect must keep the accepted native conversation"
+    );
+
+    core.doc_host
+        .queue_message(CHAT, "continue after disconnect", vec![])
+        .unwrap();
+    let replacement = attached_sessions(&core).await;
+    wait_for(|| prompts.lock().unwrap().len() == 2, "replacement input").await;
+    assert_eq!(
+        harness.requests.lock().unwrap()[1].resume.as_deref(),
+        Some("sess-queue")
+    );
+    assert_ne!(sessions, replacement);
+    let replay = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(first.sequence, replay.sequence);
+    assert!(replay.refusal.is_none());
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "replay cannot disconnect a replacement"
+    );
+    let mut stale = request.clone();
+    stale.client_request_id = "stale-panel".into();
+    assert!(
+        client
+            .disconnect_thread_session(stale, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("changed")
+    );
+    let mut collision = request;
+    collision.provider_sessions = replacement;
+    assert!(
+        client
+            .disconnect_thread_session(collision, &core.device_id)
+            .await
+            .expect_err("a request identity cannot target different sessions")
+            .to_string()
+            .contains("different sessions")
+    );
+    core.workspace
+        .create_chat("replica", None, Some("foreign-owner"), None, None)
+        .unwrap();
+    assert!(
+        client
+            .disconnect_thread_session(
+                DisconnectThreadSessionParams {
+                    chat_id: "replica".into(),
+                    client_request_id: "foreign".into(),
+                    provider_sessions: sessions,
+                },
+                &core.device_id
+            )
+            .await
+            .is_err()
+    );
+    assert!(core.sessions.has_live_runtime(CHAT));
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_disconnect_does_not_require_a_live_agent_credential() {
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (core, harness, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "long-running session", vec![])
+        .unwrap();
+    let provider_sessions = attached_sessions(&core).await;
+    // Credential liveness and the user's authority to stop their runtime are
+    // different boundaries. Never fabricate an agent scope for this action.
+    core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .disconnect_thread_session(
+            DisconnectThreadSessionParams {
+                chat_id: CHAT.into(),
+                client_request_id: "user-not-agent".into(),
+                provider_sessions,
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    assert!(reply.refusal.is_none(), "{:?}", reply.refusal);
+    wait_for(
+        || !core.sessions.has_live_runtime(CHAT),
+        "user-authorized teardown",
+    )
+    .await;
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_disconnect_survives_response_loss_rebuild_and_does_not_stop_an_idle_replacement() {
+    use zeron_engine::orchestration::{
+        WriteBoundary,
+        effects::{EffectExecutor, EffectRequest},
+    };
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (mut harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().park_after_done = true;
+    let (core, harness, _) = setup_with((harness, prompts)).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "first runtime", vec![])
+        .unwrap();
+    let sessions = attached_sessions(&core).await;
+    core.orchestration_host.as_ref().unwrap().shutdown().await;
+    settled_store(&core).await;
+    let request = DisconnectThreadSessionParams {
+        chat_id: CHAT.into(),
+        client_request_id: "after-commit-loss".into(),
+        provider_sessions: sessions,
+    };
+    // First commit reserves the payload; second accepts detach plus its outbox.
+    core.orchestration
+        .store
+        .inject_failure(WriteBoundary::AfterCommit, 2);
+    assert!(
+        client
+            .disconnect_thread_session(request.clone(), &core.device_id)
+            .await
+            .is_err()
+    );
+    let accepted = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(accepted.refusal.is_none());
+    core.orchestration.store.rebuild().unwrap();
+    let replay = client
+        .disconnect_thread_session(request, &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(accepted.sequence, replay.sequence);
+    let effect = core
+        .orchestration
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|effect| {
+            matches!(
+                effect.request,
+                EffectRequest::ProviderSessionDisconnect { .. }
+            )
+        })
+        .unwrap();
+
+    core.sessions.interrupt(CHAT).await.unwrap();
+    let mut next = harness.requests.lock().unwrap()[0].clone();
+    next.prompt = "replacement runtime".into();
+    next.resume = None;
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            next,
+            Some("replacement-input".into()),
+        )
+        .await
+        .unwrap();
+    attached_sessions(&core).await;
+    let _ = harness.finish.send(());
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|status| status.status == zeron_proto::SessionStatus::Idle)
+        },
+        "idle replacement",
+    )
+    .await;
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "fixture must retain a parked provider process"
+    );
+    let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+    assert_eq!(
+        bridge
+            .execute(&effect, tokio_util::sync::CancellationToken::new())
+            .await,
+        zeron_engine::orchestration::effects::EffectOutcome::Succeeded
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "a delayed disconnect must not cancel an idle replacement"
+    );
+    assert_eq!(harness.requests.lock().unwrap().len(), 2);
+    core.shutdown().await;
+}
+
 /// Nothing is running, so a queued message is just a message: it goes out at
 /// once, and the queue is empty again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -343,6 +1827,54 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
         "the rest of the queue to flush",
     )
     .await;
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .thread(&CHAT.into())
+                .unwrap()
+                .is_some_and(|p| {
+                    p.runs.iter().any(|run| {
+                        run.user_message_id.0 == third_id
+                            && run.status
+                                == zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+                    })
+                })
+        },
+        "the third queued run to accept its provider turn",
+    )
+    .await;
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.runs.len(),
+        3,
+        "delivery never creates another logical run"
+    );
+    let provider = projection.runs[0].provider_thread_id.as_ref().unwrap();
+    for run in &projection.runs {
+        assert_eq!(run.provider_thread_id.as_ref(), Some(provider));
+        let attempt = projection
+            .attempts
+            .iter()
+            .find(|attempt| run.active_attempt_id.as_ref() == Some(&attempt.id))
+            .unwrap();
+        assert_eq!(&attempt.provider_thread_id, provider);
+        assert_eq!(
+            attempt.native_thread_id.as_ref().map(String::as_str),
+            Some("sess-queue")
+        );
+        let root = projection
+            .nodes
+            .iter()
+            .find(|node| run.root_node_id.as_ref() == Some(&node.id))
+            .unwrap();
+        assert_eq!(root.provider_thread_id.as_ref(), Some(provider));
+    }
     wait_for(
         || user_message_id(&core, "third").as_deref() == Some(third_id.as_str()),
         "the next held queue id to remain stable too",
@@ -505,6 +2037,187 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
     .await;
     let _ = harness.finish.send(());
     core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_stop_reaches_completed_native_background_and_holds_queue_without_agent_credentials() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus;
+    fn records<'a>(
+        p: &'a zeron_engine::orchestration::projection::ThreadProjection,
+        kind: &str,
+    ) -> &'a [serde_json::Value] {
+        p.records.get(kind).map(Vec::as_slice).unwrap_or_default()
+    }
+    for parked in [false, true] {
+        let (mut harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+        let fixture = Arc::get_mut(&mut harness).unwrap();
+        fixture.park_after_done = parked;
+        fixture.native_background = true;
+        let (core, harness, prompts) = setup_with((harness, prompts)).await;
+        core.doc_host
+            .queue_message(CHAT, "opening with background", vec![])
+            .unwrap();
+        let original = running_canonical(&core).await;
+        let run_id = original.runs[0].id.clone();
+        let queued_id = core
+            .doc_host
+            .queue_message(CHAT, "held follow-up", vec![])
+            .unwrap();
+        let BeginQueueEditOutcome::Acquired {
+            lease_id,
+            base_text_hash,
+            ..
+        } = core
+            .doc_host
+            .begin_queued_message_edit(CHAT, &queued_id, "desktop", "editor")
+            .await
+            .unwrap()
+        else {
+            panic!("fixture queue edit must be acquired");
+        };
+        let _ = harness.finish.send(());
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .queue_ui_state(&CHAT.into())
+                    .is_ok_and(|s| {
+                        s.background_run_id.as_ref() == Some(&run_id.0) && s.active_run_id.is_none()
+                    })
+                    && !core.sessions.turn_in_flight(CHAT)
+            },
+            "completed root with pending native work",
+        )
+        .await;
+        if parked {
+            assert!(
+                core.sessions.has_live_runtime(CHAT),
+                "must exercise a settled live process"
+            );
+        } else {
+            wait_for(
+                || !core.sessions.has_live_runtime(CHAT),
+                "already dead native process",
+            )
+            .await;
+        }
+        let before = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+        let transcript_before = core
+            .doc_host
+            .open(CHAT)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        let client = zeron_rpc::memory_client(core.rpc_service());
+        client
+            .call(
+                zeron_rpc::methods::QUEUE_COMMAND,
+                serde_json::json!({
+                    "chatId":CHAT,"command":{"kind":"interrupt"}
+                }),
+            )
+            .await
+            .unwrap();
+        wait_for(
+            || {
+                !core.sessions.has_live_runtime(CHAT)
+                    && core
+                        .orchestration
+                        .store
+                        .thread(&CHAT.into())
+                        .unwrap()
+                        .is_some_and(|p| {
+                            records(&p, "subagent").iter().any(|task| {
+                                task["origin"] == "provider_native"
+                                    && task["status"] == "interrupted"
+                            })
+                        })
+            },
+            "exact background Stop and durable settlement",
+        )
+        .await;
+        let after = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Completed);
+        assert_eq!(after.runs[0].completed_at, before.runs[0].completed_at);
+        assert_eq!(after.attempts[0], before.attempts[0]);
+        assert_eq!(
+            core.doc_host
+                .open(CHAT)
+                .unwrap()
+                .doc()
+                .read_entries()
+                .unwrap(),
+            transcript_before,
+            "background Stop must preserve the ordinary completed transcript too"
+        );
+        assert_eq!(
+            records(&after, "message")
+                .iter()
+                .find(|m| m["role"] == "assistant"),
+            records(&before, "message")
+                .iter()
+                .find(|m| m["role"] == "assistant")
+        );
+        assert!(
+            core.orchestration
+                .store
+                .queue_ui_state(&CHAT.into())
+                .unwrap()
+                .background_run_id
+                .is_none()
+        );
+        assert!(matches!(
+            core.doc_host
+                .finish_queued_message_edit(
+                    CHAT,
+                    &queued_id,
+                    &lease_id,
+                    FinishQueueEditAction::Commit,
+                    Some("edited held follow-up"),
+                    Some(&base_text_hash),
+                )
+                .await
+                .unwrap(),
+            FinishQueueEditOutcome::Committed
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(queue_texts(&core), vec!["edited held follow-up"]);
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "Stop cannot release a queued inference"
+        );
+        assert!(core.orchestration.store.verify_projections().unwrap());
+        core.doc_host
+            .send_queued_now(CHAT, &queued_id)
+            .await
+            .unwrap();
+        wait_for(
+            || {
+                prompts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "edited held follow-up")
+            },
+            "explicit next send after background Stop",
+        )
+        .await;
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
 }
 
 /// A `Steer` command asks for the running turn directly — a client that decided
@@ -1591,7 +3304,53 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
             assert_eq!(requests[1].model, config.model);
             assert_eq!(requests[1].reasoning, config.reasoning);
             assert_eq!(requests[1].model_options, config.model_options);
+            assert!(
+                requests[1].resume.is_none(),
+                "a changed model cannot resume the old generation"
+            );
         }
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .thread(&CHAT.into())
+                    .unwrap()
+                    .is_some_and(|p| {
+                        p.runs.iter().any(|run| {
+                            run.user_message_id.0 == id
+                                && run.status
+                                    == zeron_proto::orchestration::OrchestrationV2RunStatus::Running
+                        })
+                    })
+            },
+            "the queued selection to be accepted canonically",
+        )
+        .await;
+        let projection = core
+            .orchestration
+            .store
+            .thread(&CHAT.into())
+            .unwrap()
+            .unwrap();
+        let selected = projection
+            .runs
+            .iter()
+            .find(|run| run.user_message_id.0 == id)
+            .unwrap();
+        assert_eq!(selected.model_selection.model, "new-model");
+        assert_ne!(
+            selected.provider_thread_id,
+            projection.runs[0].provider_thread_id
+        );
+        let attempt = projection
+            .attempts
+            .iter()
+            .find(|attempt| selected.active_attempt_id.as_ref() == Some(&attempt.id))
+            .unwrap();
+        assert_eq!(
+            Some(&attempt.provider_thread_id),
+            selected.provider_thread_id.as_ref()
+        );
         let _ = harness.finish.send(());
         core.shutdown().await;
     }

@@ -105,6 +105,9 @@ impl Harness for Mock {
             }))
             .await
             .unwrap();
+            // This mock is already executing the requested input. Session
+            // readiness alone must not establish the steerable root turn.
+            tx.send(Ok(AgentEvent::InputAccepted)).await.unwrap();
             let result = if request.prompt == "PONG child" {
                 let caps = call(&mcp, "orchestrator_capabilities", json!({})).await;
                 assert!(
@@ -199,6 +202,7 @@ impl Harness for Mock {
                 }))
                 .await
                 .unwrap();
+                tx.send(Ok(AgentEvent::InputAccepted)).await.unwrap();
                 let task = call(
                     &mcp,
                     "delegate_task",

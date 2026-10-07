@@ -6,6 +6,7 @@ pub mod mcp;
 mod planner;
 pub(crate) mod runtime;
 mod search;
+pub(crate) mod session_control;
 #[cfg(test)]
 mod tests;
 mod title;
@@ -24,6 +25,37 @@ use super::queue_service::QueueService;
 use super::service::{CallerScope, ToolError};
 use super::{Error, Kernel, ReceiptStatus, Result, task};
 
+/// Request-identity tables (same shape: `command_id`, `payload_json`).
+pub(crate) const QUEUE_USER_REQUESTS: &str = "orchestration_queue_user_requests";
+pub(crate) const SESSION_USER_REQUESTS: &str = "orchestration_session_user_requests";
+
+/// Reserve a user request identity before dispatch. True for a first or exact
+/// replay; false when the id is already bound to different content.
+pub(crate) fn reserve_request(
+    conn: &rusqlite::Connection,
+    table: &'static str,
+    command_id: &str,
+    payload: &str,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let previous: Option<String> = conn
+        .query_row(
+            &format!("SELECT payload_json FROM {table} WHERE command_id=?1"),
+            [command_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(previous) = previous {
+        return Ok(previous == payload);
+    }
+    conn.execute(
+        &format!("INSERT INTO {table} VALUES(?1,?2)"),
+        rusqlite::params![command_id, payload],
+    )?;
+    Ok(true)
+}
+
+pub(crate) use planner::{can_promote_to_steer, promotion_mode};
 pub(crate) use planner::plan;
 
 #[derive(Clone)]
@@ -51,6 +83,7 @@ impl QueueCommand {
             "t3_queue_reorder" => "queued-run.reorder",
             "t3_queue_promote_to_steer" => "queued-message.promote-to-steer",
             "t3_pending_request_respond" => "runtime-request.respond",
+            "host.disconnect_provider_sessions" => "provider-session.detach",
             "t3_thread_update" => "thread.metadata.update",
             "t3_thread_organize" => match self.input["action"].as_str() {
                 Some("pin") => "thread.pin",

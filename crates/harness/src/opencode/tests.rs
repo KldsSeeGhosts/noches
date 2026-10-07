@@ -1,5 +1,47 @@
 use super::*;
 
+#[test]
+fn detached_prompt_ack_is_exact_once_and_cannot_accept_a_replacement_turn() {
+    let first = TurnState::begin(None);
+    let mut replacement = TurnState::begin(None);
+    assert!(!replacement.accept_submission(first.submission_id));
+    assert!(replacement.post_pending);
+    assert!(replacement.accept_submission(replacement.submission_id));
+    assert!(!replacement.accept_submission(replacement.submission_id));
+    replacement = TurnState::begin(None);
+    replacement.active = false;
+    assert!(!replacement.accept_submission(replacement.submission_id));
+    assert!(replacement.post_pending);
+}
+
+#[test]
+fn unacked_submissions_survive_turn_replacement_and_are_bounded() {
+    let mut unacked = UnackedSubmissions::default();
+    let mut command = TurnState::begin(None);
+    command.message_id = Some("steer-1".into());
+    unacked.track(&command);
+    // A root prompt without an app message id and an already-acked turn are
+    // never tracked.
+    unacked.track(&TurnState::begin(None));
+    let mut acked = TurnState::begin(None);
+    acked.message_id = Some("acked".into());
+    assert!(acked.accept_submission(acked.submission_id));
+    unacked.track(&acked);
+    assert_eq!(unacked.0.len(), 1);
+    // The turn was replaced; its late ack still resolves exactly once.
+    let replacement = TurnState::begin(None);
+    assert!(!{ let mut r = replacement; r.accept_submission(command.submission_id) });
+    assert_eq!(unacked.take(command.submission_id).as_deref(), Some("steer-1"));
+    assert_eq!(unacked.take(command.submission_id), None);
+    for n in 0..UnackedSubmissions::CAP + 5 {
+        let mut turn = TurnState::begin(None);
+        turn.message_id = Some(format!("m{n}"));
+        unacked.track(&turn);
+    }
+    assert_eq!(unacked.0.len(), UnackedSubmissions::CAP);
+    assert_eq!(unacked.0.front().unwrap().1, "m5");
+}
+
 #[tokio::test]
 async fn owned_mcp_registration_and_cleanup_match_both_wire_generations() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -222,6 +264,7 @@ impl TurnWire {
         let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
         let delay_prompt_ms = overrides["delayPromptMs"].as_u64().unwrap_or(0);
         let command_failure = overrides["commandFailure"].as_bool().unwrap_or(false);
+        let command_delay_ms = overrides["commandDelayMs"].as_u64().unwrap_or(0);
         let command_names: Vec<String> = overrides["commandNames"]
             .as_array()
             .map(|names| {
@@ -280,6 +323,10 @@ impl TurnWire {
                         let _ = request_tx.send(path);
                         return;
                     }
+                    if is_post && command_delay_ms > 0 && path.ends_with("/command") {
+                        // The real endpoint blocks for the whole turn.
+                        tokio::time::sleep(Duration::from_millis(command_delay_ms)).await;
+                    }
                     if hold_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
                         let _ = request_tx.send(path);
                         std::future::pending::<()>().await;
@@ -330,8 +377,8 @@ impl TurnWire {
             steer_tx
                 .send(crate::SteerMessage {
                     notification_acceptance: None,
-                    prompt: "second".into(),
-                    message_id: None,
+                    prompt: overrides["queuedPrompt"].as_str().unwrap_or("second").into(),
+                    message_id: overrides["queuedMessageId"].as_str().map(str::to_owned),
                 })
                 .await
                 .unwrap();
@@ -469,6 +516,46 @@ async fn queued_turn_ignores_previous_turn_duplicate_idle() {
             "queued turn was completed before its response"
         );
     }
+}
+
+#[tokio::test]
+async fn late_command_ack_still_receipts_a_steer_whose_turn_already_settled() {
+    // `/compact` blocks for the whole turn, so its HTTP ack lands after the
+    // SSE idle has already ended the run. Without a receipt the engine would
+    // redispatch an input that already ran.
+    let mut wire = TurnWire::start_config(
+        true,
+        false,
+        true,
+        None,
+        "1.18.31",
+        json!({"commandNames": ["compact"], "queuedPrompt": "/compact",
+            "queuedMessageId": "steer-1", "commandDelayMs": 700}),
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    while !wire.posts.lock().unwrap().iter().any(|(path, _)| path.ends_with("/command")) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    wire.status("busy");
+    // Both idle encodings settle the turn while the command POST is open.
+    wire.status("idle");
+    wire.idle();
+    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut accepted = vec![];
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::InputAcceptedFor { message_id } => accepted.push(message_id),
+                AgentEvent::Done { .. } => return accepted,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(accepted, vec!["steer-1".to_string()]);
 }
 
 #[tokio::test]

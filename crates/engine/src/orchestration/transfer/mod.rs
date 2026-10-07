@@ -3,6 +3,7 @@
 pub mod context;
 pub mod delivery;
 pub mod mcp;
+mod retry;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -32,6 +33,8 @@ pub enum SourcePoint {
 
 #[derive(Debug, Clone)]
 pub enum TransferOperation {
+    /// Desktop user authority does not impersonate an active provider session.
+    User(Box<TransferOperation>),
     Fork {
         target: ThreadId,
         source: SourcePoint,
@@ -57,6 +60,7 @@ pub enum TransferOperation {
 impl TransferOperation {
     pub fn command_type(&self) -> &'static str {
         match self {
+            Self::User(operation) => operation.command_type(),
             Self::Fork { .. } => "thread.fork",
             Self::MergeBack { .. } => "thread.merge_back",
             Self::Update { .. } => "kernel.transfer.update",
@@ -66,6 +70,7 @@ impl TransferOperation {
     }
     pub fn lock_threads(&self) -> Vec<ThreadId> {
         match self {
+            Self::User(operation) => operation.lock_threads(),
             Self::Fork { target, .. } | Self::MergeBack { target, .. } => vec![target.clone()],
             Self::Update { transfer, .. } | Self::CreateHandoff { transfer, .. } => {
                 ["sourceThreadId", "targetThreadId"]
@@ -184,6 +189,10 @@ pub(crate) fn plan(
     operation: &TransferOperation,
     now: i64,
 ) -> Result<Plan> {
+    let (operation, user) = match operation {
+        TransferOperation::User(operation) => (operation.as_ref(), true),
+        operation => (operation, false),
+    };
     let mut plan = Plan::default();
     let source = require_thread(conn, &command.thread_id)?;
     match operation {
@@ -253,6 +262,21 @@ pub(crate) fn plan(
                     run.id
                 )));
             }
+            // A second fork's merge-back would wedge the parent ("multiple forks")
+            // with no way to clear either, so a user must deliver the first.
+            if merge
+                && user
+                && transfers(conn, target)?.iter().any(|t| {
+                    t["type"] == "merge_back"
+                        && t["status"] == "pending"
+                        && t["targetThreadId"] == target.0
+                        && t["sourceThreadId"] != source.thread.id.0
+                })
+            {
+                return Err(Error::Invariant(format!(
+                    "Another fork is already waiting to merge back into {target}. Send a message in {target} to deliver it first, then merge this fork."
+                )));
+            }
             let source_transfers = transfers(conn, &source.thread.id)?;
             let base = if merge {
                 source_transfers
@@ -281,7 +305,7 @@ pub(crate) fn plan(
                 "sourcePoint":canonical_point(&source,run),"basePoint":base,
                 "sourceProviderInstanceId":run.provider_instance_id,
                 "targetProviderInstanceId":target_projection.as_ref().map(|p| &p.thread.model_selection.instance_id),
-                "targetRunId":null,"status":"pending","resolution":null,"createdBy":"agent",
+                "targetRunId":null,"status":"pending","resolution":null,"createdBy":if user {"user"} else {"agent"},
                 "error":if merge {if provider.is_none() {Some("Source merge-back run has no provider thread.")} else {None}}
                     else if provider.as_ref().is_some_and(|p| p["nativeThreadRef"]["strength"] == "strong") {None}
                     else {Some("Source provider thread does not expose a strong native thread ref.")},
@@ -293,8 +317,8 @@ pub(crate) fn plan(
                 thread["title"] = json!(
                     title_for(operation).unwrap_or_else(|| format!("{} fork", source.thread.title))
                 );
-                thread["createdBy"] = json!("agent");
-                thread["creationSource"] = json!("mcp");
+                thread["createdBy"] = json!(if user { "user" } else { "agent" });
+                thread["creationSource"] = json!(if user { "web" } else { "mcp" });
                 thread["activeProviderThreadId"] = Value::Null;
                 thread["lineage"] = json!({"parentThreadId":source.thread.id,"relationshipToParent":"fork","rootThreadId":source.thread.lineage.root_thread_id});
                 thread["forkedFrom"] =
@@ -425,6 +449,11 @@ pub(crate) fn plan(
             plan.emit(command, "context-transfer.created", transfer, now)?;
             plan.emit(command, "context-handoff.updated", handoff, now)?;
             handoff_metadata(&source, command, &mut plan, handoff, now)?;
+        }
+        TransferOperation::User(_) => {
+            return Err(Error::Invariant(
+                "Nested user transfer is not supported.".into(),
+            ));
         }
         TransferOperation::Checkpoint { record } => {
             conn.execute(
@@ -579,7 +608,7 @@ pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool
         .collect();
     if queued && !pending.is_empty() {
         return Err(Error::Invariant(format!(
-            "Thread {thread} has a pending merge-back transfer; queued merge-back consumption is not implemented yet."
+            "Thread {thread} has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it."
         )));
     }
     if pending
@@ -590,7 +619,7 @@ pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool
         > 1
     {
         return Err(Error::Invariant(format!(
-            "Thread {thread} has pending merge-back transfers from multiple forks."
+            "Thread {thread} has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together."
         )));
     }
     Ok(())

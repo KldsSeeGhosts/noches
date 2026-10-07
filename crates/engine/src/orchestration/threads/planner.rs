@@ -8,7 +8,7 @@ use crate::orchestration::command::{Command, Plan, run_terminal};
 use crate::orchestration::effects::EffectRequest;
 use crate::orchestration::event::{encode_component, iso};
 use crate::orchestration::projection::{self, ThreadProjection};
-use crate::orchestration::task::{active_run, emit_execution, execution_seed, message, records};
+use crate::orchestration::task::{active_run, emit_execution, message, records};
 use crate::orchestration::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -51,6 +51,12 @@ fn message_metadata(message: &mut Value, input: &Send) {
 #[derive(Debug, Clone)]
 pub enum ThreadOperation {
     Send(Send),
+    /// Host-only late-steer recovery. Validation and dispatch planning share
+    /// one SQL snapshot; this cannot silently retarget an ordinary Send.
+    SteerFollowUp {
+        effect: Box<crate::orchestration::effects::Effect>,
+        message_id: MessageId,
+    },
     Interrupt {
         run_id: RunId,
         reason: Option<String>,
@@ -61,6 +67,7 @@ impl ThreadOperation {
     pub fn command_type(&self) -> &'static str {
         match self {
             Self::Send(_) => "message.dispatch",
+            Self::SteerFollowUp { .. } => "message.steer-follow-up",
             Self::Interrupt { .. } => "run.interrupt",
         }
     }
@@ -90,6 +97,98 @@ pub(crate) fn steerable(projection: &ThreadProjection) -> Option<&OrchestrationV
         .max_by_key(|r| r.ordinal)
 }
 
+/// Queue promotion and ordinary steering replace an attempt, not the logical
+/// run. The effect freezes the original process while the new root owns input.
+pub(crate) fn restart_attempt(
+    projection: &ThreadProjection,
+    command: &Command,
+    plan: &mut Plan,
+    run: &OrchestrationV2Run,
+    session_id: &str,
+    turn: &Value,
+    message_id: &MessageId,
+    now: i64,
+) -> Result<OrchestrationV2Run> {
+    let old = projection
+        .attempts
+        .iter()
+        .find(|a| {
+            Some(&a.id) == run.active_attempt_id.as_ref()
+                && a.run_id == run.id
+                && Some(&a.root_node_id) == run.root_node_id.as_ref()
+                && Some(&a.provider_thread_id) == run.provider_thread_id.as_ref()
+                && a.provider_turn_id
+                    .as_ref()
+                    .is_some_and(|id| turn["id"] == id.0)
+        })
+        .ok_or_else(|| unsupported(command, "Missing exact restart attempt"))?;
+    let root = projection
+        .nodes
+        .iter()
+        .find(|n| Some(&n.id) == run.root_node_id.as_ref() && n.run_id.as_ref() == Some(&run.id))
+        .ok_or_else(|| unsupported(command, "Missing exact restart root"))?;
+    let ordinal = projection
+        .attempts
+        .iter()
+        .filter(|a| a.run_id == run.id)
+        .map(|a| a.attempt_ordinal)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let attempt_id = RunAttemptId(format!(
+        "run-attempt:{}:{ordinal}",
+        encode_component(&run.id.0)
+    ));
+    let root_id = NodeId(format!("node:{}:{ordinal}", encode_component(&run.id.0)));
+    let mut previous = old.clone();
+    previous.status = OrchestrationV2RunAttemptStatus::Superseded;
+    previous.completed_at = Some(iso(now)?);
+    plan.emit(command, "run-attempt.updated", &previous, now)?;
+    let mut previous_root = root.clone();
+    previous_root.status = OrchestrationV2ExecutionNodeStatus::Interrupted;
+    previous_root.completed_at = Some(iso(now)?);
+    plan.emit(command, "node.updated", &previous_root, now)?;
+    let mut attempt = old.clone();
+    attempt.id = attempt_id.clone();
+    attempt.attempt_ordinal = ordinal;
+    attempt.root_node_id = root_id.clone();
+    attempt.provider_turn_id = None;
+    attempt.reason = OrchestrationV2RunAttemptReason::SteeringRestart;
+    attempt.status = OrchestrationV2RunAttemptStatus::Pending;
+    attempt.started_at = None;
+    attempt.completed_at = None;
+    let root: OrchestrationV2ExecutionNode = serde_json::from_value(json!({
+        "id":root_id,"threadId":projection.thread.id,"runId":run.id,"rootNodeId":root_id,
+        "parentNodeId":null,"kind":"root_turn","status":"pending","countsForRun":true,
+        "providerThreadId":run.provider_thread_id,"providerTurnId":null,"nativeItemRef":null,
+        "runtimeRequestId":null,"checkpointScopeId":null,"startedAt":null,"completedAt":null}))?;
+    let mut restarted = run.clone();
+    restarted.root_node_id = Some(root_id);
+    restarted.active_attempt_id = Some(attempt_id);
+    restarted.user_message_id = message_id.clone();
+    restarted.status = OrchestrationV2RunStatus::Starting;
+    plan.emit(command, "run.updated", &restarted, now)?;
+    plan.emit(command, "run-attempt.created", &attempt, now)?;
+    plan.emit(command, "node.updated", &root, now)?;
+    plan.cancel_process_effects = true;
+    plan.effects.push(EffectRequest::ProviderTurnRestart {
+        provider_session_id: ProviderSessionId(session_id.into()),
+        provider_thread_id: run
+            .provider_thread_id
+            .clone()
+            .ok_or_else(|| unsupported(command, "Restart run has no provider thread"))?,
+        provider_turn_id: ProviderTurnId(
+            turn["id"]
+                .as_str()
+                .ok_or_else(|| unsupported(command, "Restart turn has no id"))?
+                .into(),
+        ),
+        interrupted_attempt_id: old.id.clone(),
+        run_id: run.id.clone(),
+    });
+    Ok(restarted)
+}
+
 pub(crate) fn user_item(
     projection: &ThreadProjection,
     run: &OrchestrationV2Run,
@@ -113,6 +212,23 @@ pub(crate) fn user_item(
     Ok(item)
 }
 
+pub(crate) fn next_item_ordinal(projection: &ThreadProjection, plan: &Plan) -> Result<i64> {
+    let mut last = records(projection, "turn-item")
+        .iter()
+        .filter_map(|item| item["ordinal"].as_i64())
+        .max()
+        .unwrap_or(0);
+    for event in &plan.events {
+        if let OrchestrationV2DomainEvent::TurnItemUpdated(event) = event
+            && event.thread_id == projection.thread.id
+        {
+            let item = serde_json::to_value(&event.payload)?;
+            last = last.max(item["ordinal"].as_i64().unwrap_or(0));
+        }
+    }
+    Ok(last + 1)
+}
+
 pub(crate) fn assistant_item(
     projection: &ThreadProjection,
     command: &Command,
@@ -129,10 +245,14 @@ pub(crate) fn assistant_item(
         .iter()
         .find(|i| i["id"] == id);
     let time = iso(now)?;
+    let ordinal = match previous.and_then(|i| i["ordinal"].as_i64()) {
+        Some(ordinal) => ordinal,
+        None => next_item_ordinal(projection, plan)?,
+    };
     let item = json!({"id":id,"type":"assistant_message","threadId":projection.thread.id,
         "runId":message["runId"],"nodeId":message["nodeId"],"providerThreadId":attempt["providerThreadId"],
         "providerTurnId":attempt["providerTurnId"],"nativeItemRef":null,"parentItemId":null,
-        "ordinal":previous.and_then(|i| i["ordinal"].as_i64()).unwrap_or_else(|| records(projection,"turn-item").iter().filter_map(|i| i["ordinal"].as_i64()).max().unwrap_or(0)+1),
+        "ordinal":ordinal,
         "status":if message["streaming"] == true {"running"} else {"completed"},"title":null,
         "startedAt":previous.map(|i| &i["startedAt"]).cloned().unwrap_or(json!(time)),
         "completedAt":if message["streaming"] == true {Value::Null} else {json!(time)},"updatedAt":time,
@@ -201,6 +321,134 @@ pub(crate) fn plan(
         .ok_or_else(|| unsupported(command, "Missing thread"))?;
     let mut plan = Plan::default();
     match op {
+        ThreadOperation::SteerFollowUp { effect, message_id } => {
+            if effect.thread_id != command.thread_id {
+                return Err(unsupported(command, "Foreign steering effect"));
+            }
+            let saved = crate::orchestration::effects::get(conn, &effect.id)?
+                .filter(|saved| {
+                    saved.request == effect.request && saved.command_id == effect.command_id
+                })
+                .ok_or_else(|| unsupported(command, "Steering effect changed"))?;
+            if crate::orchestration::steering::confirmed(conn, &effect.id)? {
+                // The kernel requires a receipted event even for a no-op.
+                plan.emit(command, "thread.metadata-updated", &projection.thread, now)?;
+                return Ok(plan);
+            }
+            let EffectRequest::ProviderTurnSteer {
+                message_id: expected,
+                ..
+            } = &saved.request
+            else {
+                return Err(unsupported(command, "Not a steering effect"));
+            };
+            if expected != message_id {
+                return Err(unsupported(command, "Steering message changed"));
+            }
+            if !matches!(
+                saved.status,
+                crate::orchestration::effects::EffectStatus::Pending
+                    | crate::orchestration::effects::EffectStatus::Running
+            ) {
+                return Err(unsupported(
+                    command,
+                    "Steering effect is no longer dispatchable",
+                ));
+            }
+            let (run, turn) =
+                crate::orchestration::steering::target(&projection, &saved.request)
+                    .ok_or_else(|| unsupported(command, "Recorded steering target changed"))?;
+            if let Some(expected) =
+                crate::orchestration::steering::admitted_runtime(conn, &effect.id)?
+                && crate::orchestration::steering::runtime_id(
+                    conn,
+                    &command.thread_id,
+                    &crate::orchestration::steering::RuntimeTarget::for_run(run)
+                        .ok_or_else(|| unsupported(command, "Steering run has no runtime target"))?,
+                )?
+                .as_ref()
+                    != Some(&expected)
+            {
+                return Err(unsupported(command, "Steering runtime was replaced"));
+            }
+            // Only normal completion authorizes T3's late follow-up. Stop,
+            // cancellation, supersession, failure and missing turns do not.
+            if turn["status"] != "completed"
+                || !matches!(
+                    run.status,
+                    OrchestrationV2RunStatus::Running
+                        | OrchestrationV2RunStatus::Waiting
+                        | OrchestrationV2RunStatus::Completed
+                )
+            {
+                return Err(unsupported(command, "Steering target did not complete"));
+            }
+            let message = records(&projection, "message")
+                .iter()
+                .find(|m| m["id"] == message_id.0)
+                .ok_or_else(|| unsupported(command, "Steering message is missing"))?;
+            let delegated = message["delegatedCompletion"].is_object();
+            let provider_instance = if delegated {
+                &run.provider_instance_id
+            } else {
+                &projection.thread.provider_instance_id
+            };
+            let driver = records(&projection, "provider-thread")
+                .iter()
+                .filter(|p| p["providerInstanceId"] == provider_instance.0)
+                .max_by_key(|p| p["generation"].as_i64().unwrap_or(0))
+                .and_then(|p| p["driver"].as_str())
+                .ok_or_else(|| unsupported(command, "Follow-up provider missing"))?;
+            let mut follow_up = self::plan(
+                conn,
+                command,
+                &ThreadOperation::Send(Send {
+                    message_id: message_id.clone(),
+                    text: message["text"].as_str().unwrap_or_default().into(),
+                    mode: T3ThreadSendInputMode::Auto,
+                    driver: driver.into(),
+                    sender: message["senderThreadId"]
+                        .as_str()
+                        .unwrap_or(&command.thread_id.0)
+                        .into(),
+                    target_run: None,
+                    metadata: Some(SendMetadata {
+                        scheduled_task_id: serde_json::from_value(
+                            message["scheduledTaskId"].clone(),
+                        )
+                        .ok()
+                        .flatten(),
+                        sender_thread_id: serde_json::from_value(message["senderThreadId"].clone())
+                            .ok()
+                            .flatten(),
+                        attachments: serde_json::from_value(message["attachments"].clone())
+                            .unwrap_or_default(),
+                        model_selection: delegated.then(|| run.model_selection.clone()),
+                        created_by: serde_json::from_value(message["createdBy"].clone())
+                            .unwrap_or(OrchestrationV2Actor::Agent),
+                        creation_source: serde_json::from_value(message["creationSource"].clone())
+                            .unwrap_or(OrchestrationV2CreationSource::Mcp),
+                    }),
+                }),
+                now,
+            )?;
+            // Keep composer references and automatic-mail ownership, not just
+            // the text/attachments. The accepted message identity is unchanged.
+            for event in &mut follow_up.events {
+                if let OrchestrationV2DomainEvent::MessageUpdated(updated) = event {
+                    let mut payload = serde_json::to_value(&updated.payload)?;
+                    if payload["id"] == message_id.0 {
+                        for key in ["context", "delegatedCompletion", "notification"] {
+                            if let Some(value) = message.get(key) {
+                                payload[key] = value.clone();
+                            }
+                        }
+                        updated.payload = serde_json::from_value(payload)?;
+                    }
+                }
+            }
+            return Ok(follow_up);
+        }
         ThreadOperation::Send(input) => {
             // Refuse native children BEFORE unparking or writing any message.
             if native_child(conn, &projection)? {
@@ -277,67 +525,16 @@ pub(crate) fn plan(
                 }
                 let mut run = run.clone();
                 if !direct {
-                    let old = projection
-                        .attempts
-                        .iter()
-                        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
-                        .ok_or_else(|| unsupported(command, "Missing attempt"))?;
-                    let ordinal = projection
-                        .attempts
-                        .iter()
-                        .filter(|a| a.run_id == run.id)
-                        .map(|a| a.attempt_ordinal)
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
-                    let attempt_id = RunAttemptId(format!(
-                        "run-attempt:{}:{ordinal}",
-                        encode_component(&run.id.0)
-                    ));
-                    let root_id = NodeId(format!("node:{}:{ordinal}", encode_component(&run.id.0)));
-                    let mut previous = old.clone();
-                    previous.status = OrchestrationV2RunAttemptStatus::Superseded;
-                    previous.completed_at = Some(iso(now)?);
-                    plan.emit(command, "run-attempt.updated", &previous, now)?;
-                    if let Some(root) = projection
-                        .nodes
-                        .iter()
-                        .find(|n| Some(&n.id) == run.root_node_id.as_ref())
-                    {
-                        let mut root = root.clone();
-                        root.status = OrchestrationV2ExecutionNodeStatus::Interrupted;
-                        root.completed_at = Some(iso(now)?);
-                        plan.emit(command, "node.updated", &root, now)?;
-                    }
-                    let mut attempt = old.clone();
-                    attempt.id = attempt_id.clone();
-                    attempt.attempt_ordinal = ordinal;
-                    attempt.root_node_id = root_id.clone();
-                    attempt.provider_turn_id = None;
-                    attempt.reason = OrchestrationV2RunAttemptReason::SteeringRestart;
-                    attempt.status = OrchestrationV2RunAttemptStatus::Pending;
-                    attempt.started_at = None;
-                    attempt.completed_at = None;
-                    let root: OrchestrationV2ExecutionNode = serde_json::from_value(json!({
-                        "id":root_id,"threadId":projection.thread.id,"runId":run.id,"rootNodeId":root_id,
-                        "parentNodeId":null,"kind":"root_turn","status":"pending","countsForRun":true,
-                        "providerThreadId":run.provider_thread_id,"providerTurnId":null,"nativeItemRef":null,
-                        "runtimeRequestId":null,"checkpointScopeId":null,"startedAt":null,"completedAt":null}))?;
-                    run.root_node_id = Some(root_id);
-                    run.active_attempt_id = Some(attempt_id);
-                    run.user_message_id = input.message_id.clone();
-                    run.status = OrchestrationV2RunStatus::Starting;
-                    plan.emit(command, "run.updated", &run, now)?;
-                    plan.emit(command, "run-attempt.created", &attempt, now)?;
-                    plan.emit(command, "node.updated", &root, now)?;
-                    plan.cancel_process_effects = true;
-                    plan.effects.push(EffectRequest::ProviderTurnRestart {
-                        provider_session_id: ProviderSessionId(session_id.into()),
-                        provider_thread_id: run.provider_thread_id.clone().unwrap(),
-                        provider_turn_id: ProviderTurnId(turn["id"].as_str().unwrap().into()),
-                        interrupted_attempt_id: old.id.clone(),
-                        run_id: run.id.clone(),
-                    });
+                    run = restart_attempt(
+                        &projection,
+                        command,
+                        &mut plan,
+                        &run,
+                        session_id,
+                        turn,
+                        &input.message_id,
+                        now,
+                    )?;
                 } else {
                     plan.effects.push(EffectRequest::ProviderTurnSteer {
                         provider_session_id: ProviderSessionId(session_id.into()),
@@ -403,7 +600,8 @@ pub(crate) fn plan(
                     thread.provider_instance_id = selection.instance_id.clone();
                     thread.model_selection = selection.clone();
                 }
-                let mut seed = execution_seed(
+                let mut seed = crate::orchestration::task::execution_seed_for(
+                    &projection,
                     &thread,
                     ordinal,
                     &input.message_id.0,
@@ -468,10 +666,8 @@ pub(crate) fn plan(
             }
         }
         ThreadOperation::Interrupt { run_id, reason } => {
-            let run = projection
-                .runs
-                .iter()
-                .find(|r| &r.id == run_id && !run_terminal(&r.status))
+            let run = crate::orchestration::background::interruptible_run(&projection)
+                .filter(|r| &r.id == run_id)
                 .ok_or_else(|| unsupported(command, "No interruptible run"))?;
             if !projection
                 .nodes
@@ -497,7 +693,7 @@ pub(crate) fn plan(
                 run.active_attempt_id
                     .as_ref()
                     .is_some_and(|id| t["runAttemptId"] == id.0)
-                    && t["status"] == "running"
+                    && (t["status"] == "running" || run_terminal(&run.status))
             });
             let item = json!({"id":format!("turn-item:{}:interrupt-request",encode_component(&run.id.0)),
                 "type":"run_interrupt_request","threadId":projection.thread.id,"runId":run.id,"nodeId":run.root_node_id,
@@ -514,10 +710,36 @@ pub(crate) fn plan(
                     OrchestrationV2RunStatus::Preparing
                         | OrchestrationV2RunStatus::Starting
                         | OrchestrationV2RunStatus::Running
+                        | OrchestrationV2RunStatus::Waiting
                 )
             {
-                // T3 records this terminality synchronously; no provider exists
-                // to interrupt, and cancelled starts may never be replayed.
+                // No accepted native turn exists, so terminalize synchronously.
+                // A process can nevertheless be parked on an early callback;
+                // retire that exact admission without inventing a native turn.
+                let provider = records(&projection, "provider-thread")
+                    .iter()
+                    .find(|provider| {
+                        Some(provider["id"].as_str().unwrap_or_default())
+                            == run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+                    })
+                    .ok_or_else(|| unsupported(command, "Run has no provider thread record"))?;
+                crate::orchestration::queue::runtime::observe(
+                    &projection,
+                    command,
+                    &mut plan,
+                    &run.id,
+                    provider,
+                    &zeron_proto::AgentEvent::Done {
+                        status: zeron_proto::DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    now,
+                )?;
+                plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                    run_id: run.id.clone(),
+                });
                 let mut next = serde_json::to_value(run)?;
                 next["status"] = json!("interrupted");
                 next["completedAt"] = json!(iso(now)?);
@@ -564,6 +786,12 @@ pub(crate) fn plan(
                 result["title"] = json!("Interrupted");
                 result["message"] = json!("Run interrupted before provider start");
                 plan.emit(command, "turn-item.updated", &result, now)?;
+            } else if !has_turn && run_terminal(&run.status) {
+                // A failed/settled root may have no accepted provider turn.
+                // Keep exact attempt/process admission even for local repair.
+                plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                    run_id: run.id.clone(),
+                });
             } else {
                 let turn =
                     turn.ok_or_else(|| unsupported(command, "No running turn to interrupt"))?;
@@ -571,21 +799,32 @@ pub(crate) fn plan(
                     .iter()
                     .find(|p| p["id"] == turn["providerThreadId"])
                     .ok_or_else(|| unsupported(command, "Missing provider thread"))?;
-                let session_id = provider["providerSessionId"]
-                    .as_str()
-                    .ok_or_else(|| unsupported(command, "Missing provider session"))?;
-                let session = records(&projection, "provider-session")
-                    .iter()
-                    .find(|s| s["id"] == session_id)
-                    .ok_or_else(|| unsupported(command, "Inactive provider session"))?;
-                if session["capabilities"]["turns"]["supportsInterrupt"] != true {
-                    return Err(unsupported(command, "Provider cannot interrupt"));
+                if let Some(session_id) = provider["providerSessionId"].as_str() {
+                    let session = records(&projection, "provider-session")
+                        .iter()
+                        .find(|s| s["id"] == session_id)
+                        .ok_or_else(|| unsupported(command, "Inactive provider session"))?;
+                    if session["capabilities"]["turns"]["supportsInterrupt"] != true {
+                        return Err(unsupported(command, "Provider cannot interrupt"));
+                    }
+                    plan.effects.push(EffectRequest::ProviderTurnInterrupt {
+                        provider_session_id: session_id.into(),
+                        provider_thread_id: turn["providerThreadId"]
+                            .as_str()
+                            .ok_or_else(|| unsupported(command, "Turn has no provider thread"))?
+                            .into(),
+                        provider_turn_id: turn["id"]
+                            .as_str()
+                            .ok_or_else(|| unsupported(command, "Turn has no id"))?
+                            .into(),
+                    });
+                } else {
+                    // Real output can precede attachment metadata too. The
+                    // host's physical runtime fence still permits user Stop.
+                    plan.effects.push(EffectRequest::ManagedRunInterrupt {
+                        run_id: run.id.clone(),
+                    });
                 }
-                plan.effects.push(EffectRequest::ProviderTurnInterrupt {
-                    provider_session_id: session_id.into(),
-                    provider_thread_id: turn["providerThreadId"].as_str().unwrap().into(),
-                    provider_turn_id: turn["id"].as_str().unwrap().into(),
-                });
             }
         }
     }

@@ -222,6 +222,7 @@ impl Fixture {
                 1_800_000_000_001,
             )
             .unwrap();
+        self.provider_event("parent", zeron_proto::AgentEvent::InputAccepted);
     }
 
     fn clone_thread(&self, id: &str, project: &str, lineage: Value) {
@@ -302,12 +303,12 @@ async fn transfer_merge_refusals_precede_thread_send_side_effects() {
         (
             true,
             1,
-            "has a pending merge-back transfer; queued merge-back consumption is not implemented yet.",
+            "has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it.",
         ),
         (
             false,
             2,
-            "has pending merge-back transfers from multiple forks.",
+            "has merge-backs from more than one fork waiting; merge-backs from multiple forks cannot be delivered together.",
         ),
     ] {
         let f = Fixture::new();
@@ -399,6 +400,82 @@ async fn transfer_merge_refusals_precede_thread_send_side_effects() {
         assert_eq!(json!(after.runs), json!(before.runs));
         assert_eq!(after.records, before.records);
     }
+}
+
+/// A user merging a second fork would leave the parent unsendable ("multiple
+/// forks") with no UI to clear it, so the planner refuses it up front.
+#[tokio::test]
+async fn user_merge_back_is_refused_while_another_fork_is_pending() {
+    use crate::orchestration::transfer::{SourcePoint, TransferOperation};
+
+    let f = Fixture::new();
+    f.running(false);
+    let mut parent_run = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap()
+        .runs[0]
+        .clone();
+    parent_run.status = OrchestrationV2RunStatus::Completed;
+    f.emit("parent", "run.updated", json!(parent_run));
+    for index in 0..2 {
+        let child = format!("fork:{index}");
+        let receipt = f
+            .service
+            .kernel
+            .transfer_command(
+                &"parent".into(),
+                format!("fork-command:{index}").into(),
+                TransferOperation::Fork {
+                    target: child.clone().into(),
+                    source: SourcePoint::Run {
+                        run_id: parent_run.id.clone(),
+                    },
+                    title: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let mut run = parent_run.clone();
+        run.id = format!("run:{child}").into();
+        run.thread_id = child.clone().into();
+        f.emit(&child, "run.updated", json!(run));
+        let receipt = f
+            .service
+            .kernel
+            .transfer_command(
+                &child.into(),
+                format!("merge-command:{index}").into(),
+                TransferOperation::User(Box::new(TransferOperation::MergeBack {
+                    target: "parent".into(),
+                    source: SourcePoint::Run { run_id: run.id },
+                })),
+            )
+            .await
+            .unwrap();
+        if index == 0 {
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        } else {
+            assert_eq!(receipt.status, ReceiptStatus::Rejected);
+            let message = receipt.error.unwrap();
+            assert!(message.contains("Send a message in parent"), "{message}");
+            assert!(!message.contains("not implemented"), "{message}");
+        }
+    }
+    let pending = f
+        .service
+        .kernel
+        .store
+        .thread_transfers(&"parent".into())
+        .unwrap()
+        .into_iter()
+        .filter(|t| t["type"] == "merge_back" && t["status"] == "pending")
+        .count();
+    assert_eq!(pending, 1);
 }
 
 #[test]
@@ -646,6 +723,27 @@ async fn restart_supersedes_attempt_without_reopening_a_task() {
         .runs[0]
         .active_attempt_id
         .clone();
+    let original = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let runtime =
+        crate::orchestration::steering::RuntimeTarget::for_run(&original.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"parent".into(),
+                &runtime,
+                "old-process",
+            )
+        })
+        .unwrap();
     let restart = f.send(json!({"threadId":"parent","message":"new direction","mode":"restart","clientRequestId":"restart"})).await;
     assert_eq!(
         restart.delivery,
@@ -669,6 +767,57 @@ async fn restart_supersedes_attempt_without_reopening_a_task() {
         OrchestrationV2RunAttemptReason::SteeringRestart
     );
     assert_eq!(p.runs.len(), 1);
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.request,
+                crate::orchestration::effects::EffectRequest::ProviderTurnRestart { .. }
+            )
+        })
+        .unwrap();
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let json: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["attempt_id"], json!(old));
+    assert_eq!(
+        saved["runtime"]["root_node_id"],
+        json!(original.runs[0].root_node_id)
+    );
+    assert_eq!(saved["runtime"]["runtime_id"], "old-process");
+    assert_eq!(
+        saved["replacement_attempt_id"],
+        json!(p.runs[0].active_attempt_id)
+    );
+    f.service.kernel.store.rebuild().unwrap();
+    let after: String = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(saved, serde_json::from_str::<Value>(&after).unwrap());
 }
 
 #[tokio::test]
@@ -1225,6 +1374,804 @@ async fn late_steering_becomes_one_receipted_followup_with_the_same_message() {
     );
 }
 
+async fn steering_effect(f: &Fixture, key: &str) -> crate::orchestration::effects::Effect {
+    // Dispatchable steering is admitted against a bound live runtime.
+    let p = f.service.kernel.store.thread(&"parent".into()).unwrap().unwrap();
+    let target = crate::orchestration::steering::RuntimeTarget::for_run(&p.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            if crate::orchestration::steering::runtime_id(tx, &"parent".into(), &target)?.is_none() {
+                crate::orchestration::steering::bind_runtime(tx, &"parent".into(), &target, "test-runtime")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    unbound_steering_effect(f, key).await
+}
+
+async fn unbound_steering_effect(f: &Fixture, key: &str) -> crate::orchestration::effects::Effect {
+    let sent = f
+        .send(
+            json!({"threadId":"parent","message":format!("steering input {key}"),
+        "mode":"steer","clientRequestId":key}),
+        )
+        .await;
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(&e.request,
+        crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. }
+            if *message_id == sent.message_id)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn steering_target_fences_session_generation_attempt_root_and_message_ownership() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "target-fences").await;
+    let original = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(crate::orchestration::steering::target(&original, &effect.request).is_some());
+    for field in [
+        "providerSessionId",
+        "lastRunOrdinal",
+        "providerInstanceId",
+        "id",
+    ] {
+        let mut p = original.clone();
+        let provider = p
+            .records
+            .get_mut("provider-thread")
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        provider[field] = if field == "lastRunOrdinal" {
+            json!(99)
+        } else {
+            json!("replacement")
+        };
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+    for field in ["activeAttemptId", "rootNodeId", "providerThreadId"] {
+        let mut p = original.clone();
+        let mut run = json!(p.runs[0]);
+        run[field] = json!("replacement");
+        p.runs[0] = serde_json::from_value(run).unwrap();
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    for field in ["runId", "nodeId"] {
+        let mut p = original.clone();
+        p.records
+            .get_mut("message")
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["id"] == message_id.0)
+            .unwrap()[field] = json!("foreign");
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_steering_cannot_reopen_interrupted_failed_or_cancelled_work() {
+    for status in [
+        zeron_proto::DoneStatus::Interrupted,
+        zeron_proto::DoneStatus::Errored,
+    ] {
+        let f = Fixture::new();
+        f.running(false);
+        let effect = steering_effect(&f, "stopped").await;
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Done {
+                status,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        );
+        let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+            &effect.request
+        else {
+            panic!()
+        };
+        let before = f.service.kernel.store.projection_frontier().unwrap();
+        assert!(
+            super::runner::late_steer(&f.service.kernel, &effect, message_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            before
+        );
+        assert_eq!(
+            f.service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "cancelled").await;
+    f.service.kernel.recover(1_800_000_000_010).await.unwrap();
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_steering_cannot_follow_up_after_session_replacement() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "replacement").await;
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["providerSessionId"] = json!("replacement-session");
+    f.emit("parent", "provider-thread.updated", provider);
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn owner_cancelled_steering_cannot_follow_up_even_after_normal_completion() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "cancelled-after-completion").await;
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::effects::cancel_process(
+                conn,
+                &"parent".into(),
+                1_800_000_000_005,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    let before = f.service.kernel.store.projection_frontier().unwrap();
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err(),
+        "normal completion must not override the owner's later cancellation"
+    );
+    assert_eq!(
+        f.service.kernel.store.projection_frontier().unwrap(),
+        before
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_provider_turn_cannot_revive_a_later_stopped_run() {
+    for status in ["interrupted", "failed", "cancelled", "rolled_back"] {
+        let f = Fixture::new();
+        f.running(false);
+        let effect = steering_effect(&f, status).await;
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        );
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let mut run = json!(p.runs[0]);
+        run["status"] = json!(status);
+        f.emit("parent", "run.updated", run);
+        let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+            &effect.request
+        else {
+            panic!()
+        };
+        assert!(
+            super::runner::late_steer(&f.service.kernel, &effect, message_id)
+                .await
+                .is_err(),
+            "{status} must not reopen because its root finished before the run stopped"
+        );
+        assert_eq!(
+            f.service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn steering_receipts_are_correlated_durable_and_release_only_their_uncertainty_barrier() {
+    use crate::orchestration::effects::{EffectRequest, EffectStatus};
+    let f = Fixture::new();
+    f.running(false);
+    let first = steering_effect(&f, "confirmed").await;
+    let second = steering_effect(&f, "unconfirmed").await;
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            tx.execute(
+                "UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1
+            WHERE effect_id IN (?1,?2)",
+                rusqlite::params![first.id, second.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: "unrelated".into(),
+        },
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&first.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    let EffectRequest::ProviderTurnSteer { message_id, .. } = &first.request else {
+        panic!()
+    };
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&first.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Succeeded
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&second.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    f.service.kernel.store.rebuild().unwrap();
+    let reopened = Kernel::open(Arc::new(DocsStore::open(f._dir.path()).unwrap()), "host").unwrap();
+    reopened.recover(1_800_000_000_020).await.unwrap();
+    assert!(
+        reopened
+            .store
+            .read(|conn| crate::orchestration::steering::confirmed(conn, &first.id))
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .store
+            .read(|conn| crate::orchestration::steering::confirmed(conn, &second.id))
+            .unwrap()
+    );
+    assert_eq!(
+        reopened
+            .store
+            .read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM orchestration_steering_acceptances",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_cannot_confirm_steering_admitted_without_a_bound_runtime() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = unbound_steering_effect(&f, "no-runtime").await;
+    let p = f.service.kernel.store.thread(&"parent".into()).unwrap().unwrap();
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .write(|tx| crate::orchestration::steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn provider_confirmation_wins_a_worker_timeout_without_replaying_steering() {
+    use crate::orchestration::effects::{EffectOutcome, EffectStatus};
+    let f = Fixture::new();
+    f.running(false);
+    let mut effect = steering_effect(&f, "timeout-race").await;
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            tx.execute(
+                "UPDATE orchestration_effect_outbox SET status='running',dispatch_started=1,
+            attempt_count=1,lease_owner='worker',lease_expires_at=?2 WHERE effect_id=?1",
+                rusqlite::params![effect.id, 1_800_000_100_000_i64],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    effect = f.service.kernel.store.effect(&effect.id).unwrap().unwrap();
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.service
+            .kernel
+            .store
+            .write(|tx| crate::orchestration::steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .unwrap()
+    );
+    assert!(
+        f.service
+            .kernel
+            .store
+            .finish_effect(&effect, &EffectOutcome::Uncertain, 1_800_000_000_006, 5)
+            .unwrap()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Succeeded
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    super::runner::late_steer(&f.service.kernel, &effect, message_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn steering_receipt_write_failure_and_replaced_session_cannot_fabricate_acceptance() {
+    use crate::orchestration::{steering, store::WriteBoundary};
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "write-fence").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    f.service
+        .kernel
+        .store
+        .inject_failure(WriteBoundary::BeforeCommit, 1);
+    assert!(
+        f.service
+            .kernel
+            .store
+            .write(|tx| steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .is_err()
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["providerSessionId"] = json!("replacement-session");
+    f.emit("parent", "provider-thread.updated", provider);
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .write(|tx| steering::confirm(tx, &p, &effect, 1_800_000_000_006))
+            .unwrap()
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn legacy_steering_without_the_receipt_contract_is_not_speculatively_replayed() {
+    use crate::orchestration::steering;
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "legacy").await;
+    f.service.kernel.store.write(|tx| {
+        tx.execute("DELETE FROM orchestration_steering_inputs WHERE effect_id=?1", [&effect.id])?;
+        tx.execute("UPDATE orchestration_effect_outbox SET status='failed',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        Ok(())
+    }).unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    f.send(json!({"threadId":"parent","message":"explicit next turn"}))
+        .await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.service
+            .kernel
+            .store
+            .read(|conn| steering::unconfirmed_messages(conn, &p, p.runs.last().unwrap()))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn replacement_process_with_same_logical_attempt_cannot_accept_or_follow_up_an_old_steer() {
+    use crate::orchestration::{
+        effects::{EffectRequest, EffectStatus},
+        steering,
+    };
+    let f = Fixture::new();
+    f.running(false);
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let target = steering::RuntimeTarget::for_run(&p.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|tx| steering::bind_runtime(tx, &p.thread.id, &target, "old-runtime"))
+        .unwrap();
+    let effect = steering_effect(&f, "process-incarnation").await;
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .read(|conn| steering::admitted_runtime(conn, &effect.id))
+            .unwrap()
+            .as_deref(),
+        Some("old-runtime")
+    );
+    f.service.kernel.store.write(|tx| {
+        tx.execute("UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        steering::bind_runtime(tx, &p.thread.id, &target, "replacement-runtime")
+    }).unwrap();
+    let EffectRequest::ProviderTurnSteer { message_id, .. } = &effect.request else {
+        panic!()
+    };
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn explicit_provider_switch_retires_old_steer_uncertainty_without_claiming_acceptance() {
+    use crate::orchestration::{
+        effects::{EffectRequest, EffectStatus},
+        steering,
+    };
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "old-provider-unknown").await;
+    f.service.kernel.store.write(|tx| {
+        tx.execute("UPDATE orchestration_effect_outbox SET status='succeeded' WHERE effect_type='provider-turn.start'", [])?;
+        tx.execute("UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        Ok(())
+    }).unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut selection = p.thread.model_selection.clone();
+    selection.instance_id = ProviderInstanceId("other-provider".into());
+    let receipt = f
+        .service
+        .kernel
+        .dispatch(
+            &Command {
+                id: "explicit-provider-switch".into(),
+                thread_id: "parent".into(),
+                operation: Operation::Thread(Box::new(super::planner::ThreadOperation::Send(
+                    super::planner::Send {
+                        message_id: "explicit-new-input".into(),
+                        text: "explicit provider switch".into(),
+                        mode: T3ThreadSendInputMode::Auto,
+                        driver: "mock".into(),
+                        sender: "parent".into(),
+                        target_run: None,
+                        metadata: Some(super::planner::SendMetadata {
+                            scheduled_task_id: None,
+                            sender_thread_id: None,
+                            attachments: vec![],
+                            model_selection: Some(selection),
+                            created_by: OrchestrationV2Actor::User,
+                            creation_source: OrchestrationV2CreationSource::Web,
+                        }),
+                    },
+                ))),
+            },
+            1_800_000_000_005,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{receipt:?}");
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Cancelled
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    let claimed = f
+        .service
+        .kernel
+        .store
+        .claim_effect("new-worker", 1_800_000_000_006, 30_000)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(claimed.request, EffectRequest::ProviderTurnStart { .. }),
+        "old steering uncertainty cannot permanently block an explicitly admitted provider turn"
+    );
+}
+
 #[tokio::test]
 async fn empty_wait_and_terminal_explicit_run_do_not_wait_for_a_newer_run() {
     let f = Fixture::new();
@@ -1488,6 +2435,584 @@ async fn running_interrupt_targets_the_provider_turn_and_refuses_unsupported_cap
         "Unable to interrupt thread parent: Failed to dispatch orchestration command run.interrupt (command:mcp:session%2Fparent%3A1:thread-interrupt:unsupported)."
     );
     assert_eq!(before, f.service.kernel.store.events().unwrap().len());
+}
+
+#[tokio::test]
+async fn control_settlement_is_transactionally_fenced_against_process_replacement_and_owner_cancel()
+{
+    use crate::orchestration::{
+        effects::EffectRequest, steering::RuntimeTarget, task::TaskOperation,
+    };
+    for cancelled in [false, true] {
+        let f = Fixture::new();
+        f.running(false);
+        let original = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let runtime = RuntimeTarget::for_run(&original.runs[0]).unwrap();
+        f.service
+            .kernel
+            .store
+            .write(|conn| {
+                crate::orchestration::steering::bind_runtime(
+                    conn,
+                    &"parent".into(),
+                    &runtime,
+                    "original-process",
+                )
+            })
+            .unwrap();
+        f.service
+            .interrupt(
+                f.caller.clone(),
+                serde_json::from_value(json!({"threadId":"parent","clientRequestId":"exact-stop"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let effect = f
+            .service
+            .kernel
+            .store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.request, EffectRequest::ProviderTurnInterrupt { .. }))
+            .unwrap();
+        if cancelled {
+            f.service
+                .kernel
+                .store
+                .cancel_effect(&effect.id, crate::now_ms())
+                .unwrap();
+        } else {
+            f.service
+                .kernel
+                .store
+                .write(|conn| {
+                    crate::orchestration::steering::bind_runtime(
+                        conn,
+                        &"parent".into(),
+                        &runtime,
+                        "replacement-process",
+                    )
+                })
+                .unwrap();
+        }
+        f.service
+            .kernel
+            .task_command(
+                &"parent".into(),
+                "stale-control-repair".into(),
+                TaskOperation::ControlSettlement {
+                    effect_id: effect.id,
+                },
+            )
+            .await
+            .unwrap();
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Running);
+        assert_eq!(
+            after.attempts[0].status,
+            OrchestrationV2RunAttemptStatus::Running
+        );
+        assert_eq!(records(&after, "provider-turn")[0]["status"], "running");
+    }
+}
+
+fn completed_with_native_background(f: &Fixture) {
+    f.running(false);
+    finish_root_with_native_background(f);
+}
+
+fn finish_root_with_native_background(f: &Fixture) {
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Subagent {
+            parent_tool_use_id: "native-child".into(),
+            event: Box::new(zeron_proto::AgentEvent::TextDelta {
+                text: "still working".into(),
+            }),
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["pendingBackgroundTasks"] =
+        json!([{"taskId":"shell","kind":"command","description":"dev server"}]);
+    f.emit("parent", "provider-thread.updated", provider);
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: Some("Finished main reply".into()),
+            error: None,
+            session_id: None,
+        },
+    );
+}
+
+async fn stop_background(f: &Fixture) -> crate::orchestration::effects::Effect {
+    let result = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"background-stop"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        OrchestratorMcpThreadInterruptResultStatus::InterruptRequested
+    );
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.request,
+                crate::orchestration::effects::EffectRequest::ProviderTurnInterrupt { .. }
+            )
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn settled_root_stop_preserves_reply_holds_queue_and_repairs_only_bounded_native_work() {
+    use crate::orchestration::task::TaskOperation;
+    let f = Fixture::new();
+    f.running(false);
+    let queued = f
+        .send(json!({"threadId":"parent","message":"held next turn","mode":"queue"}))
+        .await;
+    finish_root_with_native_background(&f);
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let run = &before.runs[0];
+    let provider = records(&before, "provider-thread")[0]["id"].clone();
+    let turn = records(&before, "provider-turn")[0]["id"].clone();
+    let mut delegated = records(&before, "subagent")[0].clone();
+    delegated["id"] = json!("delegated");
+    delegated["origin"] = json!("app_owned");
+    delegated["childThreadId"] = json!("independent-child");
+    f.emit("parent", "subagent.updated", delegated);
+    // Canonical queued runs have later ordinals but do not own the Stop.
+    for (id, kind, input, origin, owner) in [
+        (
+            "old-shell",
+            "command_execution",
+            json!("serve"),
+            Value::Null,
+            json!(run.id),
+        ),
+        (
+            "runless-tool",
+            "dynamic_tool",
+            json!({}),
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            "persistent-monitor",
+            "dynamic_tool",
+            json!({"persistent":true}),
+            Value::Null,
+            json!(run.id),
+        ),
+        (
+            "delegated-item",
+            "subagent",
+            Value::Null,
+            json!("app_owned"),
+            json!(run.id),
+        ),
+        (
+            "later-shell",
+            "command_execution",
+            json!("later"),
+            Value::Null,
+            json!(queued.run_id),
+        ),
+    ] {
+        f.emit("parent", "turn-item.updated", json!({
+            "id":id,"threadId":"parent","runId":owner,"nodeId":run.root_node_id,
+            "providerThreadId":provider,"providerTurnId":turn,"nativeItemRef":null,"parentItemId":null,
+            "ordinal":100+f.service.kernel.store.events().unwrap().len(),"status":"running","title":id,
+            "startedAt":null,"completedAt":null,"updatedAt":"2026-10-07T04:00:00.000Z",
+            "type":kind,"input":input,"output":"","origin":origin,"toolName":"fixture",
+            "subagentId":"delegated","driver":"mock","providerInstanceId":"mock",
+            "childThreadId":"independent-child","prompt":"","result":null
+        }));
+    }
+    // An older, no-longer-live provider's roster must not leave the Waiting
+    // strip stuck after the owning app thread's only runtime has retired.
+    let mut old_provider = records(&before, "provider-thread")[0].clone();
+    old_provider["id"] = json!("old-provider");
+    old_provider["providerSessionId"] = Value::Null;
+    f.emit("parent", "provider-thread.updated", old_provider);
+    let hint = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"parent".into())
+        .unwrap();
+    assert_eq!(hint.background_run_id.as_deref(), Some(run.id.0.as_str()));
+    assert!(hint.active_run_id.is_none());
+    let effect = stop_background(&f).await;
+    f.service
+        .kernel
+        .task_command(
+            &"parent".into(),
+            "background-repair".into(),
+            TaskOperation::ControlSettlement {
+                effect_id: effect.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Completed);
+    assert_eq!(after.runs[0].completed_at, before.runs[0].completed_at);
+    assert_eq!(after.attempts[0], before.attempts[0]);
+    assert_eq!(
+        crate::orchestration::task::result_text(&after, &after.runs[0]),
+        "Finished main reply"
+    );
+    assert_eq!(
+        records(&after, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "provider_native")
+            .unwrap()["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        records(&after, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "app_owned")
+            .unwrap()["status"],
+        "running"
+    );
+    assert!(
+        records(&after, "provider-thread")
+            .iter()
+            .all(|p| p["pendingBackgroundTasks"] == json!([]))
+    );
+    for (id, status) in [
+        ("old-shell", "interrupted"),
+        ("runless-tool", "interrupted"),
+        ("persistent-monitor", "running"),
+        ("delegated-item", "running"),
+        ("later-shell", "running"),
+    ] {
+        assert_eq!(
+            records(&after, "turn-item")
+                .iter()
+                .find(|i| i["id"] == id)
+                .unwrap()["status"],
+            status
+        );
+    }
+    let next = after.runs.iter().find(|r| r.id == queued.run_id).unwrap();
+    assert_eq!(next.status, OrchestrationV2RunStatus::Queued);
+    assert_eq!(next.queue_held.as_ref(), Some(&true));
+    // A late native event cannot reopen the stopped child or invent a new one.
+    for tool in ["native-child", "new-late-child"] {
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Subagent {
+                parent_tool_use_id: tool.into(),
+                event: Box::new(zeron_proto::AgentEvent::TextDelta {
+                    text: "late".into(),
+                }),
+            },
+        );
+    }
+    let late = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(records(&late, "subagent").len(), 2);
+    assert_eq!(
+        records(&late, "subagent")
+            .iter()
+            .find(|t| t["origin"] == "provider_native")
+            .unwrap()["status"],
+        "interrupted"
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let retry = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"background-stop"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The later queued run is not promoted by an idempotent Stop retry.
+    assert_eq!(
+        retry.status,
+        OrchestratorMcpThreadInterruptResultStatus::NoActiveRun
+    );
+}
+
+#[tokio::test]
+async fn completed_background_repair_refuses_cancelled_replaced_and_superseded_controls() {
+    use crate::orchestration::{steering::RuntimeTarget, task::TaskOperation};
+    for fence in ["cancelled", "replacement", "new-run"] {
+        let f = Fixture::new();
+        completed_with_native_background(&f);
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let runtime = RuntimeTarget::for_run(&p.runs[0]).unwrap();
+        f.service
+            .kernel
+            .store
+            .write(|conn| {
+                crate::orchestration::steering::bind_runtime(
+                    conn,
+                    &"parent".into(),
+                    &runtime,
+                    "old-runtime",
+                )
+            })
+            .unwrap();
+        let effect = stop_background(&f).await;
+        match fence {
+            "cancelled" => {
+                f.service
+                    .kernel
+                    .store
+                    .cancel_effect(&effect.id, crate::now_ms())
+                    .unwrap();
+            }
+            "replacement" => {
+                f.service
+                    .kernel
+                    .store
+                    .write(|conn| {
+                        crate::orchestration::steering::bind_runtime(
+                            conn,
+                            &"parent".into(),
+                            &runtime,
+                            "replacement",
+                        )
+                    })
+                    .unwrap();
+            }
+            _ => {
+                f.send(json!({"threadId":"parent","message":"new foreground turn"}))
+                    .await;
+            }
+        }
+        f.service
+            .kernel
+            .task_command(
+                &"parent".into(),
+                "refused-background-repair".into(),
+                TaskOperation::ControlSettlement {
+                    effect_id: effect.id,
+                },
+            )
+            .await
+            .unwrap();
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            records(&after, "subagent")[0]["status"],
+            "running",
+            "{fence}"
+        );
+        assert_eq!(
+            records(&after, "provider-thread")[0]["pendingBackgroundTasks"],
+            records(&p, "provider-thread")[0]["pendingBackgroundTasks"],
+            "{fence}"
+        );
+        assert!(
+            !records(&after, "turn-item")
+                .iter()
+                .any(|i| i["title"] == "Background work stopped")
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_roots_without_native_work_and_rolled_back_roots_do_not_offer_background_stop() {
+    for rolled_back in [false, true] {
+        let f = Fixture::new();
+        if rolled_back {
+            completed_with_native_background(&f);
+        } else {
+            f.running(false);
+            f.provider_event(
+                "parent",
+                zeron_proto::AgentEvent::Done {
+                    status: zeron_proto::DoneStatus::Completed,
+                    result: Some("Done".into()),
+                    error: None,
+                    session_id: None,
+                },
+            );
+        }
+        if rolled_back {
+            let p = f
+                .service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap();
+            let mut run = json!(p.runs[0]);
+            run["status"] = json!("rolled_back");
+            f.emit("parent", "run.updated", run);
+        }
+        assert!(
+            f.service
+                .kernel
+                .store
+                .queue_ui_state(&"parent".into())
+                .unwrap()
+                .background_run_id
+                .is_none()
+        );
+        let effects_before = f.service.kernel.store.effects().unwrap();
+        let result = f
+            .service
+            .interrupt(
+                f.caller.clone(),
+                serde_json::from_value(json!({"threadId":"parent","runId":f.caller.run_id}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json!(result.status),
+            if rolled_back {
+                json!("rolled_back")
+            } else {
+                json!("completed")
+            }
+        );
+        assert_eq!(f.service.kernel.store.effects().unwrap(), effects_before);
+    }
+}
+
+#[tokio::test]
+async fn failed_root_without_accepted_turn_can_settle_dead_background_without_inventing_a_session()
+{
+    use crate::orchestration::{effects::EffectRequest, task::TaskOperation};
+    let f = Fixture::new();
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut run = json!(p.runs[0]);
+    run["status"] = json!("failed");
+    run["completedAt"] = json!("2026-10-07T04:00:00.000Z");
+    f.emit("parent", "run.updated", run);
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["pendingBackgroundTasks"] = json!([{"taskId":"old-shell","kind":"command"}]);
+    f.emit("parent", "provider-thread.updated", provider);
+    let result = f
+        .service
+        .interrupt(
+            f.caller.clone(),
+            serde_json::from_value(
+                json!({"threadId":"parent","clientRequestId":"failed-background"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        OrchestratorMcpThreadInterruptResultStatus::InterruptRequested
+    );
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.request, EffectRequest::ManagedRunInterrupt { .. }))
+        .unwrap();
+    f.service
+        .kernel
+        .task_command(
+            &"parent".into(),
+            "failed-background-repair".into(),
+            TaskOperation::ControlSettlement {
+                effect_id: effect.id,
+            },
+        )
+        .await
+        .unwrap();
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs[0].status, OrchestrationV2RunStatus::Failed);
+    assert!(records(&after, "provider-session").is_empty());
+    assert!(records(&after, "provider-turn").is_empty());
+    assert_eq!(
+        records(&after, "provider-thread")[0]["pendingBackgroundTasks"],
+        json!([])
+    );
 }
 
 #[tokio::test]

@@ -42,6 +42,14 @@ pub(crate) fn plan(
     match op.name.as_str() {
         "host.sync_loro_queue" => sync_loro(conn, &mut plan, command, &p, &op.input, now)?,
         "host.adopt_loro_delivery" => adopt_delivery(&mut plan, command, &p, &op.input, now)?,
+        "host.disconnect_provider_sessions" => {
+            if op.caller.is_some() {
+                return Err(refuse(
+                    "Provider session disconnect requires user authority.",
+                ));
+            }
+            super::session_control::plan(conn, &mut plan, command, &p, &op.input, now)?;
+        }
         "host.title_generated" => {
             let mut thread = serde_json::to_value(&p.thread)?;
             if thread["titleRegeneration"]["requestId"] != op.input["requestId"] {
@@ -179,6 +187,13 @@ fn queue_mutation(
             if automatic(&message) {
                 return Err(refuse("Automatic completion deliveries cannot be edited."));
             }
+            if let Some(expected) = op.input["expectedText"].as_str()
+                && message["text"].as_str() != Some(expected)
+            {
+                return Err(refuse(
+                    "This queued message changed; your edit was not applied.",
+                ));
+            }
             message["text"] = json!(text);
             message["updatedAt"] = json!(iso(now)?);
             plan.emit(command, "message.updated", &message, now)?;
@@ -263,7 +278,14 @@ fn queue_mutation(
                 return Err(refuse("Queued run is missing message or execution state."));
             }
             let target = op.input["targetRunId"].as_str().unwrap_or("");
-            steer(&mut Plan::default(), command, p, target, message, now)?;
+            let (_, _, _, mode) = steering_target(p, target, message)?;
+            if let Some(expected) = op.input["expectedExecution"].as_str()
+                && serde_json::to_value(mode)?.as_str() != Some(expected)
+            {
+                return Err(refuse(
+                    "The queue delivery mode changed; review the action before sending.",
+                ));
+            }
             cancel(plan, command, p, run, now)?;
             steer(plan, command, p, target, message, now)?;
             plan.queue_patch = Some(json!({"action":"cancel","messageId":run.user_message_id}));
@@ -273,14 +295,20 @@ fn queue_mutation(
     }
 }
 
-fn steer(
-    plan: &mut Plan,
-    command: &Command,
-    p: &ThreadProjection,
+fn steering_target<'a>(
+    p: &'a ThreadProjection,
     target: &str,
     message: &Value,
-    now: i64,
-) -> Result<()> {
+) -> Result<(
+    &'a OrchestrationV2Run,
+    &'a str,
+    &'a Value,
+    zeron_proto::QueuePromotionMode,
+)> {
+    use zeron_proto::QueuePromotionMode;
+    if p.thread.archived_at.is_some() {
+        return Err(refuse("Thread is not active."));
+    }
     let run = p
         .runs
         .iter()
@@ -323,27 +351,91 @@ fn steer(
         .ok_or_else(|| refuse("Provider session is not active."))?;
     let session = records(p, "provider-session")
         .iter()
-        .find(|s| s["id"] == session_id)
+        .find(|s| s["id"] == session_id && s["providerInstanceId"] == run.provider_instance_id.0)
         .ok_or_else(|| refuse("Provider session is not active."))?;
-    if session["capabilities"]["turns"]["supportsActiveSteering"] != true {
-        return Err(refuse("Provider does not support active steering."));
-    }
+    let caps = &session["capabilities"]["turns"];
+    let mode = if caps["supportsActiveSteering"] == true {
+        QueuePromotionMode::ActiveSteering
+    } else if caps["supportsInterrupt"] == true
+        && caps["supportsSteeringByInterruptRestart"] == true
+    {
+        if p.thread.model_selection != run.model_selection {
+            return Err(refuse(
+                "A model selection handoff is required before restart.",
+            ));
+        }
+        QueuePromotionMode::InterruptRestart
+    } else {
+        return Err(refuse("Provider cannot steer or interrupt/restart."));
+    };
     let turn = records(p, "provider-turn")
         .iter()
         .find(|t| {
             t["runAttemptId"].as_str() == run.active_attempt_id.as_ref().map(|a| a.0.as_str())
+                && t["nodeId"].as_str() == run.root_node_id.as_ref().map(|n| n.0.as_str())
+                && t["providerThreadId"] == provider["id"]
                 && t["status"] == "running"
         })
         .ok_or_else(|| refuse("No running provider turn found for active run."))?;
+    if provider["providerInstanceId"] != run.provider_instance_id.0
+        || provider["lastRunOrdinal"] != run.ordinal
+        || !p.attempts.iter().any(|attempt| {
+            Some(&attempt.id) == run.active_attempt_id.as_ref()
+                && attempt.run_id == run.id
+                && Some(&attempt.root_node_id) == run.root_node_id.as_ref()
+                && Some(&attempt.provider_thread_id) == run.provider_thread_id.as_ref()
+                && attempt
+                    .provider_turn_id
+                    .as_ref()
+                    .is_some_and(|id| turn["id"] == id.0)
+        })
+        || !p.nodes.iter().any(|node| {
+            Some(&node.id) == run.root_node_id.as_ref() && node.run_id.as_ref() == Some(&run.id)
+        })
+    {
+        return Err(refuse("The active attempt/provider binding changed."));
+    }
+    Ok((run, session_id, turn, mode))
+}
+
+fn steer(
+    plan: &mut Plan,
+    command: &Command,
+    p: &ThreadProjection,
+    target: &str,
+    message: &Value,
+    now: i64,
+) -> Result<()> {
+    let (run, session_id, turn, mode) = steering_target(p, target, message)?;
+    let message_id = message["id"]
+        .as_str()
+        .ok_or_else(|| Error::Invariant("Promoted message has no id.".into()))?
+        .to_owned();
+    let restarted;
+    let run = if mode == zeron_proto::QueuePromotionMode::InterruptRestart {
+        restarted = crate::orchestration::threads::planner::restart_attempt(
+            p,
+            command,
+            plan,
+            run,
+            session_id,
+            turn,
+            &MessageId(message_id.clone()),
+            now,
+        )?;
+        &restarted
+    } else {
+        run
+    };
     let mut message = message.clone();
     message["runId"] = json!(run.id);
     message["nodeId"] = json!(run.root_node_id);
     message["createdAt"] = json!(iso(now)?);
     message["updatedAt"] = json!(iso(now)?);
     plan.emit(command, "message.updated", &message, now)?;
-    let mut item = json!({"id":format!("turn-item:message:{}",crate::orchestration::event::encode_component(message["id"].as_str().unwrap())),
+    let mut item = json!({"id":format!("turn-item:message:{}",crate::orchestration::event::encode_component(&message_id)),
         "threadId":p.thread.id,"runId":run.id,"nodeId":run.root_node_id,"providerThreadId":run.provider_thread_id,
-        "providerTurnId":turn["id"],"nativeItemRef":null,"parentItemId":null,
+        "providerTurnId":if mode == zeron_proto::QueuePromotionMode::ActiveSteering {turn["id"].clone()}else{Value::Null},"nativeItemRef":null,"parentItemId":null,
         "ordinal":records(p,"turn-item").iter().filter_map(|i|i["ordinal"].as_i64()).max().unwrap_or(0)+1,
         "status":"completed","title":null,"startedAt":iso(now)?,"completedAt":iso(now)?,"updatedAt":iso(now)?,
         "type":"user_message","messageId":message["id"],"inputIntent":if command.command_type()?=="queued-message.promote-to-steer"{"promoted_queued_to_steer"}else{"steer"},
@@ -355,13 +447,35 @@ fn steer(
         }
     }
     plan.emit(command, "turn-item.updated", &item, now)?;
-    plan.effects.push(EffectRequest::ProviderTurnSteer {
-        provider_session_id: ProviderSessionId(session_id.into()),
-        provider_thread_id: run.provider_thread_id.clone().unwrap(),
-        provider_turn_id: ProviderTurnId(turn["id"].as_str().unwrap().into()),
-        message_id: MessageId(message["id"].as_str().unwrap().into()),
-    });
+    if mode == zeron_proto::QueuePromotionMode::ActiveSteering {
+        plan.effects.push(EffectRequest::ProviderTurnSteer {
+            provider_session_id: ProviderSessionId(session_id.into()),
+            provider_thread_id: run.provider_thread_id.clone().ok_or_else(|| {
+                Error::Invariant("Promotion target run has no provider thread.".into())
+            })?,
+            provider_turn_id: ProviderTurnId(
+                turn["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Invariant("Promotion target turn has no id.".into()))?
+                    .into(),
+            ),
+            message_id: MessageId(message_id),
+        });
+    }
     Ok(())
+}
+
+/// Use the actual steering planner for the passive UI hint, so provider,
+/// maintenance and attempt/turn fences cannot drift from the mutation path.
+pub(crate) fn promotion_mode(p: &ThreadProjection) -> Option<zeron_proto::QueuePromotionMode> {
+    let run = task::active_run(p)?;
+    steering_target(p, &run.id.0, &json!({"text":"message"}))
+        .ok()
+        .map(|(_, _, _, mode)| mode)
+}
+
+pub(crate) fn can_promote_to_steer(p: &ThreadProjection) -> bool {
+    promotion_mode(p) == Some(zeron_proto::QueuePromotionMode::ActiveSteering)
 }
 
 fn respond(
@@ -488,10 +602,13 @@ fn enqueue_answer(
         .iter()
         .any(|r| !crate::orchestration::command::run_terminal(&r.status));
     let driver = records(p, "provider-thread")
-        .first()
+        .iter()
+        .rev()
+        .find(|provider| provider["providerInstanceId"] == p.thread.provider_instance_id.0)
         .and_then(|t| t["driver"].as_str())
         .unwrap_or("unknown");
-    let seed = task::execution_seed(
+    let seed = task::execution_seed_for(
+        p,
         &p.thread,
         ordinal,
         id,
@@ -819,7 +936,8 @@ fn sync_loro(
             }
         } else {
             ordinal += 1;
-            let seed = task::execution_seed(
+            let seed = task::execution_seed_for(
+                p,
                 &p.thread,
                 ordinal,
                 &row.id,
@@ -864,30 +982,55 @@ fn adopt_delivery(
         .into_iter()
         .find(|r| r.user_message_id.0 == input["messageId"].as_str().unwrap_or(""))
         .ok_or_else(|| refuse("Queued run no longer exists."))?;
-    let mut value = serde_json::to_value(run)?;
-    value["status"] = json!("starting");
-    value["queuePosition"] = Value::Null;
-    plan.emit(command, "run.updated", &value, now)?;
-    let seed = task::execution_seed(
+    let seed = task::execution_seed_for(
+        p,
         &p.thread,
         run.ordinal,
         &run.user_message_id.0,
         "starting",
-        records(p, "provider-thread")
-            .first()
-            .and_then(|p| p["driver"].as_str())
+        input["driver"]
+            .as_str()
+            .or_else(|| {
+                records(p, "provider-thread")
+                    .iter()
+                    .rev()
+                    .find(|provider| {
+                        provider["providerInstanceId"] == p.thread.provider_instance_id.0
+                    })
+                    .and_then(|provider| provider["driver"].as_str())
+            })
             .unwrap_or("unknown"),
         now,
     )?;
-    let mut provider = serde_json::to_value(seed.provider_thread)?;
-    if let Some(previous) = records(p, "provider-thread")
+    // Queue admission only reserves identities. At delivery, bind the existing
+    // run/attempt/root together to the selected provider generation, retaining
+    // the queue's message identity and the user's current model selection.
+    let mut value = serde_json::to_value(run)?;
+    value["status"] = json!("starting");
+    value["queuePosition"] = Value::Null;
+    value["providerInstanceId"] = json!(seed.run.provider_instance_id);
+    value["modelSelection"] = json!(seed.run.model_selection);
+    value["providerThreadId"] = json!(seed.provider_thread.id);
+    plan.emit(command, "run.updated", &value, now)?;
+    let mut attempt = p
+        .attempts
         .iter()
-        .find(|r| r["id"] == provider["id"])
-    {
-        provider = previous.clone();
-        provider["lastRunOrdinal"] = json!(run.ordinal);
-    }
-    provider["ownerNodeId"] = json!(run.root_node_id);
+        .find(|attempt| run.active_attempt_id.as_ref() == Some(&attempt.id))
+        .cloned()
+        .ok_or_else(|| refuse("Queued run has no active attempt."))?;
+    attempt.provider_instance_id = seed.run.provider_instance_id;
+    attempt.provider_thread_id = seed.provider_thread.id.clone();
+    plan.emit(command, "run-attempt.updated", &attempt, now)?;
+    let mut root = p
+        .nodes
+        .iter()
+        .find(|node| run.root_node_id.as_ref() == Some(&node.id))
+        .cloned()
+        .ok_or_else(|| refuse("Queued run has no root node."))?;
+    root.provider_thread_id = Some(seed.provider_thread.id.clone());
+    plan.emit(command, "node.updated", &root, now)?;
+    let mut provider = seed.provider_thread;
+    provider.owner_node_id = run.root_node_id.clone();
     plan.emit(command, "provider-thread.updated", &provider, now)?;
     Ok(())
 }

@@ -600,8 +600,15 @@ impl ClaudeHarness {
     }
 }
 
+#[derive(Debug)]
 enum StdinMsg {
     Line(String),
+    /// Adapter delivery acknowledgement belongs to the write/flush boundary,
+    /// not the local writer mailbox. This is not a CLI prompt-echo receipt.
+    Steer {
+        line: String,
+        receipt: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Close stdin (end of steering input): the CLI finishes the current turn
     /// and exits, which ends the run stream at stdout EOF.
     Close,
@@ -684,22 +691,26 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
 /// tolerated and logged.
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
     while let Some(msg) = rx.recv().await {
-        match msg {
-            StdinMsg::Line(line) => {
-                let write = async {
-                    stdin.write_all(line.as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await
-                };
-                if let Err(e) = write.await {
-                    tracing::debug!(target: "zeron_harness::claude", "stdin write failed (tolerated): {e}");
-                    return;
-                }
-            }
+        let (line, receipt) = match msg {
+            StdinMsg::Line(line) => (line, None),
+            StdinMsg::Steer { line, receipt } => (line, Some(receipt)),
             StdinMsg::Close => {
                 let _ = stdin.shutdown().await;
                 return;
             }
+        };
+        let write = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        }
+        .await;
+        if let Some(receipt) = receipt {
+            let _ = receipt.send(write.is_ok());
+        }
+        if let Err(e) = write {
+            tracing::debug!(target: "zeron_harness::claude", "stdin write failed (tolerated): {e}");
+            return;
         }
     }
 }
@@ -809,11 +820,20 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let accepted = stdin_tx.send(StdinMsg::Line(line)).is_ok();
-                    if let Some(receipt) = msg.notification_acceptance {
-                        let _ = receipt.send(accepted);
-                        if !accepted {continue 'main;}
-                    }
+                    let queued = if let Some(receipt) = msg.notification_acceptance {
+                        match stdin_tx.send(StdinMsg::Steer { line, receipt }) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                if let StdinMsg::Steer { receipt, .. } = error.0 {
+                                    let _ = receipt.send(false);
+                                }
+                                false
+                            }
+                        }
+                    } else {
+                        stdin_tx.send(StdinMsg::Line(line)).is_ok()
+                    };
+                    if !queued {continue 'main;}
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.
@@ -1116,6 +1136,66 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steering_writer_acknowledges_a_flushed_line_not_its_mailbox() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read -r line; test \"$line\" = user-line")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (receipt, mut accepted) = tokio::sync::oneshot::channel();
+        tx.send(StdinMsg::Steer {
+            line: "user-line".into(),
+            receipt,
+        })
+        .unwrap();
+        assert!(matches!(
+            accepted.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let writer = tokio::spawn(stdin_writer(child.stdin.take().unwrap(), rx));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), accepted)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(child.wait().await.unwrap().success());
+        drop(tx);
+        writer.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steering_writer_refuses_a_closed_provider_pipe() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        child.wait().await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (receipt, accepted) = tokio::sync::oneshot::channel();
+        tx.send(StdinMsg::Steer {
+            line: "not-delivered".into(),
+            receipt,
+        })
+        .unwrap();
+        let writer = tokio::spawn(stdin_writer(stdin, rx));
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), accepted)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        writer.await.unwrap();
+    }
 
     #[test]
     fn session_rules_never_expand_exact_consent_to_a_pattern() {

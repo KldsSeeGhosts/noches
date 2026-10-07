@@ -18,6 +18,19 @@ pub struct HostQueue {
 }
 
 impl HostQueue {
+    /// The runtime can be briefly idle between admitted restart attempts.
+    /// That gap does not authorize draining another document-owned input.
+    pub(crate) fn has_starting_turn(&self, chat: &str) -> super::super::Result<bool> {
+        self.domain.kernel.store.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orchestration_projection_runs
+                 WHERE thread_id=?1 AND status='starting')",
+                [chat],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     pub(crate) async fn prepare_locked(
         &self,
         handle: &Arc<crate::ChatDocHandle>,
@@ -85,10 +98,16 @@ impl HostQueue {
                     }
                 }
                 Some("reorder") => {
+                    let existing = handle.doc().read_queue().map_err(|_| unavailable())?;
                     for (index, id) in patch["messageIds"]
                         .as_array()
                         .into_iter()
                         .flatten()
+                        .filter(|id| {
+                            existing
+                                .iter()
+                                .any(|row| Some(row.id.as_str()) == id.as_str())
+                        })
                         .enumerate()
                     {
                         handle
@@ -219,6 +238,142 @@ impl HostQueue {
             return Err(unavailable());
         }
         Ok(())
+    }
+
+    /// The user controls their queue without impersonating an active agent.
+    /// SQL acceptance, legacy drain and durable Loro patches share one lane.
+    pub async fn mutate_for_user(
+        &self,
+        request: zeron_proto::MutateQueuedRunParams,
+    ) -> Result<zeron_proto::MutateQueuedRunResult, ToolError> {
+        use zeron_proto::QueuedRunAction;
+        use zeron_proto::orchestration_mcp::OrchestratorMcpFailureCode as Code;
+
+        for id in [
+            &request.chat_id,
+            &request.queued_run_id,
+            &request.client_request_id,
+        ] {
+            if id.trim().is_empty() || id.len() > 512 {
+                return Err(ToolError::new(
+                    Code::InvalidRequest,
+                    "Queue identities must be nonempty and at most 512 bytes.",
+                ));
+            }
+        }
+        if !self.docs.is_host(&request.chat_id) {
+            return Err(ToolError::new(
+                Code::OrchestrationError,
+                "Queue mutations require the owning host.",
+            ));
+        }
+        let thread = ThreadId(request.chat_id.clone());
+        let handle = self
+            .docs
+            .open(&request.chat_id)
+            .map_err(|_| unavailable())?;
+        let _guard = handle.orchestration_queue_lock().await;
+        self.prepare_locked(&handle).await?;
+        let current = self
+            .domain
+            .kernel
+            .store
+            .thread(&thread)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        if current.thread.deleted_at.is_some() || current.thread.archived_at.is_some() {
+            return Err(unavailable());
+        }
+        let (name, mut input) = match &request.action {
+            QueuedRunAction::Edit {
+                text,
+                expected_text,
+            } => (
+                "t3_queue_edit",
+                json!({"text":text,"expectedText":expected_text}),
+            ),
+            QueuedRunAction::Cancel => ("t3_queue_cancel", json!({})),
+            QueuedRunAction::Reorder { before_run_id } => {
+                ("t3_queue_reorder", json!({"beforeRunId":before_run_id}))
+            }
+            QueuedRunAction::PromoteToSteer { target_run_id } => (
+                "t3_queue_promote_to_steer",
+                json!({"targetRunId":target_run_id,"expectedExecution":"active_steering"}),
+            ),
+            QueuedRunAction::PromoteToRestart { target_run_id } => (
+                "t3_queue_promote_to_steer",
+                json!({"targetRunId":target_run_id,"expectedExecution":"interrupt_restart"}),
+            ),
+        };
+        input["threadId"] = json!(request.chat_id);
+        input["queuedRunId"] = json!(request.queued_run_id);
+        let id = CommandId(format!(
+            "ui:queue:{}:{}",
+            crate::orchestration::event::encode_component(&request.chat_id),
+            crate::orchestration::event::encode_component(&request.client_request_id),
+        ));
+        let payload = serde_json::to_string(&json!({"name":name,"input":input}))
+            .map_err(|_| unavailable())?;
+        let same = self
+            .domain
+            .kernel
+            .store
+            .write(|conn| {
+                super::reserve_request(conn, super::QUEUE_USER_REQUESTS, &id.0, &payload)
+            })
+            .map_err(|_| unavailable())?;
+        if !same {
+            return Err(ToolError::new(
+                Code::InvalidRequest,
+                "This queue request identity already belongs to different content or an action.",
+            ));
+        }
+        let replay = self
+            .domain
+            .kernel
+            .store
+            .receipt(&id)
+            .map_err(|_| unavailable())?
+            .is_some();
+        if !replay
+            && let Some(run) = super::queued(&current)
+                .into_iter()
+                .find(|run| run.id.0 == request.queued_run_id)
+        {
+            let rows = handle.doc().read_queue().map_err(|_| unavailable())?;
+            if rows
+                .iter()
+                .any(|row| row.id == run.user_message_id.0 && row.delivery_gate.is_some())
+            {
+                return Err(ToolError::new(
+                    Code::InvalidRequest,
+                    "This message is protected by an edit or review gate.",
+                ));
+            }
+            if matches!(request.action, QueuedRunAction::Edit { .. })
+                && rows.iter().any(|row| row.id == run.user_message_id.0)
+            {
+                return Err(ToolError::new(
+                    Code::InvalidRequest,
+                    "Document-backed messages require an edit lease.",
+                ));
+            }
+        }
+        let receipt = self
+            .domain
+            .mutate(None, thread.clone(), name, input, id, crate::now_ms())
+            .await
+            .map_err(|_| unavailable())?;
+        self.apply_patches(&thread, &handle)?;
+        handle.publish_orchestration_queue();
+        Ok(zeron_proto::MutateQueuedRunResult {
+            sequence: receipt.result_sequence,
+            refusal: (receipt.status == crate::orchestration::ReceiptStatus::Rejected).then(|| {
+                receipt
+                    .error
+                    .unwrap_or_else(|| "The queue action was refused.".into())
+            }),
+        })
     }
 }
 

@@ -45,6 +45,8 @@ pub mod methods {
     pub const ACKNOWLEDGE_THREAD_WOKE: &str = "AcknowledgeThreadWoke";
     pub const WATCH_THREAD_LIFECYCLES: &str = "WatchThreadLifecycles";
     pub const GET_QUEUE_STATE: &str = "GetQueueState";
+    /// Owner-only user authority over canonical queued runs (never an agent scope).
+    pub const MUTATE_QUEUED_RUN: &str = "MutateQueuedRun";
     pub const GET_THREAD_SUMMARIES: &str = "GetThreadSummaries";
     pub const GET_THREAD_TIMELINE: &str = "GetThreadTimeline";
     pub const LIST_LAUNCH_PROJECTS: &str = "ListLaunchProjects";
@@ -54,6 +56,9 @@ pub mod methods {
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
     pub const GET_THREAD_TRANSFER_STATE: &str = "GetThreadTransferState";
+    pub const FORK_THREAD: &str = "ForkThread";
+    pub const MERGE_THREAD_BACK: &str = "MergeThreadBack";
+    pub const DISCONNECT_THREAD_SESSION: &str = "DisconnectThreadSession";
     /// `{chatId,checkpointId}` -> RestorePreview. Does not change files.
     pub const PREVIEW_FILE_CHECKPOINT_RESTORE: &str = "PreviewFileCheckpointRestore";
     /// `{chatId,checkpointId,expectedHeadSha,expectedChecksum}` -> RestoreResult.
