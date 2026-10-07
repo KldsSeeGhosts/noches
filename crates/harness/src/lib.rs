@@ -209,9 +209,14 @@ impl std::fmt::Debug for HarnessError {
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
+#[derive(Default)]
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+    /// Host-owned local image files that ride this steer. Their path refs
+    /// already appear in `prompt`; harnesses with native image input (Codex,
+    /// Claude) also send them as image items, others keep the references.
+    pub attachments: Vec<String>,
     /// Host-local app mailbox delivery receipt. When present, a rejected/idle
     /// active steer must return false, not silently start a new native turn;
     /// the durable orchestration continuation owns that fallback.
@@ -309,6 +314,18 @@ pub trait Harness: Send + Sync {
         false
     }
     fn session_lifecycle(&self) -> Option<&dyn session_lifecycle::SessionLifecycle> {
+        None
+    }
+    /// The context window (tokens) this adapter's catalog declares for a
+    /// model and its selected options, for bounding handoff context before a
+    /// provider has reported its own occupancy. None = not declared; callers
+    /// fall back to provider telemetry, then a conservative default. Pure
+    /// catalog lookup: never spawns a process.
+    fn model_context_window(
+        &self,
+        _model: &str,
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<u64> {
         None
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel];

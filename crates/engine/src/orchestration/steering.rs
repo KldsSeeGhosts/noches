@@ -389,6 +389,7 @@ pub(crate) async fn execute(
         .kernel
         .store
         .read(|conn| super::ui_queue::attachment_paths(conn, &effect.thread_id, &message_id.0))?;
+    let mut images = crate::doc_host::steer_image_paths(paths.iter().map(String::as_str));
     if !paths.is_empty() {
         text.push_str("\n\nAttachments:\n");
         text.push_str(
@@ -406,6 +407,9 @@ pub(crate) async fn execute(
             .launch_attachment_path(attachment["id"].as_str().unwrap_or(""), &effect.thread_id.0)?
         {
             if !paths.contains(&path) {
+                if attachment["type"] == "image" && !images.contains(&path) {
+                    images.extend(crate::doc_host::steer_image_paths([path.as_str()]));
+                }
                 text.push_str(&format!(
                     "\nAttached {} (local file): {path}",
                     attachment["type"].as_str().unwrap_or("file")
@@ -428,7 +432,13 @@ pub(crate) async fn execute(
     drop(guards);
     let outcome = bridge
         .sessions
-        .steer_canonical(&effect.thread_id.0, &expected, &text, message_id.0.clone())
+        .steer_canonical_with_attachments(
+            &effect.thread_id.0,
+            &expected,
+            &text,
+            message_id.0.clone(),
+            images,
+        )
         .await
         .map_err(|e| super::Error::Invariant(e.to_string()))?;
     match outcome {

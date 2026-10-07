@@ -64,6 +64,7 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
             source_thread_id: "native-source".into(),
             source_turn_id: Some("stable-turn".into()),
             source_next_turn_id: None,
+            rollback_turns: None,
             cwd: cwd.path().to_string_lossy().into_owned(),
             model: "gpt-5.6-sol".into(),
             runtime_mode: Default::default(),
@@ -78,6 +79,7 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
             source_thread_id: "native-source".into(),
             source_turn_id: None,
             source_next_turn_id: None,
+            rollback_turns: None,
             cwd: cwd.path().to_string_lossy().into_owned(),
             model: "gpt-5.6-sol".into(),
             runtime_mode: Default::default(),
@@ -90,6 +92,60 @@ async fn native_fork_uses_stable_turn_and_returns_fresh_identity_without_a_turn(
         refused
             .to_string()
             .contains("without a native turn reference")
+    );
+}
+
+#[tokio::test]
+async fn legacy_fork_forks_at_head_then_reverts_the_counted_paginated_turns() {
+    use zeron_harness::session_lifecycle::{NativeForkRequest, SessionLifecycle};
+    let cwd = tempfile::tempdir().unwrap();
+    let harness = harness();
+    let request = |source: &str, turns| NativeForkRequest {
+        source_thread_id: source.into(),
+        source_turn_id: None,
+        source_next_turn_id: None,
+        rollback_turns: turns,
+        cwd: cwd.path().to_string_lossy().into_owned(),
+        model: "gpt-5.6-sol".into(),
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
+        mcp: Default::default(),
+    };
+    assert!(harness.supports_fork_rollback());
+    // Two later turns are dropped; the oldest of them is the revert boundary.
+    assert_eq!(
+        harness
+            .fork_thread(request("legacy-source", Some(2)))
+            .await
+            .unwrap(),
+        "legacy-fork-reverted"
+    );
+    // A forked thread still on legacy history cannot be trimmed: the fork is
+    // reported uncertain rather than silently left at head.
+    let legacy = harness
+        .fork_thread(request("legacy-history-source", Some(1)))
+        .await
+        .unwrap_err();
+    assert!(legacy.to_string().contains("legacy history"), "{legacy}");
+    // Asking for more turns than the fork has is a mismatch, never a guess.
+    let short = harness
+        .fork_thread(request("legacy-short-source", Some(3)))
+        .await
+        .unwrap_err();
+    assert!(short.to_string().contains("fewer turns"), "{short}");
+    // A boundary turn without an id is a protocol error, never a head fork.
+    let noid = harness
+        .fork_thread(request("legacy-noid-source", Some(2)))
+        .await
+        .unwrap_err();
+    assert!(matches!(noid, HarnessError::Protocol(_)), "{noid}");
+    assert!(noid.to_string().contains("without an id"), "{noid}");
+    // No counted boundary at all still refuses to fork a moving head.
+    assert!(
+        harness
+            .fork_thread(request("legacy-source", None))
+            .await
+            .is_err()
     );
 }
 
@@ -408,6 +464,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
             prompt: "redirect please".into(),
             message_id: Some("direct-steer-message".into()),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .expect("steer queued");
@@ -448,6 +505,31 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
 }
 
 #[tokio::test]
+async fn steering_sends_host_owned_images_as_native_local_image_items() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "look at this".into(),
+            message_id: Some("image-steer-message".into()),
+            attachments: vec!["/tmp/steer-shot.png".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-image"), controls).await;
+    // The fake only emits this delta after seeing the text plus a localImage item.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "image-steered".into()
+        }),
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "image-steer-message".into(),
+    }));
+}
+
+#[tokio::test]
 async fn notification_steer_receipts_native_acceptance() {
     let (controls, steer, _token) = controls("Yes");
     let (receipt, response) = oneshot::channel();
@@ -456,6 +538,7 @@ async fn notification_steer_receipts_native_acceptance() {
             prompt: "redirect please".into(),
             message_id: Some("stable-completion-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -480,6 +563,7 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
             prompt: "redirect please".into(),
             message_id: Some("stable-completion-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -520,6 +604,7 @@ async fn app_server_exit_during_steer_is_uncertain_not_a_rejection() {
             prompt: "redirect please".into(),
             message_id: Some("lost-transport-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -536,6 +621,7 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
             prompt: "redirect please".into(),
             message_id: Some("fallback-steer-message".into()),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .expect("steer queued");
@@ -1192,6 +1278,7 @@ async fn live_subagent_spawn_and_followup_keep_one_transcript() {
                 notification_acceptance: None,
                 prompt: "Reuse the SAME existing subagent for one more task: reply exactly child-second. Use followup_task if available, otherwise send_input. Do not spawn a new agent. Wait for it to finish, then reply exactly parent-second. Do not inspect or change files.".into(),
                 message_id: None,
+                ..Default::default()
             }).await.unwrap();
         }
         if turn == 2 {

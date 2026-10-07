@@ -473,6 +473,55 @@ fn queued_message_prompt(text: &str, attachments: &[String]) -> String {
     format!("{body}{trailer}")
 }
 
+/// Absolute local image files among `paths` — the part of a steer harnesses
+/// with native image input can inline. Everything else stays a text reference.
+pub(crate) fn steer_image_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            let path = std::path::Path::new(path);
+            path.is_absolute()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "png" | "jpg" | "jpeg" | "webp" | "gif"
+                        )
+                    })
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The attachment trailer's paths in a composer steer prompt.
+fn prompt_attachment_paths(prompt: &str) -> Vec<String> {
+    let Some((_, trailer)) = prompt.split_once(ATTACHMENT_PROMPT_HEADER) else {
+        return Vec::new();
+    };
+    steer_image_paths(
+        trailer
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- ")),
+    )
+}
+
+/// Paths from user text that are existing uploads of this host; anything else
+/// named in a prompt is just text and never read for the provider.
+fn host_owned_images(uploads: Option<&crate::uploads::Uploads>, paths: Vec<String>) -> Vec<String> {
+    let Some(uploads) = uploads else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter(|path| {
+            let local = std::path::Path::new(path);
+            uploads.owns(local) && local.is_file()
+        })
+        .collect()
+}
+
 fn queue_text_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -566,6 +615,9 @@ impl PartialEq for QueueSnapshot {
                         && a.background_run_id == b.background_run_id
                         && a.can_promote_to_steer == b.can_promote_to_steer
                         && a.promotion_mode == b.promotion_mode
+                        && a.promotion_selection == b.promotion_selection
+                        && a.promotion_selection_deferred == b.promotion_selection_deferred
+                        && a.promotion_blocked == b.promotion_blocked
                 }
                 _ => false,
             }
@@ -700,6 +752,31 @@ mod queue_snapshot_tests {
 }
 
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
+
+/// See `DocHost::freeze_queue_for_stop`.
+pub(crate) struct QueueFreeze<'a> {
+    handle: &'a ChatDocHandle,
+    previously_paused: bool,
+    keep: bool,
+    _drain: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl QueueFreeze<'_> {
+    pub(crate) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for QueueFreeze<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.handle
+                .queue_paused
+                .store(self.previously_paused, Ordering::Release);
+        }
+    }
+}
+
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
@@ -1320,6 +1397,10 @@ impl DocHost {
     /// and the transfer-read jail.
     pub fn set_uploads(&self, uploads: crate::uploads::Uploads) {
         let _ = self.inner.uploads.set(uploads);
+    }
+
+    pub(crate) fn uploads(&self) -> Option<&crate::uploads::Uploads> {
+        self.inner.uploads.get()
     }
 
     /// Wire the peer-link cache (engine assembly, edge runtimes only) — the
@@ -4420,6 +4501,26 @@ impl DocHost {
         }
     }
 
+    /// Freeze the queue for a whole-thread Stop exactly like an ordinary user
+    /// Stop: interrupting publishes Idle, which would otherwise let the
+    /// drainer start the next queued message. The returned guard holds the
+    /// drain lock and restores the previous pause state on drop unless
+    /// `keep` is called (some step was admitted).
+    pub(crate) async fn freeze_queue_for_stop<'a>(
+        &self,
+        handle: &'a Arc<ChatDocHandle>,
+    ) -> Result<QueueFreeze<'a>, EngineError> {
+        let drain = handle.drain_lock.lock().await;
+        self.prepare_orchestration_queue(handle).await?;
+        let previously_paused = handle.queue_paused.swap(true, Ordering::AcqRel);
+        Ok(QueueFreeze {
+            handle,
+            previously_paused,
+            keep: false,
+            _drain: drain,
+        })
+    }
+
     /// Send one taken queue row.
     async fn dispatch_queued(
         &self,
@@ -4439,7 +4540,12 @@ impl DocHost {
         let prompt = queued_message_prompt(&item.text, &item.attachments);
         if send == QueueSend::Steer {
             match sessions
-                .steer(chat_id, &prompt, Some(message_id.clone()))
+                .steer_with_attachments(
+                    chat_id,
+                    &prompt,
+                    Some(message_id.clone()),
+                    steer_image_paths(item.attachments.iter().map(String::as_str)),
+                )
                 .await?
             {
                 SteerOutcome::Accepted => return Ok(()),
@@ -5709,7 +5815,13 @@ impl DocHost {
         {
             tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
         }
-        match sessions.steer(chat_id, &prompt, message_id.clone()).await? {
+        // The trailer is free text (typed, pasted, or from a paired device):
+        // only files this host committed as uploads may ride in as images.
+        let images = host_owned_images(self.uploads(), prompt_attachment_paths(&prompt));
+        match sessions
+            .steer_with_attachments(chat_id, &prompt, message_id.clone(), images)
+            .await?
+        {
             SteerOutcome::Accepted => {
                 handle.queue_paused.store(false, Ordering::Release);
                 Ok((SessionCommandStatus::Applied, None))
@@ -6806,3 +6918,34 @@ mod publication_eviction_tests {
 #[cfg(test)]
 #[path = "doc_host_sync_tests.rs"]
 mod sync_lifecycle_tests;
+
+#[cfg(test)]
+mod steer_image_tests {
+    use super::*;
+
+    #[test]
+    fn steer_prompt_images_must_be_existing_host_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        std::fs::create_dir_all(uploads.dir()).unwrap();
+        let owned = uploads.dir().join("shot.png");
+        std::fs::write(&owned, b"x").unwrap();
+        let outside = dir.path().join("secret.png");
+        std::fs::write(&outside, b"x").unwrap();
+        let prompt = format!(
+            "look\n\n{ATTACHMENT_PROMPT_HEADER}\n- {}\n- {}\n- {}\n- {}/missing.png\n- {}/../secret.png",
+            owned.display(),
+            outside.display(),
+            dir.path().join("elsewhere").join("passwd.png").display(),
+            uploads.dir().display(),
+            uploads.dir().display(),
+        );
+        let parsed = prompt_attachment_paths(&prompt);
+        assert_eq!(parsed.len(), 5, "the parser alone trusts the text");
+        assert_eq!(
+            host_owned_images(Some(&uploads), parsed.clone()),
+            vec![owned.to_string_lossy().into_owned()]
+        );
+        assert!(host_owned_images(None, parsed).is_empty());
+    }
+}

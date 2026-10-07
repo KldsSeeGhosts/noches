@@ -321,6 +321,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a dispatch's native-session fields state, so the engine never has to
+/// guess. `request.resume == Some(id)` is always an explicit resume; the
+/// variant only distinguishes the absent case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NativeIntent {
+    /// No statement: older/ordinary sends. The engine threads the chat's
+    /// remembered native session back in (zeron sessions.ts:736).
+    #[default]
+    Legacy,
+    /// The orchestration planner chose a new provider generation, or one whose
+    /// native history is not provably the accepted one. Never resume whatever
+    /// session the engine happens to remember for this chat/instance.
+    Fresh,
+}
+
 #[derive(Clone)]
 pub struct SessionsEngine {
     inner: Arc<Inner>,
@@ -607,6 +622,7 @@ impl SessionsEngine {
                 prompt: prompt.into(),
                 message_id: Some(message_id),
                 notification_acceptance: Some(accepted_tx),
+                ..Default::default()
             })
             .is_err()
         {
@@ -665,6 +681,19 @@ impl SessionsEngine {
         prompt: &str,
         message_id: String,
     ) -> Result<CanonicalSteerOutcome, EngineError> {
+        self.steer_canonical_with_attachments(chat_id, expected, prompt, message_id, Vec::new())
+            .await
+    }
+
+    /// [`Self::steer_canonical`] carrying host-owned local image files.
+    pub(crate) async fn steer_canonical_with_attachments(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+        prompt: &str,
+        message_id: String,
+        attachments: Vec<String>,
+    ) -> Result<CanonicalSteerOutcome, EngineError> {
         let _admission = self.admit_work()?;
         let handle = self.doc_handle(chat_id)?;
         let admissible = |run: &RunHandle, statuses: &HashMap<String, Session>| {
@@ -700,6 +729,7 @@ impl SessionsEngine {
                     prompt: prompt.into(),
                     message_id: Some(message_id.clone()),
                     notification_acceptance: Some(accepted_tx),
+                    attachments,
                 })
                 .is_err()
             {
@@ -824,8 +854,15 @@ impl SessionsEngine {
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
         self.refuse_readonly_child(chat_id)?;
-        self.dispatch_with(chat_id, harness_id, request, message_id, false)
-            .await
+        self.dispatch_with(
+            chat_id,
+            harness_id,
+            request,
+            message_id,
+            false,
+            NativeIntent::Legacy,
+        )
+        .await
     }
 
     fn refuse_readonly_child(&self, chat_id: &str) -> Result<(), EngineError> {
@@ -848,8 +885,9 @@ impl SessionsEngine {
         harness_id: HarnessId,
         request: RunRequest,
         message_id: Option<String>,
+        native: NativeIntent,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, false)
+        self.dispatch_with(chat_id, harness_id, request, message_id, false, native)
             .await
     }
 
@@ -865,8 +903,16 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
         startup_retry: bool,
+        native: NativeIntent,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, startup_retry))
+        Box::pin(self.dispatch_inner(
+            chat_id,
+            harness_id,
+            request,
+            message_id,
+            startup_retry,
+            native,
+        ))
     }
 
     async fn dispatch_inner(
@@ -876,7 +922,13 @@ impl SessionsEngine {
         mut request: RunRequest,
         mut message_id: Option<String>,
         startup_retry: bool,
+        native: NativeIntent,
     ) -> Result<String, EngineError> {
+        if native == NativeIntent::Fresh && request.resume.is_some() {
+            return Err(EngineError::Other(
+                "A fresh native start cannot carry a resume session.".into(),
+            ));
+        }
         let _admission = self.admit_work()?;
         // A kernel-owned start may already carry imported provider context.
         // Keep the original app message separate from that native-only input.
@@ -1017,6 +1069,7 @@ impl SessionsEngine {
                     notification_acceptance: None,
                     prompt: request.prompt.clone(),
                     message_id: Some(user_id.clone()),
+                    ..Default::default()
                 };
                 if steer_tx.try_send(message).is_ok() {
                     // Same race as `steer`: the harness can consume this and
@@ -1094,7 +1147,7 @@ impl SessionsEngine {
         // problem now (`session/load` falls back to `session/new` internally),
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
-        if request.resume.is_none() {
+        if request.resume.is_none() && native == NativeIntent::Legacy {
             request.resume = self.inner.resume_for_instance(
                 chat_id,
                 &request.cwd,
@@ -1158,48 +1211,14 @@ impl SessionsEngine {
                 })
                 .unwrap_or_else(|| request.cwd.clone());
             let instance_id = requested_instance.clone();
-            let model = request.model.clone().unwrap_or_else(|| {
-                self.inner
-                    .registry
-                    .provider_instances
-                    .snapshot(&self.inner.registry)
-                    .iter()
-                    .find(|p| p.provider_instance_id == instance_id)
-                    .and_then(|p| p.models.first())
-                    .map(|m| m.id.clone())
-                    .unwrap_or_else(|| "default".into())
-            });
-            let mut inherited_options = request.model_options.clone();
-            // The legacy composer/harness option chip uses on/off strings.
-            // Canonical T3 boolean descriptors retain actual boolean values.
-            if let Some(model_row) = self
-                .inner
-                .registry
-                .provider_instances
-                .snapshot(&self.inner.registry)
-                .iter()
-                .find(|p| p.provider_instance_id == instance_id)
-                .and_then(|p| p.models.iter().find(|m| m.id == model))
-            {
-                for descriptor in model_row.options.as_ref().into_iter().flatten() {
-                    if let zeron_proto::provider_instance::ProviderOptionDescriptor::Boolean(option) =
-                        descriptor
-                        && let Some(value) = inherited_options.get_mut(&option.id)
-                        && let Some(text) = value.as_str()
-                    {
-                        *value = serde_json::Value::Bool(matches!(text, "on" | "true"));
-                    }
-                }
-            }
-            if let Some(reasoning) = request.reasoning {
-                let option_id = crate::provider_instances::reasoning_option_key(harness_id);
-                inherited_options
-                    .entry(option_id)
-                    .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));
-            }
-            let selection = serde_json::from_value(serde_json::json!({
-                "instanceId":instance_id,"model":model,"options":inherited_options
-            }))
+            let selection = crate::provider_instances::request_selection(
+                &self.inner.registry,
+                &instance_id,
+                harness_id,
+                request.model.as_deref(),
+                &request.model_options,
+                request.reasoning,
+            )
             .map_err(|e| EngineError::Other(e.to_string()))?;
             let mut scope = InvocationScope {
                 environment_id: self.inner.device_id.clone(),
@@ -1256,6 +1275,10 @@ impl SessionsEngine {
                     .map_err(|e| EngineError::Other(e.to_string()))?;
             }
         }
+        // Admission may have replaced the injected id (a generation the planner
+        // rebuilt from portable context carries none): the startup retry must
+        // not re-inject what the planner just refused.
+        let resume_injected = resume_injected && request.resume.is_some();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -1388,6 +1411,19 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        self.steer_with_attachments(chat_id, prompt, message_id, Vec::new())
+            .await
+    }
+
+    /// [`Self::steer`] carrying host-owned local image files for harnesses
+    /// with native image input; their path references stay in `prompt`.
+    pub async fn steer_with_attachments(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+        attachments: Vec<String>,
+    ) -> Result<SteerOutcome, EngineError> {
         self.refuse_readonly_child(chat_id)?;
         let _admission = self.admit_work()?;
         let configured = self
@@ -1419,6 +1455,7 @@ impl SessionsEngine {
             notification_acceptance: None,
             prompt: prompt.to_string(),
             message_id: Some(user_id.clone()),
+            attachments,
         };
         {
             // Serialize mailbox acceptance with confirmation and Done-time
@@ -3522,7 +3559,14 @@ async fn drive_run(
                 // The user entry write inside dispatch is idempotent by
                 // message id; `startup_retry` makes this attempt final.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), true)
+                    .dispatch_with(
+                        &chat,
+                        harness_id,
+                        retry,
+                        Some(message_id),
+                        true,
+                        NativeIntent::Legacy,
+                    )
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
@@ -3903,6 +3947,102 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Records the resume id each run request carries, then parks.
+    struct ResumeProbe {
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for ResumeProbe {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Resume probe"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            _: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            lock(&self.seen).push(request.resume);
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    // The planner, not engine memory, owns native continuity for canonical
+    // starts: a fresh generation never rides the remembered session, while an
+    // unqualified send keeps today's engine-owned resume.
+    #[tokio::test]
+    async fn fresh_native_intent_never_injects_the_remembered_session() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(ResumeProbe { seen: seen.clone() }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let chat = "chat-fresh";
+        core.sessions
+            .inner
+            .remember_harness_session(chat, "remembered", "/tmp", None);
+        core.sessions
+            .dispatch(chat, HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        core.sessions.interrupt(chat).await.unwrap();
+        core.sessions
+            .dispatch_orchestrated(chat, HarnessId::Mock, request(), None, NativeIntent::Fresh)
+            .await
+            .unwrap();
+        core.sessions.interrupt(chat).await.unwrap();
+        // An explicit resume stays explicit; "fresh" plus a resume id is a
+        // contradiction the engine refuses instead of choosing one.
+        let mut explicit = request();
+        explicit.resume = Some("planned".into());
+        core.sessions
+            .dispatch_orchestrated(
+                chat,
+                HarnessId::Mock,
+                explicit.clone(),
+                None,
+                NativeIntent::Legacy,
+            )
+            .await
+            .unwrap();
+        core.sessions.interrupt(chat).await.unwrap();
+        assert!(
+            core.sessions
+                .dispatch_orchestrated(chat, HarnessId::Mock, explicit, None, NativeIntent::Fresh)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *lock(&seen),
+            vec![
+                Some("remembered".to_string()),
+                None,
+                Some("planned".to_string())
+            ]
+        );
+        core.sessions.shutdown().await;
+    }
 
     #[tokio::test]
     async fn permission_bridge_round_trip_is_id_scoped_and_not_a_question() {
@@ -4668,6 +4808,7 @@ mod tests {
                 HarnessId::Mock,
                 input,
                 Some("user-input".into()),
+                NativeIntent::Legacy,
             )
             .await
             .unwrap();

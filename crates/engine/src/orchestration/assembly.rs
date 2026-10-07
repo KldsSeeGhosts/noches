@@ -543,7 +543,6 @@ impl RunnerBridge {
         super::transfer::ensure_start_allowed(
             &self.kernel.store.thread_transfers(thread)?,
             thread,
-            false,
         )?;
         // Sessions publishes Idle before this independent observer commits
         // Done. Bound the admission race without inventing another active run.

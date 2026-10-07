@@ -68,6 +68,42 @@ if has "$line" '"method":"model/list"'; then
   emit "{\"id\":$(rid "$line"),\"result\":{\"account\":{\"type\":\"apiKey\"},\"requiresOpenaiAuth\":false}}"
   exec sleep 30
 fi
+if has "$line" '"method":"thread/fork"' && has "$line" '"threadId":"legacy-'; then
+  # Legacy source: no lastTurnId (head fork), then the paginated revert dance.
+  has "$line" '"lastTurnId"' && exit 1
+  case "$line" in
+    *legacy-history-source*) fork_id=legacy-history-fork; mode=legacy ;;
+    *legacy-short-source*) fork_id=legacy-short-fork; mode=paginated ;;
+    *legacy-noid-source*) fork_id=legacy-noid-fork; mode=paginated ;;
+    *) fork_id=legacy-fork; mode=paginated ;;
+  esac
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$fork_id\"}}}"
+  read -r line || exit 1
+  has "$line" '"method":"thread/read"' || exit 1
+  has "$line" "\"threadId\":\"$fork_id\"" || exit 1
+  has "$line" '"includeTurns":false' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"$fork_id\",\"historyMode\":\"$mode\"}}}"
+  [ "$mode" = legacy ] && exec sleep 30
+  read -r line || exit 1
+  has "$line" '"method":"thread/turns/list"' || exit 1
+  has "$line" '"sortDirection":"desc"' || exit 1
+  if [ "$fork_id" = legacy-short-fork ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"}],\"nextCursor\":null}}"
+    exec sleep 30
+  fi
+  if [ "$fork_id" = legacy-noid-fork ]; then
+    # The boundary turn carries no id: the revert point is unknown.
+    emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"},{\"status\":\"completed\"}],\"nextCursor\":null}}"
+    exec sleep 30
+  fi
+  has "$line" '"limit":2' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"id\":\"t3\"},{\"id\":\"t2\"}],\"nextCursor\":\"more\"}}"
+  read -r line || exit 1
+  has "$line" '"method":"thread/revert"' || exit 1
+  has "$line" '"beforeTurnId":"t2"' || exit 1
+  emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"legacy-fork-reverted\"}}}"
+  exec sleep 30
+fi
 if has "$line" '"method":"thread/fork"'; then
   has "$line" '"threadId":"native-source"' || exit 1
   has "$line" '"lastTurnId":"stable-turn"' || exit 1
@@ -284,6 +320,25 @@ case "$turnline" in
     emit '{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}'
   else
     fail_turn "$fid" "expected fallback turn/start with steer text"
+  fi
+  ;;
+
+# A host-owned image rides turn/steer as a native localImage item after the text.
+*scenario:steer-image*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  if has "$steerline" '"method":"turn/steer"' &&
+    has "$steerline" '"type":"localImage"' &&
+    has "$steerline" '"path":"/tmp/steer-shot.png"' &&
+    has "$steerline" 'look at this'; then
+    emit "{\"id\":$sid,\"result\":{}}"
+    emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"image-steered"}}'
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  else
+    emit "{\"id\":$sid,\"error\":{\"code\":-32600,\"message\":\"bad steer\"}}"
+    emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"steer image missing"}}}}'
   fi
   ;;
 

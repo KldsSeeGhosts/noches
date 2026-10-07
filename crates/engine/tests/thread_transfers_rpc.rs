@@ -106,6 +106,20 @@ impl Harness for RecordingHarness {
                 session_id: Some(native),
             });
         } else {
+            if request.prompt.contains("use-a-tool") {
+                events.push(AgentEvent::ToolCall {
+                    id: "tool-1".into(),
+                    call: zeron_proto::ToolCall::Exec {
+                        command: "echo hello".into(),
+                    },
+                });
+                events.push(AgentEvent::ToolResult {
+                    id: "tool-1".into(),
+                    is_error: false,
+                    output: Some("hello".into()),
+                    diff: None,
+                });
+            }
             events.push(AgentEvent::TextDelta {
                 text: format!("Decision for {}", request.prompt),
             });
@@ -735,5 +749,154 @@ async fn desktop_transfer_refuses_foreign_owner_identity_collision_and_non_paren
         .to_string()
         .into();
     assert!(error.as_str().unwrap().contains("nonempty"));
+    core.shutdown().await;
+}
+
+fn texts(page: &zeron_proto::transfer::InheritedHistoryPage) -> Vec<String> {
+    page.entries
+        .iter()
+        .map(|entry| {
+            entry["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn inherited_history_pages_are_bounded_stable_and_follow_nested_forks() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, client, _requests) = setup(root.path()).await;
+    send(&core, "source", "q1").await;
+    let second = send(&core, "source", "q2").await;
+    client
+        .fork_thread(fork(&second, "fork-a", "child"), &core.device_id)
+        .await
+        .unwrap();
+
+    // A parent with no fork lineage has nothing inherited.
+    let none = client
+        .thread_inherited_history("source", &core.device_id, None, None)
+        .await
+        .unwrap();
+    assert!(none.entries.is_empty() && none.next_before.is_none() && none.total == 0);
+
+    // Newest page first, oldest first within it; the cursor walks backwards.
+    let newest = client
+        .thread_inherited_history("child", &core.device_id, None, Some(3))
+        .await
+        .unwrap();
+    assert_eq!(newest.total, 4);
+    assert_eq!(newest.remaining, 1);
+    assert_eq!(
+        texts(&newest),
+        ["Decision for q1", "q2", "Decision for q2"]
+    );
+    let oldest = client
+        .thread_inherited_history("child", &core.device_id, newest.next_before.as_deref(), Some(3))
+        .await
+        .unwrap();
+    assert_eq!(texts(&oldest), ["q1"]);
+    assert!(oldest.next_before.is_none() && oldest.remaining == 0);
+    // Limits are clamped, never trusted.
+    let clamped = client
+        .thread_inherited_history("child", &core.device_id, None, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(clamped.entries.len(), 1);
+
+    // New parent runs after the fork point never move the cursor or the totals.
+    send(&core, "source", "q3").await;
+    let again = client
+        .thread_inherited_history("child", &core.device_id, None, Some(3))
+        .await
+        .unwrap();
+    assert_eq!(texts(&again), texts(&newest));
+    assert_eq!(again.next_before, newest.next_before);
+    let replay = client
+        .thread_inherited_history("child", &core.device_id, newest.next_before.as_deref(), Some(3))
+        .await
+        .unwrap();
+    assert_eq!(texts(&replay), texts(&oldest));
+
+    // A cursor from nowhere is refused, not guessed at.
+    let stale = client
+        .thread_inherited_history("child", &core.device_id, Some("inherited:[\"gone\",\"x\"]"), None)
+        .await;
+    assert!(
+        stale
+            .unwrap_err()
+            .to_string()
+            .contains(zeron_proto::transfer::INHERITED_CURSOR_EXPIRED),
+        "a stale cursor carries the typed code"
+    );
+
+    // A fork of a fork inherits the whole chain, ids still collision-free.
+    let child_run = send(&core, "child", "c1").await;
+    client
+        .fork_thread(fork(&child_run, "fork-b", "grandchild"), &core.device_id)
+        .await
+        .unwrap();
+    let nested = client
+        .thread_inherited_history("grandchild", &core.device_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(nested.total, 6);
+    assert_eq!(nested.entries.len(), 6);
+    let ids: std::collections::BTreeSet<_> = nested
+        .entries
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 6);
+    assert_eq!(texts(&nested)[4], "c1");
+
+    // Passive: reading history started nothing and wrote nothing.
+    assert!(
+        core.orchestration
+            .store
+            .thread(&"child".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len()
+            == 1
+    );
+    core.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn inherited_history_carries_the_source_documents_tool_calls_and_survives_missing_docs() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, client, _requests) = setup(root.path()).await;
+    let run = send(&core, "source", "use-a-tool please").await;
+    client
+        .fork_thread(fork(&run, "fork-tools", "toolchild"), &core.device_id)
+        .await
+        .unwrap();
+    let page = client
+        .thread_inherited_history("toolchild", &core.device_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 2, "prompt + one agent entry");
+    let parts = page.entries[1]["parts"].as_array().unwrap();
+    let tool = parts.iter().find(|p| p["kind"] == "tool").expect("tool part");
+    assert_eq!(tool["call"]["command"], "echo hello");
+    // Exactly what the parent transcript holds: the doc keeps no raw output here.
+    assert_eq!(tool["resolved"], true);
+    assert!(tool.get("subagentRef").is_none(), "no live subagent link");
+    assert!(parts.iter().any(|p| p["kind"] == "text"));
+    let ids: Vec<_> = page.entries.iter().map(|e| e["id"].clone()).collect();
+    // A cursor taken on the agent entry works the same on the document path.
+    let older = client
+        .thread_inherited_history("toolchild", &core.device_id, ids[1].as_str(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(older.entries.len(), 1);
     core.shutdown().await;
 }

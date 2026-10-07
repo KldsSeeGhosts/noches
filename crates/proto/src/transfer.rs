@@ -83,6 +83,10 @@ pub struct ThreadTransferState {
     pub latest_forkable_run_id: Option<String>,
     #[serde(default)]
     pub latest_mergeable_run_id: Option<String>,
+    /// Newest started run of any outcome: the stale-action fence for a
+    /// session reset (queued runs have not started and never move it).
+    #[serde(default)]
+    pub latest_started_run_id: Option<String>,
     /// Passive identities only: no credentials or native provider payload.
     #[serde(default)]
     pub attached_provider_sessions: Vec<ProviderSessionRef>,
@@ -93,6 +97,48 @@ pub struct ThreadTransferState {
 pub struct TransferStateParams {
     #[serde(default)]
     pub chat_id: String,
+}
+
+/// Prefix of the error a host answers with when an inherited-history cursor is
+/// not one of its entries (the list moved or the cursor is foreign). Clients
+/// restart from the newest page on exactly this code and on no other failure.
+pub const INHERITED_CURSOR_EXPIRED: &str = "inherited-history-cursor-expired";
+
+/// One page of a fork's inherited history, newest page first. Entries are
+/// `SessionMessageEntry`-shaped (bounded text, tool summaries, media refs) so
+/// the client renders them with the ordinary transcript row builders.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedHistoryParams {
+    #[serde(default)]
+    pub chat_id: String,
+    /// Opaque cursor from a previous page's `nextBefore`; absent = newest page.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Entries per page; the host clamps it.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedHistoryPage {
+    pub thread_id: String,
+    /// Oldest first within the page.
+    #[serde(default)]
+    pub entries: Vec<Value>,
+    /// Pass back as `before` for the next older page; absent at the start.
+    #[serde(default)]
+    pub next_before: Option<String>,
+    /// Entries older than this page.
+    #[serde(default)]
+    pub remaining: u64,
+    /// Every inherited entry, so the boundary can say how much is above.
+    #[serde(default)]
+    pub total: u64,
+    /// Entries or parts the host shortened or left out to stay in budget.
+    #[serde(default)]
+    pub shortened: u32,
 }
 
 /// Stable conversation boundary; choosing a fork never starts an agent.
@@ -153,6 +199,48 @@ pub struct ProviderSessionRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisconnectThreadSessionResult {
+    pub sequence: i64,
+    pub refusal: Option<String>,
+}
+
+/// Whole-thread Stop: the foreground run, native background work and every
+/// app-owned delegated child task (recursively) of this one thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopThreadWorkParams {
+    pub chat_id: String,
+    /// Replaying the same id repeats the first frozen target set exactly.
+    pub client_request_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopThreadWorkResult {
+    pub sequence: i64,
+    /// Runs whose Stop was admitted, including the thread's own.
+    pub stopped_runs: u32,
+    /// Targets that settled or changed before their fence was reached.
+    pub skipped: u32,
+    pub refusal: Option<String>,
+}
+
+/// Forced session reconstruction: the next turn starts a fresh provider-thread
+/// generation seeded with bounded portable history. Never edits history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetThreadSessionParams {
+    pub chat_id: String,
+    pub client_request_id: String,
+    /// Newest started run the panel observed; a newer turn refuses the reset.
+    pub observed_run_id: Option<String>,
+    /// Attachments the panel observed (may be empty for an idle thread).
+    #[serde(default)]
+    pub provider_sessions: Vec<ProviderSessionRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetThreadSessionResult {
     pub sequence: i64,
     pub refusal: Option<String>,
 }

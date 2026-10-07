@@ -119,6 +119,57 @@ impl Harness for FixtureHarness {
             .chain(stream::pending())
             .boxed());
         }
+        if request.prompt.contains("Review how conversation forks") {
+            return Ok(Box::pin(stream::iter([
+                Ok(AgentEvent::SessionStarted {
+                    instance_id: None,
+                    session_id: native.clone(),
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    cwd: request.cwd,
+                    tools: vec![],
+                    assistant_message_id: uuid::Uuid::new_v4().to_string(),
+                }),
+                Ok(AgentEvent::InputAccepted),
+                Ok(AgentEvent::ToolCall {
+                    id: "inspect".into(),
+                    call: zeron_proto::ToolCall::Exec { command: "git log --oneline -3".into() },
+                }),
+                Ok(AgentEvent::ToolResult {
+                    id: "inspect".into(),
+                    is_error: false,
+                    output: Some("a1b2c3d Pin the fork source run\n9f8e7d6 Retain request identity\n5c4b3a2 Add handoff coverage".into()),
+                    diff: None,
+                }),
+                Ok(AgentEvent::ToolCall {
+                    id: "note".into(),
+                    call: zeron_proto::ToolCall::EditFile {
+                        path: "NOTES.md".into(),
+                        old_string: None,
+                        new_string: None,
+                    },
+                }),
+                Ok(AgentEvent::ToolResult {
+                    id: "note".into(),
+                    is_error: false,
+                    output: None,
+                    diff: Some(zeron_proto::ToolDiff {
+                        path: "NOTES.md".into(),
+                        old_text: Some("# Notes\n".into()),
+                        new_text: "# Notes\n\nA fork pins its source run.\n".into(),
+                    }),
+                }),
+                Ok(AgentEvent::TextDelta {
+                    text: "The screenshot shows the lineage panel. The source run is pinned, and a fork resumes only its own accepted native history.".into(),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some(native),
+                }),
+            ])));
+        }
         let text = if request
             .prompt
             .ends_with("Check the retry boundary in this fork.")
@@ -147,6 +198,10 @@ impl Harness for FixtureHarness {
         ])))
     }
 }
+
+/// Seeded earlier parent turns (plus the initial one) so the fork's inherited
+/// history pages and the load-earlier row shows.
+const EARLIER_PARENT_TURNS: usize = 14;
 
 async fn send(core: &EngineCore, chat: &str, key: &str, text: &str) -> anyhow::Result<()> {
     let result = core
@@ -288,6 +343,13 @@ fn main() -> anyhow::Result<()> {
             "Could not prepare the isolated fixture checkout"
         );
     }
+    // A real raster inside the chat's checkout: the host's attachment transport
+    // serves it to the inherited history exactly as it serves a live transcript.
+    let screenshot = checkout.join("lineage.png");
+    image::RgbImage::from_fn(360, 160, |x, y| {
+        image::Rgb([(40 + x / 3) as u8, (90 + y) as u8, (200 - x / 4) as u8])
+    })
+    .save(&screenshot)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let core = runtime.block_on(async {
         let registry = Arc::new(HarnessRegistry::new());
@@ -328,7 +390,14 @@ fn main() -> anyhow::Result<()> {
                 "runtimeMode":"full-access", "interactionMode":"default"}
         })).await?;
         core.workspace.rename_chat("fixture-background", "Stop native background work")?;
-        send(&core, "fixture-parent", "initial", "Review how conversation forks and agent handoffs preserve context.").await
+        // Deep enough history that the fork pages: the load-earlier row shows.
+        for n in 1..=EARLIER_PARENT_TURNS {
+            send(&core, "fixture-parent", &format!("earlier-{n}"), &format!("Earlier note {n}.")).await?;
+        }
+        send(&core, "fixture-parent", "initial", &format!(
+            "Review how conversation forks and agent handoffs preserve context.\n\n\
+             Attached images (local files — open them to view):\n- {}",
+            screenshot.display())).await
     })?;
     // Keep the actual listener through server startup: dropping a port probe
     // lets another host worker claim it before the fixture's IPC bind.
@@ -419,9 +488,18 @@ fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(projection.runs.is_empty(), "Fork eagerly started a provider");
                 let model = state.read_with(cx, |state, _| details::DetailsModel::for_chat(state, &child));
                 anyhow::ensure!(model.merge_target.as_deref() == Some("fixture-parent"), "Fork parent lineage missing");
-                window.update(cx, |shell, _, cx| shell.fixture_orchestration_transcript_start(cx))?;
-                pause(cx, 300).await;
+                let shape = state.read_with(cx, |state, _| state.fixture_inherited_shape(&child));
+                anyhow::ensure!(shape.tool_rows > 0 && shape.image_attachments > 0 && shape.load_earlier,
+                    "Inherited history did not render full tool/media rows with a paged boundary: {shape:?}");
                 capture(window.into(), cx, &output, &format!("idle-fork-{mode}"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_transcript_start(cx))?;
+                pause(cx, 900).await;
+                capture(window.into(), cx, &output, &format!("idle-fork-top-{mode}"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_load_earlier(child.clone(), cx))?;
+                pause(cx, 800).await;
+                let shape = state.read_with(cx, |state, _| state.fixture_inherited_shape(&child));
+                anyhow::ensure!(!shape.load_earlier, "Loading earlier history did not reach the start: {shape:?}");
+                capture(window.into(), cx, &output, &format!("idle-fork-all-{mode}"))?;
                 let send_core = renderer_core.clone();
                 let send_chat = child.clone();
                 gpui_tokio::Tokio::spawn(cx, async move {
@@ -445,7 +523,7 @@ fn main() -> anyhow::Result<()> {
                     "Parent Details did not show the child's native acceptance receipt");
                 anyhow::ensure!(parent.transfers.iter().any(|row| row.title == "Merge-back context" && row.status == "Pending"),
                     "Merge-back was not pending for the parent's next message");
-                anyhow::ensure!(renderer_core.orchestration.store.thread(&"fixture-parent".into())?.unwrap().runs.len() == 1,
+                anyhow::ensure!(renderer_core.orchestration.store.thread(&"fixture-parent".into())?.unwrap().runs.len() == EARLIER_PARENT_TURNS + 1,
                     "Preparing merge-back eagerly started a parent provider");
                 capture(window.into(), cx, &output, &format!("merge-back-{mode}"))?;
                 window.update(cx, |_, window, _| window.resize(size(px(960.), px(720.))))?;

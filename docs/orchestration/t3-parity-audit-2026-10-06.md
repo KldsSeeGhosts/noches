@@ -33,11 +33,13 @@ it is not alone evidence that a feature works in either application.
 | Native vs app-owned agents | `SubagentProjection`, provider event ingest, client-runtime subagent selectors | `delegation`, `subagents`, `agents`, composer/sidebar: observational native children and app-owned tasks retain separate authority and share presentation. Existing. |
 | Thread launch/workspace binding | `ThreadLaunchService`, `ThreadManagementService` | `launch`, `worktree`, `thread_service`: explicit root/existing/new-worktree preparation, durable setup admission; existing with adapter gaps below. |
 | Lazy fork and merge-back | [ThreadForkService](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/server/src/orchestration-v2/ThreadForkService.ts) | **Added:** owner-routed user RPCs, pinned source, stable request identity, immediate inherited chat config, no eager provider start. Direct-parent merge prepares context; it is not a Git merge. |
-| Thread relationships | [ThreadRelationshipsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/ThreadRelationshipsControl.tsx) | **Added:** Details lineage, parent/fork navigation, bounded scroll regions, fork/checkpoint actions, merge-back action and sidebar fork shortcut. Existing Agents panel continues to own delegated-task controls. |
+| Thread relationships | [ThreadRelationshipsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/ThreadRelationshipsControl.tsx) | **Added:** Details lineage, parent/fork navigation, bounded scroll regions, fork/checkpoint actions, merge-back action and sidebar fork shortcut. Existing Agents panel continues to own delegated-task controls. Lineage rows in Details and the Agents panel are keyboard-reachable (Tab, up/down, Enter/Space), skip unavailable threads and show T3's hover arrow. Status icon/label per row and the hover card remain gaps. |
 | Disconnect agent session | `ThreadRelationshipsControl.stopSession`, client-runtime `stopThreadSession`, `Orchestrator.dispatchProviderSessionDetach`, `ProviderSessionManager` | **Added:** passive attachment revisions, owner-routed user RPC, atomic detach plan and durable exact-run teardown. Conversation/native history and app-owned child threads are preserved. Reattachment, changed attempts/generations and active or idle replacement runtimes fence delayed effects. |
+| Whole-thread and child Stop | `Orchestrator.dispatchRunInterrupt` (per run, `holdQueue`), client-runtime `interruptThreadTurn`, `DelegatedTaskService` cancel; T3 pins no bulk Stop at this commit | **Added (Noches-specific):** `StopThreadWork` (owner-routed, capability `thread-work-stop-v1`) freezes the thread's interruptible run/settled background work and every non-terminal app-owned child task, recursively, leaves first, under one stable request identity (`orchestration/stop_all.rs`). Each step is an ordinary kernel command (`TaskOperation::Cancel` / `ThreadOperation::Interrupt`) with derived identity, so it inherits exact run/attempt/root/process fences and control admission; a target that settled or was replaced is skipped, never retargeted, and a replay repeats only the first frozen set. Ownership is the parent's own task record, so forks, native children and other threads' tasks are never reached. Completed replies, persistent monitors and unrelated threads are untouched. The relationship-panel Stop (`CancelDelegatedTask`) was verified end to end against a live child runtime and fixed to be owner-routed. UI: Agents panel Active header **Stop all**; composer Stop/Escape are unchanged. |
+| Forced session reconstruction | `ThreadRelationshipsControl` Disconnect only; T3 has no reset | **Added (Noches-specific):** Details **Reset agent session** (`ResetThreadSession`, capability `provider-session-reset-v1`) closes the provider conversations a started run used, tears down attached sessions as Disconnect does, and rebinds queued runs to one fresh generation. The next turn starts a new provider-thread generation with full bounded portable history and never rides the engine-remembered native session. Refused while a run is active, for a stale observed run or attachment set, and with nothing to reset; stable identity makes a retry repeat the same request. History, runs and the app conversation are kept (distinct from Disconnect, which keeps native history). |
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
-| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering, capability-fenced active steering and same-selection interrupt/restart promotion. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Provider/model promotion transitions and queued merge-back remain gaps. |
+| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering, capability-fenced active steering and same-selection interrupt/restart promotion. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Provider/model promotion transitions (issue #49 §1) and queued merge-back consumption are implemented on branch i49/selection; same-instance handoff restarts, the composer-to-thread selection sync and the explicit fresh-native-start contract (the sessions engine never auto-resumes a generation the planner rebuilt from portable context) are implemented on branch i49/fresh. |
 | Stop after foreground completion | Current `Orchestrator` background settlement and shared pending-work selector | **Added:** completed-root background Stop through user composer/Escape→durable command→canonical admission→exact runtime teardown→bounded settlement. Completed reply/attempt/timestamps survive; later work, app-owned tasks and persistent monitors are not terminated. Background-only queue-watch changes now reach the composer. |
 | Scheduler | server scheduler and launch/intake dispatch | `scheduler`, Settings Automations: persistent claims, recurring/manual/webhook work, bound/unbound dispatch, restart/deduplication. Existing. |
 | PR association and settlement | `PullRequestWatchReactor`, `PullRequestSyncReactor`, `ThreadSettlementService` | `pull_requests`, `git_actions`, Details/lifecycle: authenticated linking, stable watch receipts, wake/settlement fences. Some environment/project settlement policy UI remains incomplete. |
@@ -101,7 +103,9 @@ is not an acceptable substitute.
   completion and notification rows are excluded, matching T3's user-queue selector.
 - Canonical actions use the owning host's user authority and the existing kernel
   planner. Stable request reservations prevent a retry from changing its content
-  or target. SQL-only text edits preserve attachments, context and provenance;
+  or target. SQL-only edits preserve context and provenance and keep attachments unless the
+  edit replaces them (host-validated uploads, fingerprint-fenced; dropped files
+  are cleaned up once unreferenced);
   stale text or an already-started run is refused without overwriting it. An
   automatic drain retains both the edit and the composer's previous draft.
 - Typed rows retain explicit interrupting **Send now** and their host edit leases.
@@ -165,10 +169,15 @@ is not an acceptable substitute.
   mailbox. Successful adapter acknowledgement records a durable per-message
   receipt; explicit refusal fails the effect, while a dropped receipt channel
   or ten-second timeout leaves acceptance uncertain. Codex confirms after its
-  native steering RPC. Claude confirms only after its stdin writer successfully
-  writes and flushes the user line, not when the writer mailbox accepts it.
-  This Claude boundary proves adapter transport delivery, not CLI prompt echo
-  or completed provider work.
+  native steering RPC. Claude's stdin writer answers the mailbox acknowledgement
+  only after it successfully writes and flushes the user line (transport
+  delivery, not the writer mailbox). The exact native receipt is separate: every
+  Claude stdin line carries a host-chosen `uuid` and the CLI runs with
+  `--replay-user-messages`, whose `isReplay` echo of that `uuid` (verified on CLI
+  2.1.292) becomes `InputAcceptedFor`, so Claude retires pending input only by
+  that echo. A duplicate or unknown echo accepts nothing; an echo that never
+  arrives stays unaccepted for the host's recovery. Not proven live: echo timing
+  for a steer queued past a turn boundary.
 - Canonical receipts survive projection rebuild and process restart. An exact
   late `InputAcceptedFor` can record confirmation in the provider-event
   transaction and release only its own uncertainty barrier. Persisted proof
@@ -251,11 +260,36 @@ is not an acceptable substitute.
   fixture now issues a real scoped MCP credential before dispatch rather than
   relying on an unbound ordinary runtime.
 
+## Simultaneous provider processes
+
+Noches keeps one physical provider runtime per **app thread**, keyed by thread
+id in the sessions map; an app-owned delegated child is its own app thread, so
+a parent, its children and their descendants already run concurrently as
+separate processes (the delegation tests start several). Whole-thread Stop
+therefore needs no multi-runtime-per-thread model: each target is stopped
+through its own thread's exact runtime, and native subagents live inside their
+provider process and are covered by that thread's own Stop. Changing the model
+would only matter for several live provider processes *within one thread*
+(for example a user-selected second harness alongside the first); nothing in
+the delegation, queue or Stop paths needs that, so it is deliberately not
+attempted here.
+
 ## Remaining gaps
 
-Tracked in issue #49 (provider/model transitions during queue promotion,
-queued merge-back consumption, native Claude/Pi/ACP fork and receipts, full
-inherited tool/media history, whole-thread Stop, context-window/compact policy,
-and live-provider and non-Mac verification). Older builds stored false
+Still open after #49: native Pi/negotiated-ACP fork and exact input receipts
+(ACP `session/fork` is unstable and head-only; those adapters keep boundary
+retirement), loaded-process history injection, driver-authorized cross-account
+and cross-checkout native continuation, conversation rollback, provider
+clone/setup progress edges, project/environment PR-settlement settings,
+sparse/submodule checkpoints, catalog context windows beyond Claude, and
+live-provider, remote multi-device and non-Mac verification. Older builds stored false
 acceptance at session initialization; those rows cannot retrospectively prove
 provider submission, so no speculative migration or historical replay is done.
+
+Legacy-row policy: steering effects admitted before the per-input receipt
+contract have no `orchestration_steering_inputs` row. They are never joined into
+unconfirmed-input recovery (not replayed as historical context), never gain an
+`orchestration_steering_acceptances` row without an exact provider receipt, and
+are never reinterpreted as rejected; acceptance of a run's root is likewise
+derived only from a bound provider-turn record, never from session start.
+Regression: `legacy_steering_rows_are_never_replayed_or_speculatively_accepted`.

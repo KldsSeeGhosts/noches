@@ -715,6 +715,46 @@ pub(crate) fn reasoning_option_key(harness: HarnessId) -> &'static str {
     }
 }
 
+/// The canonical saved selection a run request (or composer chat config) asks
+/// for. One definition, so the admission path and the composer's selection sync
+/// can never disagree about what the same config means.
+pub(crate) fn request_selection(
+    registry: &HarnessRegistry,
+    instance_id: &ProviderInstanceId,
+    harness: HarnessId,
+    model: Option<&str>,
+    options: &serde_json::Map<String, Value>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+) -> Result<ModelSelection, serde_json::Error> {
+    let rows = registry.provider_instances.snapshot(registry);
+    let instance = rows.iter().find(|p| &p.provider_instance_id == instance_id);
+    let model = model.map(str::to_owned).unwrap_or_else(|| {
+        instance
+            .and_then(|p| p.models.first())
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| "default".into())
+    });
+    let mut options = options.clone();
+    // The legacy composer/harness option chip uses on/off strings.
+    // Canonical T3 boolean descriptors retain actual boolean values.
+    if let Some(model_row) = instance.and_then(|p| p.models.iter().find(|m| m.id == model)) {
+        for descriptor in model_row.options.as_ref().into_iter().flatten() {
+            if let ProviderOptionDescriptor::Boolean(option) = descriptor
+                && let Some(value) = options.get_mut(&option.id)
+                && let Some(text) = value.as_str()
+            {
+                *value = Value::Bool(matches!(text, "on" | "true"));
+            }
+        }
+    }
+    if let Some(reasoning) = reasoning {
+        options
+            .entry(reasoning_option_key(harness))
+            .or_insert_with(|| serde_json::to_value(reasoning).expect("reasoning"));
+    }
+    serde_json::from_value(json!({"instanceId":instance_id,"model":model,"options":options}))
+}
+
 /// A selection's options as the id → value map `ChatConfig::model_options` uses.
 pub(crate) fn selection_options(
     selection: &zeron_proto::provider_instance::ModelSelection,

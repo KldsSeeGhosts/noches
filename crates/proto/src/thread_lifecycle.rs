@@ -59,7 +59,16 @@ pub struct QueueUiState {
     pub can_promote_to_steer: bool,
     /// The UI names an interrupting restart explicitly. Host admission checks
     /// the observed mode again, so stale Steer clicks cannot become restarts.
+    #[serde(deserialize_with = "lenient_promotion_mode")]
     pub promotion_mode: Option<QueuePromotionMode>,
+    /// The saved next-turn selection the promotion would run on (restart modes),
+    /// or would leave waiting (`promotion_selection_deferred`). Clients echo it
+    /// back so the host can refuse an action reviewed against a stale selection.
+    pub promotion_selection: Option<crate::provider_instance::ModelSelection>,
+    /// Active steering keeps the live selection; the saved one applies next turn.
+    pub promotion_selection_deferred: bool,
+    /// Why a selection change cannot be delivered into the running turn.
+    pub promotion_blocked: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +76,17 @@ pub struct QueueUiState {
 pub enum QueuePromotionMode {
     ActiveSteering,
     InterruptRestart,
+    /// The saved selection needs a new provider generation seeded with context.
+    InterruptRestartWithHandoff,
+}
+
+/// A mode this build does not know (a newer host) reads as "no promotion
+/// hint" instead of failing the whole queue snapshot.
+fn lenient_promotion_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<QueuePromotionMode>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,6 +97,9 @@ pub struct QueueUiEntry {
     pub text: String,
     pub attachments: Vec<serde_json::Value>,
     pub attachment_paths: Vec<String>,
+    /// Compact summaries of the message's retained context records (T3
+    /// `OrchestrationMessageContext`); the payloads stay on the host.
+    pub context: Vec<QueueContextRef>,
     pub held: bool,
     pub delivery_gate: Option<serde_json::Value>,
     pub automatic: bool,
@@ -103,10 +126,13 @@ pub struct MutateQueuedRunParams {
     rename_all_fields = "camelCase"
 )]
 pub enum QueuedRunAction {
-    /// Text-only edit: attachments and context remain on the original message.
+    /// Edit the text; attachments and context stay on the original message
+    /// unless `attachments` replaces them.
     Edit {
         text: String,
         expected_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<QueueAttachmentEdit>,
     },
     Cancel,
     Reorder {
@@ -114,10 +140,70 @@ pub enum QueuedRunAction {
     },
     PromoteToSteer {
         target_run_id: String,
+        #[serde(default)]
+        expected_selection: Option<crate::provider_instance::ModelSelection>,
     },
     PromoteToRestart {
         target_run_id: String,
+        /// The restart replaces the provider generation and carries a handoff.
+        #[serde(default)]
+        handoff: bool,
+        #[serde(default)]
+        expected_selection: Option<crate::provider_instance::ModelSelection>,
     },
+}
+
+/// One retained context record of a queued message, reduced to what a compact
+/// row shows. Bodies (terminal output, diffs, HTML) never ride the queue state.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueContextRef {
+    pub context_id: String,
+    /// Open set: image, file, terminal, element, preview-annotation,
+    /// review-comment, mention, skill, thread, or a kind this build lacks.
+    pub kind: String,
+    pub label: String,
+    /// What distinguishes the record from its label (path, range, title).
+    pub detail: String,
+}
+
+/// A queue edit's attachment change, fenced to the attachments the editor saw.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueAttachmentEdit {
+    /// [`queue_attachment_fingerprint`] of the entry the edit started from.
+    pub expected: String,
+    /// Host-owned upload paths after the edit: kept ones plus newly committed
+    /// uploads. Dropped paths are cleaned up once nothing references them.
+    pub paths: Vec<String>,
+    /// Claimed attachment ids to drop from the message.
+    pub remove_ids: Vec<String>,
+}
+
+/// Stable identity of a queued message's attachment set: claimed attachment
+/// ids and upload paths in order. Clients echo it so the host can refuse an
+/// edit made against attachments that changed.
+pub fn queue_attachment_fingerprint(attachments: &[serde_json::Value], paths: &[String]) -> String {
+    let ids: Vec<&str> = attachments
+        .iter()
+        .filter_map(|attachment| attachment["id"].as_str())
+        .collect();
+    // Length-prefixed so a path containing a separator cannot collide with
+    // two paths.
+    let join = |items: &[&str]| -> String {
+        items
+            .iter()
+            .map(|item| format!("{}:{item}", item.len()))
+            .collect()
+    };
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    format!("claims={}|paths={}", join(&ids), join(&paths))
+}
+
+impl QueueUiEntry {
+    pub fn attachment_fingerprint(&self) -> String {
+        queue_attachment_fingerprint(&self.attachments, &self.attachment_paths)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,6 +225,32 @@ pub struct PendingQuestionUi {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_unknown_promotion_mode_does_not_drop_the_queue() {
+        let state: super::QueueUiState = serde_json::from_str(
+            r#"{"threadId":"t","promotionMode":"a_future_mode","queue":[{"messageId":"m","text":"work"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(state.promotion_mode, None);
+        assert_eq!(state.queue.len(), 1);
+        let known: super::QueueUiState =
+            serde_json::from_str(r#"{"promotionMode":"interrupt_restart_with_handoff"}"#).unwrap();
+        assert_eq!(
+            known.promotion_mode,
+            Some(super::QueuePromotionMode::InterruptRestartWithHandoff)
+        );
+    }
+
+    #[test]
+    fn attachment_fingerprints_do_not_collide_on_separators() {
+        let one = vec!["/a,b".to_string()];
+        let two = vec!["/a".to_string(), "b".to_string()];
+        assert_ne!(
+            super::queue_attachment_fingerprint(&[], &one),
+            super::queue_attachment_fingerprint(&[], &two)
+        );
+    }
+
+    #[test]
     fn old_queue_snapshots_do_not_claim_document_provenance_or_steering() {
         let state: super::QueueUiState =
             serde_json::from_str(r#"{"threadId":"old","queue":[{"messageId":"m","text":"work"}]}"#)
@@ -148,6 +260,9 @@ mod tests {
         assert!(state.active_run_id.is_none());
         assert!(state.background_run_id.is_none());
         assert!(state.promotion_mode.is_none());
+        assert!(state.promotion_selection.is_none());
+        assert!(!state.promotion_selection_deferred);
+        assert!(state.promotion_blocked.is_none());
     }
 
     #[test]
@@ -158,9 +273,44 @@ mod tests {
         let mut value = value;
         value["action"]["expectedText"] = serde_json::json!("old");
         let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
-        assert_eq!(request.action, super::QueuedRunAction::Edit {
-            text: "new".into(), expected_text: "old".into(),
-        });
+        assert_eq!(
+            request.action,
+            super::QueuedRunAction::Edit {
+                text: "new".into(),
+                expected_text: "old".into(),
+                attachments: None,
+            }
+        );
+    }
+
+    #[test]
+    fn queue_attachment_edits_are_additive_and_fenced_by_a_fingerprint() {
+        let value = serde_json::json!({"chatId":"thread","queuedRunId":"run",
+            "clientRequestId":"stable", "action":{"type":"edit","text":"new","expectedText":"old",
+            "attachments":{"expected":"claims=1:a|paths=6:/x.png","paths":["/y.png"]}}});
+        let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
+        let super::QueuedRunAction::Edit { attachments, .. } = request.action else {
+            panic!("edit expected");
+        };
+        let edit = attachments.expect("attachment edit");
+        assert_eq!(edit.paths, vec!["/y.png".to_string()]);
+        assert!(edit.remove_ids.is_empty());
+        let entry = super::QueueUiEntry {
+            attachments: vec![serde_json::json!({"id":"a"})],
+            attachment_paths: vec!["/x.png".into()],
+            ..Default::default()
+        };
+        assert_eq!(entry.attachment_fingerprint(), edit.expected);
+        // A text-only edit stays byte-compatible with older hosts.
+        let text_only = super::QueuedRunAction::Edit {
+            text: "t".into(),
+            expected_text: "o".into(),
+            attachments: None,
+        };
+        assert!(
+            serde_json::to_value(&text_only).unwrap()["attachments"].is_null(),
+            "{text_only:?}"
+        );
     }
 
     #[test]
@@ -170,6 +320,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(super::SettleSource::User).unwrap(),
             "User"
+        );
+    }
+
+    #[test]
+    fn promotion_actions_default_to_unreviewed_and_name_the_handoff_mode() {
+        let steer: super::QueuedRunAction =
+            serde_json::from_str(r#"{"type":"promoteToSteer","targetRunId":"run"}"#).unwrap();
+        assert_eq!(
+            steer,
+            super::QueuedRunAction::PromoteToSteer {
+                target_run_id: "run".into(),
+                expected_selection: None,
+            }
+        );
+        let restart: super::QueuedRunAction = serde_json::from_str(
+            r#"{"type":"promoteToRestart","targetRunId":"run","handoff":true,
+                "expectedSelection":{"instanceId":"claude","model":"opus"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            restart,
+            super::QueuedRunAction::PromoteToRestart {
+                handoff: true,
+                expected_selection: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&super::QueuePromotionMode::InterruptRestartWithHandoff).unwrap(),
+            r#""interrupt_restart_with_handoff""#
         );
     }
 }

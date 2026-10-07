@@ -6,7 +6,7 @@
 //!
 //! Typed rows retain `Send now` and their host edit leases. Canonical work can
 //! steer a compatible active attempt or explicitly interrupt/restart it;
-//! text edits preserve attachments/context
+//! edits preserve context, can replace uploaded attachments,
 //! and retain the draft if another editor or automatic drain wins the race.
 
 use gpui::{
@@ -72,6 +72,8 @@ enum QueuePrimaryAction {
     SendNow,
     Steer,
     Restart,
+    /// The saved selection needs a new provider generation seeded with context.
+    RestartWithHandoff,
 }
 
 impl QueuePrimaryAction {
@@ -80,7 +82,39 @@ impl QueuePrimaryAction {
             Self::SendNow => "Send now (interrupt)",
             Self::Steer => "Steer active response",
             Self::Restart => "Send now (interrupt and restart)",
+            Self::RestartWithHandoff => "Send now (restart with handoff)",
         }
+    }
+}
+
+/// The row action's tooltip, naming the selection it will run on and why it is
+/// unavailable. The host decides all of it; this only words the hint.
+fn primary_tooltip(
+    action: QueuePrimaryAction,
+    enabled: bool,
+    queue: Option<&zeron_proto::QueueUiState>,
+) -> String {
+    let model = queue
+        .and_then(|queue| queue.promotion_selection.as_ref())
+        .map(|selection| selection.model.to_string());
+    if !enabled {
+        return queue
+            .and_then(|queue| queue.promotion_blocked.clone())
+            .unwrap_or_else(|| "Waiting for provider capabilities".into());
+    }
+    match (action, model) {
+        (QueuePrimaryAction::Steer, Some(_))
+            if queue.is_some_and(|queue| queue.promotion_selection_deferred) =>
+        {
+            "Steer active response (the new model applies next turn)".into()
+        }
+        (QueuePrimaryAction::Restart, Some(model)) => {
+            format!("Send now on {model} (interrupt and restart)")
+        }
+        (QueuePrimaryAction::RestartWithHandoff, Some(model)) => {
+            format!("Send now on {model} (restart with handoff)")
+        }
+        (action, _) => action.tooltip().into(),
     }
 }
 
@@ -89,6 +123,9 @@ fn canonical_primary_action(queue: &zeron_proto::QueueUiState) -> Option<QueuePr
     match queue.promotion_mode {
         Some(QueuePromotionMode::ActiveSteering) => Some(QueuePrimaryAction::Steer),
         Some(QueuePromotionMode::InterruptRestart) => Some(QueuePrimaryAction::Restart),
+        Some(QueuePromotionMode::InterruptRestartWithHandoff) => {
+            Some(QueuePrimaryAction::RestartWithHandoff)
+        }
         None if queue.can_promote_to_steer => Some(QueuePrimaryAction::Steer),
         None => None,
     }
@@ -99,8 +136,37 @@ fn canonical_primary_action(queue: &zeron_proto::QueueUiState) -> Option<QueuePr
 pub(crate) struct CanonicalQueueEdit {
     run_id: String,
     base_text: String,
+    /// What the pinned retry identity covers: the saved text plus the staged
+    /// attachment set. Any change mints a new identity.
     request: Option<(String, String)>,
+    /// Attachments the host keeps that the composer cannot show (claimed by an
+    /// agent): never removed by this edit.
     attachment_count: usize,
+    /// `queue_attachment_fingerprint` of the entry when the edit began.
+    expected_attachments: String,
+    /// Composer strip id → host path of the uploads loaded for this edit.
+    loaded: Vec<(String, String)>,
+    /// False while the uploads load, or when they could not be read back: the
+    /// edit then changes text only and the host keeps them.
+    attachments_editable: bool,
+}
+
+impl CanonicalQueueEdit {
+    pub(crate) fn attachments_editable(&self) -> bool {
+        self.attachments_editable
+    }
+}
+
+/// Whether the composer's attachment set differs from the loaded one.
+fn staged_changed(
+    loaded: &[(String, String)],
+    staged: &[crate::attachments::StagedAttachment],
+) -> bool {
+    loaded.len() != staged.len()
+        || loaded
+            .iter()
+            .zip(staged)
+            .any(|((id, _), staged)| *id != staged.id)
 }
 
 /// Merge only for presentation. Never resurrect a consumed Loro intent from
@@ -292,6 +358,77 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     } else {
         parsed.text
     }
+}
+
+const CONTEXT_HREF: &str = "](t3-context://v1/";
+const MAX_CONTEXT_LABEL: usize = 512;
+
+/// T3's inline context references (`[label](t3-context://v1/<kind>/<id>)`, or
+/// `![label](..)` for images) as their labels. Image chips vanish when the
+/// row already summarizes its attachments. The link syntax is position only;
+/// anything malformed stays as typed.
+fn replace_context_references(text: &str, drop_images: bool) -> String {
+    if !text.contains(CONTEXT_HREF) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(found) = text[cursor..].find(CONTEXT_HREF) {
+        let close = cursor + found;
+        let href_start = close + CONTEXT_HREF.len();
+        let label_start = text[..close]
+            .rfind('[')
+            .filter(|&start| start >= cursor && close - start <= MAX_CONTEXT_LABEL);
+        let href_end = text[href_start..]
+            .find([')', ' ', '\n'])
+            .map(|end| href_start + end)
+            .filter(|&end| text[end..].starts_with(')') && end - href_start <= 200);
+        let valid = match (label_start, href_end) {
+            (Some(start), Some(end)) => {
+                let label = &text[start + 1..close];
+                let mut parts = text[href_start..end].split('/');
+                let (kind, id, extra) = (parts.next(), parts.next(), parts.next());
+                (!label.contains(['\n', ']']) && extra.is_none())
+                    .then_some((start, end, kind.unwrap_or(""), id.unwrap_or("")))
+                    .filter(|(_, _, kind, id)| !kind.is_empty() && !id.is_empty())
+            }
+            _ => None,
+        };
+        let Some((start, end, kind, _)) = valid else {
+            out.push_str(&text[cursor..href_start]);
+            cursor = href_start;
+            continue;
+        };
+        let image = text[..start].ends_with('!');
+        out.push_str(&text[cursor..start - usize::from(image)]);
+        if !(image && kind == "image" && drop_images) {
+            out.push_str(&text[start + 1..close]);
+        }
+        cursor = end + 1;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Metadata chips for a row's retained context. Image/file records are the
+/// attachments the row already lists, so only the other kinds are named.
+fn queue_context_chips(context: &[zeron_proto::QueueContextRef]) -> Vec<String> {
+    context
+        .iter()
+        .filter(|record| !matches!(record.kind.as_str(), "image" | "file"))
+        .map(|record| {
+            let what = if record.detail.is_empty() {
+                &record.label
+            } else {
+                &record.detail
+            };
+            if what.is_empty() {
+                record.kind.clone()
+            } else {
+                format!("{} {what}", record.kind)
+            }
+        })
+        .collect()
 }
 
 /// Project file references for display without changing the stored delivery text.
@@ -575,7 +712,16 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => queue_row_text(&item.text, &item.attachments),
+            _ => {
+                let summarized = !item.attachments.is_empty()
+                    || canonical
+                        .as_ref()
+                        .is_some_and(|entry| !entry.attachments.is_empty());
+                queue_row_text(
+                    &replace_context_references(&item.text, summarized),
+                    &item.attachments,
+                )
+            }
         };
 
         let edit_id = item.id.clone();
@@ -626,9 +772,15 @@ impl Composer {
             QueuePrimaryAction::SendNow
         });
         let primary_id = item.id.clone();
+        let primary_tooltip = primary_tooltip(
+            primary_action,
+            resolved_primary.is_some(),
+            state.canonical_queues.get(chat_id),
+        );
         let primary = self.queue_primary_action_button(
             &key,
             primary_action,
+            primary_tooltip,
             resolved_primary.is_some(),
             queue_latest_shortcut_visible(
                 ix,
@@ -726,7 +878,7 @@ impl Composer {
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .when(!being_edited, |el| {
                 let mut labels = queue_attachment_labels(&item.text, &item.attachments);
-                if let Some(entry) = canonical {
+                if let Some(entry) = &canonical {
                     labels.extend(entry.attachments.iter().map(|attachment| {
                         attachment["name"]
                             .as_str()
@@ -734,11 +886,22 @@ impl Composer {
                             .to_owned()
                     }));
                 }
-                let summary = if labels.len() > 1 {
+                let mut summary = if labels.len() > 1 {
                     format!("{} attachments · {}", labels.len(), labels.join(" · "))
                 } else {
                     labels.join(" · ")
                 };
+                let chips = canonical
+                    .as_ref()
+                    .map(|entry| queue_context_chips(&entry.context))
+                    .unwrap_or_default();
+                let has_meta = !labels.is_empty() || !chips.is_empty();
+                if !chips.is_empty() {
+                    if !summary.is_empty() {
+                        summary.push_str(" · ");
+                    }
+                    summary.push_str(&chips.join(" · "));
+                }
                 let only_images = text.as_ref() == crate::attachments::ATTACHMENT_ONLY_TEXT;
                 let title = if only_images {
                     summary.clone().into()
@@ -759,10 +922,11 @@ impl Composer {
                             .text_color(theme.text.opacity(0.9))
                             .child(title),
                     );
-                if !labels.is_empty() && !only_images {
+                if has_meta && !only_images {
                     content = content.child(
                         div()
                             .truncate()
+                            .font_family(theme.font_mono.clone())
                             .text_size(px(11.0))
                             .line_height(px(13.0))
                             .text_color(theme.text_muted)
@@ -812,9 +976,13 @@ impl Composer {
                             && edit.attachment_count > 0
                         {
                             SharedString::from(format!(
-                                "Editing text · {} attachments kept",
+                                "Editing · {} agent attachments kept",
                                 edit.attachment_count
                             ))
+                        } else if let Some(edit) = &self.canonical_queue_edit
+                            && !edit.attachments_editable
+                        {
+                            SharedString::from("Loading attachments…")
                         } else {
                             SharedString::from("Editing in composer")
                         }),
@@ -1163,22 +1331,18 @@ impl Composer {
         &self,
         key: &SharedString,
         action: QueuePrimaryAction,
+        tooltip: String,
         enabled: bool,
         show_shortcut: bool,
         theme: &Theme,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
-        let tooltip = if enabled {
-            action.tooltip()
-        } else {
-            "Waiting for provider capabilities"
-        };
         let accent = theme.accent;
         let compact = self.queue_preview_limit() == 1;
         div()
             .id(SharedString::from(format!("{key}-primary")))
             .role(gpui::Role::Button)
-            .aria_label(tooltip)
+            .aria_label(tooltip.clone())
             // Both labels occupy the same slot; modifier previews never move
             // the message text, thumbnails, or adjacent actions.
             .w(px(if compact { 28.0 } else { 72.0 }))
@@ -1224,7 +1388,9 @@ impl Composer {
             } else {
                 div()
                     .child(match action {
-                        QueuePrimaryAction::SendNow | QueuePrimaryAction::Restart => "Send now",
+                        QueuePrimaryAction::SendNow
+                        | QueuePrimaryAction::Restart
+                        | QueuePrimaryAction::RestartWithHandoff => "Send now",
                         QueuePrimaryAction::Steer => "Steer",
                     })
                     .into_any_element()
@@ -1492,28 +1658,39 @@ impl Composer {
     ) {
         match action {
             QueuePrimaryAction::SendNow => self.send_queued_now(id, cx),
-            QueuePrimaryAction::Steer | QueuePrimaryAction::Restart => {
+            QueuePrimaryAction::Steer
+            | QueuePrimaryAction::Restart
+            | QueuePrimaryAction::RestartWithHandoff => {
                 let state = self.state.read(cx);
                 let Some(entry) = self.canonical_queue_entry(&id, state) else {
                     return;
                 };
-                let Some(target_run_id) = self
+                let Some((target_run_id, expected_selection)) = self
                     .target
                     .chat_id(state)
                     .and_then(|id| state.canonical_queues.get(id))
                     .filter(|queue| canonical_primary_action(queue) == Some(action))
-                    .and_then(|queue| queue.active_run_id.clone())
+                    .and_then(|queue| {
+                        Some((queue.active_run_id.clone()?, queue.promotion_selection.clone()))
+                    })
                 else {
                     return;
                 };
                 let run_id = entry.queued_run_id.clone();
+                // The host refuses if the selection or mode shown here moved.
                 self.canonical_queue_action(
                     id,
                     run_id,
-                    if action == QueuePrimaryAction::Restart {
-                        zeron_proto::QueuedRunAction::PromoteToRestart { target_run_id }
-                    } else {
-                        zeron_proto::QueuedRunAction::PromoteToSteer { target_run_id }
+                    match action {
+                        QueuePrimaryAction::Steer => zeron_proto::QueuedRunAction::PromoteToSteer {
+                            target_run_id,
+                            expected_selection,
+                        },
+                        _ => zeron_proto::QueuedRunAction::PromoteToRestart {
+                            target_run_id,
+                            handoff: action == QueuePrimaryAction::RestartWithHandoff,
+                            expected_selection,
+                        },
                     },
                     cx,
                 );
@@ -2051,11 +2228,17 @@ impl Composer {
         self.queue_edit_chat_id = Some(chat.id.clone());
         self.queue_edit_host_device_id = Some(chat.device_id.clone());
         self.editing_queued = Some(id);
+        let paths = entry.attachment_paths.clone();
+        let host_device_id = chat.device_id.clone();
+        let run_id = entry.queued_run_id.clone();
         self.canonical_queue_edit = Some(CanonicalQueueEdit {
-            run_id: entry.queued_run_id,
+            run_id: run_id.clone(),
             base_text: entry.text.clone(),
             request: None,
-            attachment_count: entry.attachments.len() + entry.attachment_paths.len(),
+            attachment_count: entry.attachments.len(),
+            expected_attachments: entry.attachment_fingerprint(),
+            loaded: Vec::new(),
+            attachments_editable: paths.is_empty(),
         });
         self.queue_edit_draft = Some((
             self.input.read(cx).text().to_string(),
@@ -2068,7 +2251,82 @@ impl Composer {
         self.focus_pending = true;
         self.input
             .update(cx, |input, cx| input.set_text(entry.text, cx));
+        if !paths.is_empty() {
+            let key = self.current_key.clone();
+            self.load_canonical_edit_attachments(run_id, key, host_device_id, paths, cx);
+        }
         cx.notify();
+    }
+
+    /// Read the row's uploads back so the strip can show, drop and replace
+    /// them. A failed read leaves the edit text-only: the host keeps them.
+    fn load_canonical_edit_attachments(
+        &mut self,
+        run_id: String,
+        key: String,
+        host_device_id: String,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let mut loaded = Vec::new();
+            for path in &paths {
+                let image = crate::attachments::read_attachment_image(
+                    &engine,
+                    cx.background_executor(),
+                    Some(&host_device_id),
+                    path,
+                    None,
+                )
+                .await;
+                let Some(image) = image else {
+                    loaded.clear();
+                    break;
+                };
+                loaded.push((
+                    path.clone(),
+                    crate::attachments::StagedAttachment {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: image.name,
+                        image: image.image,
+                    },
+                ));
+            }
+            this.update(cx, |composer, cx| {
+                // The edit may have ended or moved to another row, or the
+                // composer to another chat, meanwhile.
+                let Some(edit) = composer
+                    .canonical_queue_edit
+                    .as_mut()
+                    .filter(|edit| edit.run_id == run_id && composer.current_key == key)
+                else {
+                    return;
+                };
+                if loaded.len() == paths.len() {
+                    edit.loaded = loaded
+                        .iter()
+                        .map(|(path, staged)| (staged.id.clone(), path.clone()))
+                        .collect();
+                    edit.attachments_editable = true;
+                    composer
+                        .attachments
+                        .entry(key)
+                        .or_default()
+                        .extend(loaded.into_iter().map(|(_, staged)| staged));
+                } else {
+                    composer.failure = Some(
+                        "Couldn't load the queued attachments; this edit changes text only and keeps them"
+                            .into(),
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn finish_canonical_queue_edit(&mut self, text: String, cx: &mut Context<Self>) {
@@ -2081,11 +2339,13 @@ impl Composer {
             cx.notify();
             return;
         }
-        if !self.staged().is_empty() || !self.staged_appshots().is_empty() {
-            self.failure = Some("This edit changes text only; the queued attachments are kept. Remove the new attachments to save.".into());
+        if !self.staged_appshots().is_empty() {
+            self.failure =
+                Some("Appshots can't be added to a queued message; remove them to save".into());
             cx.notify();
             return;
         }
+        let staged = self.staged().to_vec();
         let (Some(chat_id), Some(host), Some(edit), Some(engine)) = (
             self.queue_edit_chat_id.clone(),
             self.queue_edit_host_device_id.clone(),
@@ -2094,23 +2354,37 @@ impl Composer {
         ) else {
             return;
         };
+        if !edit.attachments_editable {
+            if !staged.is_empty() {
+                self.failure = Some("The queued attachments are still loading".into());
+                cx.notify();
+                return;
+            }
+        }
+        let attachments_changed =
+            edit.attachments_editable && staged_changed(&edit.loaded, &staged);
+        let identity = format!(
+            "{text}\0{}",
+            staged
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         if edit
             .request
             .as_ref()
-            .is_none_or(|(previous, _)| *previous != text)
+            .is_none_or(|(previous, _)| *previous != identity)
         {
-            edit.request = Some((text.clone(), uuid::Uuid::new_v4().to_string()));
+            edit.request = Some((identity, uuid::Uuid::new_v4().to_string()));
         }
-        let request = zeron_proto::MutateQueuedRunParams {
-            chat_id,
-            queued_run_id: edit.run_id.clone(),
-            client_request_id: edit.request.as_ref().unwrap().1.clone(),
-            target_device_id: Some(host),
-            action: zeron_proto::QueuedRunAction::Edit {
-                text,
-                expected_text: edit.base_text.clone(),
-            },
-        };
+        let request_id = edit.request.as_ref().unwrap().1.clone();
+        let (run_id, base_text, expected) = (
+            edit.run_id.clone(),
+            edit.base_text.clone(),
+            edit.expected_attachments.clone(),
+        );
+        let loaded = edit.loaded.clone();
         self.queue_edit_finishing = true;
         self.input.update(cx, |input, cx| {
             input.read_only = true;
@@ -2118,7 +2392,38 @@ impl Composer {
         });
         cx.notify();
         self.queue_edit_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.mutate_queued_run(request).await;
+            let result = async {
+                let attachments = if attachments_changed {
+                    // Upload identities derive from the pinned request, so a
+                    // retry recommits the same files instead of new ones.
+                    let mut paths = Vec::new();
+                    for (index, attachment) in staged.iter().enumerate() {
+                        if let Some((_, path)) = loaded.iter().find(|(id, _)| *id == attachment.id) {
+                            paths.push(path.clone());
+                            continue;
+                        }
+                        let path = crate::attachments::upload_attachment(
+                            &engine, cx.background_executor(), Some(&host),
+                            &format!("{request_id}-{index}"), attachment, None,
+                        ).await.map_err(|error| error.to_string())?;
+                        paths.push(path);
+                    }
+                    Some(zeron_proto::QueueAttachmentEdit { expected, paths, remove_ids: Vec::new() })
+                } else {
+                    None
+                };
+                engine.mutate_queued_run(zeron_proto::MutateQueuedRunParams {
+                    chat_id,
+                    queued_run_id: run_id,
+                    client_request_id: request_id,
+                    target_device_id: Some(host),
+                    action: zeron_proto::QueuedRunAction::Edit {
+                        text,
+                        expected_text: base_text,
+                        attachments,
+                    },
+                }).await.map_err(|error| error.to_string())
+            }.await;
             this.update(cx, |composer, cx| {
                 composer.queue_edit_finishing = false;
                 composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
@@ -2334,7 +2639,7 @@ mod tests {
 
     use super::{
         PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
-        canonical_primary_action, latest_queued_message, one_line, queue_action_needs_host,
+        canonical_primary_action, latest_queued_message, one_line, primary_tooltip, queue_action_needs_host,
         queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible,
         queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
@@ -2523,6 +2828,9 @@ mod tests {
                 base_text: "original work".into(),
                 request: None,
                 attachment_count: 0,
+                expected_attachments: String::new(),
+                loaded: Vec::new(),
+                attachments_editable: true,
             });
             composer.queue_edit_draft = Some(("previous draft".into(), vec![], vec![]));
             composer
@@ -2599,6 +2907,47 @@ mod tests {
         );
         queue.promotion_mode = None;
         assert_eq!(canonical_primary_action(&queue), None);
+    }
+
+    #[test]
+    fn primary_tooltip_names_the_selection_the_host_will_run_and_why_it_is_unavailable() {
+        use zeron_proto::{QueuePromotionMode, QueueUiState};
+        let mut queue = QueueUiState::default();
+        queue.promotion_mode = Some(QueuePromotionMode::InterruptRestartWithHandoff);
+        assert_eq!(
+            canonical_primary_action(&queue),
+            Some(QueuePrimaryAction::RestartWithHandoff)
+        );
+        queue.promotion_selection = serde_json::from_value(
+            serde_json::json!({"instanceId":"claude","model":"claude-opus"}),
+        )
+        .ok();
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::RestartWithHandoff, true, Some(&queue)),
+            "Send now on claude-opus (restart with handoff)"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Restart, true, Some(&queue)),
+            "Send now on claude-opus (interrupt and restart)"
+        );
+        queue.promotion_selection_deferred = true;
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, true, Some(&queue)),
+            "Steer active response (the new model applies next turn)"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, true, None),
+            "Steer active response"
+        );
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, false, Some(&queue)),
+            "Waiting for provider capabilities"
+        );
+        queue.promotion_blocked = Some("Send it after the current run.".into());
+        assert_eq!(
+            primary_tooltip(QueuePrimaryAction::Steer, false, Some(&queue)),
+            "Send it after the current run."
+        );
     }
 
     #[test]
@@ -2683,6 +3032,147 @@ mod tests {
             "fix the test then ship it"
         );
         assert_eq!(one_line("  spaced   out  ").as_ref(), "spaced out");
+    }
+
+    #[test]
+    fn context_references_render_as_labels_and_malformed_links_stay_typed() {
+        let text = "See [build.log](t3-context://v1/terminal/ctx_1) and ![shot.png](t3-context://v1/image/img_2) now";
+        assert_eq!(
+            super::replace_context_references(text, false),
+            "See build.log and shot.png now"
+        );
+        assert_eq!(
+            super::replace_context_references(text, true),
+            "See build.log and  now",
+            "an image chip vanishes when the row lists its attachments"
+        );
+        for typed in [
+            "[x](t3-context://v1/terminal)",
+            "[x](t3-context://v1/terminal/a/b)",
+            "[unclosed](t3-context://v1/terminal/a",
+            "[two\nlines](t3-context://v1/skill/a)",
+            "plain [link](https://example.com)",
+            "](t3-context://v1/skill/a)",
+        ] {
+            assert_eq!(super::replace_context_references(typed, true), typed);
+        }
+        assert_eq!(
+            super::replace_context_references(
+                "[a](t3-context://v1/skill/s1)[b](t3-context://v1/mention/m1)",
+                false
+            ),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn retained_context_chips_name_every_kind_without_repeating_attachments() {
+        let record = |kind: &str, label: &str, detail: &str| zeron_proto::QueueContextRef {
+            kind: kind.into(),
+            label: label.into(),
+            detail: detail.into(),
+            ..Default::default()
+        };
+        let chips = super::queue_context_chips(&[
+            record("image", "shot.png", "shot.png"),
+            record("file", "notes", "notes.txt"),
+            record("terminal", "tail", "zsh L10-20"),
+            record("element", "button", "button #save"),
+            record("preview-annotation", "mark", "Header is cramped"),
+            record("review-comment", "comment", "src/lib.rs lines 3-4"),
+            record("mention", "lib", "src/lib.rs"),
+            record("skill", "x", "frontend-design"),
+            record("thread", "Parent", "Parent thread"),
+            record("future-kind", "Opaque", ""),
+            record("empty", "", ""),
+        ]);
+        assert_eq!(
+            chips,
+            [
+                "terminal zsh L10-20",
+                "element button #save",
+                "preview-annotation Header is cramped",
+                "review-comment src/lib.rs lines 3-4",
+                "mention src/lib.rs",
+                "skill frontend-design",
+                "thread Parent thread",
+                "future-kind Opaque",
+                "empty",
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_attachment_changes_are_detected_by_identity_and_order() {
+        use crate::attachments::StagedAttachment;
+        use gpui::{Image, ImageFormat};
+        let staged = |id: &str| StagedAttachment {
+            id: id.into(),
+            name: format!("{id}.png"),
+            image: std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+        };
+        let loaded = vec![
+            ("a".to_string(), "/p/a.png".to_string()),
+            ("b".into(), "/p/b.png".into()),
+        ];
+        assert!(!super::staged_changed(&loaded, &[staged("a"), staged("b")]));
+        assert!(
+            super::staged_changed(&loaded, &[staged("b"), staged("a")]),
+            "reorder"
+        );
+        assert!(super::staged_changed(&loaded, &[staged("a")]), "removal");
+        assert!(
+            super::staged_changed(&loaded, &[staged("a"), staged("b"), staged("new")]),
+            "addition"
+        );
+        assert!(
+            super::staged_changed(&loaded, &[staged("a"), staged("new")]),
+            "replacement"
+        );
+        assert!(!super::staged_changed(&[], &[]));
+    }
+
+    #[gpui::test]
+    fn canonical_edit_blocks_attaching_only_until_its_uploads_are_loaded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        let state = cx.new(|_| crate::state::AppState::new());
+        let composer = cx.new(|cx| super::Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.canonical_queue_edit = Some(super::CanonicalQueueEdit {
+                run_id: "run".into(),
+                base_text: "work".into(),
+                request: None,
+                attachment_count: 0,
+                expected_attachments: "claims=|paths=8:/p/a.png".into(),
+                loaded: Vec::new(),
+                attachments_editable: false,
+            });
+            composer.add_paths(vec![std::path::PathBuf::from("/nope/b.png")], cx);
+            assert!(
+                composer.failure.is_some(),
+                "still loading: staging is refused with a notice"
+            );
+            composer.failure = None;
+            composer
+                .canonical_queue_edit
+                .as_mut()
+                .unwrap()
+                .attachments_editable = true;
+            assert!(
+                composer
+                    .canonical_queue_edit
+                    .as_ref()
+                    .unwrap()
+                    .attachments_editable()
+            );
+            composer.add_paths(vec![std::path::PathBuf::from("/nope/b.png")], cx);
+            assert!(
+                composer.failure.is_none(),
+                "an editable edit stages normally"
+            );
+        });
     }
 
     #[test]

@@ -74,6 +74,193 @@ async fn disconnect_fences_cover_reattachment_attempt_and_generation() {
     ));
 }
 
+#[tokio::test]
+async fn reset_generation_predicate_marks_only_the_first_run_after_a_closed_conversation() {
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    let index = p.runs.iter().position(|r| r.id == run.id).unwrap();
+    // An ordinary conversation, and the same one before any reset, resumes.
+    assert!(!super::session_control::fresh_after_reset(
+        &p,
+        &p.runs[index]
+    ));
+    let provider = run.provider_thread_id.clone().unwrap();
+    let mut fresh = p.runs[index].clone();
+    fresh.id = "after-reset".into();
+    fresh.ordinal += 1;
+    fresh.provider_thread_id = Some("fresh-generation".into());
+    let rows = p.records.get_mut("provider-thread").unwrap();
+    let mut closed = rows
+        .iter()
+        .find(|row| row["id"] == provider.0)
+        .unwrap()
+        .clone();
+    closed["status"] = json!("closed");
+    let mut generation = closed.clone();
+    generation["id"] = json!("fresh-generation");
+    generation["status"] = json!("not_loaded");
+    generation["nativeThreadRef"] = serde_json::Value::Null;
+    generation["providerSessionId"] = serde_json::Value::Null;
+    rows.retain(|row| row["id"] != provider.0);
+    rows.push(closed);
+    rows.push(generation);
+    // The conversation a user reset closed never resumes natively...
+    assert!(super::session_control::fresh_after_reset(
+        &p,
+        &p.runs[index]
+    ));
+    // ...the first turn on its replacement is rebuilt, a later one resumes it.
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::{Cancelled, Completed, Failed};
+    fresh.status = Completed;
+    p.runs.push(fresh.clone());
+    assert!(super::session_control::fresh_after_reset(&p, &fresh));
+    let mut later = fresh.clone();
+    later.id = "later".into();
+    later.ordinal += 1;
+    p.runs.push(later.clone());
+    assert!(!super::session_control::fresh_after_reset(&p, &later));
+    // A first run cancelled before it started, or one that failed before any
+    // native session existed, proves nothing: the next start is still fresh.
+    for (status, started) in [(Cancelled, false), (Failed, true), (Cancelled, true)] {
+        let mut q = p.clone();
+        let first = q.runs.iter_mut().find(|r| r.id == fresh.id).unwrap();
+        first.status = status.clone();
+        first.started_at = started.then(|| "2026-01-01T00:00:00.000Z".to_string());
+        assert!(
+            super::session_control::fresh_after_reset(&q, &later),
+            "{status:?} started={started}"
+        );
+        // ...until a native session is accepted on the fresh generation.
+        q.records
+            .get_mut("provider-thread")
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == "fresh-generation")
+            .unwrap()["nativeThreadRef"] =
+            json!({"driver":"mock","nativeId":"native","strength":"strong"});
+        assert!(
+            !super::session_control::fresh_after_reset(&q, &later),
+            "{status:?}: an accepted native identity continues the generation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_plan_closes_started_conversations_and_moves_queued_runs_together() {
+    use zeron_proto::orchestration::OrchestrationV2RunStatus::{Completed, Queued, Starting};
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    p.records.remove("provider-session");
+    let index = p.runs.iter().position(|r| r.id == run.id).unwrap();
+    p.runs[index].status = Completed;
+    // Two queued follow-ups bound to the started conversation, one already
+    // on its own fresh one: only the first two share a new generation.
+    for (id, ordinal) in [("queued-a", 2), ("queued-b", 3)] {
+        let mut queued = p.runs[index].clone();
+        queued.id = id.into();
+        queued.ordinal = ordinal;
+        queued.status = Queued;
+        queued.active_attempt_id = None;
+        p.runs.push(queued);
+    }
+    let plan_for = |p: &super::ThreadProjection, observed: Option<&str>| {
+        let command = Command {
+            id: CommandId("reset".into()),
+            thread_id: p.thread.id.clone(),
+            operation: Operation::Recover,
+        };
+        let mut plan = crate::orchestration::command::Plan::default();
+        let result = fixture.service.kernel.store.read(|conn| {
+            super::session_control::plan_reset(
+                conn,
+                &mut plan,
+                &command,
+                p,
+                &json!({"observedRunId":observed,"providerSessions":[]}),
+                NOW,
+            )
+        });
+        (result, plan)
+    };
+    let (stale, _) = plan_for(&p, Some("another-run"));
+    assert!(stale.unwrap_err().to_string().contains("newer turn"));
+    let (ok, plan) = plan_for(&p, Some(&run.id.0));
+    ok.unwrap();
+    let events: Vec<Value> = plan
+        .events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect();
+    let of = |kind: &str| -> Vec<&Value> { events.iter().filter(|e| e["type"] == kind).collect() };
+    let threads = of("provider-thread.updated");
+    assert_eq!(
+        threads.len(),
+        2,
+        "one closed conversation, one new generation"
+    );
+    assert_eq!(threads[0]["payload"]["status"], "closed");
+    assert_eq!(
+        threads[0]["payload"]["id"],
+        run.provider_thread_id.as_ref().unwrap().0
+    );
+    let fresh = threads[1]["payload"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(fresh, run.provider_thread_id.as_ref().unwrap().0);
+    assert!(threads[1]["payload"]["nativeThreadRef"].is_null());
+    assert!(threads[1]["payload"]["contextUsage"].is_null());
+    assert!(threads[1]["payload"]["nativeMetadata"].is_null());
+    let moved: Vec<_> = of("run.updated")
+        .into_iter()
+        .map(|e| {
+            (
+                e["payload"]["id"].clone(),
+                e["payload"]["providerThreadId"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        vec![
+            (json!("queued-a"), json!(fresh)),
+            (json!("queued-b"), json!(fresh))
+        ]
+    );
+    // The started run keeps its history; nothing else is rewritten.
+    assert!(
+        of("run.updated")
+            .iter()
+            .all(|e| e["payload"]["id"] != run.id.0)
+    );
+
+    // A turn that is still running refuses, and so does a thread that never
+    // started a conversation.
+    p.runs[index].status = Starting;
+    let (active, _) = plan_for(&p, Some(&run.id.0));
+    assert!(
+        active
+            .unwrap_err()
+            .to_string()
+            .contains("Stop the current run")
+    );
+    p.runs[index].status = Completed;
+    p.records.remove("provider-thread");
+    let (empty, _) = plan_for(&p, Some(&run.id.0));
+    assert!(empty.unwrap_err().to_string().contains("no agent session"));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     service: QueueDomain,
@@ -1463,6 +1650,606 @@ async fn queued_promotion_restarts_one_logical_run_with_original_message_and_exa
     );
 }
 
+/// Save the next-turn selection on the thread, as `thread.model-selection.set`
+/// or `provider.switch` would.
+fn save_selection(f: &Fixture, instance: &str, model: &str) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut thread = json!(p.thread);
+    thread["providerInstanceId"] = json!(instance);
+    thread["modelSelection"] = json!({"instanceId":instance,"model":model});
+    f.seed("target", "thread.provider-switched", thread);
+}
+
+fn set_driver(f: &Fixture, driver: &str) {
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = task::records(&p, "provider-thread")[0].clone();
+    provider["driver"] = json!(driver);
+    f.seed("target", "provider-thread.updated", provider);
+}
+
+fn selection(instance: &str, model: &str) -> Value {
+    json!({"instanceId":instance,"model":model})
+}
+
+async fn promote(f: &Fixture, id: &str, input: Value) -> super::super::CommandReceipt {
+    f.service
+        .mutate(
+            None,
+            "target".into(),
+            "t3_queue_promote_to_steer",
+            input,
+            id.into(),
+            NOW,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn promotion_hint_follows_the_complete_selection_and_transition_policy() {
+    use zeron_proto::QueuePromotionMode::*;
+    // (driver, saved selection, active, interrupt+restart, mode, deferred, blocked)
+    let cases = [
+        ("codex", ("mock", "mock-1"), true, true, Some(ActiveSteering), false, false),
+        ("codex", ("mock", "mock-2"), true, true, Some(InterruptRestart), false, false),
+        ("codex", ("mock", "mock-2"), true, false, Some(ActiveSteering), true, false),
+        ("codex", ("mock", "mock-2"), false, true, Some(InterruptRestart), false, false),
+        ("codex", ("mock", "mock-2"), false, false, None, false, false),
+        // A same-instance change the adapter cannot absorb is a new generation.
+        ("mock", ("mock", "mock-2"), true, true, Some(InterruptRestartWithHandoff), false, false),
+        ("mock", ("mock", "mock-2"), true, false, None, false, true),
+        ("codex", ("other", "other-1"), true, true, Some(InterruptRestartWithHandoff), false, false),
+        ("codex", ("other", "other-1"), true, false, None, false, true),
+    ];
+    for (driver, (instance, model), active, restart, mode, deferred, blocked) in cases {
+        let f = Fixture::new();
+        f.start_target().await;
+        set_driver(&f, driver);
+        set_promotion_capabilities(&f, active, restart, restart);
+        f.sync("direction").await;
+        save_selection(&f, instance, model);
+        let hint = f
+            .service
+            .kernel
+            .store
+            .queue_ui_state(&"target".into())
+            .unwrap();
+        let label = format!("{driver} {instance}/{model} active={active} restart={restart}");
+        assert_eq!(hint.promotion_mode, mode, "{label}");
+        assert_eq!(hint.promotion_selection_deferred, deferred, "{label}");
+        assert_eq!(hint.promotion_blocked.is_some(), blocked, "{label}");
+        let changed = model != "mock-1";
+        assert_eq!(
+            hint.promotion_selection.is_some(),
+            changed && mode.is_some(),
+            "{label}: the displayed selection is echoed only when it matters"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_instance_model_change_restarts_the_native_generation_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("switch models now").await;
+    save_selection(&f, "mock", "mock-2");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart","expectedSelection":selection("mock","mock-2"),
+        "resolvedSelection":selection("mock","mock-2"),"targetDriver":"codex"});
+    let first = promote(&f, "promote-model", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-2");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    assert_eq!(
+        run.provider_thread_id, active.provider_thread_id,
+        "an absorbed model change keeps the native generation"
+    );
+    let attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(attempt.attempt_ordinal, 2);
+    assert_eq!(attempt.provider_thread_id, active.provider_thread_id.clone().unwrap());
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-model")
+        .unwrap();
+    assert!(matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref()));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw)?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(
+        saved["runtime"]["attempt_id"],
+        json!(active.active_attempt_id)
+    );
+    assert_eq!(saved["replacement_attempt_id"], json!(attempt.id));
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let replay = promote(&f, "promote-model", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn cross_instance_promotion_rebinds_the_replacement_attempt_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue on the other provider").await;
+    save_selection(&f, "other", "other-1");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let old_attempt = before.runs[0].active_attempt_id.clone().unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart_with_handoff",
+        "expectedSelection":selection("other","other-1"),
+        "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"});
+    let first = promote(&f, "promote-cross", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs.len(), before.runs.len(), "one logical run");
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.provider_instance_id.0, "other");
+    assert_eq!(run.model_selection.model.to_string(), "other-1");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    assert_eq!(run.status, OrchestrationV2RunStatus::Starting);
+    let generation = run.provider_thread_id.clone().unwrap();
+    assert_ne!(Some(&generation), active.provider_thread_id.as_ref());
+    assert_eq!(
+        generation.0,
+        "provider-thread:app:target:other:1:attempt:2",
+        "a per-attempt generation never collides with the original"
+    );
+    let provider = task::records(&after, "provider-thread")
+        .iter()
+        .find(|p| p["id"] == generation.0)
+        .unwrap()
+        .clone();
+    assert_eq!(provider["driver"], "claudeAgent");
+    assert_eq!(provider["providerInstanceId"], "other");
+    assert!(provider["nativeThreadRef"].is_null());
+    assert_eq!(provider["lastRunOrdinal"], run.ordinal);
+    let attempt = after
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref())
+        .unwrap();
+    assert_eq!(attempt.provider_instance_id.0, "other");
+    assert_eq!(attempt.provider_thread_id, generation);
+    assert!(
+        json!(attempt)["nativeThreadId"].is_null(),
+        "the new generation never inherits the old native identity"
+    );
+    let old = after.attempts.iter().find(|a| a.id == old_attempt).unwrap();
+    assert_eq!(old.status, OrchestrationV2RunAttemptStatus::Superseded);
+    assert_eq!(old.provider_thread_id, active.provider_thread_id.clone().unwrap());
+    assert_eq!(old.provider_instance_id.0, "mock");
+    let root = after
+        .nodes
+        .iter()
+        .find(|n| Some(&n.id) == run.root_node_id.as_ref())
+        .unwrap();
+    assert_eq!(root.provider_thread_id.as_ref(), Some(&generation));
+    // Teardown names the OLD exact provider/process, independent of the binding.
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-cross")
+        .unwrap();
+    assert!(matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, interrupted_attempt_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref() && interrupted_attempt_id == &old_attempt));
+    let saved: Value = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            let raw: Option<String> = conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&raw.expect("a frozen target"))?)
+        })
+        .unwrap();
+    assert_eq!(saved["runtime"]["runtime_id"], "original-process");
+    assert_eq!(saved["runtime"]["attempt_id"], json!(old_attempt));
+    assert_eq!(
+        saved["runtime"]["provider_thread_id"],
+        json!(active.provider_thread_id)
+    );
+    assert_eq!(saved["replacement_attempt_id"], json!(attempt.id));
+    let other = after
+        .runs
+        .iter()
+        .find(|r| r.user_message_id.0 == "queue-two")
+        .unwrap();
+    assert_eq!(other.status, OrchestrationV2RunStatus::Queued);
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    f.service.kernel.store.rebuild().unwrap();
+    let rebuilt = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(json!(rebuilt.runs), json!(after.runs));
+    let replay = promote(&f, "promote-cross", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn same_instance_handoff_change_restarts_on_a_new_generation_and_fences_the_old_process() {
+    use crate::orchestration::{effects::EffectRequest, steering::RuntimeTarget};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    // The test adapter cannot switch models inside a native session.
+    set_driver(&f, "mock");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue on the next model").await;
+    save_selection(&f, "mock", "mock-2");
+    let before = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let old_attempt = before.runs[0].active_attempt_id.clone().unwrap();
+    let runtime = RuntimeTarget::for_run(&before.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::steering::bind_runtime(
+                conn,
+                &"target".into(),
+                &runtime,
+                "original-process",
+            )
+        })
+        .unwrap();
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"interrupt_restart_with_handoff",
+        "expectedSelection":selection("mock","mock-2"),
+        "resolvedSelection":selection("mock","mock-2"),"targetDriver":"mock"});
+    // The non-handoff click for the same change is a stale action, not a restart.
+    let stale = promote(
+        &f,
+        "promote-stale",
+        json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart",
+            "expectedSelection":selection("mock","mock-2"),
+            "resolvedSelection":selection("mock","mock-2"),"targetDriver":"mock"}),
+    )
+    .await;
+    assert_eq!(stale.status, ReceiptStatus::Rejected);
+    let first = promote(&f, "promote-same", input.clone()).await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.runs.len(), before.runs.len(), "one logical run");
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-2");
+    assert_eq!(run.user_message_id.0, "queue-one");
+    let generation = run.provider_thread_id.clone().unwrap();
+    assert_eq!(
+        generation.0, "provider-thread:app:target:mock:1:attempt:2",
+        "a handoff on the same instance is a new generation, never the old one"
+    );
+    let old = after.attempts.iter().find(|a| a.id == old_attempt).unwrap();
+    assert_eq!(old.status, OrchestrationV2RunAttemptStatus::Superseded);
+    assert_eq!(
+        old.provider_thread_id,
+        active.provider_thread_id.clone().unwrap()
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    let effect = effects
+        .iter()
+        .find(|e| e.command_id.0 == "promote-same")
+        .unwrap();
+    assert!(
+        matches!(&effect.request, EffectRequest::ProviderTurnRestart { provider_thread_id, interrupted_attempt_id, .. }
+        if Some(provider_thread_id) == active.provider_thread_id.as_ref() && interrupted_attempt_id == &old_attempt)
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+    let replay = promote(&f, "promote-same", input).await;
+    assert_eq!(replay.result_sequence, first.result_sequence);
+    assert_eq!(
+        f.service.kernel.store.effects().unwrap().len(),
+        effects.len()
+    );
+}
+
+#[tokio::test]
+async fn stopping_during_a_cross_instance_restart_cancels_it_and_binds_nothing_late() {
+    use crate::orchestration::effects::{EffectRequest, EffectStatus};
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, true, true);
+    let queued = f.sync("continue elsewhere").await;
+    save_selection(&f, "other", "other-1");
+    let receipt = promote(
+        &f,
+        "promote-then-stop",
+        json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart_with_handoff",
+            "expectedSelection":selection("other","other-1"),
+            "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"}),
+    )
+    .await;
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{:?}", receipt.error);
+    let restarting = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = restarting.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.status, OrchestrationV2RunStatus::Starting);
+    let stop = f
+        .service
+        .kernel
+        .store
+        .dispatch(
+            &Command {
+                id: "stop-mid-restart".into(),
+                thread_id: "target".into(),
+                operation: Operation::Thread(Box::new(
+                    crate::orchestration::threads::planner::ThreadOperation::Interrupt {
+                        run_id: active.id.clone(),
+                        reason: None,
+                    },
+                )),
+            },
+            NOW + 1,
+        )
+        .unwrap();
+    assert_eq!(stop.status, ReceiptStatus::Accepted, "{:?}", stop.error);
+    let effect = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.command_id.0 == "promote-then-stop")
+        .unwrap();
+    assert!(matches!(effect.request, EffectRequest::ProviderTurnRestart { .. }));
+    assert_eq!(
+        effect.status,
+        EffectStatus::Cancelled,
+        "the pending replacement start cannot outlive the stop"
+    );
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert!(crate::orchestration::command::run_terminal(&run.status));
+    assert_eq!(
+        run.provider_instance_id.0, "other",
+        "the binding stays exact for the records that already name it"
+    );
+    assert!(f.service.kernel.store.verify_projections().unwrap());
+}
+
+#[tokio::test]
+async fn selection_promotion_refuses_stale_unresolved_and_mismatched_requests_atomically() {
+    for fence in [
+        "stale-selection",
+        "missing-selection",
+        "unresolved-instance",
+        "resolution-for-another-selection",
+        "steer-click",
+        "no-interrupt-for-handoff",
+    ] {
+        let f = Fixture::new();
+        let active = f.start_target().await;
+        set_driver(&f, "codex");
+        set_promotion_capabilities(&f, true, fence != "no-interrupt-for-handoff", fence != "no-interrupt-for-handoff");
+        let queued = f.sync("direction").await;
+        save_selection(&f, "other", "other-1");
+        let mut input = json!({"queuedRunId":queued,"targetRunId":active.id,
+            "expectedExecution":"interrupt_restart_with_handoff",
+            "expectedSelection":selection("other","other-1"),
+            "resolvedSelection":selection("other","other-1"),"targetDriver":"claudeAgent"});
+        match fence {
+            "stale-selection" => input["expectedSelection"] = selection("other", "other-2"),
+            "missing-selection" => input["expectedSelection"] = Value::Null,
+            "unresolved-instance" => {
+                input["resolvedSelection"] = Value::Null;
+                input["targetDriver"] = Value::Null;
+            }
+            "resolution-for-another-selection" => {
+                input["resolvedSelection"] = selection("other", "other-2")
+            }
+            "steer-click" => input["expectedExecution"] = json!("active_steering"),
+            _ => {}
+        }
+        let frontier = f.service.kernel.store.projection_frontier().unwrap();
+        let receipt = promote(&f, &format!("refused-{fence}"), input).await;
+        assert_eq!(receipt.status, ReceiptStatus::Rejected, "{fence}");
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            frontier,
+            "{fence}: a refusal writes nothing"
+        );
+        let after = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.runs.iter().find(|r| r.id.0 == queued).unwrap().status,
+            OrchestrationV2RunStatus::Queued,
+            "{fence}"
+        );
+        let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+        assert_eq!(run.provider_instance_id.0, "mock", "{fence}");
+        assert_eq!(run.active_attempt_id, active.active_attempt_id, "{fence}");
+    }
+}
+
+#[tokio::test]
+async fn a_selection_that_waits_for_the_next_turn_steers_without_moving_the_run() {
+    use crate::orchestration::effects::EffectRequest;
+    let f = Fixture::new();
+    let active = f.start_target().await;
+    set_driver(&f, "codex");
+    set_promotion_capabilities(&f, true, false, false);
+    let queued = f.sync("steer on the old model").await;
+    save_selection(&f, "mock", "mock-2");
+    let input = json!({"queuedRunId":queued,"targetRunId":active.id,
+        "expectedExecution":"active_steering","expectedSelection":selection("mock","mock-2")});
+    // Both the displayed selection and the mode are fenced.
+    let mut stale = input.clone();
+    stale["expectedSelection"] = selection("mock", "mock-3");
+    assert_eq!(
+        promote(&f, "waiting-stale", stale).await.status,
+        ReceiptStatus::Rejected
+    );
+    let mut unsure = input.clone();
+    unsure["expectedSelection"] = Value::Null;
+    assert_eq!(
+        promote(&f, "waiting-unreviewed", unsure).await.status,
+        ReceiptStatus::Rejected,
+        "the user must have been shown that the selection waits"
+    );
+    let receipt = promote(&f, "waiting-ok", input).await;
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{:?}", receipt.error);
+    let after = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let run = after.runs.iter().find(|r| r.id == active.id).unwrap();
+    assert_eq!(run.model_selection.model.to_string(), "mock-1");
+    assert_eq!(run.active_attempt_id, active.active_attempt_id);
+    assert_eq!(
+        after.thread.model_selection.model.to_string(),
+        "mock-2",
+        "the saved selection stays for the next turn"
+    );
+    let effects = f.service.kernel.store.effects().unwrap();
+    assert!(effects.iter().any(
+        |e| e.command_id.0 == "waiting-ok" && matches!(e.request, EffectRequest::ProviderTurnSteer { .. })
+    ));
+    assert!(!effects.iter().any(
+        |e| e.command_id.0 == "waiting-ok" && matches!(e.request, EffectRequest::ProviderTurnRestart { .. })
+    ));
+}
+
 #[tokio::test]
 async fn restart_promotion_refuses_stale_modes_capabilities_bindings_and_maintenance_atomically() {
     for fence in [
@@ -2148,4 +2935,499 @@ async fn failed_work_stays_visible_after_later_queue_cancellation() {
     .unwrap();
     assert!(!page.result.thread.settled);
     assert!(page.result.thread.settled_at.is_none());
+}
+
+fn cleanup_paths(f: &Fixture) -> Vec<Vec<String>> {
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|effect| match effect.request {
+            crate::orchestration::effects::EffectRequest::QueuedAttachmentCleanup { paths } => {
+                Some(paths)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn typed_attachment_changes_and_cancellation_queue_cleanup_effects_once() {
+    let f = Fixture::new();
+    let sync = |rows: Vec<zeron_doc::QueuedMessage>, id: &str| {
+        let f = &f;
+        let id = id.to_string();
+        async move {
+            let result = f
+                .service
+                .mutate(
+                    None,
+                    ThreadId("target".into()),
+                    "host.sync_loro_queue",
+                    json!({"items":rows,"driver":"mock"}),
+                    CommandId(id),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, ReceiptStatus::Accepted, "{:?}", result.error);
+        }
+    };
+    let mut row = zeron_doc::QueuedMessage::new("queue-one", "first", "host");
+    row.attachments = vec!["/uploads/a.png".into(), "/uploads/b.png".into()];
+    sync(vec![row.clone()], "sync-1").await;
+    assert!(cleanup_paths(&f).is_empty(), "a new row owns its files");
+    // A lease edit that replaced b with c drops exactly b.
+    row.attachments = vec!["/uploads/a.png".into(), "/uploads/c.png".into()];
+    sync(vec![row.clone()], "sync-2").await;
+    assert_eq!(cleanup_paths(&f), vec![vec!["/uploads/b.png".to_string()]]);
+    // The same state replayed under a new identity drops nothing more.
+    sync(vec![row.clone()], "sync-3").await;
+    assert_eq!(cleanup_paths(&f).len(), 1);
+    // Removing the row cancels the queued run and releases what is left.
+    sync(vec![], "sync-4").await;
+    assert_eq!(
+        cleanup_paths(&f),
+        vec![
+            vec!["/uploads/b.png".to_string()],
+            vec!["/uploads/a.png".to_string(), "/uploads/c.png".to_string()],
+        ]
+    );
+    let owned = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(
+        owned.is_empty(),
+        "the released row no longer names its files"
+    );
+}
+
+#[tokio::test]
+async fn shared_claims_survive_a_cancelled_message_and_unowned_files_are_never_deleted() {
+    let f = Fixture::new();
+    let first = f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let claim =
+        json!({"type":"image","id":"shared","name":"a.png","mimeType":"image/png","sizeBytes":1});
+    let own =
+        json!({"type":"image","id":"own","name":"b.png","mimeType":"image/png","sizeBytes":1});
+    for (id, claims) in [
+        ("queue-one", vec![claim.clone(), own]),
+        ("queue-two", vec![claim]),
+    ] {
+        let mut message = task::records(&p, "message")
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()
+            .clone();
+        message["attachments"] = json!(claims);
+        f.seed("target", "message.updated", message);
+    }
+    f.call(
+        "t3_queue_cancel",
+        json!({"threadId":"target","queuedRunId":first}),
+    )
+    .await
+    .unwrap();
+    let claimed: Vec<Vec<String>> = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|effect| match effect.request {
+            crate::orchestration::effects::EffectRequest::AttachmentCleanup { attachment_ids } => {
+                Some(attachment_ids)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![vec!["own".to_string()]],
+        "the claim another queued message still references stays"
+    );
+
+    // The guarded delete: owned + unreferenced files only, idempotently.
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+    std::fs::create_dir_all(uploads.dir()).unwrap();
+    let file = |name: &str| {
+        let path = uploads.dir().join(name);
+        std::fs::write(&path, b"x").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let (kept, dropped) = (file("kept.png"), file("dropped.png"));
+    let outside = dir.path().join("outside.png");
+    std::fs::write(&outside, b"x").unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO orchestration_queue_attachments VALUES('target','queue-two',?1)",
+                [serde_json::to_string(&vec![&kept])?],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let escaping = format!("{}/../outside.png", uploads.dir().display());
+    let paths = vec![
+        kept.clone(),
+        dropped.clone(),
+        outside.to_string_lossy().into_owned(),
+        escaping,
+    ];
+    for _ in 0..2 {
+        super::attachments::remove_unreferenced(&f.service.kernel.store, &uploads, &paths).unwrap();
+        assert!(
+            std::path::Path::new(&kept).exists(),
+            "another row still names it"
+        );
+        assert!(!std::path::Path::new(&dropped).exists());
+        assert!(
+            outside.exists(),
+            "files outside the uploads root are never touched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_loro_rows_files_are_cleaned_even_while_its_intent_lags() {
+    let f = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+    std::fs::create_dir_all(uploads.dir()).unwrap();
+    let path = uploads.dir().join("lagging.png");
+    std::fs::write(&path, b"x").unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut row = zeron_doc::QueuedMessage::new("queue-one", "first", "host");
+    row.attachments = vec![path.clone()];
+    let sync = |rows: Vec<zeron_doc::QueuedMessage>, id: &str| {
+        let f = &f;
+        let id = id.to_string();
+        async move {
+            let result = f
+                .service
+                .mutate(
+                    None,
+                    ThreadId("target".into()),
+                    "host.sync_loro_queue",
+                    json!({"items":rows,"driver":"mock"}),
+                    CommandId(id),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, ReceiptStatus::Accepted, "{:?}", result.error);
+        }
+    };
+    sync(vec![row.clone()], "sync-1").await;
+    let store = &f.service.kernel.store;
+    super::attachments::remove_unreferenced(store, &uploads, &[path.clone()]).unwrap();
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "a live queued row still owns its file"
+    );
+    // Cancelling through the planner commits before the Loro row is dropped:
+    // the intents table still names the file when the cleanup effect runs.
+    let run = store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap()
+        .runs
+        .into_iter()
+        .find(|r| r.user_message_id.0 == "queue-one")
+        .unwrap();
+    f.call(
+        "t3_queue_cancel",
+        json!({"threadId":"target","queuedRunId":run.id.0}),
+    )
+    .await
+    .unwrap();
+    super::attachments::remove_unreferenced(store, &uploads, &[path.clone()]).unwrap();
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "a cancelled row's file must not be orphaned by a lagging intent"
+    );
+    // The lagging row arriving in a later sync does not re-claim anything.
+    sync(vec![row], "sync-2").await;
+    let owned = store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(owned.is_empty(), "{owned:?}");
+}
+
+#[tokio::test]
+async fn agent_callers_cannot_edit_queued_attachments_but_can_edit_text() {
+    let f = Fixture::new();
+    let id = f.sync("first").await;
+    let edit = |command: &str, with_attachments: bool| {
+        let f = &f;
+        let command = CommandId(command.into());
+        let mut input = json!({"threadId":"target","queuedRunId":id,"text":"edited","expectedText":"first"});
+        if with_attachments {
+            input["attachments"] =
+                json!({"expected":"claims=|paths=","paths":["/uploads/x.png"],"removeIds":[]});
+        }
+        async move {
+            f.service
+                .mutate(
+                    Some(f.caller.clone()),
+                    "target".into(),
+                    "t3_queue_edit",
+                    input,
+                    command,
+                    NOW,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let refused = edit("agent-attachments", true).await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    assert!(
+        refused.error.as_deref().unwrap_or("").contains("Agents cannot"),
+        "{:?}",
+        refused.error
+    );
+    let named = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(named.is_empty(), "{named:?}");
+    let ok = edit("agent-text", false).await;
+    assert_eq!(ok.status, ReceiptStatus::Accepted, "{:?}", ok.error);
+}
+
+#[tokio::test]
+async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
+    use crate::orchestration::effects::EffectRequest;
+    let f = Fixture::new();
+    let id = f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let claim = json!({"type":"image","id":"claimed","name":"a.png","mimeType":"image/png","sizeBytes":1,"extra":true});
+    let mut message = task::records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    message["attachments"] = json!([claim]);
+    message["context"] = json!({"version":1,"records":[
+        {"version":1,"contextId":"img","label":"a.png","kind":"image","attachmentId":"claimed",
+         "name":"a.png","mimeType":"image/png","sizeBytes":1},
+        {"version":1,"contextId":"note","label":"Note","kind":"skill","name":"note"}]});
+    f.seed("target", "message.updated", message);
+    let edit = |expected: &str, paths: Value, remove: Value| {
+        json!({"queuedRunId":id,"text":"edited","expectedText":"first",
+            "attachments":{"expected":expected,"paths":paths,"removeIds":remove}})
+    };
+    let run = |input: Value, command: &str| {
+        let f = &f;
+        let command = CommandId(command.into());
+        async move {
+            f.service
+                .mutate(None, "target".into(), "t3_queue_edit", input, command, NOW)
+                .await
+                .unwrap()
+        }
+    };
+    let refused = run(
+        edit("claims=5:other|paths=", json!([]), json!([])),
+        "edit-stale",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    let refused = run(
+        edit("claims=7:claimed|paths=", json!([]), json!(["nope"])),
+        "edit-unknown",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    let too_many: Vec<String> = (0..9).map(|n| format!("/uploads/{n}.png")).collect();
+    let refused = run(
+        edit("claims=7:claimed|paths=", json!(too_many), json!([])),
+        "edit-many",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    assert!(cleanup_paths(&f).is_empty(), "refusals change nothing");
+    let before = f.service.kernel.store.projection_frontier().unwrap();
+
+    let input = edit(
+        "claims=7:claimed|paths=",
+        json!(["/uploads/new.png"]),
+        json!(["claimed"]),
+    );
+    let first = run(input.clone(), "edit-ok").await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let replay = run(input, "edit-ok").await;
+    assert_eq!(
+        replay.result_sequence, first.result_sequence,
+        "response-loss replay"
+    );
+    assert!(f.service.kernel.store.projection_frontier().unwrap() > before);
+    let check = |f: &Fixture| {
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        let message = task::records(&p, "message")
+            .iter()
+            .find(|m| m["id"] == "queue-one")
+            .unwrap()
+            .clone();
+        assert_eq!(message["text"], "edited");
+        assert_eq!(message["attachments"], json!([]));
+        let records = message["context"]["records"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "context bound to the dropped claim is dropped"
+        );
+        assert_eq!(records[0]["contextId"], "note");
+        let paths = f
+            .service
+            .kernel
+            .store
+            .read(|conn| {
+                crate::orchestration::ui_queue::attachment_paths(
+                    conn,
+                    &"target".into(),
+                    "queue-one",
+                )
+            })
+            .unwrap();
+        assert_eq!(paths, vec!["/uploads/new.png".to_string()]);
+    };
+    check(&f);
+    f.service.kernel.store.rebuild().unwrap();
+    check(&f);
+    // Another queued message and its text are untouched.
+    let other = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        task::records(&other, "message")
+            .iter()
+            .any(|m| m["id"] == "queue-two" && m["text"] == "second")
+    );
+    let claims: Vec<_> = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(&e.request, EffectRequest::AttachmentCleanup { attachment_ids } if attachment_ids == &vec!["claimed".to_string()]))
+        .collect();
+    assert_eq!(claims.len(), 1, "the dropped claim is cleaned exactly once");
+}
+
+#[tokio::test]
+async fn queue_state_summarizes_every_retained_context_kind_without_payloads() {
+    let f = Fixture::new();
+    f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut message = task::records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    let big = "x".repeat(70_000);
+    message["context"] = json!({"version":1,"records":[
+        {"version":1,"contextId":"i","label":"shot","kind":"image","attachmentId":"a","name":"shot.png","mimeType":"image/png","sizeBytes":1},
+        {"version":1,"contextId":"f","label":"notes","kind":"file","attachmentId":"b","name":"notes.txt","mimeType":"text/plain","sizeBytes":1},
+        {"version":1,"contextId":"t","label":"tail","kind":"terminal","terminalId":"1","terminalLabel":"zsh","lineStart":10,"lineEnd":20,"text":big},
+        {"version":1,"contextId":"e","label":"btn","kind":"element","pageUrl":"http://x","pageTitle":null,"tagName":"button","selector":"#save","htmlPreview":"<b>","componentName":null,"source":null,"styles":""},
+        {"version":1,"contextId":"pa","label":"mark","kind":"preview-annotation","annotationId":"1","pageUrl":"http://x","pageTitle":"Page","comment":"c","targetSummary":"Header","styleChanges":[]},
+        {"version":1,"contextId":"rc","label":"cmt","kind":"review-comment","sectionId":"s","sectionTitle":"S","filePath":"src/lib.rs","startIndex":1,"endIndex":2,"rangeLabel":"lines 1-2","text":"t","diff":"d"},
+        {"version":1,"contextId":"m","label":"lib","kind":"mention","path":"src/lib.rs"},
+        {"version":1,"contextId":"s","label":"sk","kind":"skill","name":"design"},
+        {"version":1,"contextId":"th","label":"Th","kind":"thread","environmentId":"host","threadId":"parent","title":"Parent"},
+        {"version":1,"contextId":"u","label":"Opaque","kind":"future-kind","payload":{"k":1}}]});
+    f.seed("target", "message.updated", message);
+    let state = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"target".into())
+        .unwrap();
+    let entry = state
+        .queue
+        .iter()
+        .find(|e| e.message_id == "queue-one")
+        .unwrap();
+    let kinds: Vec<_> = entry
+        .context
+        .iter()
+        .map(|c| (c.kind.as_str(), c.detail.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("image", "shot.png"),
+            ("file", "notes.txt"),
+            ("terminal", "zsh L10-20"),
+            ("element", "button #save"),
+            ("preview-annotation", "Header"),
+            ("review-comment", "src/lib.rs lines 1-2"),
+            ("mention", "src/lib.rs"),
+            ("skill", "design"),
+            ("thread", "Parent"),
+            ("future-kind", ""),
+        ]
+    );
+    assert!(
+        serde_json::to_string(entry).unwrap().len() < 4_000,
+        "terminal bodies and diffs never ride the queue state"
+    );
+    assert!(
+        state
+            .queue
+            .iter()
+            .find(|e| e.message_id == "queue-two")
+            .unwrap()
+            .context
+            .is_empty()
+    );
 }

@@ -164,6 +164,15 @@ impl Uploads {
         &self.inner.dir
     }
 
+    /// Whether `path` names a file inside this host's durable uploads dir
+    /// (lexically: no `..` escapes). Cleanup deletes only such files.
+    pub fn owns(&self, path: &Path) -> bool {
+        path.starts_with(&self.inner.dir)
+            && !path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    }
+
     /// Accept `root` for reads from now on (idempotent). Profile import calls
     /// this so transcripts that embed absolute paths under the local profile's
     /// uploads root keep resolving after the switch to a synced profile.

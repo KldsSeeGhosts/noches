@@ -67,12 +67,17 @@ keep the rendered order and `sidebar_visible_order` in sync.
   "backgroundRunId": null,
   "canPromoteToSteer": false,
   "promotionMode": "interrupt_restart",
+  "promotionSelection": null,
+  "promotionSelectionDeferred": false,
+  "promotionBlocked": null,
   "queue": [{
     "queuedRunId": "run:chat:2",
     "messageId": "queued-user-message",
     "text": "Continue after this turn",
     "attachments": [],
     "attachmentPaths": ["/uploads/image.png"],
+    "context": [{"contextId": "ctx_1", "kind": "terminal", "label": "build.log",
+                 "detail": "zsh L10-20"}],
     "held": true,
     "deliveryGate": null,
     "automatic": false
@@ -97,7 +102,10 @@ Queue entries are untruncated and in delivery order (automatic completion first,
 then queue position/ordinal). Hide `automatic` entries in the user queue.
 `deliveryGate` retains the existing Loro `editing|reviewRequired` JSON; its
 presence blocks MCP mutations. `attachments` retains canonical T3 attachment
-objects; `attachmentPaths` retains Noches uploads without changing T3 schemas.
+objects; `attachmentPaths` retains Noches uploads without changing T3 schemas
+(for a SQL-only row, the uploads its last edit committed). `context` is a bounded
+summary of the message's retained context records (every T3 kind; unknown kinds
+keep their label): never the terminal text, diff or HTML bodies.
 Pending questions exclude approvals; `responseType=not_resumable` remains
 readable but `answerable=false`. Reads never acknowledge tasks, answer questions,
 approve permissions, deliver messages, or execute on replicas.
@@ -119,7 +127,13 @@ work and later runs. No background-only effect may cancel a replacement process.
 ### Canonical queue promotion
 
 `promotionMode` is an additive passive hint: `active_steering`,
-`interrupt_restart`, or null. Older snapshots default it to null.
+`interrupt_restart`, `interrupt_restart_with_handoff`, or null. Older snapshots
+default it to null. It is computed from the thread's complete saved selection
+(instance, model and options) against the running run's: `promotionSelection`
+echoes the saved selection a restart mode would move the run to (or that an
+active steer leaves waiting, with `promotionSelectionDeferred` true), and
+`promotionBlocked` explains a selection change that cannot be delivered into the
+running turn.
 `canPromoteToSteer` remains true only for non-interrupting steering, so older
 clients never advertise an interrupt as **Steer**. The native canonical row
 uses **Steer** for direct delivery and **Send now** with the tooltip
@@ -129,12 +143,35 @@ uses **Steer** for direct delivery and **Send now** with the tooltip
 `clientRequestId`. Its promotion actions are:
 
 ```json
-{"type":"promoteToSteer","targetRunId":"run:chat:1"}
-{"type":"promoteToRestart","targetRunId":"run:chat:1"}
+{"type":"promoteToSteer","targetRunId":"run:chat:1","expectedSelection":null}
+{"type":"promoteToRestart","targetRunId":"run:chat:1","handoff":false,"expectedSelection":null}
 ```
 
-The host rechecks the observed delivery mode before consuming the row. A stale
-Steer click cannot become an interrupting restart. The pinned MCP
+An edit is text-only unless it carries an `attachments` change:
+
+```json
+{"type":"edit","text":"...","expectedText":"...",
+ "attachments":{"expected":"claims=a|paths=/u/1.png","paths":["/u/2.png"],"removeIds":["a"]}}
+```
+
+`paths` is the full set of host-owned uploads after the edit (kept plus files
+the client committed with `UploadCommit` on the host); `removeIds` drops claimed
+(agent) attachments. `expected` is `queue_attachment_fingerprint` of the entry
+the editor saw (`QueueUiEntry::attachment_fingerprint`); a changed set is
+refused without applying the text either. New paths must be files this host
+committed and no other queued row names; at most 8 attachments remain. Files an
+edit drops, and files of a cancelled queued message, are deleted by a durable
+`queued-attachment.cleanup` effect only when no queue row references them
+(claims no other message references use the existing `attachment.cleanup`).
+The retry identity must be pinned to the staged set so a replay recommits the
+same uploads. Document-backed rows keep their edit leases.
+
+`handoff` names `interrupt_restart_with_handoff`; `expectedSelection` is the
+`promotionSelection` the client displayed. The host rechecks both, plus the
+observed delivery mode, before consuming the row: a stale Steer click cannot
+become an interrupting restart, and a restart cannot retarget a selection other
+than the one shown. A restart that moves the run to a changed selection must
+carry `expectedSelection`. The pinned MCP
 `t3_queue_promote_to_steer` operation follows the current capability policy.
 Direct steering never falls back to a late send or restart.
 
@@ -150,11 +187,38 @@ The document queue also checks the canonical Starting state before draining:
 the brief idle-runtime gap between attempts cannot send or prematurely display
 another queued message.
 
-Provider-instance/model-selection transitions remain conservatively refused.
+Selection transitions follow the adapter's negotiated policy
+(`task::selection_transition`). A change the live native session absorbs
+restarts now on the new selection and keeps native resume; when the session
+cannot interrupt/restart the message is actively steered and the saved selection
+waits for the next turn. A different provider instance restarts into a new
+provider generation with a bounded handoff built from the pre-restart
+projection, including this run's partial output, under a per-generation
+`provider-handoff:{run}:attempt:{n}` identity. The host validates the saved
+selection through the live provider catalog and freezes it into the command, so
+a replay never consults a changed catalog. Teardown stays fenced to the old
+exact provider/process. A same-instance change the adapter cannot absorb (for
+example a model change on `pi`, `grok` or an unlisted driver) takes the same
+handoff restart as a cross-instance one: a new provider-thread generation, a
+per-attempt `provider-handoff:{run}:attempt:{n}` identity, and a start the
+sessions engine is told is **fresh** (`NativeIntent::Fresh`), so it never
+resumes the native session the engine still remembers for the chat.
+The thread's saved selection is the authority. The desktop composer's
+`SetChatConfig` mirrors into it on the owning host
+(`selection_sync::mirror_chat_config`): one catalog-validated
+`thread.model-selection.set` / `provider.switch` command, none when the
+selection is unchanged, and it never interrupts or restarts a running turn. A
+config the live catalog rejects is not mirrored (the chat row stays LWW and the
+next admission re-validates). A config written on another device reaches the
+thread at its next admission; it is not mirrored while a turn runs.
 The native typed-row **Send now** still uses its existing document command/edit
 lease path; this is not a claim that every typed-row interaction uses canonical
-promotion. Context metadata is retained, but full native rendering of every
-context record type is not implemented by this change.
+promotion. Context records are retained on the message and shown in the row as
+compact monospace chips (`context`); `[label](t3-context://v1/<kind>/<id>)`
+references in the text display as their labels. Steering carries host-owned
+image files natively where the adapter supports image input (Codex `localImage`,
+Claude image blocks); every path also stays a text reference for adapters that
+do not.
 
 ## Merge seams and validation scope
 
@@ -166,10 +230,9 @@ context record type is not implemented by this change.
   permits restart/late-steer follow-up; substituting it would duplicate the
   promoted message or dispatch after the target run dies. Runner dispatch uses
   the durable command receipt to keep ordinary send and promotion separate.
-  Provider selection-transition negotiation also belongs at that seam: cross-instance
-  promotion currently refuses, rather than silently steering the old instance.
-  Same-selection interrupt/restart promotion is now installed through the shared
-  canonical restart/control executor described above.
+  Provider selection-transition negotiation is installed in the promotion planner
+  (see the canonical queue promotion section) and shares the same restart/control
+  executor.
 - `QueueDomain::settle_for_host(thread, source, now)` exposes guarded `Auto`
   settlement for PR-watch/settings workers. Configured inactivity/PR sweeps are
   not installed by this slice; the PR-watch/settings integration must call it.

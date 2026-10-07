@@ -133,6 +133,7 @@ async fn delayed_turn(scenario: &str) {
             message_id: None,
             prompt: "second".into(),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -141,6 +142,7 @@ async fn delayed_turn(scenario: &str) {
             message_id: None,
             prompt: "third".into(),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -168,6 +170,7 @@ async fn delayed_turn(scenario: &str) {
             message_id: None,
             prompt: "fourth".into(),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -233,6 +236,7 @@ async fn cancel_quiet(scenario: &str) {
             message_id: None,
             prompt: "must not run".into(),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .unwrap();

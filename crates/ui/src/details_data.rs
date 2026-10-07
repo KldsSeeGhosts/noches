@@ -24,6 +24,11 @@ pub struct DetailsStore {
     transfer_pending: HashSet<(String, String)>,
     transfer_again: HashSet<(String, String)>,
     transfer_debounce: HashSet<(String, String)>,
+    /// Inherited-history page reads in flight, one per chat.
+    history_pending: HashSet<(String, String)>,
+    /// Chats whose first inherited page failed to load: refreshes stay quiet
+    /// until the backoff passes, then the chat's own row offers a manual retry.
+    history_first_failed: HashMap<(String, String), FirstPageFailure>,
     pub notice: Option<String>,
     pub(crate) transfer_actions: HashSet<String>,
     /// One pinned request per (chat, intent): an unresolved Merge never blocks
@@ -32,6 +37,14 @@ pub struct DetailsStore {
     pub(crate) session_actions: HashSet<(String, String)>,
     pub(crate) session_retries:
         HashMap<(String, String), zeron_proto::transfer::DisconnectThreadSessionParams>,
+    /// A reset and a whole-thread Stop each pin one request per (owner, chat),
+    /// so a retry after a lost response repeats the same request identity.
+    pub(crate) reset_actions: HashSet<(String, String)>,
+    pub(crate) reset_retries:
+        HashMap<(String, String), zeron_proto::transfer::ResetThreadSessionParams>,
+    pub(crate) stop_actions: HashSet<(String, String)>,
+    pub(crate) stop_retries:
+        HashMap<(String, String), zeron_proto::transfer::StopThreadWorkParams>,
 }
 
 /// What the user asked for; keys a pinned retry together with the chat.
@@ -47,7 +60,47 @@ pub(crate) enum ConversationTransfer {
     Merge(zeron_proto::transfer::MergeThreadBackParams),
 }
 
+/// Automatic retries of a failed first inherited page, spaced out; once spent
+/// only the retry row in the transcript tries again. Retries ride the next
+/// refresh after the delay, never a timer of their own.
+const FIRST_PAGE_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(120),
+];
+
+struct FirstPageFailure {
+    attempts: usize,
+    /// `None` once the automatic retries are spent.
+    retry_at: Option<std::time::Instant>,
+}
+
 impl DetailsStore {
+    /// Whether a refresh may (re)issue the first inherited page now.
+    fn first_page_due(&self, key: &(String, String)) -> bool {
+        self.history_first_failed.get(key).is_none_or(|failure| {
+            failure
+                .retry_at
+                .is_some_and(|at| std::time::Instant::now() >= at)
+        })
+    }
+
+    fn note_first_page_failure(
+        failed: &mut HashMap<(String, String), FirstPageFailure>,
+        key: &(String, String),
+    ) {
+        let attempts = failed.get(key).map_or(0, |failure| failure.attempts) + 1;
+        failed.insert(
+            key.clone(),
+            FirstPageFailure {
+                attempts,
+                retry_at: FIRST_PAGE_BACKOFF
+                    .get(attempts - 1)
+                    .map(|delay| std::time::Instant::now() + *delay),
+            },
+        );
+    }
+
     pub(crate) fn transfer_busy(&self, chat: &str) -> bool {
         self.transfer_actions.contains(chat)
     }
@@ -85,6 +138,8 @@ impl DetailsStore {
             .retain(|(owner, id), _| live.contains(&(owner.as_str(), id.as_str())));
         let ids: HashSet<&str> = chats.iter().map(|c| c.id.as_str()).collect();
         self.transfer_retries.retain(|(id, _), _| ids.contains(id.as_str()));
+        self.history_first_failed
+            .retain(|(owner, id), _| live.contains(&(owner.as_str(), id.as_str())));
     }
 }
 
@@ -95,12 +150,35 @@ pub struct DetailsSnapshot {
     pub transfer: Option<ThreadTransferState>,
     /// Frozen presentation only; these rows never enter the child's document.
     pub(crate) inherited: Option<std::sync::Arc<Vec<crate::transcript::Row>>>,
+    /// Full inherited transcript, loaded newest page first. `None` until the
+    /// first page lands (or when the host cannot page); `inherited` then holds
+    /// the frozen text preview.
+    history: Option<InheritedHistory>,
     /// The API has no start timestamp: keep first observation stable across reads.
     setup_observed: Option<(String, DateTime<Utc>)>,
     pub error: Option<String>,
     /// Set once a full Details read has completed; a transfer-only row
     /// (chat selection) does not satisfy the panel.
     full: bool,
+}
+
+#[doc(hidden)]
+#[cfg(feature = "orchestration-fixture")]
+#[derive(Debug, Default)]
+pub struct InheritedShape {
+    pub tool_rows: usize,
+    pub image_attachments: usize,
+    pub load_earlier: bool,
+}
+
+/// Pages of a fork's inherited transcript already rendered into rows.
+struct InheritedHistory {
+    /// Oldest first; each page is prepared off the UI thread once.
+    rows: Vec<crate::transcript::Row>,
+    next_before: Option<String>,
+    remaining: u64,
+    /// The last page read failed; the "load earlier" row offers a retry.
+    failed: bool,
 }
 
 impl DetailsStore {
@@ -195,19 +273,108 @@ fn prepare_inherited(
     } else {
         "Fork continues here · inherited conversation above".into()
     };
-    let identity = format!("fork-boundary:{}", state.thread_id);
-    rows.push(Row {
+    rows.push(boundary_row(&state.thread_id.0, state.version as u64, parent, label));
+    Some(std::sync::Arc::new(rows))
+}
+
+fn boundary_row(
+    thread_id: &str,
+    version: u64,
+    parent: &str,
+    label: String,
+) -> crate::transcript::Row {
+    let identity = format!("fork-boundary:{thread_id}");
+    crate::transcript::Row {
         id: identity.clone().into(),
         entry_id: identity.into(),
-        version: state.version as u64,
+        version,
         turn_start: true,
         timestamp: None,
         copy_text: None,
-        kind: RowKind::ForkBoundary {
+        kind: crate::transcript::RowKind::ForkBoundary {
             label: label.into(),
             source_chat_id: parent.into(),
         },
-    });
+    }
+}
+
+/// Turn one inherited-history page into read-only rows with the ordinary
+/// transcript builders. Runs on the background executor, once per page.
+fn prepare_history_rows(
+    page: &zeron_proto::transfer::InheritedHistoryPage,
+    owner: &str,
+) -> Vec<crate::transcript::Row> {
+    use crate::transcript::rows_for_entry;
+    use zeron_doc::SessionMessageEntry;
+    let mut rows = Vec::new();
+    for value in &page.entries {
+        let Ok(mut entry) = serde_json::from_value::<SessionMessageEntry>(value.clone()) else {
+            continue;
+        };
+        // The owner device serves media through its attachment transport.
+        entry.device_id = owner.to_owned();
+        let mut prepared = rows_for_entry(&entry, false, &mut |_, text| {
+            std::sync::Arc::new(crate::markdown::parser::parse_full(text))
+        });
+        for row in &mut prepared {
+            // The host sends no wall-clock for inherited items; never invent one.
+            row.timestamp = None;
+        }
+        rows.extend(prepared);
+    }
+    rows
+}
+
+/// The clickable row above a fork's inherited history: load earlier pages, or
+/// retry the one that failed.
+fn more_row(chat: &str, label: String, version: u64) -> crate::transcript::Row {
+    let identity = format!("inherited-more:{chat}");
+    crate::transcript::Row {
+        id: identity.clone().into(),
+        entry_id: identity.into(),
+        version,
+        turn_start: true,
+        timestamp: None,
+        copy_text: None,
+        kind: crate::transcript::RowKind::InheritedMore {
+            label: label.into(),
+            chat_id: chat.into(),
+        },
+    }
+}
+
+/// The rows a fork shows above its own conversation: an optional "load
+/// earlier" row, the loaded pages, then the explicit boundary.
+fn assemble_history(
+    state: &ThreadTransferState,
+    chat: &str,
+    history: &InheritedHistory,
+) -> Option<std::sync::Arc<Vec<crate::transcript::Row>>> {
+    let parent = fork_source(state)?;
+    let mut rows = Vec::with_capacity(history.rows.len() + 2);
+    if history.next_before.is_some() {
+        let label = if history.failed {
+            format!(
+                "Could not load earlier history · retry ({} earlier)",
+                history.remaining
+            )
+        } else {
+            format!("Load earlier history · {} earlier", history.remaining)
+        };
+        // Re-keys the row when the count or failure state changes.
+        rows.push(more_row(
+            chat,
+            label,
+            history.remaining << 1 | u64::from(history.failed),
+        ));
+    }
+    rows.extend(history.rows.iter().cloned());
+    rows.push(boundary_row(
+        &state.thread_id.0,
+        state.version as u64,
+        parent,
+        "Fork continues here · inherited conversation above".into(),
+    ));
     Some(std::sync::Arc::new(rows))
 }
 
@@ -362,6 +529,7 @@ pub fn apply_snapshot(model: &mut DetailsModel, row: &DetailsSnapshot) {
         model.merge_target = fork_source(transfer).map(str::to_owned);
         model.transfers = map_transfers(transfer);
         model.attached_provider_sessions = transfer.attached_provider_sessions.clone();
+        model.latest_started_run_id = transfer.latest_started_run_id.clone();
     }
 }
 
@@ -530,6 +698,7 @@ impl AppState {
                     Err(e) => row.error = Some(e.to_string()),
                 }
                 state.apply_transfer_state(&key, transfer, inherited);
+                state.ensure_inherited_history(&key, cx);
                 let parent = state
                     .details
                     .rows
@@ -629,6 +798,7 @@ impl AppState {
                     .filter(|_| follow_parent)
                     .map(str::to_owned);
                 state.apply_transfer_state(&key, transfer, inherited);
+                state.ensure_inherited_history(&key, cx);
                 if let Some(parent) = parent {
                     state.fetch_transfer_state(&parent, false, false, cx);
                 }
@@ -692,6 +862,9 @@ impl AppState {
                         let next = inherited.or_else(|| prepare_inherited(&v));
                         bump = row.inherited.is_some() || next.is_some();
                         row.inherited = next;
+                        // The paged transcript belongs to the old inputs.
+                        row.history = None;
+                        self.details.history_first_failed.remove(key);
                     }
                     row.transfer = Some(v);
                 }
@@ -701,6 +874,193 @@ impl AppState {
         if bump {
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
         }
+    }
+
+    /// Load the newest page of a fork's inherited transcript once per set of
+    /// inherited inputs. Hosts without the capability keep the text preview.
+    fn ensure_inherited_history(&mut self, key: &(String, String), cx: &mut Context<Self>) {
+        let wanted = self.details.rows.get(key).is_some_and(|row| {
+            row.history.is_none() && row.transfer.as_ref().and_then(fork_source).is_some()
+        });
+        if wanted && self.details.first_page_due(key) {
+            self.fetch_inherited_page(key, None, cx);
+        }
+    }
+
+    /// The transcript's "load earlier history" row.
+    pub fn load_more_inherited_history(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            return;
+        };
+        let key = (chat.device_id.clone(), chat.id.clone());
+        let history = self
+            .details
+            .rows
+            .get(&key)
+            .and_then(|row| row.history.as_ref());
+        match history {
+            Some(history) => {
+                if let Some(before) = history.next_before.clone() {
+                    self.fetch_inherited_page(&key, Some(before), cx);
+                }
+            }
+            // The first page failed: this is the manual retry.
+            None if self.details.history_first_failed.remove(&key).is_some() => {
+                self.fetch_inherited_page(&key, None, cx);
+            }
+            None => {}
+        }
+    }
+
+    fn fetch_inherited_page(
+        &mut self,
+        key: &(String, String),
+        before: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.chat_host_supports(&key.1, zeron_proto::capabilities::THREAD_INHERITED_HISTORY_V1)
+            || self.details.history_pending.contains(key)
+        {
+            return;
+        }
+        let Some(engine) = self.engine().cloned() else {
+            return;
+        };
+        self.details.history_pending.insert(key.clone());
+        let key = key.clone();
+        cx.spawn(async move |this, cx| {
+            let page = engine
+                .client()
+                .thread_inherited_history(&key.1, &key.0, before.as_deref(), None)
+                .await;
+            let rows = match &page {
+                Ok(page) => {
+                    let page = page.clone();
+                    let owner = key.0.clone();
+                    cx.background_executor()
+                        .spawn(async move { prepare_history_rows(&page, &owner) })
+                        .await
+                }
+                Err(_) => Vec::new(),
+            };
+            this.update(cx, |state, cx| {
+                state.details.history_pending.remove(&key);
+                if state.apply_inherited_page(&key, before, page, rows) {
+                    state.ensure_inherited_history(&key, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_inherited_page(
+        &mut self,
+        key: &(String, String),
+        before: Option<String>,
+        page: Result<zeron_proto::transfer::InheritedHistoryPage, zeron_rpc::RpcError>,
+        rows: Vec<crate::transcript::Row>,
+    ) -> bool {
+        let Some(row) = self.details.rows.get_mut(key) else {
+            return false;
+        };
+        match page {
+            Ok(page) if before.is_none() => {
+                self.details.history_first_failed.remove(key);
+                row.history = Some(InheritedHistory {
+                    rows,
+                    next_before: page.next_before,
+                    remaining: page.remaining,
+                    failed: false,
+                });
+            }
+            Ok(page) => {
+                // A reset (new inherited inputs) or a duplicate click may have
+                // moved the cursor since this read was issued.
+                let Some(history) = row
+                    .history
+                    .as_mut()
+                    .filter(|h| h.next_before.as_deref() == before.as_deref())
+                else {
+                    return false;
+                };
+                history.rows.splice(0..0, rows);
+                history.next_before = page.next_before;
+                history.remaining = page.remaining;
+                history.failed = false;
+            }
+            Err(error) => {
+                tracing::debug!(chat = %key.1, %error, "inherited history read failed");
+                // The host refuses a cursor it no longer knows (its typed
+                // code, not any message that happens to mention a cursor):
+                // start over from the newest page instead of skipping history.
+                if before.is_some()
+                    && matches!(
+                        &error,
+                        zeron_rpc::RpcError::Failed(message)
+                            if message.contains(zeron_proto::transfer::INHERITED_CURSOR_EXPIRED)
+                    )
+                    && row.history.take().is_some()
+                {
+                    return true;
+                }
+                match row.history.as_mut() {
+                    Some(history) if before.is_some() => history.failed = true,
+                    Some(_) => return false,
+                    // A first page that failed keeps the preview and shows a
+                    // retry row; refreshes back off instead of re-asking.
+                    None => {
+                        DetailsStore::note_first_page_failure(&mut self.details.history_first_failed, key);
+                        let Some(preview) = row.inherited.as_ref() else {
+                            return false;
+                        };
+                        let mut rows = preview.as_ref().clone();
+                        if rows
+                            .first()
+                            .is_some_and(|first| matches!(first.kind, crate::transcript::RowKind::InheritedMore { .. }))
+                        {
+                            rows.remove(0);
+                        }
+                        rows.insert(0, more_row(&key.1, "Could not load inherited history · retry".into(), 0));
+                        row.inherited = Some(std::sync::Arc::new(rows));
+                        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                        return false;
+                    }
+                }
+            }
+        }
+        let (Some(transfer), Some(history)) = (row.transfer.as_ref(), row.history.as_ref()) else {
+            return false;
+        };
+        if let Some(assembled) = assemble_history(transfer, &key.1, history) {
+            row.inherited = Some(assembled);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
+        false
+    }
+
+    /// Fixture assertions over the rows a fork shows above its conversation.
+    #[doc(hidden)]
+    #[cfg(feature = "orchestration-fixture")]
+    pub fn fixture_inherited_shape(&self, chat_id: &str) -> InheritedShape {
+        use crate::transcript::RowKind;
+        let mut shape = InheritedShape::default();
+        let rows = self
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .and_then(|chat| self.details.inherited_rows(chat));
+        for row in rows.into_iter().flatten() {
+            match &row.kind {
+                RowKind::ToolGroup { tools, .. } => shape.tool_rows += tools.len(),
+                RowKind::User { attachments, .. } => shape.image_attachments += attachments.len(),
+                RowKind::GeneratedImage { .. } => shape.image_attachments += 1,
+                RowKind::InheritedMore { .. } => shape.load_earlier = true,
+                _ => {}
+            }
+        }
+        shape
     }
 
     pub fn control_details_setup(&mut self, chat: &str, action: &str, cx: &mut Context<Self>) {
@@ -855,6 +1215,205 @@ mod tests {
         let third = transfer_state(3, vec![inherited_message("m1"), inherited_message("m2")]);
         state.apply_transfer_state(&key, Ok(third), None);
         assert_eq!(state.transcript_revision, revision.wrapping_add(1));
+    }
+
+    fn history_page(
+        ids: &[&str],
+        next_before: Option<&str>,
+        remaining: u64,
+    ) -> zeron_proto::transfer::InheritedHistoryPage {
+        let entries = ids
+            .iter()
+            .map(|id| match *id {
+                "tool" => json!({"id": "inherited:tool", "role": "assistant", "createdAt": 0, "deviceId": "",
+                    "parts": [
+                        {"kind": "tool", "id": "t", "call": {"kind": "exec", "command": "ls"},
+                         "resolved": true, "output": "a\nb"},
+                        {"kind": "text", "id": "x", "text": "listed"},
+                        {"kind": "image", "id": "i", "path": "/work/a.png", "name": "a.png",
+                         "mimeType": "image/png"}]}),
+                "image" => json!({"id": "inherited:image", "role": "user", "createdAt": 0, "deviceId": "",
+                    "parts": [{"kind": "text", "id": "text",
+                        "text": "look\n\nAttached images (local files — open them to view):\n- /work/a.png"}]}),
+                id => json!({"id": format!("inherited:{id}"), "role": "user", "createdAt": 0,
+                    "deviceId": "", "parts": [{"kind": "text", "id": "text", "text": id}]}),
+            })
+            .collect();
+        zeron_proto::transfer::InheritedHistoryPage {
+            thread_id: "child".into(),
+            entries,
+            next_before: next_before.map(str::to_owned),
+            remaining,
+            total: 10,
+            shortened: 0,
+        }
+    }
+
+    fn fork_state() -> (AppState, (String, String)) {
+        let mut state = AppState::new();
+        let key = ("dev".to_owned(), "child".to_owned());
+        state.apply_transfer_state(&key, Ok(transfer_state(1, vec![inherited_message("m1")])), None);
+        (state, key)
+    }
+
+    #[test]
+    fn history_pages_render_tools_media_and_the_boundary_read_only() {
+        let page = history_page(&["image", "tool"], Some("inherited:image"), 4);
+        let rows = prepare_history_rows(&page, "dev");
+        use crate::transcript::RowKind;
+        let RowKind::User { attachments, .. } = &rows[0].kind else {
+            panic!("user row first");
+        };
+        assert_eq!(attachments.len(), 1, "inherited media keeps its thumbnail");
+        assert!(rows.iter().any(|r| matches!(&r.kind, RowKind::ToolGroup { tools, .. } if tools.len() == 1)));
+        assert!(rows.iter().any(|r| matches!(&r.kind, RowKind::GeneratedImage { owner, .. } if owner == "dev")));
+        assert!(rows.iter().all(|r| r.timestamp.is_none()), "no invented wall-clock");
+    }
+
+    #[test]
+    fn first_page_replaces_the_preview_and_older_pages_prepend_in_order() {
+        let (mut state, key) = fork_state();
+        let preview = state.details.rows[&key].inherited.clone().unwrap();
+        assert_eq!(preview.len(), 2, "text preview + boundary");
+        let revision = state.transcript_revision;
+        let newest = history_page(&["c", "d"], Some("inherited:c"), 2);
+        let rows = prepare_history_rows(&newest, "dev");
+        assert!(!state.apply_inherited_page(&key, None, Ok(newest), rows));
+        let shown = state.details.rows[&key].inherited.clone().unwrap();
+        // load-more row, two entries, boundary
+        assert!(matches!(shown[0].kind, crate::transcript::RowKind::InheritedMore { .. }));
+        assert_eq!(shown.len(), 4);
+        assert!(matches!(shown.last().unwrap().kind, crate::transcript::RowKind::ForkBoundary { .. }));
+        assert_eq!(state.transcript_revision, revision.wrapping_add(1));
+
+        let older = history_page(&["a", "b"], None, 0);
+        let rows = prepare_history_rows(&older, "dev");
+        state.apply_inherited_page(&key, Some("inherited:c".into()), Ok(older), rows);
+        let shown = state.details.rows[&key].inherited.clone().unwrap();
+        let ids: Vec<_> = shown.iter().map(|r| r.id.to_string()).collect();
+        assert_eq!(
+            ids[..4],
+            ["inherited:a", "inherited:b", "inherited:c", "inherited:d"],
+            "{ids:?}"
+        );
+        assert!(
+            !shown.iter().any(|r| matches!(r.kind, crate::transcript::RowKind::InheritedMore { .. })),
+            "no load-more row once the start is reached"
+        );
+    }
+
+    #[test]
+    fn a_stale_older_page_is_dropped_and_failures_keep_loaded_history() {
+        let (mut state, key) = fork_state();
+        let newest = history_page(&["c"], Some("inherited:c"), 5);
+        let rows = prepare_history_rows(&newest, "dev");
+        state.apply_inherited_page(&key, None, Ok(newest), rows);
+        let revision = state.transcript_revision;
+        // A page issued for a cursor the row no longer holds changes nothing.
+        let stale = history_page(&["z"], None, 0);
+        let rows = prepare_history_rows(&stale, "dev");
+        state.apply_inherited_page(&key, Some("inherited:other".into()), Ok(stale), rows);
+        assert_eq!(state.transcript_revision, revision);
+        // A failed older read keeps what is loaded and offers a retry.
+        let restart = state.apply_inherited_page(
+            &key,
+            Some("inherited:c".into()),
+            Err(zeron_rpc::RpcError::Failed("offline".into())),
+            vec![],
+        );
+        assert!(!restart);
+        let shown = state.details.rows[&key].inherited.clone().unwrap();
+        assert!(matches!(&shown[0].kind, crate::transcript::RowKind::InheritedMore { label, .. } if label.contains("retry")));
+        assert_eq!(shown.len(), 3);
+        // A failure that merely mentions a cursor is not the typed code: the
+        // loaded pages stay.
+        let restart = state.apply_inherited_page(
+            &key,
+            Some("inherited:c".into()),
+            Err(zeron_rpc::RpcError::Transport("cursor stream reset".into())),
+            vec![],
+        );
+        assert!(!restart);
+        assert!(state.details.rows[&key].history.is_some());
+        // The host forgetting the cursor (its typed code) restarts from the
+        // newest page.
+        let restart = state.apply_inherited_page(
+            &key,
+            Some("inherited:c".into()),
+            Err(zeron_rpc::RpcError::Failed(format!(
+                "{}: The inherited-history cursor is no longer valid.",
+                zeron_proto::transfer::INHERITED_CURSOR_EXPIRED
+            ))),
+            vec![],
+        );
+        assert!(restart);
+        assert!(state.details.rows[&key].history.is_none());
+    }
+
+    #[test]
+    fn a_failed_first_page_shows_a_retry_row_and_backs_off_instead_of_refetching() {
+        use crate::transcript::RowKind;
+        let (mut state, key) = fork_state();
+        let revision = state.transcript_revision;
+        assert!(state.details.first_page_due(&key), "nothing failed yet");
+        let restart = state.apply_inherited_page(
+            &key,
+            None,
+            Err(zeron_rpc::RpcError::Failed("offline".into())),
+            vec![],
+        );
+        assert!(!restart);
+        // The preview stays, with a retry row on top.
+        let shown = state.details.rows[&key].inherited.clone().unwrap();
+        assert!(matches!(&shown[0].kind, RowKind::InheritedMore { label, .. } if label.contains("retry")));
+        assert_eq!(shown.len(), 3, "retry row + text preview + boundary");
+        assert_eq!(state.transcript_revision, revision.wrapping_add(1));
+        // Refreshes do not re-issue the read until the backoff passes.
+        assert!(!state.details.first_page_due(&key));
+        // A second failure replaces the row instead of stacking another.
+        state.details.history_first_failed.get_mut(&key).unwrap().retry_at =
+            Some(std::time::Instant::now());
+        assert!(state.details.first_page_due(&key));
+        state.apply_inherited_page(&key, None, Err(zeron_rpc::RpcError::Closed), vec![]);
+        assert_eq!(state.details.rows[&key].inherited.as_ref().unwrap().len(), 3);
+        assert_eq!(state.details.history_first_failed[&key].attempts, 2);
+        // Once the automatic retries are spent only the retry row tries again.
+        state.apply_inherited_page(&key, None, Err(zeron_rpc::RpcError::Closed), vec![]);
+        assert!(state.details.history_first_failed[&key].retry_at.is_some());
+        state.apply_inherited_page(&key, None, Err(zeron_rpc::RpcError::Closed), vec![]);
+        assert!(state.details.history_first_failed[&key].retry_at.is_none());
+        assert!(!state.details.first_page_due(&key));
+        // A success clears the failure and replaces the preview.
+        let newest = history_page(&["c"], None, 0);
+        let rows = prepare_history_rows(&newest, "dev");
+        state.apply_inherited_page(&key, None, Ok(newest), rows);
+        assert!(state.details.first_page_due(&key));
+        let shown = state.details.rows[&key].inherited.clone().unwrap();
+        assert!(!shown.iter().any(|r| matches!(&r.kind, RowKind::InheritedMore { .. })));
+        // New inherited inputs forget an old failure.
+        state.apply_inherited_page(&key, None, Err(zeron_rpc::RpcError::Closed), vec![]);
+        state.details.history_first_failed.insert(
+            key.clone(),
+            FirstPageFailure { attempts: 3, retry_at: None },
+        );
+        let next = transfer_state(3, vec![inherited_message("m1"), inherited_message("m2")]);
+        state.apply_transfer_state(&key, Ok(next), None);
+        assert!(state.details.first_page_due(&key));
+    }
+
+    #[test]
+    fn changed_inherited_inputs_discard_the_loaded_pages() {
+        let (mut state, key) = fork_state();
+        let newest = history_page(&["c"], None, 0);
+        let rows = prepare_history_rows(&newest, "dev");
+        state.apply_inherited_page(&key, None, Ok(newest), rows);
+        assert!(state.details.rows[&key].history.is_some());
+        let same = transfer_state(2, vec![inherited_message("m1")]);
+        state.apply_transfer_state(&key, Ok(same), None);
+        assert!(state.details.rows[&key].history.is_some(), "unchanged inputs keep the pages");
+        let next = transfer_state(3, vec![inherited_message("m1"), inherited_message("m2")]);
+        state.apply_transfer_state(&key, Ok(next), None);
+        assert!(state.details.rows[&key].history.is_none());
     }
 
     #[test]

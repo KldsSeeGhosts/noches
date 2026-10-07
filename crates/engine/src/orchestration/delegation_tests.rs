@@ -2377,3 +2377,352 @@ async fn acknowledging_all_active_batch_members_keeps_successor_delivery_fence()
         2
     );
 }
+
+fn managed_interrupt_threads(fixture: &Fixture) -> std::collections::BTreeSet<String> {
+    fixture
+        .kernel()
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter(|effect| {
+            matches!(
+                effect.request,
+                super::effects::EffectRequest::ManagedRunInterrupt { .. }
+            )
+        })
+        .map(|effect| effect.thread_id.0)
+        .collect()
+}
+
+fn scope_for(fixture: &Fixture, thread: &super::projection::ThreadProjection) -> CallerScope {
+    CallerScope {
+        thread_id: thread.thread.id.clone(),
+        run_id: thread.runs[0].id.clone(),
+        session_id: format!("session/{}:1", thread.thread.id.0),
+        project_id: thread.thread.project_id.clone(),
+        workspace_root: fixture.dir.path().into(),
+        runtime_mode: thread.thread.runtime_mode,
+        interaction_mode: thread.thread.interaction_mode,
+        provider_instance_id: thread.thread.provider_instance_id.clone(),
+    }
+}
+
+/// An unrelated top-level thread with its own active run and delegated task.
+async fn foreign_parent(fixture: &Fixture) -> (CallerScope, TaskStatusResult) {
+    let command = Command::wire(serde_json::from_value(json!({
+        "type":"thread.create","commandId":"create-foreign","threadId":"foreign","projectId":"project","title":"Foreign",
+        "createdBy":"user","creationSource":"web","modelSelection":{"instanceId":"mock","model":"mock-1"},
+        "runtimeMode":"full-access","interactionMode":"default","branch":"main","worktreePath":fixture.dir.path()
+    })).unwrap()).unwrap();
+    assert_eq!(
+        fixture
+            .kernel()
+            .store
+            .dispatch(&command, NOW)
+            .unwrap()
+            .status,
+        ReceiptStatus::Accepted
+    );
+    let foreign = fixture
+        .kernel()
+        .store
+        .thread(&ThreadId("foreign".into()))
+        .unwrap()
+        .unwrap();
+    let seed =
+        execution_seed(&foreign.thread, 1, "foreign-input", "starting", "mock", NOW).unwrap();
+    assert_eq!(
+        fixture
+            .kernel()
+            .store
+            .dispatch(
+                &Command {
+                    id: CommandId("seed-foreign".into()),
+                    thread_id: foreign.thread.id.clone(),
+                    operation: Operation::CreateExecution(Box::new(seed)),
+                },
+                NOW
+            )
+            .unwrap()
+            .status,
+        ReceiptStatus::Accepted
+    );
+    let scope = scope_for(
+        fixture,
+        &fixture
+            .kernel()
+            .store
+            .thread(&ThreadId("foreign".into()))
+            .unwrap()
+            .unwrap(),
+    );
+    let task = fixture
+        .service
+        .delegate_task(
+            scope.clone(),
+            serde_json::from_value(json!({"task":"Foreign work","clientRequestId":"foreign-task"}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (scope, task)
+}
+
+#[tokio::test]
+async fn whole_thread_stop_walks_owned_tasks_leaves_first_and_replays_its_frozen_targets() {
+    let fixture = Fixture::new();
+    let outer = fixture.delegate("outer").await;
+    let sibling = fixture.delegate("sibling").await;
+    let done = fixture.delegate("done").await;
+    fixture.complete(&done, "kept reply").await;
+    let child = fixture.child(&outer);
+    let nested = fixture
+        .service
+        .delegate_task(
+            scope_for(&fixture, &child),
+            serde_json::from_value(json!({"task":"Nested work","clientRequestId":"nested"}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (_foreign_scope, foreign) = foreign_parent(&fixture).await;
+    // A persistent monitor belongs to the foreground run's provider, not to an
+    // app-owned task: whole-thread Stop must leave it as plain Stop does.
+    let parent = fixture.parent();
+    fixture.seed_event(&parent.thread.id, "turn-item.updated", json!({
+        "id":"persistent-monitor","threadId":parent.thread.id,"runId":parent.runs[0].id,"nodeId":parent.runs[0].root_node_id,
+        "providerThreadId":parent.runs[0].provider_thread_id,"providerTurnId":null,"nativeItemRef":null,"parentItemId":null,
+        "ordinal":900,"status":"running","title":"monitor","startedAt":null,"completedAt":null,
+        "updatedAt":"2026-10-07T04:00:00.000Z","type":"dynamic_tool","input":{"persistent":true},"output":"",
+        "origin":null,"toolName":"monitor"
+    }));
+
+    let first =
+        super::stop_all::stop_thread_work(fixture.kernel(), &fixture.caller.thread_id, "stop-1")
+            .await
+            .unwrap();
+    // nested, outer, sibling and the foreground run; the settled task is spared.
+    assert_eq!((first.stopped_runs, first.skipped), (4, 0));
+    assert!(first.refusal.is_none());
+    let interrupted = managed_interrupt_threads(&fixture);
+    for task in [&outer, &sibling, &nested] {
+        assert!(interrupted.contains(&task.child_thread_id.0), "{task:?}");
+    }
+    assert!(!interrupted.contains(&done.child_thread_id.0));
+    assert!(!interrupted.contains(&foreign.child_thread_id.0));
+    assert!(!interrupted.contains("foreign"));
+    // Descendants first: the nested task is step 0 under its own owner.
+    let receipt = |index| {
+        fixture
+            .kernel()
+            .store
+            .receipt(&super::stop_all::step_id(
+                &fixture.caller.thread_id,
+                "stop-1",
+                index,
+            ))
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(receipt(0).thread_id, child.thread.id);
+    assert_eq!(receipt(1).thread_id, fixture.caller.thread_id);
+    assert_eq!(receipt(3).command_type, "run.interrupt");
+
+    let after = fixture.parent();
+    let delivery = |id: &NodeId| {
+        records(&after, "subagent")
+            .iter()
+            .find(|task| task["id"] == id.0)
+            .unwrap()["completionDelivery"]["state"]
+            .clone()
+    };
+    assert_eq!(delivery(&outer.task_id), "disposed");
+    assert_eq!(delivery(&sibling.task_id), "disposed");
+    // The settled task keeps its terminal status and reply. Its wake belongs
+    // to the interrupted foreground run's cohort, exactly as under plain Stop.
+    assert_eq!(
+        records(&after, "subagent")
+            .iter()
+            .find(|task| task["id"] == done.task_id.0)
+            .unwrap()["status"],
+        "completed"
+    );
+    assert_eq!(
+        records(&after, "turn-item")
+            .iter()
+            .find(|item| item["id"] == "persistent-monitor")
+            .unwrap()["status"],
+        "running"
+    );
+    assert_eq!(
+        fixture.status(&done).await.summary.as_deref(),
+        Some("kept reply")
+    );
+    let foreign_child = fixture
+        .kernel()
+        .store
+        .thread(&foreign.child_thread_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        foreign_child.runs[0].status,
+        OrchestrationV2RunStatus::Starting
+    );
+
+    // Work started after the request is outside its frozen target set, and a
+    // retry (response loss) repeats the first answer without new effects.
+    let late = fixture
+        .service
+        .delegate_task(
+            scope_for(&fixture, &fixture.child(&sibling)),
+            serde_json::from_value(json!({"task":"Late work","clientRequestId":"late"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let effects = fixture.kernel().store.effects().unwrap().len();
+    let replay =
+        super::stop_all::stop_thread_work(fixture.kernel(), &fixture.caller.thread_id, "stop-1")
+            .await
+            .unwrap();
+    assert_eq!((replay.stopped_runs, replay.skipped), (4, 0));
+    assert_eq!(fixture.kernel().store.effects().unwrap().len(), effects);
+    assert!(!managed_interrupt_threads(&fixture).contains(&late.child_thread_id.0));
+    assert_eq!(
+        fixture.child(&late).runs[0].status,
+        OrchestrationV2RunStatus::Starting
+    );
+}
+
+#[tokio::test]
+async fn whole_thread_stop_refuses_delegated_children_and_unknown_threads() {
+    let fixture = Fixture::new();
+    let task = fixture.delegate("owned").await;
+    let kernel = fixture.kernel();
+    let refused = super::stop_all::stop_thread_work(kernel, &task.child_thread_id, "from-child")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("owns it"), "{refused}");
+    assert!(
+        super::stop_all::stop_thread_work(kernel, &ThreadId("nope".into()), "unknown")
+            .await
+            .is_err()
+    );
+    // Nothing was stopped by either refusal.
+    assert!(managed_interrupt_threads(&fixture).is_empty());
+}
+
+#[tokio::test]
+async fn panel_stop_and_whole_thread_stop_tear_down_the_exact_live_child_runtime() {
+    for whole_thread in [false, true] {
+        let fixture = Fixture::new();
+        let task = fixture.delegate("live-stop").await;
+        let (offers, _received) = tokio::sync::mpsc::unbounded_channel();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (core, bridge) = mock_bridge(&fixture, Arc::new(SteeringMock { offers, starts }));
+        // The parent's own provider start is not under test.
+        fixture
+            .kernel()
+            .store
+            .cancel_effect(
+                &fixture.kernel().store.effects().unwrap()[0].id,
+                crate::now_ms(),
+            )
+            .unwrap();
+        let worker =
+            EffectWorker::new(fixture.kernel().store.clone(), bridge, "stop-worker".into());
+        assert!(worker.step(crate::now_ms()).await.unwrap());
+        assert!(core.sessions.turn_in_flight(&task.child_thread_id.0));
+        if whole_thread {
+            let result = super::stop_all::stop_thread_work(
+                fixture.kernel(),
+                &fixture.caller.thread_id,
+                "stop-live",
+            )
+            .await
+            .unwrap();
+            assert_eq!((result.stopped_runs, result.skipped), (2, 0));
+        } else {
+            fixture
+                .service
+                .cancel_for_user(&fixture.caller.thread_id, task.task_id.to_string())
+                .await
+                .unwrap();
+        }
+        while worker.step(crate::now_ms()).await.unwrap() {}
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.status(&task).await.status
+                    == OrchestratorMcpDelegatedTaskStatus::Interrupted
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!core.sessions.turn_in_flight(&task.child_thread_id.0));
+        core.sessions.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn whole_thread_stop_freezes_the_child_process_and_ignores_a_replacement() {
+    use super::steering::RuntimeTarget;
+    let fixture = Fixture::new();
+    let task = fixture.delegate("replaced").await;
+    let child = fixture.child(&task);
+    let runtime = RuntimeTarget::for_run(&child.runs[0]).unwrap();
+    let bind = |process: &str| {
+        fixture
+            .kernel()
+            .store
+            .write(|conn| super::steering::bind_runtime(conn, &child.thread.id, &runtime, process))
+            .unwrap()
+    };
+    bind("original-process");
+    super::stop_all::stop_thread_work(fixture.kernel(), &fixture.caller.thread_id, "frozen")
+        .await
+        .unwrap();
+    let effect = fixture
+        .kernel()
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|effect| {
+            effect.thread_id == child.thread.id
+                && matches!(
+                    effect.request,
+                    super::effects::EffectRequest::ManagedRunInterrupt { .. }
+                )
+        })
+        .unwrap();
+    let frozen: Option<String> = fixture
+        .kernel()
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT target_json FROM orchestration_control_targets WHERE effect_id=?1",
+                [&effect.id],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(frozen.unwrap().contains("original-process"));
+    // A replacement process on the same logical attempt is never repaired by
+    // the original Stop's settlement.
+    bind("replacement-process");
+    fixture
+        .op(
+            &child.thread.id,
+            TaskOperation::ControlSettlement {
+                effect_id: effect.id.clone(),
+            },
+        )
+        .await;
+    let after = fixture.child(&task);
+    assert_eq!(after.runs[0].status, child.runs[0].status);
+    assert_eq!(after.attempts[0].status, child.attempts[0].status);
+}

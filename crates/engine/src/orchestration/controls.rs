@@ -99,10 +99,19 @@ fn target(p: &ThreadProjection, request: &EffectRequest) -> Option<ControlTarget
                     && &a.provider_thread_id == provider_thread_id
                     && a.provider_turn_id.as_ref() == Some(provider_turn_id)
             })?;
+            let restart = matches!(request, EffectRequest::ProviderTurnRestart { .. });
+            // A selection-changing restart has already rebound the run to its
+            // replacement provider generation; the old exact process is still
+            // identified by the interrupted attempt's own binding.
             let run = p.runs.iter().find(|r| {
+                let instance = if restart {
+                    &attempt.provider_instance_id
+                } else {
+                    &r.provider_instance_id
+                };
                 r.id == attempt.run_id
-                    && r.provider_thread_id.as_ref() == Some(provider_thread_id)
-                    && provider["providerInstanceId"] == r.provider_instance_id.0
+                    && (restart || r.provider_thread_id.as_ref() == Some(provider_thread_id))
+                    && provider["providerInstanceId"] == instance.0
                     && provider["lastRunOrdinal"] == r.ordinal
             })?;
             let replacement = if let EffectRequest::ProviderTurnRestart {
@@ -120,6 +129,8 @@ fn target(p: &ThreadProjection, request: &EffectRequest) -> Option<ControlTarget
                         && Some(&a.root_node_id) == run.root_node_id.as_ref()
                         && a.reason == OrchestrationV2RunAttemptReason::SteeringRestart
                         && a.attempt_ordinal == attempt.attempt_ordinal + 1
+                        && Some(&a.provider_thread_id) == run.provider_thread_id.as_ref()
+                        && a.provider_instance_id == run.provider_instance_id
                 })?;
                 Some(next.id.clone())
             } else {

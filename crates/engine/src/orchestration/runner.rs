@@ -412,6 +412,19 @@ impl RunnerBridge {
                 .unwrap_or_default(),
         )
         .await?;
+        // The planner, not engine memory, owns native continuity: a generation
+        // it rebuilt from portable history must not silently resume whatever
+        // session the engine remembers for this chat.
+        let native = if super::transfer::delivery::fresh_native_start(
+            &self.kernel,
+            &effect.thread_id,
+            &run,
+            request.resume.as_deref(),
+        )? {
+            crate::sessions::NativeIntent::Fresh
+        } else {
+            crate::sessions::NativeIntent::Legacy
+        };
         if let Err(error) = (super::checkpoint::FileCheckpointService {
             kernel: self.kernel.clone(),
         })
@@ -454,6 +467,7 @@ impl RunnerBridge {
                 harness.id(),
                 request,
                 Some(run.user_message_id.0.clone()),
+                native,
             )
             .await
         {
@@ -678,6 +692,9 @@ impl RunnerBridge {
         match &effect.request {
             EffectRequest::TerminalCleanup | EffectRequest::AttachmentCleanup { .. } => {
                 super::launch::deletion::execute(self, effect).await
+            }
+            EffectRequest::QueuedAttachmentCleanup { paths } => {
+                super::queue::attachments::execute_cleanup(self, paths).await
             }
             EffectRequest::ProviderSessionDetach { .. }
             | EffectRequest::ProviderSessionDisconnect { .. }

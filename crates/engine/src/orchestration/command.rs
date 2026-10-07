@@ -126,6 +126,8 @@ pub(crate) struct Plan {
     pub queue_lifecycle: Option<serde_json::Value>,
     pub queue_intents: Option<Vec<zeron_doc::QueuedMessage>>,
     pub queue_patch: Option<serde_json::Value>,
+    /// Upload paths a queued message owns after this command; empty drops its row.
+    pub queue_attachments: Vec<(String, Vec<String>)>,
 }
 
 impl Plan {

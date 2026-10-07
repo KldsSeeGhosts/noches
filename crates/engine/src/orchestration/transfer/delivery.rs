@@ -242,6 +242,30 @@ pub(super) fn resumable_native(
 /// ProviderTurnStartService.ts retains ready handoffs from failed/interrupted
 /// starts on the same provider thread. Consumption stays on the original run;
 /// retry delivery must not create another transfer or reuse an uncertain native.
+/// A bare `/compact` (no attachments) is native maintenance: it must not carry
+/// imported history, and a handoff prepared for it is still owed afterwards.
+pub(super) fn is_compaction(message: &Value) -> bool {
+    message["attachments"].as_array().is_none_or(Vec::is_empty)
+        && message["text"].as_str().is_some_and(|text| {
+            // JS `String.trim`: Unicode space + BOM, not NEL.
+            text.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+                .eq_ignore_ascii_case("/compact")
+        })
+}
+
+pub(super) fn run_is_compaction(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {
+    super::super::task::records(projection, "message")
+        .iter()
+        .any(|message| message["id"] == run.user_message_id.0 && is_compaction(message))
+}
+
+/// T3 `hasConversation`: a user message other than a bare `/compact`.
+pub(super) fn has_conversation(projection: &ThreadProjection) -> bool {
+    super::super::task::records(projection, "message")
+        .iter()
+        .any(|message| message["role"] == "user" && !is_compaction(message))
+}
+
 fn handoff_for_run(
     handoff: &Value,
     projection: &ThreadProjection,
@@ -255,11 +279,16 @@ fn handoff_for_run(
                 .is_some_and(|p| handoff["toProviderThreadId"] == p.0)
                 && projection.runs.iter().any(|source| {
                     handoff["targetRunId"] == source.id.0
-                        && matches!(
+                        && (matches!(
                             source.status,
                             OrchestrationV2RunStatus::Failed
                                 | OrchestrationV2RunStatus::Interrupted
                         )
+                            // A completed `/compact` deferred its handoff and
+                            // never delivered it; the next turn still owes it.
+                            || (source.status == OrchestrationV2RunStatus::Completed
+                                && handoff["delivery"].is_null()
+                                && run_is_compaction(projection, source)))
                 })))
 }
 
@@ -526,6 +555,82 @@ impl HandoffDelivery for EngineDelivery<'_> {
     }
 }
 
+/// A selection-changing restart replaces the provider generation inside one
+/// logical run. Returns the attempt that first ran on the current generation
+/// and the interrupted attempt just before it (a different generation), or None
+/// when the run has stayed on its original generation.
+fn restart_origin<'a>(
+    projection: &'a ThreadProjection,
+    run: &OrchestrationV2Run,
+) -> Option<(&'a OrchestrationV2RunAttempt, &'a OrchestrationV2RunAttempt)> {
+    let attempts = |ordinal: i64| {
+        projection
+            .attempts
+            .iter()
+            .find(|a| a.run_id == run.id && a.attempt_ordinal == ordinal)
+    };
+    let current = projection
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == run.active_attempt_id.as_ref() && a.run_id == run.id)?;
+    let mut first = current;
+    while first.attempt_ordinal > 1
+        && first.reason == OrchestrationV2RunAttemptReason::SteeringRestart
+        && let Some(previous) = attempts(first.attempt_ordinal - 1)
+        && previous.provider_thread_id == first.provider_thread_id
+    {
+        first = previous;
+    }
+    if first.attempt_ordinal == 1
+        || first.reason != OrchestrationV2RunAttemptReason::SteeringRestart
+    {
+        return None;
+    }
+    Some((first, attempts(first.attempt_ordinal - 1)?))
+}
+
+/// Whether a started run is a generation the planner rebuilt from portable
+/// context (provider handoff to this run, or a user reset), rather than one
+/// continuing an accepted native session. Only then may the engine be told
+/// not to resume whatever it remembers for the chat; a run with no positive
+/// evidence (for example the first canonical turn of an adopted chat) keeps
+/// the engine's own continuity.
+pub(crate) fn fresh_native_start(
+    kernel: &Kernel,
+    thread: &ThreadId,
+    run: &OrchestrationV2Run,
+    resume: Option<&str>,
+) -> Result<bool> {
+    if resume.is_some() {
+        return Ok(false);
+    }
+    let projection = kernel
+        .store
+        .thread(thread)?
+        .ok_or_else(|| Error::Invariant("Run thread missing after preparation.".into()))?;
+    if super::super::queue::session_control::fresh_after_reset(&projection, run) {
+        return Ok(true);
+    }
+    let to = run.provider_thread_id.as_ref().map(|id| id.0.as_str());
+    let handoffs = kernel.store.thread_transfers(thread)?;
+    Ok(handoffs.iter().any(|t| {
+        t["type"] == "provider_handoff"
+            && t["targetRunId"] == run.id.0
+            && super::super::task::records(&projection, "context-handoff")
+                .iter()
+                .any(|h| h["transferId"] == t["id"] && h["toProviderThreadId"].as_str() == to)
+    }))
+}
+
+/// Delegated-completion and notification runs are automatic deliveries; they
+/// never consume context the user is waiting to send (a pending merge-back).
+fn automatic_run(projection: &ThreadProjection, run: &OrchestrationV2Run) -> bool {
+    super::super::task::records(projection, "message")
+        .iter()
+        .find(|m| m["id"] == run.user_message_id.0)
+        .is_some_and(|m| m.get("delegatedCompletion").is_some() || m.get("notification").is_some())
+}
+
 /// Normal start integration. `request.prompt` retains current input verbatim;
 /// imported context is prepended only to native input, not historical transcript.
 pub async fn prepare_run(
@@ -541,17 +646,29 @@ pub async fn prepare_run(
         .store
         .thread(thread)?
         .ok_or_else(|| Error::Invariant("Transfer target missing.".into()))?;
+    let compaction = run_is_compaction(&projection, run);
+    if compaction && !has_conversation(&projection) {
+        return Err(Error::Invariant(
+            "Start a conversation before compacting this thread.".into(),
+        ));
+    }
     let all = kernel.store.thread_transfers(thread)?;
-    super::ensure_start_allowed(&all, thread, false)?;
-    let needs_full_switch = all.iter().any(|t| {
-        t["type"] == "merge_back" && t["status"] == "pending" && t["targetThreadId"] == thread.0
-    });
+    super::ensure_start_allowed(&all, thread)?;
+    // Queued runs may be admitted while a merge-back waits. The first
+    // non-automatic run to actually start consumes it; a cancelled queued run
+    // never reaches here, and an automatic delivery leaves it pending.
+    let automatic = automatic_run(&projection, run);
+    let claims_pending =
+        |t: &Value| t["status"] == "pending" && !(automatic && t["type"] == "merge_back");
+    let needs_full_switch = all
+        .iter()
+        .any(|t| t["type"] == "merge_back" && claims_pending(t) && t["targetThreadId"] == thread.0);
     let relevant: Vec<_> = all
         .into_iter()
         .filter(|t| {
             t["targetThreadId"] == thread.0
                 && matches!(t["type"].as_str(), Some("fork" | "merge_back"))
-                && (t["status"] == "pending" || t["targetRunId"] == run.id.0)
+                && (claims_pending(t) || t["targetRunId"] == run.id.0)
         })
         .collect();
     let mut handoffs = vec![];
@@ -565,23 +682,65 @@ pub async fn prepare_run(
     {
         request.resume = target_native.clone();
     }
-    if let Some(previous) = projection
+    let restart = restart_origin(&projection, run);
+    let earlier = projection
         .runs
         .iter()
-        .filter(|r| r.ordinal < run.ordinal && super::forkable(&r.status))
-        .max_by_key(|r| r.ordinal)
-        && (previous.provider_instance_id != run.provider_instance_id
-            || selection_transition(
-                target_provider["driver"].as_str().unwrap_or_default(),
-                &previous.model_selection,
-                &run.model_selection,
-            ) == SelectionTransition::CreateWithHandoff
-            || (provider_for_run(&projection, run)
-                .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
-                && target_native.is_none()
-                && request.resume.is_none()))
-    {
-        let id = format!("provider-handoff:{}", encode_component(&run.id.0));
+        .filter(|r| {
+            r.ordinal < run.ordinal
+                && super::forkable(&r.status)
+                && !super::super::queue::session_control::never_started(r)
+        })
+        .max_by_key(|r| r.ordinal);
+    // A restart that moved the run onto another generation hands off from the
+    // run itself, partial output included. Otherwise the previous finished run
+    // is the source, and only when the selection cannot ride the native session.
+    let source = if restart.is_some() {
+        Some(run)
+    } else {
+        earlier.filter(|previous| {
+            previous.provider_instance_id != run.provider_instance_id
+                // A user reset closed the previous conversation: rebuild fully.
+                || (previous.provider_thread_id != run.provider_thread_id
+                    && provider_for_run(&projection, previous)
+                        .is_some_and(|p| p["status"] == "closed"))
+                // The fresh generation has no accepted native conversation yet
+                // (its first run was cancelled or failed before one existed).
+                || super::super::queue::session_control::fresh_generation(&projection, run)
+                || selection_transition(
+                    target_provider["driver"].as_str().unwrap_or_default(),
+                    &previous.model_selection,
+                    &run.model_selection,
+                ) == SelectionTransition::CreateWithHandoff
+                || (provider_for_run(&projection, run)
+                    .is_some_and(|p| p["nativeThreadRef"]["nativeId"].is_string())
+                    && target_native.is_none()
+                    && request.resume.is_none())
+        })
+    };
+    if let Some(previous) = source {
+        // One transfer per provider generation of a run, never per run: the
+        // earlier attempt's handoff belongs to the generation it fed.
+        let (id, command_id) = match restart {
+            Some((first, _)) => (
+                format!(
+                    "provider-handoff:{}:attempt:{}",
+                    encode_component(&run.id.0),
+                    first.attempt_ordinal
+                ),
+                format!(
+                    "provider-handoff:{}:attempt:{}",
+                    run.id.0, first.attempt_ordinal
+                ),
+            ),
+            None => (
+                format!("provider-handoff:{}", encode_component(&run.id.0)),
+                format!("provider-handoff:{}", run.id.0),
+            ),
+        };
+        let source_instance = restart
+            .map(|(_, interrupted)| interrupted.provider_instance_id.clone())
+            .unwrap_or_else(|| previous.provider_instance_id.clone());
         let existing = kernel
             .store
             .thread_transfers(thread)?
@@ -623,6 +782,12 @@ pub async fn prepare_run(
                     .map(|r| r.ordinal >= from)
                     .unwrap_or(seen.is_none() && i["runId"].is_null())
             });
+            if restart.is_some() {
+                // The prompt being delivered is the run's current input, not history.
+                items.retain(|i| {
+                    i["messageId"] != run.user_message_id.0 && i["id"] != run.user_message_id.0
+                });
+            }
             if seen.is_none() {
                 items.splice(0..0, super::inherited_items(&kernel.store, &projection)?);
             }
@@ -644,13 +809,13 @@ pub async fn prepare_run(
                 "createdByProviderInstanceId":null,"createdAt":now,"updatedAt":now});
             let transfer = json!({"id":id,"type":"provider_handoff","sourceThreadId":thread,"targetThreadId":thread,
                 "sourcePoint":super::canonical_point(&projection,previous),"basePoint":seen.map(|r| super::canonical_point(&projection,r)),
-                "sourceProviderInstanceId":previous.provider_instance_id,"targetProviderInstanceId":run.provider_instance_id,
+                "sourceProviderInstanceId":source_instance,"targetProviderInstanceId":run.provider_instance_id,
                 "targetRunId":run.id,"status":"consumed","resolution":{"strategy":if seen.is_none() {"portable_context"} else {"delta_context"},"contextHandoffId":handoff_id},
                 "createdBy":"system","error":null,"createdAt":now,"updatedAt":now,"consumedAt":now});
             let receipt = kernel
                 .transfer_command(
                     thread,
-                    CommandId(format!("provider-handoff:{}", run.id.0)),
+                    CommandId(command_id),
                     super::TransferOperation::CreateHandoff {
                         transfer: Box::new(transfer.clone()),
                         handoff: Box::new(handoff.clone()),
@@ -743,24 +908,60 @@ pub async fn prepare_run(
                 .as_str()
                 .map(str::to_owned)
         });
-        // TODO(parity-native): Codex legacy refs need upstream's paginated
-        // fork/revert fallback. Until then use portable context, never fork a
-        // moving head or an OpenCode boundary whose later cursor is unknown.
-        let stable_native_boundary = transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
+        // A native cursor forks atomically at the boundary. A legacy source
+        // turn (no cursor) can still fork natively when the adapter can revert
+        // a head fork and every later turn is settled and countable; otherwise
+        // use portable context, never a moving head or an OpenCode boundary
+        // whose later cursor is unknown.
+        let legacy_rollback = harness
+            .session_lifecycle()
+            .filter(|lifecycle| lifecycle.supports_fork_rollback())
+            .and_then(|_| legacy_rollback_turns(&source_projection, source_run));
+        let stable_native_boundary = (transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
             .is_string()
-            && (next_run.is_none() || next_turn.is_some());
-        if transfer["type"] == "fork"
+            && (next_run.is_none() || next_turn.is_some()))
+            || (!transfer["sourcePoint"]["providerTurnRef"]["nativeId"].is_string()
+                && legacy_rollback.is_some());
+        let fork_request = (transfer["type"] == "fork"
             && stable_native_boundary
             && native_fork_eligible(
                 &transfer,
                 source_run,
                 &run.provider_instance_id,
                 capabilities,
-            )
-        {
-            let lifecycle = harness
-                .session_lifecycle()
-                .ok_or_else(|| Error::Invariant("Native fork adapter unavailable.".into()))?;
+            ))
+        .then(|| NativeForkRequest {
+            source_thread_id: transfer["sourcePoint"]["providerThreadRef"]["nativeId"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
+            source_turn_id: transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
+                .as_str()
+                .map(str::to_owned),
+            source_next_turn_id: next_turn,
+            rollback_turns: legacy_rollback,
+            cwd: request.cwd.clone(),
+            model: run.model_selection.model.clone(),
+            runtime_mode: request.runtime_mode,
+            interaction_mode: request.interaction_mode,
+            mcp: mcp.clone(),
+        });
+        // A definite "cannot fork this boundary" routes to portable context
+        // before anything is recorded as in flight.
+        let native_fork = match fork_request {
+            Some(fork_request) => {
+                let lifecycle = harness
+                    .session_lifecycle()
+                    .ok_or_else(|| Error::Invariant("Native fork adapter unavailable.".into()))?;
+                lifecycle
+                    .can_fork_now(&fork_request)
+                    .await
+                    .map_err(|e| Error::Invariant(e.to_string()))?
+                    .then_some((lifecycle, fork_request))
+            }
+            None => None,
+        };
+        if let Some((lifecycle, fork_request)) = native_fork {
             kernel.store.write(|tx| {
                 let marker = json!({"status":"fork_pending","targetRunId":run.id});
                 tx.execute("INSERT INTO orchestration_transfer_delivery(transfer_id,target_run_id,status,payload_json) VALUES(?1,?2,'fork_pending',?3)",
@@ -768,21 +969,7 @@ pub async fn prepare_run(
                 Ok(())
             })?;
             let native = lifecycle
-                .fork_thread(NativeForkRequest {
-                    source_thread_id: transfer["sourcePoint"]["providerThreadRef"]["nativeId"]
-                        .as_str()
-                        .unwrap_or("")
-                        .into(),
-                    source_turn_id: transfer["sourcePoint"]["providerTurnRef"]["nativeId"]
-                        .as_str()
-                        .map(str::to_owned),
-                    source_next_turn_id: next_turn,
-                    cwd: request.cwd.clone(),
-                    model: run.model_selection.model.clone(),
-                    runtime_mode: request.runtime_mode,
-                    interaction_mode: request.interaction_mode,
-                    mcp: mcp.clone(),
-                })
+                .fork_thread(fork_request)
                 .await
                 .map_err(|e| Error::Invariant(e.to_string()))?;
             transfer["resolution"] = json!({"strategy":"native_fork","providerThreadRef":{
@@ -865,6 +1052,15 @@ pub async fn prepare_run(
             .into_iter()
             .find(|t| t["id"] == handoff["transferId"])
         {
+            // A provider handoff fed the generation it was prepared for. After a
+            // restart onto another generation the run's own handoff covers the
+            // history again; re-injecting the earlier one would duplicate it.
+            if transfer["type"] == "provider_handoff"
+                && handoff["toProviderThreadId"].as_str()
+                    != run.provider_thread_id.as_ref().map(|id| id.0.as_str())
+            {
+                continue;
+            }
             handoffs.push(handoff.clone());
             durable_transfers.push(transfer);
         }
@@ -982,7 +1178,7 @@ pub async fn prepare_run(
         &attachments,
         usage.as_ref(),
         native_estimate,
-        None,
+        declared_model_window(harness, request),
     );
     let delivery = EngineDelivery {
         kernel,
@@ -997,7 +1193,9 @@ pub async fn prepare_run(
         budget,
         &delivered_ids,
         harness.session_lifecycle().is_some(),
-        false,
+        // `/compact` must compact the native conversation, not an imported
+        // preamble: inline delivery waits for the next ordinary turn.
+        compaction,
         &delivery,
     )
     .await?;
@@ -1005,6 +1203,44 @@ pub async fn prepare_run(
         request.prompt = format!("{}\n\n{}", prepared.context, request.prompt);
     }
     Ok(())
+}
+
+/// Terminal provider turns after the source run's turn on its provider thread:
+/// the revert count for a legacy (cursor-less) native fork. None when the
+/// boundary turn is unknown or any later turn is still live, because a count
+/// over a moving head would cut the wrong place.
+fn legacy_rollback_turns(
+    projection: &ThreadProjection,
+    source_run: &OrchestrationV2Run,
+) -> Option<usize> {
+    let turns = super::super::task::records(projection, "provider-turn");
+    let attempt = source_run.active_attempt_id.as_ref()?;
+    let boundary = turns.iter().find(|turn| turn["runAttemptId"] == attempt.0)?;
+    let provider = &boundary["providerThreadId"];
+    let boundary_ordinal = boundary["ordinal"].as_i64()?;
+    let mut later = 0;
+    for turn in turns
+        .iter()
+        .filter(|turn| turn["providerThreadId"] == *provider)
+        .filter(|turn| turn["ordinal"].as_i64().is_some_and(|o| o > boundary_ordinal))
+    {
+        match turn["status"].as_str()? {
+            "completed" | "interrupted" | "failed" | "cancelled" => later += 1,
+            _ => return None,
+        }
+    }
+    Some(later)
+}
+
+/// The target model's catalog-declared window, so a first handoff (no
+/// occupancy telemetry yet) is bounded by the model it will actually reach
+/// instead of a fixed default.
+pub(super) fn declared_model_window(harness: &dyn Harness, request: &RunRequest) -> Option<usize> {
+    let model = request.model.as_deref()?;
+    harness
+        .model_context_window(model, &request.model_options)
+        .map(|window| window as usize)
+        .filter(|window| *window > 0)
 }
 
 /// A provider acknowledgement / first native output confirms input acceptance.

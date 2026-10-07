@@ -27,10 +27,20 @@
 //! - Steering: queued [`SteerMessage`]s are written to stdin as user lines at
 //!   any time; the CLI folds them into the running turn at its own step
 //!   boundary.
+//! - RECEIPTS: every stdin user line carries a host-chosen `uuid`, and the CLI
+//!   runs with `--replay-user-messages`, which re-emits a user line on stdout
+//!   (`isReplay`, same `uuid`) when it consumes it. That echo — not the pipe
+//!   write/flush, which only proves the bytes left us — is the exact native
+//!   receipt: it becomes [`AgentEvent::InputAcceptedFor`] for the mailbox
+//!   message (or [`AgentEvent::InputAccepted`] for the initial prompt). The
+//!   flush result still answers `notification_acceptance` (local delivery);
+//!   an echo that never arrives stays unaccepted so the host's recovery owns
+//!   it. Replay frames are never folded into the transcript.
 //! - Interrupt: cancelling [`RunControls::interrupt`] sends the protocol-level
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
+mod fork;
 mod normalize;
 mod wire;
 
@@ -91,6 +101,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// How long an errored result waits for the echo of an already-written
+    /// steer before the run is allowed to end (see [`drain_echoes`]).
+    echo_drain: Duration,
     /// Command discovery cache: only a successful probe is cached, so a
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
@@ -103,6 +116,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            echo_drain: Duration::from_millis(500),
             commands: tokio::sync::OnceCell::new(),
         }
     }
@@ -131,6 +145,12 @@ impl ClaudeHarness {
         self
     }
 
+    /// Tune how long an errored result waits for in-flight steer echoes.
+    pub fn with_echo_drain(mut self, echo_drain: Duration) -> Self {
+        self.echo_drain = echo_drain;
+        self
+    }
+
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
             return crate::executable::validate_native_override(p);
@@ -152,7 +172,29 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    /// The CLI's config root as the child will see it, including login-shell
+    /// values in packaged GUI builds, not only the engine's environment.
+    fn config_root(&self, exe: &PathBuf) -> PathBuf {
+        let mut cmd = Command::new(exe);
+        crate::compose_child_environment(&mut cmd, exe);
+        self.launch.apply_launch(&mut cmd);
+        #[cfg(not(windows))]
+        let command_env = cmd.as_std().get_envs();
+        #[cfg(windows)]
+        let command_env = cmd.as_std_mut().get_envs();
+        command_env
+            .filter(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
+            .find_map(|(_, value)| value.filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| crate::executable::home_or_current_dir().join(".claude"))
+    }
+
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest, resume: &ResumeLaunch) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_environment(&mut cmd, exe);
         self.launch.apply_launch(&mut cmd);
@@ -165,6 +207,9 @@ impl ClaudeHarness {
             // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            // Echo each consumed stdin user line (same `uuid`) as the native
+            // input receipt.
+            "--replay-user-messages",
             // Newer Claude models emit no readable thinking text unless a
             // summary is asked for (raw reasoning stays provider-private).
             "--thinking-display",
@@ -179,11 +224,18 @@ impl ClaudeHarness {
         // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
         // always-on thinking are settings overrides.
         if let Some(model) = &request.model {
-            let one_m = request
-                .model_options
-                .get("contextWindow")
-                .and_then(Value::as_str)
-                == Some("1m");
+            // The catalog default applies when no window was chosen, so the
+            // process runs the window the picker and the budget report.
+            let one_m = match catalog::selected_context_window(model, &request.model_options) {
+                Some(choice) => choice == "1m",
+                None => {
+                    request
+                        .model_options
+                        .get("contextWindow")
+                        .and_then(Value::as_str)
+                        == Some("1m")
+                }
+            };
             cmd.arg("--model");
             cmd.arg(if one_m {
                 format!("{model}[1m]")
@@ -204,8 +256,20 @@ impl ClaudeHarness {
         if policy.claude_permission_mode == "bypassPermissions" {
             cmd.arg("--dangerously-skip-permissions");
         }
-        if let Some(resume) = &request.resume {
-            cmd.arg(format!("--resume={resume}"));
+        match resume {
+            ResumeLaunch::None => {}
+            ResumeLaunch::Session(session) => {
+                cmd.arg(format!("--resume={session}"));
+            }
+            ResumeLaunch::Fork(token) => {
+                // The child id is ours, so a start that dies before `init`
+                // resolves to the same session instead of forking again.
+                cmd.arg(format!("--resume={}", token.parent));
+                cmd.args(["--fork-session", "--session-id", &token.child]);
+                if let Some(at) = &token.at {
+                    cmd.args(["--resume-session-at", at]);
+                }
+            }
         }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
@@ -347,6 +411,9 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
 
 #[async_trait]
 impl Harness for ClaudeHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::ClaudeCode
     }
@@ -358,6 +425,14 @@ impl Harness for ClaudeHarness {
     }
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
+    }
+    /// Receipts are the CLI's `--replay-user-messages` echo of the submitted
+    /// `uuid`, so the local `Steered` boundary cannot retire a pending input.
+    fn confirms_steered_inputs(&self) -> bool {
+        true
+    }
+    fn model_context_window(&self, model: &str, options: &serde_json::Map<String, Value>) -> Option<u64> {
+        catalog::declared_context_window(model, options)
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[
@@ -479,7 +554,9 @@ impl ClaudeHarness {
             request.interaction_mode,
         )?;
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let config_root = self.config_root(&exe);
+        let resume = ResumeLaunch::resolve(&config_root, request.resume.as_deref())?;
+        let mut cmd = self.build_command(&exe, &request, &resume);
         let mcp_config = controls.mcp.claude_config()?;
         if let Some(config) = &mcp_config {
             cmd.arg("--mcp-config").arg(config.path());
@@ -507,26 +584,11 @@ impl ClaudeHarness {
                 "",
             ]);
         }
-        let normalizer = if let Some(session_id) = &request.resume {
-            // Match the child's environment, including login-shell values in
-            // packaged GUI builds, rather than only the engine's environment.
-            #[cfg(not(windows))]
-            let command_env = cmd.as_std().get_envs();
-            #[cfg(windows)]
-            let command_env = cmd.as_std_mut().get_envs();
-            let config = command_env
-                .filter(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
-                .find_map(|(_, value)| value.filter(|value| !value.is_empty()))
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("CLAUDE_CONFIG_DIR")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                })
-                .unwrap_or_else(|| crate::executable::home_or_current_dir().join(".claude"));
-            Normalizer::for_resume(&config, session_id).await
-        } else {
-            Normalizer::new()
+        // Spawn identity comes from the history the child continues: the
+        // parent's, for a first fork run.
+        let normalizer = match resume.history_session() {
+            Some(session_id) => Normalizer::for_resume(&config_root, session_id).await,
+            None => Normalizer::new(),
         };
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -567,11 +629,17 @@ impl ClaudeHarness {
         // also ride the prompt text, so a skipped/unreadable file degrades to
         // the old-app behavior (the agent opens the path with its Read tool).
         let images = load_image_blocks(&request.attachments).await;
+        let first_uuid = new_input_uuid();
         let first = wire::user_message_line_with_images(
             &apply_ultrathink(request.reasoning, &request.prompt),
             &images,
+            &first_uuid,
         );
         let _ = stdin_tx.send(StdinMsg::Line(first));
+        // The prompt has no mailbox identity: its echo is the uncorrelated
+        // root-input receipt.
+        let mut pending_inputs = PendingInputs::default();
+        pending_inputs.register(first_uuid, None);
 
         let (event_tx, event_rx) = crate::session_event_channel(&controls.mcp);
         let session = Session {
@@ -581,10 +649,12 @@ impl ClaudeHarness {
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
             event_tx,
+            pending_inputs,
             controls,
             reasoning: request.reasoning,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            echo_drain: self.echo_drain,
             stderr_tail,
             _mcp_config: mcp_config,
         };
@@ -597,6 +667,90 @@ impl ClaudeHarness {
             rx.recv().await.map(|ev| (ev, rx))
         })
         .boxed())
+    }
+}
+
+/// How a run attaches to native history.
+enum ResumeLaunch {
+    None,
+    Session(String),
+    /// First run of a lazy fork (see [`fork`]).
+    Fork(fork::ForkToken),
+}
+
+impl ResumeLaunch {
+    fn resolve(config_root: &std::path::Path, resume: Option<&str>) -> Result<Self, HarnessError> {
+        let Some(resume) = resume else {
+            return Ok(Self::None);
+        };
+        let Some(token) = fork::ForkToken::parse(resume) else {
+            return Ok(Self::Session(resume.to_owned()));
+        };
+        match fork::plan(config_root, &token) {
+            fork::ForkPlan::ResumeChild => Ok(Self::Session(token.child)),
+            fork::ForkPlan::Fork => Ok(Self::Fork(token)),
+            // Definite: nothing has been written for this fork, so the host
+            // may rebuild from portable context rather than guess.
+            fork::ForkPlan::Unavailable => Err(HarnessError::Protocol(
+                "The Claude conversation this thread was forked from is no longer on this device."
+                    .into(),
+            )),
+        }
+    }
+
+    /// The session whose history the process continues.
+    fn history_session(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Session(id) => Some(id),
+            Self::Fork(token) => Some(&token.parent),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::session_lifecycle::SessionLifecycle for ClaudeHarness {
+    /// Turn refs are the CLI's assistant message uuids, which
+    /// `--resume-session-at` cuts at.
+    fn can_fork_from_turn(&self) -> bool {
+        true
+    }
+
+    /// Only a recorded assistant message of a parent transcript in the child's
+    /// own working directory can be forked: a moving head, a legacy turn with
+    /// no uuid, or a parent that is gone all fall back to portable context.
+    async fn can_fork_now(
+        &self,
+        request: &crate::session_lifecycle::NativeForkRequest,
+    ) -> Result<bool, HarnessError> {
+        let (Some(at), true) = (request.source_turn_id.clone(), request.rollback_turns.is_none())
+        else {
+            return Ok(false);
+        };
+        let config_root = self.config_root(&self.resolve_executable()?);
+        let (parent, cwd) = (request.source_thread_id.clone(), request.cwd.clone());
+        Ok(tokio::task::spawn_blocking(move || {
+            fork::can_fork_at(&config_root, &parent, &at, &cwd)
+        })
+        .await
+        .unwrap_or(false))
+    }
+
+    /// Forking only mints the child's identity: the CLI writes the child when
+    /// its first turn runs, and that run expands the token. No process starts
+    /// here, so there is no acceptance to lose; a retry reuses the token.
+    async fn fork_thread(
+        &self,
+        request: crate::session_lifecycle::NativeForkRequest,
+    ) -> Result<String, HarnessError> {
+        if !self.can_fork_now(&request).await? {
+            return Err(HarnessError::Protocol(
+                "Cannot fork Claude here: the source turn is not in a local transcript for this directory.".into(),
+            ));
+        }
+        fork::ForkToken::mint(&request.source_thread_id, request.source_turn_id.as_deref())
+            .map(|token| token.encode())
+            .ok_or_else(|| HarnessError::Protocol("Claude fork source id is malformed.".into()))
     }
 }
 
@@ -687,6 +841,162 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     blocks
 }
 
+/// A steer line ready to write, in submission order.
+enum PreparedSteer {
+    Line {
+        line: String,
+        uuid: String,
+        /// The mailbox message the echo of `uuid` retires, when identified.
+        receipt_for: Option<String>,
+        notification_acceptance: Option<tokio::sync::oneshot::Sender<bool>>,
+    },
+    /// The mailbox closed after every steer before it.
+    Close,
+}
+
+/// Builds steer lines one at a time off the run loop: inlining host-owned
+/// images reads files and base64-encodes them, which must not stall stdout
+/// draining or interrupt handling. `None` marks the mailbox closing.
+fn spawn_steer_preparer(
+    reasoning: Option<ReasoningLevel>,
+) -> (
+    mpsc::UnboundedSender<Option<crate::SteerMessage>>,
+    mpsc::UnboundedReceiver<PreparedSteer>,
+) {
+    let (prepare_tx, mut prepare_rx) = mpsc::unbounded_channel::<Option<crate::SteerMessage>>();
+    let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(item) = prepare_rx.recv().await {
+            let Some(msg) = item else {
+                let _ = ready_tx.send(PreparedSteer::Close);
+                return;
+            };
+            // Same best-effort inlining as the first prompt: an unreadable
+            // image keeps its path ref in the text.
+            let images = load_image_blocks(&msg.attachments).await;
+            let uuid = new_input_uuid();
+            let line = wire::user_message_line_with_images(
+                &apply_ultrathink(reasoning, &msg.prompt),
+                &images,
+                &uuid,
+            );
+            let ready = PreparedSteer::Line {
+                line,
+                uuid,
+                receipt_for: msg.message_id,
+                notification_acceptance: msg.notification_acceptance,
+            };
+            if ready_tx.send(ready).is_err() {
+                return;
+            }
+        }
+    });
+    (prepare_tx, ready_rx)
+}
+
+fn new_input_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Submitted stdin user lines awaiting their `--replay-user-messages` echo,
+/// keyed by the host-chosen line `uuid`. A line's echo is consumed once: a
+/// duplicate or unknown echo yields nothing, so it can never accept another
+/// message.
+///
+/// The engine retires a steer only on its receipt (`confirms_steered_inputs`)
+/// and re-dispatches whatever is still pending when the run dies as a fresh
+/// turn, so a steer the CLI consumed without echoing would run twice. The echo
+/// is therefore only trusted once this process has proven it echoes: the first
+/// echo seen proves it, and a turn result with none seen disproves it, after
+/// which mailbox steers fall back to boundary retirement (a receipt as soon as
+/// the line is written, as before receipts existed).
+#[derive(Default)]
+struct PendingInputs {
+    entries: std::collections::HashMap<String, Option<String>>,
+    echo_proven: bool,
+    echo_disproved: bool,
+}
+
+impl PendingInputs {
+    fn register(&mut self, uuid: String, message_id: Option<String>) {
+        self.entries.insert(uuid, message_id);
+    }
+
+    fn accept(&mut self, uuid: &str) -> Option<AgentEvent> {
+        let message_id = self.entries.remove(uuid)?;
+        self.echo_proven = true;
+        Some(crate::input_accepted_event(message_id))
+    }
+
+    /// Whether any mailbox steer still awaits its echo.
+    fn has_steers(&self) -> bool {
+        self.entries.values().any(Option::is_some)
+    }
+
+    /// A turn result arrived: an echo that never appeared by now never will.
+    fn note_turn_result(&mut self) {
+        self.echo_disproved |= !self.echo_proven;
+    }
+
+    /// Whether the echo cannot be relied on (no echo seen at a turn result).
+    fn echo_disproved(&self) -> bool {
+        self.echo_disproved
+    }
+
+    /// Boundary-retirement fallback: receipts for every mailbox steer still
+    /// pending, for a CLI that has not proven it echoes.
+    fn retire_unechoed_steers(&mut self) -> Vec<AgentEvent> {
+        let mut retired = Vec::new();
+        self.entries.retain(|_, message_id| match message_id.take() {
+            Some(message_id) => {
+                retired.push(crate::input_accepted_event(Some(message_id)));
+                false
+            }
+            None => true,
+        });
+        retired
+    }
+
+    /// Same fallback, applied only while the echo is unproven.
+    fn retire_if_unproven(&mut self) -> Vec<AgentEvent> {
+        if self.echo_proven {
+            Vec::new()
+        } else {
+            self.retire_unechoed_steers()
+        }
+    }
+}
+
+/// After an errored result the run ends and the engine would re-dispatch any
+/// steer still unechoed. A CLI that echoes does so as it dequeues the line,
+/// within moments of the result, so give already-written lines one bounded
+/// chance to be acknowledged (stdout is read to EOF or until nothing is
+/// pending). A line consumed in this window is never re-dispatched.
+async fn drain_echoes(
+    stdout_lines: &mut tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
+    pending_inputs: &mut PendingInputs,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    window: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    while pending_inputs.has_steers() {
+        let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, stdout_lines.next_line()).await
+        else {
+            break;
+        };
+        let Ok(Frame::User(user)) = wire::parse_frame(line.trim()) else {
+            continue;
+        };
+        if user.is_replay
+            && let Some(receipt) = user.uuid.as_deref().and_then(|uuid| pending_inputs.accept(uuid))
+            && event_tx.send(Ok(receipt)).await.is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
 /// tolerated and logged.
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
@@ -722,10 +1032,13 @@ struct Session {
     stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    /// Submitted stdin user lines still waiting for their native echo.
+    pending_inputs: PendingInputs,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    echo_drain: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
     _mcp_config: Option<tempfile::NamedTempFile>,
@@ -741,10 +1054,12 @@ async fn run_session(session: Session) {
         mut stdout_lines,
         stdin_tx,
         event_tx,
+        mut pending_inputs,
         controls,
         reasoning,
         interrupt_grace,
         kill_grace,
+        echo_drain,
         stderr_tail,
         _mcp_config,
     } = session;
@@ -764,6 +1079,7 @@ async fn run_session(session: Session) {
     let _permission_lifetime = interrupt.clone().drop_guard();
 
     let mut steering_open = true;
+    let (prepare_tx, mut ready_rx) = spawn_steer_preparer(reasoning);
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut any_done = false;
@@ -796,8 +1112,51 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
+                    // A replayed stdin line is the CLI's consumption receipt for
+                    // that exact submission, never conversation traffic.
+                    if let Frame::User(user) = &frame
+                        && user.is_replay
+                    {
+                        if let Some(receipt) = user
+                            .uuid
+                            .as_deref()
+                            .and_then(|uuid| pending_inputs.accept(uuid))
+                            && event_tx.send(Ok(receipt)).await.is_err()
+                        {
+                            break 'main;
+                        }
+                        continue;
+                    }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
+                        if let AgentEvent::Done { status, .. } = &ev {
+                            // A turn result with no echo ever seen disproves
+                            // the echo: retire what is pending the old way
+                            // before the result can end the run.
+                            pending_inputs.note_turn_result();
+                            for receipt in pending_inputs.retire_if_unproven() {
+                                if event_tx.send(Ok(receipt)).await.is_err() {
+                                    break 'main;
+                                }
+                            }
+                            // An errored result ends the run, and the engine
+                            // re-dispatches steers still unechoed: let ones
+                            // the CLI is already consuming be acknowledged.
+                            // A completed turn parks with the process alive,
+                            // so a late echo still lands on its own.
+                            if *status == DoneStatus::Errored
+                                && !interrupted
+                                && !drain_echoes(
+                                    &mut stdout_lines,
+                                    &mut pending_inputs,
+                                    &event_tx,
+                                    echo_drain,
+                                )
+                                .await
+                            {
+                                break 'main;
+                            }
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
@@ -817,10 +1176,23 @@ async fn run_session(session: Session) {
                 }
             },
 
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let queued = if let Some(receipt) = msg.notification_acceptance {
+            // Steers are prepared (image read + base64) off this loop, in
+            // order, so stdout draining and interrupts never wait on a file.
+            steer = steering.recv(), if steering_open && !interrupted => {
+                steering_open = steer.is_some();
+                let _ = prepare_tx.send(steer);
+            },
+
+            Some(ready) = ready_rx.recv() => match ready {
+                PreparedSteer::Line { line, uuid, receipt_for, notification_acceptance } => {
+                    // Prepared before an interrupt landed: never written.
+                    if interrupted {
+                        if let Some(receipt) = notification_acceptance {
+                            let _ = receipt.send(false);
+                        }
+                        continue 'main;
+                    }
+                    let queued = if let Some(receipt) = notification_acceptance {
                         match stdin_tx.send(StdinMsg::Steer { line, receipt }) {
                             Ok(()) => true,
                             Err(error) => {
@@ -834,6 +1206,20 @@ async fn run_session(session: Session) {
                         stdin_tx.send(StdinMsg::Line(line)).is_ok()
                     };
                     if !queued {continue 'main;}
+                    // Only an identified mailbox message can be retired by its
+                    // echo; an anonymous steer has nothing to acknowledge.
+                    if let Some(message_id) = receipt_for {
+                        pending_inputs.register(uuid, Some(message_id));
+                        // Once a result has shown this CLI does not echo,
+                        // the write is the only acknowledgement there is.
+                        if pending_inputs.echo_disproved() {
+                            for receipt in pending_inputs.retire_unechoed_steers() {
+                                if event_tx.send(Ok(receipt)).await.is_err() {
+                                    break 'main;
+                                }
+                            }
+                        }
+                    }
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.
@@ -846,10 +1232,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                 }
-                None => {
+                PreparedSteer::Close => {
                     // Mailbox closed: end the input so the run can finish
-                    // after the current turn.
-                    steering_open = false;
+                    // after the current turn (after every prepared steer).
                     let _ = stdin_tx.send(StdinMsg::Close);
                 }
             },
@@ -878,6 +1263,12 @@ async fn run_session(session: Session) {
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
+        // The process ended before any echo proved itself: its steers were
+        // written and cannot be told from consumed ones, so they retire here
+        // rather than run again as fresh turns.
+        for receipt in pending_inputs.retire_if_unproven() {
+            let _ = event_tx.send(Ok(receipt)).await;
+        }
         if interrupted && !done_after_interrupt {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
@@ -1195,6 +1586,41 @@ mod tests {
                 .unwrap()
         );
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn declared_context_window_follows_the_catalog_option() {
+        let harness = ClaudeHarness::new();
+        let mut options = serde_json::Map::new();
+        // 1M-default models report 1M with nothing selected; Sonnet is 200K.
+        for model in ["claude-opus-5-5", "claude-fable-5", "claude-fable-5-1"] {
+            assert_eq!(
+                harness.model_context_window(model, &options),
+                Some(1_000_000),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            harness.model_context_window("claude-sonnet-5", &options),
+            Some(200_000)
+        );
+        options.insert("contextWindow".into(), "200k".into());
+        assert_eq!(
+            harness.model_context_window("claude-opus-5-5", &options),
+            Some(200_000)
+        );
+        options.insert("contextWindow".into(), "1m".into());
+        assert_eq!(
+            harness.model_context_window("claude-sonnet-5", &options),
+            Some(1_000_000)
+        );
+        // No selectable window: the option cannot widen it. Custom IDs are
+        // never guessed.
+        assert_eq!(
+            harness.model_context_window("claude-opus-4-8", &options),
+            Some(200_000)
+        );
+        assert_eq!(harness.model_context_window("my-proxy-model", &options), None);
     }
 
     #[test]

@@ -65,6 +65,36 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}'
   ;;
 
+*scenario:turnref*)
+  # A finished turn names the assistant message the CLI can cut a fork after:
+  # the LAST top-level assistant frame (subagent frames never count).
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-ref"}'
+  emit '{"type":"assistant","uuid":"asst-1","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+  emit '{"type":"assistant","uuid":"asst-sub","parent_tool_use_id":"t1","message":{"content":[{"type":"text","text":"sub"}]}}'
+  emit '{"type":"assistant","uuid":"asst-2","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"done"}]}}'
+  emit '{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ref"}'
+  ;;
+
+*scenario:forkdie*)
+  # The CLI dies before `init`: no session is written, nothing was accepted.
+  exit 1
+  ;;
+
+*scenario:fork*)
+  # Reports the resume/fork flags it was launched with and adopts the
+  # host-chosen --session-id, as a forked first turn does.
+  sid=""; prev=""; flags=""
+  for a in "$@"; do
+    case "$a" in --resume=*|--fork-session) flags="$flags $a" ;; esac
+    case "$prev" in --session-id) sid="$a"; flags="$flags --session-id=$a" ;; --resume-session-at) flags="$flags --resume-session-at=$a" ;; esac
+    prev="$a"
+  done
+  [ -n "$sid" ] || sid="sess-resumed"
+  emit "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-fable-5\",\"tools\":[],\"cwd\":\"/tmp\",\"session_id\":\"$sid\"}"
+  emit "{\"type\":\"assistant\",\"uuid\":\"asst-fork\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"flags:$flags\"}]}}"
+  emit "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"flags:$flags\",\"errors\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"session_id\":\"$sid\"}"
+  ;;
+
 *scenario:wake*)
   # Eager-done + wake, the live-verified 2.1.228 background-subagent shape:
   # the parent turn settles with result #1 while the subagent still runs;
@@ -116,6 +146,22 @@ case "$first" in
   esac
   ;;
 
+*scenario:steer-image*)
+  # A host-owned image rides the steer line as an inline base64 block ahead of
+  # the text, exactly like the first prompt's attachments.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer-image"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
+  read -r steer || exit 1
+  verdict=missing-image
+  case "$steer" in
+  *'"type":"image"'*'"text":"look at this"'*)
+    case "$steer" in *'"media_type":"image/png"'*) verdict=image-steered ;; esac
+    ;;
+  esac
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"$verdict\"}}}"
+  emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer-image"}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
@@ -124,6 +170,70 @@ case "$first" in
   content=$(printf '%s\n' "$steer" | sed 's/.*"content":"\([^"]*\)".*/\1/')
   emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steered:$content\"}}}"
   emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer"}'
+  ;;
+
+*scenario:receipts*)
+  # --replay-user-messages: the CLI echoes each stdin user line (same uuid,
+  # isReplay) once it has consumed it. The prompt echo precedes any output; the
+  # steer echo follows its line; a duplicate and an unknown-uuid echo must be
+  # ignored, and the replay text must never reach the transcript.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-receipts\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  case "$*" in *--replay-user-messages*) ;; *) exit 1 ;; esac
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-receipts"}'
+  echo_user "$(uuid_of "$first")"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
+  read -r steer || exit 1
+  echo_user "unknown-uuid"
+  sid=$(uuid_of "$steer")
+  echo_user "$sid"
+  echo_user "$sid"
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-receipts"}'
+  ;;
+
+*scenario:noecho*)
+  # An older CLI: --replay-user-messages is accepted but nothing is ever echoed.
+  # A steer is consumed silently, so the host must retire it by the write.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-noecho"}'
+  read -r steer || exit 1
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"consumed"}}}'
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-noecho"}'
+  ;;
+
+*scenario:echolate*)
+  # The steer is queued past the turn's last boundary: the turn's result
+  # arrives first and the CLI echoes the line only when it dequeues it.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-late\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-late"}'
+  echo_user "$(uuid_of "$first")"
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-late"}'
+  echo_user "$(uuid_of "$steer")"
+  ;;
+
+*scenario:neverconsumed*)
+  # The CLI echoes its root prompt, then errors out without ever consuming
+  # the steer: nothing may acknowledge it (it was not run).
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-never\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-never"}'
+  echo_user "$(uuid_of "$first")"
+  # Hold the result until the steer line is on stdin so it is genuinely written.
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["boom"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-never"}'
+  ;;
+
+*scenario:erroredecho*)
+  # The result errors, and the echo of the already-written steer follows it:
+  # the CLI had consumed the line, so the host must not run it again.
+  uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
+  echo_user() { emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"REPLAYED\"},\"session_id\":\"sess-erred\",\"parent_tool_use_id\":null,\"uuid\":\"$1\",\"isReplay\":true}"; }
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-erred"}'
+  echo_user "$(uuid_of "$first")"
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["boom"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-erred"}'
+  echo_user "$(uuid_of "$steer")"
   ;;
 
 *scenario:interrupt*)

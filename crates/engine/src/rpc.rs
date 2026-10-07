@@ -1278,9 +1278,13 @@ fn forwardable(method: &str) -> bool {
             | methods::CHANGE_THREAD_PULL_REQUEST
             | methods::HANDOFF_THREAD_WORKTREE
             | methods::GET_THREAD_TRANSFER_STATE
+            | methods::GET_THREAD_INHERITED_HISTORY
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
             | methods::DISCONNECT_THREAD_SESSION
+            | methods::STOP_THREAD_WORK
+            | methods::RESET_THREAD_SESSION
+            | methods::CANCEL_DELEGATED_TASK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
@@ -1642,9 +1646,13 @@ impl RpcService for EngineRpc {
                 | methods::ACKNOWLEDGE_THREAD_WOKE
                 | methods::MUTATE_QUEUED_RUN
                 | methods::DISCONNECT_THREAD_SESSION
+                | methods::STOP_THREAD_WORK
+                | methods::RESET_THREAD_SESSION
+                | methods::CANCEL_DELEGATED_TASK
                 | methods::FORK_THREAD
                 | methods::MERGE_THREAD_BACK
                 | methods::GET_THREAD_TRANSFER_STATE
+                | methods::GET_THREAD_INHERITED_HISTORY
         ) && params.get("targetDeviceId").is_none()
             && let Some(chat) = params["chatId"]
                 .as_str()
@@ -1781,6 +1789,79 @@ impl RpcService for EngineRpc {
                 let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
                 RpcReply::value(&domain.disconnect_for_user(&self.doc_host, request).await?)
             }
+            methods::STOP_THREAD_WORK => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::StopThreadWorkParams = parse_params(params)?;
+                if request.client_request_id.trim().is_empty()
+                    || request.client_request_id.len() > 512
+                    || request.chat_id.trim().is_empty()
+                {
+                    return Err(RpcError::BadParams(
+                        "Stop requests need a chat and a request identity of at most 512 bytes."
+                            .into(),
+                    ));
+                }
+                if !self.doc_host.is_host(&request.chat_id) {
+                    return Err(RpcError::Failed(
+                        "Stopping a thread requires the owning host.".into(),
+                    ));
+                }
+                let service = self
+                    .delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Thread Stop is unavailable.".into()))?;
+                let handle = self
+                    .doc_host
+                    .open(&request.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Same freeze as an ordinary user Stop: the interrupt's Idle
+                // must not release the next queued message.
+                let mut freeze = self
+                    .doc_host
+                    .freeze_queue_for_stop(&handle)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let thread = request.chat_id.into();
+                let result = match crate::orchestration::stop_all::stop_thread_work(
+                    &service.kernel,
+                    &thread,
+                    &request.client_request_id,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if result.stopped_runs > 0 {
+                            freeze.keep();
+                        }
+                        result
+                    }
+                    // A definite refusal is not an uncertain transport failure.
+                    Err(crate::orchestration::Error::Invariant(refusal)) => {
+                        zeron_proto::transfer::StopThreadWorkResult {
+                            refusal: Some(refusal),
+                            ..Default::default()
+                        }
+                    }
+                    Err(error) => return Err(RpcError::Failed(error.to_string())),
+                };
+                RpcReply::value(&result)
+            }
+            methods::RESET_THREAD_SESSION => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::ResetThreadSessionParams =
+                    parse_params(params)?;
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Provider session control is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                RpcReply::value(&domain.reset_for_user(&self.doc_host, request).await?)
+            }
             methods::MUTATE_QUEUED_RUN => {
                 let request: zeron_proto::MutateQueuedRunParams = parse_params(params)?;
                 if !self.doc_host.is_host(&request.chat_id) {
@@ -1849,6 +1930,7 @@ impl RpcService for EngineRpc {
             }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::GET_THREAD_TRANSFER_STATE
+            | methods::GET_THREAD_INHERITED_HISTORY
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
@@ -1860,6 +1942,7 @@ impl RpcService for EngineRpc {
                     &self.sessions,
                     &self.workspace,
                     &self.registry,
+                    &self.doc_host,
                 )
                 .await
             }
@@ -2597,7 +2680,46 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
+                let selection = match &p {
+                    MutateParams::SetChatConfig { chat_id, config } => {
+                        Some((chat_id.clone(), config.clone()))
+                    }
+                    _ => None,
+                };
+                let Some((chat_id, written)) = selection else {
+                    self.mutate(p)?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                };
+                let Some(service) = self
+                    .delegation
+                    .as_ref()
+                    .filter(|_| self.doc_host.is_host(&chat_id))
+                else {
+                    self.mutate(p)?;
+                    return RpcReply::value(&serde_json::json!({ "ok": true }));
+                };
+                // The chat row is the LWW record; the thread's saved selection
+                // follows it so a mid-run composer change drives the queue's
+                // promotion mode. The write and its mirror share the chat's
+                // owner lane, and the mirror reads the row back, so overlapping
+                // writes cannot leave the thread on an older selection.
+                let handle = self
+                    .doc_host
+                    .open(&chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let _lane = handle.orchestration_queue_lock().await;
                 self.mutate(p)?;
+                let config = self.workspace.chat_config(&chat_id).unwrap_or(written);
+                if let Err(error) = crate::orchestration::selection_sync::mirror_chat_config(
+                    &service.kernel,
+                    &self.registry,
+                    &chat_id,
+                    &config,
+                )
+                .await
+                {
+                    tracing::warn!(chat = %chat_id, %error, "composer selection was not mirrored to the thread");
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
@@ -3749,10 +3871,14 @@ mod tests {
             methods::CONTROL_WORKTREE_SETUP,
             methods::HANDOFF_THREAD_WORKTREE,
             methods::GET_THREAD_TRANSFER_STATE,
+            methods::GET_THREAD_INHERITED_HISTORY,
             methods::PREVIEW_FILE_CHECKPOINT_RESTORE,
             methods::RESTORE_FILE_CHECKPOINT,
             methods::MUTATE_QUEUED_RUN,
             methods::DISCONNECT_THREAD_SESSION,
+            methods::STOP_THREAD_WORK,
+            methods::RESET_THREAD_SESSION,
+            methods::CANCEL_DELEGATED_TASK,
         ] {
             assert!(forwardable(method), "{method}");
             assert!(!is_stream_method(method), "{method}");

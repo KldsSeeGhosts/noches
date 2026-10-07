@@ -97,8 +97,74 @@ pub(crate) fn steerable(projection: &ThreadProjection) -> Option<&OrchestrationV
         .max_by_key(|r| r.ordinal)
 }
 
+/// A restart that also changes the run's selection. The old exact process is
+/// still fenced by the committed `ProviderTurnRestart` effect; this only
+/// describes the replacement binding the new attempt/root start on.
+#[derive(Debug, Clone)]
+pub(crate) struct Rebind {
+    pub selection: zeron_proto::provider_instance::ModelSelection,
+    pub driver: String,
+    pub transition: crate::orchestration::task::SelectionTransition,
+}
+
+/// Provider generation a selection-changing restart continues on. A change the
+/// native session absorbs keeps the run's own generation. Otherwise an earlier
+/// run's generation on the target instance is reused only when its selection is
+/// compatible (A->B->A); everything else, including this run's own earlier
+/// generations (their native history misses what ran since), mints a new one.
+fn restart_generation(
+    projection: &ThreadProjection,
+    run: &OrchestrationV2Run,
+    rebind: &Rebind,
+    attempt_ordinal: i64,
+    root: &NodeId,
+    now: i64,
+) -> Result<Option<OrchestrationV2ProviderThread>> {
+    use crate::orchestration::task::{SelectionTransition, reusable_generation};
+    let instance = &rebind.selection.instance_id;
+    if instance == &run.provider_instance_id
+        && rebind.transition == SelectionTransition::ApplyOnNextTurn
+    {
+        return Ok(None);
+    }
+    let time = iso(now)?;
+    if let Some((_, provider)) = reusable_generation(
+        projection,
+        instance,
+        &rebind.selection,
+        run.ordinal,
+        &rebind.driver,
+    )
+    .filter(|(_, provider)| {
+        run.provider_thread_id
+            .as_ref()
+            .is_none_or(|id| provider["id"] != id.0)
+    }) {
+        let mut provider: OrchestrationV2ProviderThread = serde_json::from_value(provider.clone())?;
+        provider.owner_node_id = Some(root.clone());
+        provider.last_run_ordinal = Some(run.ordinal);
+        provider.updated_at = time;
+        return Ok(Some(provider));
+    }
+    let id = format!(
+        "provider-thread:app:{}:{}:{}:attempt:{attempt_ordinal}",
+        encode_component(&projection.thread.id.0),
+        encode_component(&instance.0),
+        run.ordinal
+    );
+    Ok(Some(serde_json::from_value(json!({
+        "id":id,"driver":rebind.driver,"providerInstanceId":instance,
+        "providerSessionId":null,"appThreadId":projection.thread.id,"ownerNodeId":root,"nativeThreadRef":null,
+        "nativeConversationHeadRef":null,"status":"not_loaded","firstRunOrdinal":run.ordinal,"lastRunOrdinal":run.ordinal,
+        "handoffIds":[],"forkedFrom":null,"pendingBackgroundTasks":[],"createdAt":time,"updatedAt":time
+    }))?))
+}
+
 /// Queue promotion and ordinary steering replace an attempt, not the logical
 /// run. The effect freezes the original process while the new root owns input.
+/// With a `rebind` the replacement attempt/root bind to the new selection (and,
+/// when needed, a new provider generation); the effect keeps naming the OLD
+/// provider thread/turn so teardown stays fenced to the exact old process.
 pub(crate) fn restart_attempt(
     projection: &ThreadProjection,
     command: &Command,
@@ -107,6 +173,7 @@ pub(crate) fn restart_attempt(
     session_id: &str,
     turn: &Value,
     message_id: &MessageId,
+    rebind: Option<&Rebind>,
     now: i64,
 ) -> Result<OrchestrationV2Run> {
     let old = projection
@@ -148,6 +215,14 @@ pub(crate) fn restart_attempt(
     previous_root.status = OrchestrationV2ExecutionNodeStatus::Interrupted;
     previous_root.completed_at = Some(iso(now)?);
     plan.emit(command, "node.updated", &previous_root, now)?;
+    let generation = rebind
+        .map(|rebind| restart_generation(projection, run, rebind, ordinal, &root_id, now))
+        .transpose()?
+        .flatten();
+    let bound_thread = generation
+        .as_ref()
+        .map(|provider| provider.id.clone())
+        .or_else(|| run.provider_thread_id.clone());
     let mut attempt = old.clone();
     attempt.id = attempt_id.clone();
     attempt.attempt_ordinal = ordinal;
@@ -157,16 +232,33 @@ pub(crate) fn restart_attempt(
     attempt.status = OrchestrationV2RunAttemptStatus::Pending;
     attempt.started_at = None;
     attempt.completed_at = None;
+    if let Some(rebind) = rebind {
+        attempt.provider_instance_id = rebind.selection.instance_id.clone();
+    }
+    if let Some(provider) = &generation {
+        // The replacement generation has its own accepted native identity,
+        // never the interrupted attempt's.
+        attempt.provider_thread_id = provider.id.clone();
+        attempt.native_thread_id = Optional::Absent;
+    }
     let root: OrchestrationV2ExecutionNode = serde_json::from_value(json!({
         "id":root_id,"threadId":projection.thread.id,"runId":run.id,"rootNodeId":root_id,
         "parentNodeId":null,"kind":"root_turn","status":"pending","countsForRun":true,
-        "providerThreadId":run.provider_thread_id,"providerTurnId":null,"nativeItemRef":null,
+        "providerThreadId":bound_thread,"providerTurnId":null,"nativeItemRef":null,
         "runtimeRequestId":null,"checkpointScopeId":null,"startedAt":null,"completedAt":null}))?;
     let mut restarted = run.clone();
+    if let Some(rebind) = rebind {
+        restarted.provider_instance_id = rebind.selection.instance_id.clone();
+        restarted.model_selection = rebind.selection.clone();
+        restarted.provider_thread_id = bound_thread;
+    }
     restarted.root_node_id = Some(root_id);
     restarted.active_attempt_id = Some(attempt_id);
     restarted.user_message_id = message_id.clone();
     restarted.status = OrchestrationV2RunStatus::Starting;
+    if let Some(provider) = &generation {
+        plan.emit(command, "provider-thread.updated", provider, now)?;
+    }
     plan.emit(command, "run.updated", &restarted, now)?;
     plan.emit(command, "run-attempt.created", &attempt, now)?;
     plan.emit(command, "node.updated", &root, now)?;
@@ -533,6 +625,7 @@ pub(crate) fn plan(
                         session_id,
                         turn,
                         &input.message_id,
+                        None,
                         now,
                     )?;
                 } else {
@@ -558,12 +651,11 @@ pub(crate) fn plan(
                 plan.emit(command, "turn-item.updated", &item, now)?;
             } else {
                 let queued = active_run(&projection).is_some();
-                // T3 refuses a pending merge before resolving the queued
-                // provider/session. No input or unparking events may publish.
+                // A pending merge-back refuses a start here, before any input
+                // or unparking event publishes.
                 crate::orchestration::transfer::ensure_start_allowed(
                     &crate::orchestration::transfer::transfers(conn, &command.thread_id)?,
                     &command.thread_id,
-                    queued,
                 )?;
                 if queued {
                     let provider = active_run(&projection)

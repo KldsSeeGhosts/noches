@@ -465,6 +465,7 @@ async fn rejected_warm_submission_does_not_acknowledge_the_steering_boundary() {
             prompt: "rejected follow-up".into(),
             message_id: Some("rejected-warm-message".into()),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -702,6 +703,7 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
             notification_acceptance: None,
             prompt: "also do this".into(),
             message_id: Some("queued-steer-message".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

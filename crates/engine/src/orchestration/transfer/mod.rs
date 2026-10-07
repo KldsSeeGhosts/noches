@@ -598,19 +598,17 @@ pub(crate) fn inherited_items(
 }
 
 /// Shared by ThreadService's transactional send planner, ordinary admission,
-/// and the queued-start planner BEFORE accepting a new run.
-pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId, queued: bool) -> Result<()> {
+/// and the queued-start planner BEFORE accepting a new run. A pending
+/// merge-back does not block queueing: the first non-automatic run to actually
+/// start consumes it (see `delivery::prepare_run`); only merge-backs from more
+/// than one fork cannot be delivered together.
+pub fn ensure_start_allowed(transfers: &[Value], thread: &ThreadId) -> Result<()> {
     let pending: Vec<_> = transfers
         .iter()
         .filter(|t| {
             t["targetThreadId"] == thread.0 && t["type"] == "merge_back" && t["status"] == "pending"
         })
         .collect();
-    if queued && !pending.is_empty() {
-        return Err(Error::Invariant(format!(
-            "Thread {thread} has merged-back context waiting. Wait for the current run to finish, then send the message directly instead of queueing it."
-        )));
-    }
     if pending
         .iter()
         .filter_map(|t| t["sourceThreadId"].as_str())

@@ -18,6 +18,7 @@ the chat's owner device and sending `targetDeviceId`.
 | RPC | Params | Result |
 | --- | --- | --- |
 | `GetThreadTransferState` | `{chatId}` | `ThreadTransferState` |
+| `GetThreadInheritedHistory` | `{chatId, before?, limit?}` | `InheritedHistoryPage` |
 | `ForkThread` | `{chatId, commandId, targetChatId, sourcePoint, title?}` | `ThreadTransferResult` |
 | `MergeThreadBack` | `{chatId, commandId, targetChatId, sourcePoint}` | `ThreadTransferResult` |
 | `PreviewFileCheckpointRestore` | `{chatId, checkpointId}` | `RestorePreview` |
@@ -52,7 +53,20 @@ Example passive response (collections abbreviated):
   `deliveryStatus`, and empty `summaryText`. No private historical payload or
   native delivery record is published in a replica.
 - `inheritedItems`: passive source items with `inherited: true`, `sourceThreadId`,
-  and `sourceItemId`. Their original thread/run/item identity is retained.
+  and `sourceItemId`. Their original thread/run/item identity is retained. The
+  Details payload carries only a capped text preview of these.
+- `GetThreadInheritedHistory` (capability `thread-inherited-history-v1`): the full
+  read-only inherited transcript, newest page first. `entries` are
+  `SessionMessageEntry`-shaped: the user prompt, then each run's agent entries read
+  from the source chat's session document (text, reasoning, tool calls/results,
+  diffs, image refs; the turn items stand in when the document lacks the run).
+  Approvals, input requests, live subagent links and handoff/fork markers are
+  omitted. Text, tool output and diffs are
+  capped per part and a page stops at a byte budget (`shortened` counts cuts);
+  `limit` is clamped to 1..=50. `nextBefore` is the id of the oldest entry returned
+  and is the only cursor: the inherited list is frozen at the fork's source run, so
+  new parent runs never move it. An unknown cursor is refused. Images are fetched
+  by the client through the host's `ReadAttachmentChunk` transport, never inlined.
 - `checkpoints`: `FileCheckpoint {checkpoint, scope, cwd, headSha, treeSha,
   indexTreeSha, phase}`. `checkpoint` and `scope` are generated V2 types; phases
   are `started`, `completed`, and `backup`.
@@ -81,7 +95,7 @@ impersonated MCP session. Merge-back requires a live same-project direct
 parent on the same host, refuses a delegated target, and only prepares context
 for the next parent input. It neither starts nor interrupts an agent and never
 merges Git branches or writes working files. Pending queued/multiple-fork
-merge restrictions are preserved.
+merge restrictions are preserved (a waiting merge-back no longer blocks queueing).
 
 The Details audit distinguishes `Prepared` (logical consumption with no
 confirmed provider acceptance) from `Delivered` (native fork or an inline/
@@ -149,7 +163,7 @@ editors/Git processes do not participate.
   `refs/noches/checkpoints/...`, with separate-index `diff_sync` snapshots.
   Deterministic turn capture IDs and receipted publication recover a ref written
   before SQLite publication. Git objects/references are fsynced.
-- `transfer::ensure_start_allowed(transfers, thread, queued)` must run before
+- `transfer::ensure_start_allowed(transfers, thread)` must run before
   admission in the threads/queue planners. It is installed transactionally in
   `ThreadService`'s send planner and task/queue-drain paths, and in ordinary
   admission.
@@ -184,23 +198,46 @@ checkout or unavailable native coverage use full reconstruction. A stale
 caller resume cannot override a known selected provider handle. Imported
 runless history survives portable handoffs without duplicating the current
 input.
-Queued pending merges and competing forks retain T3's explicit refusals.
+Competing forks retain T3's explicit refusal. Unlike T3, a pending merge-back
+does not block queueing: the first non-automatic run to actually start consumes
+it exactly once (`prepare_run`); an automatic delivery leaves it pending, and a
+cancelled queued run never consumed it.
 
 Native hooks implemented: Codex `thread/fork` at `lastTurnId`; OpenCode 1.x
-`messageID` and 2.x `before` cut boundaries. Missing source/later cursors use
-portable context instead of copying an unstable head. Mocked protocol tests are
+`messageID` and 2.x `before` cut boundaries; Claude's lazy fork (below). Missing
+source/later cursors use portable context instead of copying an unstable head.
+
+Claude has no standalone fork primitive, so `fork_thread` only mints a deferred
+native id (`claude-fork:v1:<child>:<parent>:<assistant uuid>`) and starts no
+process. The child's first run expands it to `--resume <parent> --fork-session
+--session-id <child> --resume-session-at <uuid>`; the host-chosen child id makes
+a start that dies before `init` retry the same fork, and once the child's
+transcript exists the token resolves to a plain `--resume <child>`. Turn refs
+are the last top-level assistant frame uuid of each successful turn. Before any
+fork is recorded as in flight, `SessionLifecycle::can_fork_now` must confirm the
+uuid is in the parent's local transcript recorded in the child's working
+directory; otherwise (head with no ref, legacy turn, other directory, parent
+gone) delivery uses portable context. Verified against fake-CLI fixtures and CLI
+2.1.292 flag parsing only, not a live model turn. Mocked protocol tests are
 not live installed-provider verification.
 
 Remaining parity work, not claimed complete:
 
-- Claude/Pi/negotiated ACP native fork hooks; Codex legacy paginated fork/revert
-  fallback; lifecycle operations are not inferred from native resume support.
+- Pi/negotiated ACP native fork hooks (ACP `session/fork` is head-only); lifecycle operations are not inferred from native
+  resume support. Codex cursor-less (legacy) source turns do fork natively: head
+  fork, then paginated `thread/revert` of the counted settled later turns,
+  refused (portable fallback or uncertain fork) when a later turn is live or the
+  fork uses legacy history.
 - Loaded-process native history injection (the optional lifecycle hook currently
   defaults to unsupported, so production delivery falls back to bounded inline).
-- Live model-catalog context-window lookup. Accepted-root/native-identity usage
-  reports are wired; unknown windows retain T3's 128k fallback.
+- Handoff budgets prefer the adapter-declared catalog window
+  (`Harness::model_context_window`; Claude 200K/1M by the `contextWindow`
+  option), then accepted-root usage reports; undeclared windows retain T3's 128k
+  fallback. Codex/OpenCode/ACP catalogs do not declare one yet.
 - Cross-instance native-account resume compatibility, missing-native-input
-  reconstruction, `/compact` handoff deferral, and conversation rewind.
+  reconstruction, and conversation rewind. A bare `/compact` turn defers inline
+  handoff delivery (the next ordinary turn still owes it) and is refused on a
+  thread with no conversation.
 - Exact project-root lookup for legacy null-worktree threads at the launch-slice
   seam: currently uncertainty conservatively refuses restore.
 - Sparse checkout/submodule checkpoint parity: capture/restore explicitly refuse

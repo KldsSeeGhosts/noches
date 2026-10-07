@@ -42,7 +42,20 @@ pub(crate) fn persist(
     intents: Option<&[zeron_doc::QueuedMessage]>,
 ) -> Result<()> {
     if let Some(intents) = intents {
+        // A cancelled run released its files in its own transaction; a lagging
+        // Loro row must not re-claim them. A row without files owns no record.
+        let cancelled = cancelled_messages(conn, id)?;
         for intent in intents {
+            if cancelled.contains(&intent.id) {
+                continue;
+            }
+            if intent.attachments.is_empty() {
+                conn.execute(
+                    "DELETE FROM orchestration_queue_attachments WHERE thread_id=?1 AND message_id=?2",
+                    params![id.0, intent.id],
+                )?;
+                continue;
+            }
             conn.execute(
                 "INSERT INTO orchestration_queue_attachments VALUES(?1,?2,?3)
                  ON CONFLICT(thread_id,message_id) DO UPDATE SET paths_json=excluded.paths_json",
@@ -71,6 +84,25 @@ pub(crate) fn persist(
         }
     }
     Ok(())
+}
+
+/// User-message ids of this thread's cancelled runs: queued messages that
+/// will never start, whose Loro rows are only waiting to be dropped.
+pub(crate) fn cancelled_messages(
+    conn: &Connection,
+    thread: &ThreadId,
+) -> Result<std::collections::HashSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT json_extract(payload_json,'$.userMessageId')
+         FROM orchestration_projection_runs
+         WHERE thread_id=?1 AND json_extract(payload_json,'$.status')='cancelled'",
+    )?;
+    let rows = statement.query_map([&thread.0], |row| row.get::<_, Option<String>>(0))?;
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        ids.extend(row?);
+    }
+    Ok(ids)
 }
 
 pub(crate) fn attachment_paths(
@@ -128,6 +160,72 @@ pub(crate) fn parking_blocked(p: &projection::ThreadProjection) -> bool {
         })
 }
 
+const MAX_CONTEXT_REFS: usize = 50;
+const MAX_CONTEXT_FIELD_CHARS: usize = 200;
+
+/// Bounded presentation of a message's context records. Every known kind
+/// names its identifying field; unknown kinds keep only their label.
+fn context_refs(message: &Value) -> Vec<zeron_proto::QueueContextRef> {
+    fn field(record: &Value, key: &str) -> String {
+        record[key]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(MAX_CONTEXT_FIELD_CHARS)
+            .collect()
+    }
+    let joined = |parts: &[String]| {
+        parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    message["context"]["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_CONTEXT_REFS)
+        .filter_map(|record| {
+            let kind = record["kind"].as_str().filter(|kind| !kind.is_empty())?;
+            let detail = match kind {
+                "image" | "file" => field(record, "name"),
+                "terminal" => joined(&[
+                    field(record, "terminalLabel"),
+                    format!(
+                        "L{}-{}",
+                        record["lineStart"].as_u64().unwrap_or(0),
+                        record["lineEnd"].as_u64().unwrap_or(0)
+                    ),
+                ]),
+                "element" => joined(&[field(record, "tagName"), field(record, "selector")]),
+                "preview-annotation" => {
+                    let summary = field(record, "targetSummary");
+                    if summary.is_empty() {
+                        field(record, "pageTitle")
+                    } else {
+                        summary
+                    }
+                }
+                "review-comment" => {
+                    joined(&[field(record, "filePath"), field(record, "rangeLabel")])
+                }
+                "mention" => field(record, "path"),
+                "skill" => field(record, "name"),
+                "thread" => field(record, "title"),
+                _ => String::new(),
+            };
+            Some(zeron_proto::QueueContextRef {
+                context_id: field(record, "contextId"),
+                kind: kind.chars().take(40).collect(),
+                label: field(record, "label"),
+                detail,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
     let Some(p) = projection::read_thread(conn, id)? else {
         return Ok(QueueUiState {
@@ -161,7 +259,12 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
                     .as_array()
                     .cloned()
                     .unwrap_or_default(),
-                attachment_paths: intent.map(|i| i.attachments.clone()).unwrap_or_default(),
+                // SQL-only rows keep edited uploads in the host attachment table.
+                context: context_refs(message),
+                attachment_paths: match intent {
+                    Some(intent) => intent.attachments.clone(),
+                    None => attachment_paths(conn, id, &run.user_message_id.0).unwrap_or_default(),
+                },
                 held: run.queue_held.as_ref().copied().unwrap_or(false)
                     || intent.is_some_and(|i| i.hold_for_turn_end),
                 delivery_gate: intent
@@ -212,6 +315,7 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
         },
         woke_at: time(&marker["wokeAt"]),
     };
+    let promotion = queue::promotion_hint(&p);
     Ok(QueueUiState {
         schema_version: 1,
         thread_id: id.0.clone(),
@@ -221,8 +325,12 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
         lifecycle,
         active_run_id: task::active_run(&p).map(|run| run.id.0.clone()),
         background_run_id: super::background::settled_run(&p).map(|run| run.id.0.clone()),
-        can_promote_to_steer: queue::can_promote_to_steer(&p),
-        promotion_mode: queue::promotion_mode(&p),
+        can_promote_to_steer: promotion.mode
+            == Some(zeron_proto::QueuePromotionMode::ActiveSteering),
+        promotion_mode: promotion.mode,
+        promotion_selection: promotion.selection,
+        promotion_selection_deferred: promotion.deferred,
+        promotion_blocked: promotion.blocked,
     })
 }
 

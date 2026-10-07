@@ -86,7 +86,10 @@ fn toggle(id: &str, label: &str) -> ModelOption {
 /// The 200K/1M context-window select carried by the long-context models. The
 /// 1M window is selected via a model-id suffix (`<model>[1m]`), exactly how the
 /// CLI itself does it.
-pub(crate) fn context_window() -> ModelOption {
+///
+/// `default_choice` follows T3's manifest: the Fable and Opus 5.x lines default
+/// to the 1M window, Sonnet to 200K.
+pub(crate) fn context_window(default_choice: &str) -> ModelOption {
     ModelOption {
         id: "contextWindow".into(),
         label: "Context Window".into(),
@@ -100,8 +103,41 @@ pub(crate) fn context_window() -> ModelOption {
                 label: "1M".into(),
             },
         ],
-        default_choice: "200k".into(),
+        default_choice: default_choice.into(),
     }
+}
+
+/// The selected `contextWindow` choice for a catalog model, falling back to
+/// the catalog default. `None` for custom IDs and models without a window
+/// select (their window is not guessed).
+pub(crate) fn selected_context_window(
+    model: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let known = static_models().into_iter().find(|m| m.id == model)?;
+    let option = known.options.iter().find(|o| o.id == "contextWindow")?;
+    Some(
+        options
+            .get("contextWindow")
+            .and_then(|v| v.as_str())
+            .filter(|choice| option.choices.iter().any(|c| c.id == *choice))
+            .unwrap_or(&option.default_choice)
+            .to_owned(),
+    )
+}
+
+/// Context window of a catalog model under the selected `contextWindow`
+/// option (`1m` → the `[1m]` model-id suffix). Models outside the curated
+/// catalog (custom IDs) are not guessed.
+pub(crate) fn declared_context_window(
+    model: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    let known = static_models().into_iter().any(|m| m.id == model);
+    known.then(|| match selected_context_window(model, options).as_deref() {
+        Some("1m") => 1_000_000,
+        _ => 200_000,
+    })
 }
 
 const FULL_LADDER: &[ReasoningLevel] = &[
@@ -157,21 +193,21 @@ pub fn static_models() -> Vec<Model> {
             "Fable 5.1",
             "Most intelligent model for building agents",
             FULL_LADDER,
-            vec![context_window()],
+            vec![context_window("1m")],
         ),
         model(
             "claude-fable-5",
             "Fable 5",
             "Previous generation Fable",
             FULL_LADDER,
-            vec![context_window()],
+            vec![context_window("1m")],
         ),
         model(
             "claude-opus-5-5",
             "Opus 5.5",
             "Best for everyday, complex tasks",
             FULL_LADDER,
-            vec![context_window(), toggle("fastMode", "Fast Mode")],
+            vec![context_window("1m"), toggle("fastMode", "Fast Mode")],
         ),
         model(
             "claude-opus-4-8",
@@ -192,7 +228,7 @@ pub fn static_models() -> Vec<Model> {
             "Sonnet 5",
             "Balanced speed and intelligence",
             XHIGH_LADDER,
-            vec![context_window()],
+            vec![context_window("200k")],
         ),
         model(
             "claude-haiku-4-5",

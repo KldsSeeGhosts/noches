@@ -240,6 +240,21 @@ pub const SPRING_CHASE_MAX_LEAD: f32 = 32.0;
 /// Treat as exactly pinned within this distance of the bottom.
 pub const AT_BOTTOM_PX: f32 = 2.0;
 
+/// Where to scroll after a freshly loaded older inherited page replaced the
+/// "load earlier" row (item 0) with `count` rows: keep the first row that was
+/// already loaded at the top of the viewport instead of the start of the new
+/// page. (A negative `offset_in_item` would leave blank space above, so the
+/// row lands flush, within one row height of where it was.) `None` unless the
+/// viewport top sat on the replaced row; anything below it is shifted by the
+/// list itself.
+fn inherited_prepend_anchor(top: ListOffset, count: usize) -> Option<ListOffset> {
+    (top.item_ix == 0 && count > 1).then(|| ListOffset {
+        // The old row 1 now follows the `count` rows that replaced item 0.
+        item_ix: count,
+        offset_in_item: px(0.),
+    })
+}
+
 /// A live stream already resting at the end should keep that end anchored as
 /// its measured height grows. This is deliberately narrower than `pinned`:
 /// users gliding back toward the bottom keep the normal spring behavior.
@@ -1028,6 +1043,11 @@ pub enum RowKind {
     ForkBoundary {
         label: SharedString,
         source_chat_id: String,
+    },
+    /// Click target above the inherited pages: loads the next older page.
+    InheritedMore {
+        label: SharedString,
+        chat_id: String,
     },
     GeneratedImage {
         owner: String,
@@ -4987,7 +5007,22 @@ impl Transcript {
                     // and holds the anchor across the remeasure.
                     self.list.remeasure_items(old_range);
                 } else {
+                    // Loading earlier inherited history replaces the "load
+                    // earlier" row at the top with the older page: splice
+                    // alone would reset the viewport to the top of that page,
+                    // so re-anchor the content that was on screen.
+                    let anchor = (old_range.start == 0
+                        && old_range.len() == 1
+                        && matches!(
+                            self.rows.first().map(|row| &row.kind),
+                            Some(RowKind::InheritedMore { .. })
+                        ))
+                    .then(|| inherited_prepend_anchor(self.list.logical_scroll_top(), count))
+                    .flatten();
                     self.list.splice(old_range, count);
+                    if let Some(anchor) = anchor {
+                        self.list.scroll_to(anchor);
+                    }
                 }
                 self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
             }
@@ -6482,6 +6517,29 @@ impl Transcript {
                     "Inherited from {source_chat_id}. Open the parent in Thread details for the full history."
                 )))
                 .into_any_element(),
+            RowKind::InheritedMore { label, chat_id } => {
+                let chat_id = chat_id.clone();
+                let state = self.state.clone();
+                div()
+                    .id(SharedString::from(format!("{}-more", row.id)))
+                    .w_full()
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .child(label.clone())
+                    .on_click(move |_, _, cx| {
+                        let chat_id = chat_id.clone();
+                        state.update(cx, |state, cx| {
+                            state.load_more_inherited_history(&chat_id, cx);
+                        });
+                    })
+                    .into_any_element()
+            }
             RowKind::User {
                 text,
                 mentions,
@@ -13967,6 +14025,34 @@ mod tests {
     }
 
     #[test]
+    fn loading_earlier_inherited_history_keeps_the_loaded_content_in_view() {
+        // Viewport top on the replaced "load earlier" row: the old row 1 lands
+        // flush at the top, after the 6 replacement rows, never at a negative
+        // offset (blank space above).
+        let anchor = inherited_prepend_anchor(
+            ListOffset {
+                item_ix: 0,
+                offset_in_item: px(4.),
+            },
+            6,
+        )
+        .unwrap();
+        assert_eq!(anchor.item_ix, 6);
+        assert_eq!(anchor.offset_in_item, px(0.));
+        // A viewport already below the row is shifted by the list itself.
+        assert!(
+            inherited_prepend_anchor(
+                ListOffset {
+                    item_ix: 3,
+                    offset_in_item: px(0.)
+                },
+                6
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn diff_rows_appends_and_middle_edits() {
         let entry1 = assistant("m1", MessageStatus::Complete, vec![text_part("t0", "one")]);
         let entry2 = assistant("m2", MessageStatus::Complete, vec![text_part("t0", "two")]);
@@ -14916,6 +15002,8 @@ mod tests {
 #[cfg(any(feature = "appshots-fixture", feature = "orchestration-fixture"))]
 impl Transcript {
     pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
+        // Break the stick-to-bottom pin, or the next layout glues back to the end.
+        self.pinned = false;
         self.list.scroll_to(gpui::ListOffset::default());
         cx.notify();
     }

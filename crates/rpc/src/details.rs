@@ -22,6 +22,29 @@ impl crate::RpcClient {
             .await
     }
 
+    pub async fn stop_thread_work(
+        &self,
+        params: zeron_proto::transfer::StopThreadWorkParams,
+        owner: &str,
+    ) -> Result<zeron_proto::transfer::StopThreadWorkResult, crate::RpcError> {
+        let mut value =
+            serde_json::to_value(params).map_err(|e| crate::RpcError::BadParams(e.to_string()))?;
+        value["targetDeviceId"] = json!(owner);
+        self.call_as(crate::methods::STOP_THREAD_WORK, value).await
+    }
+
+    pub async fn reset_thread_session(
+        &self,
+        params: zeron_proto::transfer::ResetThreadSessionParams,
+        owner: &str,
+    ) -> Result<zeron_proto::transfer::ResetThreadSessionResult, crate::RpcError> {
+        let mut value =
+            serde_json::to_value(params).map_err(|e| crate::RpcError::BadParams(e.to_string()))?;
+        value["targetDeviceId"] = json!(owner);
+        self.call_as(crate::methods::RESET_THREAD_SESSION, value)
+            .await
+    }
+
     pub async fn fork_thread(
         &self,
         params: ForkThreadParams,
@@ -67,6 +90,22 @@ impl crate::RpcClient {
             crate::methods::GET_THREAD_TRANSFER_STATE,
             json!({
                 "chatId": chat, "targetDeviceId": owner
+            }),
+        )
+        .await
+    }
+
+    pub async fn thread_inherited_history(
+        &self,
+        chat: &str,
+        owner: &str,
+        before: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<zeron_proto::transfer::InheritedHistoryPage, crate::RpcError> {
+        self.call_as(
+            crate::methods::GET_THREAD_INHERITED_HISTORY,
+            json!({
+                "chatId": chat, "targetDeviceId": owner, "before": before, "limit": limit
             }),
         )
         .await

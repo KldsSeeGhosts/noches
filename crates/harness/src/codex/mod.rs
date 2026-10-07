@@ -1440,11 +1440,12 @@ async fn run_session(session: Session) {
                     let text = msg.prompt;
                     let message_id = msg.message_id;
                     let notification = msg.notification_acceptance;
+                    let images = msg.attachments;
                     if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
+                            "input": steer_input(&text, &images),
                         });
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
@@ -1482,6 +1483,10 @@ async fn run_session(session: Session) {
                                     target: "zeron_harness::codex",
                                     "turn/steer rejected (queued as next turn): {e}"
                                 );
+                                // Both fallbacks start a text-only turn: native
+                                // images ride `turn/steer` alone, so a steer that
+                                // falls back keeps its images as path references
+                                // in the text (the text always carries them).
                                 if router.active.as_deref() == Some(expected.as_str())
                                     && !router.is_completed(&expected)
                                 {
@@ -1865,6 +1870,19 @@ fn mcp_elicitation_content(params: &Value) -> Option<Value> {
         return None;
     }
     Some(Value::Object(content))
+}
+
+/// `turn/steer` input: the text, then each host-owned image as a native
+/// `localImage` item (the path refs also ride the text). The engine passes
+/// only image paths, so nothing is type-checked here.
+fn steer_input(text: &str, images: &[String]) -> Value {
+    let mut input = vec![json!({ "type": "text", "text": text })];
+    input.extend(
+        images
+            .iter()
+            .map(|path| json!({ "type": "localImage", "path": path })),
+    );
+    Value::Array(input)
 }
 
 /// Parse `item/tool/requestUserInput` questions into (wire id, question)

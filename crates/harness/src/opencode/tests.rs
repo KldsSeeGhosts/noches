@@ -379,6 +379,7 @@ impl TurnWire {
                     notification_acceptance: None,
                     prompt: overrides["queuedPrompt"].as_str().unwrap_or("second").into(),
                     message_id: overrides["queuedMessageId"].as_str().map(str::to_owned),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

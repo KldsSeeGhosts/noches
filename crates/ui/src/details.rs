@@ -52,6 +52,11 @@ pub struct DetailsModel {
     pub session_busy: bool,
     pub session_retry: bool,
     pub attached_provider_sessions: Vec<zeron_proto::transfer::ProviderSessionRef>,
+    pub reset_supported: bool,
+    pub reset_busy: bool,
+    pub reset_retry: bool,
+    /// Newest started run the host reported: the reset's stale-action fence.
+    pub latest_started_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -176,6 +181,17 @@ impl DetailsModel {
             && (self.session_retry || !self.attached_provider_sessions.is_empty())
     }
 
+    /// A reset needs a conversation to rebuild; an exact retry stays available
+    /// without one. The host still refuses while a run is active or a newer
+    /// turn started, so this only gates what the panel offers.
+    pub(crate) fn can_reset_session(&self) -> bool {
+        self.reset_supported
+            && !self.reset_busy
+            && !self.session_busy
+            && !self.transfer_busy
+            && (self.reset_retry || self.latest_started_run_id.is_some())
+    }
+
     /// Whether the action may be attempted. `fork_run_id` is a cached hint
     /// that can lag a turn that just finished, so it only dims the row
     /// (`fork_ready`); the submit path re-reads the state and refuses with a
@@ -216,7 +232,11 @@ impl DetailsModel {
                 chat_id,
                 zeron_proto::capabilities::PROVIDER_SESSION_CONTROL_V1,
             );
+            model.reset_supported = state
+                .chat_host_supports(chat_id, zeron_proto::capabilities::PROVIDER_SESSION_RESET_V1);
             let key = (chat.device_id.clone(), chat.id.clone());
+            model.reset_busy = state.details.reset_actions.contains(&key);
+            model.reset_retry = state.details.reset_retries.contains_key(&key);
             model.session_busy = state.details.session_actions.contains(&key);
             model.session_retry = state.details.session_retries.contains_key(&key);
             model.lineage = crate::delegation::related_rows(&state.delegation, chat_id, |id| {
@@ -355,6 +375,7 @@ pub struct DetailsActions {
     pub fork_thread: ShellAction<Option<String>>,
     pub merge_back: ShellAction<()>,
     pub disconnect_session: ShellAction<()>,
+    pub reset_session: ShellAction<()>,
     pub toggle_lineage: ShellAction<()>,
     pub toggle_transfers: ShellAction<()>,
     pub open_url: ShellAction<String>,
@@ -523,6 +544,8 @@ fn icon_action(
         .rounded(px(6.0))
         .cursor_pointer()
         .hover(move |el| el.bg(hover))
+        .tab_index(0)
+        .focus_visible(move |el| el.bg(hover))
         .tooltip(crate::tooltip::text(tooltip))
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(icon(glyph).size(px(14.0)).text_color(theme.text_muted))
@@ -599,6 +622,38 @@ fn lineage_section(
                 })),
         );
     }
+    if model.reset_supported
+        && (model.latest_started_run_id.is_some() || model.reset_retry || model.reset_busy)
+    {
+        let reset = actions.reset_session.clone();
+        let enabled = model.can_reset_session();
+        body = body.child(
+            row(
+                format!("details-{chat_id}-reset").into(),
+                Some(icons::RESTART),
+                theme,
+            )
+            .role(gpui::Role::Button)
+            .aria_label("Reset agent session")
+            .when(enabled, |el| hover_row(el, theme))
+            .when(!enabled, |el| el.opacity(0.45))
+            .tooltip(crate::tooltip::text(
+                "The next message starts a fresh agent session rebuilt from this conversation's history. Keeps the conversation. Not available while a run is active.",
+            ))
+            .child(label(if model.reset_busy {
+                "Resetting agent session…"
+            } else if model.reset_retry {
+                "Retry reset"
+            } else {
+                "Reset agent session"
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if enabled {
+                    reset(this, (), cx);
+                }
+            })),
+        );
+    }
     let shown = if ui.lineage_expanded {
         model.lineage.len()
     } else {
@@ -619,10 +674,11 @@ fn lineage_section(
         let is_parent = model.merge_target.as_deref() == Some(&relation.chat_id);
         let can_merge = is_parent && model.can_merge_back();
         let merge = actions.merge_back.clone();
+        let group: SharedString = format!("details-{chat_id}-relation-{}", relation.chat_id).into();
         relationships = relationships.child(
             hover_row(
                 row(
-                    format!("details-{chat_id}-relation-{}", relation.chat_id).into(),
+                    group.clone(),
                     Some(if is_parent {
                         icons::ARROW_LEFT
                     } else {
@@ -632,15 +688,48 @@ fn lineage_section(
                 ),
                 theme,
             )
+            .group(group.clone())
             .role(gpui::Role::Button)
             .aria_label(format!("Open {} {}", relation.label, relation.title))
             .when(!available, |el| el.opacity(0.45))
+            // Keyboard: Tab/Shift-Tab reach every available row, ↑/↓ step
+            // between them, Enter or Space opens (gpui's keyboard click).
+            .when(available, |el| {
+                el.tab_index(0)
+                    .focus_visible(|style| style.bg(crate::theme::wash(0.10)))
+                    .on_key_down(|event, window, cx| {
+                        let modifiers = event.keystroke.modifiers;
+                        if modifiers.control || modifiers.alt || modifiers.platform {
+                            return;
+                        }
+                        match event.keystroke.key.as_str() {
+                            "down" => window.focus_next(cx),
+                            "up" => window.focus_prev(cx),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    })
+            })
             .tooltip(crate::tooltip::text(if available {
                 "Open related conversation"
             } else {
                 "This conversation is unavailable"
             }))
             .child(label(relation.title.clone()))
+            // T3's hover arrow: the row is a link into the related chat.
+            .when(available && !is_parent, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                        .child(
+                            icon(icons::ARROW_RIGHT)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        ),
+                )
+            })
             .child(mono(relation.label.clone(), theme.text_faint, theme))
             .when(is_parent && model.transfers_supported, |el| {
                 el.child(
@@ -1467,6 +1556,30 @@ mod tests {
         assert!(!model.can_disconnect_session());
         model.session_retry = true;
         assert!(model.can_disconnect_session());
+    }
+
+    #[test]
+    fn session_reset_needs_capability_a_started_conversation_or_exact_retry() {
+        let mut model = DetailsModel::default();
+        assert!(!model.can_reset_session());
+        model.reset_supported = true;
+        assert!(!model.can_reset_session(), "nothing has run yet");
+        model.latest_started_run_id = Some("run".into());
+        assert!(model.can_reset_session());
+        for busy in ["reset", "disconnect", "transfer"] {
+            let mut busy_model = model.clone();
+            match busy {
+                "reset" => busy_model.reset_busy = true,
+                "disconnect" => busy_model.session_busy = true,
+                _ => busy_model.transfer_busy = true,
+            }
+            assert!(!busy_model.can_reset_session(), "{busy}");
+        }
+        // A pinned retry survives a stale hint that no longer names a run.
+        model.latest_started_run_id = None;
+        assert!(!model.can_reset_session());
+        model.reset_retry = true;
+        assert!(model.can_reset_session());
     }
 
     #[test]

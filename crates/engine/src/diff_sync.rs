@@ -1811,10 +1811,14 @@ pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineErr
 /// dispatch, that is the same cost class as the untracked-file reads the watch
 /// capture already does.
 pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
+    // Concurrent snapshots in one process can share a microsecond; the
+    // counter keeps their throwaway index (and git's `.lock`) distinct.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let index = std::env::temp_dir().join(format!(
-        "zeron-turn-index-{}-{}",
+        "zeron-turn-index-{}-{}-{}",
         std::process::id(),
-        chrono::Utc::now().timestamp_micros()
+        chrono::Utc::now().timestamp_micros(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let run = |args: &[&str]| {
         let mut cmd = tokio::process::Command::new("git");
