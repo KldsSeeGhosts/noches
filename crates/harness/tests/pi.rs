@@ -1162,6 +1162,23 @@ async fn discovery_lists_exact_models_commands_and_readiness() {
 }
 
 #[tokio::test]
+async fn a_failed_discovery_is_remembered_briefly_instead_of_relaunching_pi_per_caller() {
+    let env = Env::new().with("FAKE_PI_STARTUP_EXIT", "7");
+    let harness = env.harness();
+    let first = harness.models().await.unwrap_err().to_string();
+    // The picker, readiness and the command list all ask in quick succession.
+    assert_eq!(harness.models().await.unwrap_err().to_string(), first);
+    assert!(harness.authenticated().await.is_err());
+    assert!(harness.commands().await.is_err());
+    let probes = env
+        .starts()
+        .iter()
+        .filter(|s| s["argv"].as_array().unwrap().iter().any(|a| a == "--no-session"))
+        .count();
+    assert_eq!(probes, 1, "one Pi launch for four failed lookups");
+}
+
+#[tokio::test]
 async fn a_pi_without_models_is_not_authenticated() {
     let env = Env::new().with("FAKE_PI_MODELS", "[]");
     let harness = env.harness();

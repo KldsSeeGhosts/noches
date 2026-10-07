@@ -45,6 +45,9 @@ pub const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Concurrent callers (picker + readiness) share one discovery.
 const DISCOVERY_SHARE_WINDOW: Duration = Duration::from_secs(5);
+/// A failed discovery (a hung extension, a missing provider) is not retried
+/// for this long.
+const DISCOVERY_FAILURE_WINDOW: Duration = Duration::from_secs(20);
 
 const CUA_EXTENSION: &str = include_str!("noches-cua.ts");
 const POLICY_EXTENSION: &str = include_str!("noches-policy.ts");
@@ -80,7 +83,9 @@ pub struct PiHarness {
     /// Declared context windows by `provider/id`, learned from discovery and
     /// from each run's model.
     windows: Arc<Mutex<std::collections::HashMap<String, u64>>>,
-    discovery: tokio::sync::Mutex<Option<(Instant, Discovery)>>,
+    /// The latest probe's outcome: a failure is remembered briefly so pickers
+    /// and readiness checks do not each start a Pi that loads every extension.
+    discovery: tokio::sync::Mutex<Option<(Instant, Result<Discovery, HarnessError>)>>,
     /// Versions that already passed the minimum-version gate, by executable
     /// and its modification time (an in-place downgrade is checked again).
     verified: Mutex<std::collections::HashSet<(PathBuf, Option<std::time::SystemTime>)>>,
@@ -266,13 +271,30 @@ impl PiHarness {
     /// providers register their models there).
     async fn discover(&self) -> Result<Discovery, HarnessError> {
         let mut shared = self.discovery.lock().await;
-        if let Some((at, found)) = shared.as_ref()
-            && at.elapsed() < DISCOVERY_SHARE_WINDOW
-        {
-            return Ok(found.clone());
+        if let Some((at, outcome)) = shared.as_ref() {
+            match outcome {
+                Ok(found) if at.elapsed() < DISCOVERY_SHARE_WINDOW => return Ok(found.clone()),
+                Err(error) if at.elapsed() < DISCOVERY_FAILURE_WINDOW => {
+                    return Err(replayed(error));
+                }
+                _ => {}
+            }
         }
+        // Not installed or too old are answered cheaply and never remembered.
         let exe = self.resolve_executable()?;
         self.check_version(&exe).await?;
+        let outcome = self.probe(&exe).await;
+        *shared = Some((
+            Instant::now(),
+            match &outcome {
+                Ok(found) => Ok(found.clone()),
+                Err(error) => Err(replayed(error)),
+            },
+        ));
+        outcome
+    }
+
+    async fn probe(&self, exe: &Path) -> Result<Discovery, HarnessError> {
         let mut args = self.user_args()?;
         args.insert(0, "--no-session".into());
         let cwd = crate::executable::home_or_current_dir();
@@ -281,7 +303,7 @@ impl PiHarness {
             rpc,
             mut events,
             stderr_tail,
-        } = self.spawn(self.command(&exe, cwd.to_str(), &args))?;
+        } = self.spawn(self.command(exe, cwd.to_str(), &args))?;
         // Startup dialogs (project trust, login) cannot be answered here:
         // cancel them so an extension never blocks the probe.
         let canceller = rpc.clone();
@@ -359,8 +381,16 @@ impl PiHarness {
             models: catalog,
             commands: session::commands_from(&commands),
         };
-        *shared = Some((Instant::now(), found.clone()));
         Ok(found)
+    }
+}
+
+/// A copy of a remembered discovery failure (errors are not `Clone`).
+fn replayed(error: &HarnessError) -> HarnessError {
+    match error {
+        HarnessError::Transport(message) => HarnessError::Transport(message.clone()),
+        HarnessError::Protocol(message) => HarnessError::Protocol(message.clone()),
+        other => HarnessError::Protocol(other.to_string()),
     }
 }
 

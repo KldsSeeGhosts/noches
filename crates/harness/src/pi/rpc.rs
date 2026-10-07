@@ -203,8 +203,9 @@ impl PiRpc {
                     return;
                 }
             }
-            // Every sender dropped: the session is over. Closing stdin is
-            // Pi's orderly-shutdown request.
+            // Reached only once every sender is gone. The reader task keeps
+            // one until stdout closes, so while Pi lives this never runs: Pi
+            // is stopped by `Child::shutdown` (TERM, then KILL), not by EOF.
             let _ = stdin.shutdown().await;
         });
 
