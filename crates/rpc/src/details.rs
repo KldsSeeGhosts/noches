@@ -95,6 +95,22 @@ impl crate::RpcClient {
         .await
     }
 
+    pub async fn thread_inherited_history(
+        &self,
+        chat: &str,
+        owner: &str,
+        before: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<zeron_proto::transfer::InheritedHistoryPage, crate::RpcError> {
+        self.call_as(
+            crate::methods::GET_THREAD_INHERITED_HISTORY,
+            json!({
+                "chatId": chat, "targetDeviceId": owner, "before": before, "limit": limit
+            }),
+        )
+        .await
+    }
+
     pub async fn preview_file_checkpoint_restore(
         &self,
         params: CheckpointPreviewParams,

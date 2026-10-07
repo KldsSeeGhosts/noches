@@ -20,6 +20,7 @@ pub mod capabilities {
     pub const PROVIDER_SESSION_CONTROL_V1: &str = "provider-session-control-v1";
     pub const THREAD_WORK_STOP_V1: &str = "thread-work-stop-v1";
     pub const PROVIDER_SESSION_RESET_V1: &str = "provider-session-reset-v1";
+    pub const THREAD_INHERITED_HISTORY_V1: &str = "thread-inherited-history-v1";
 
     pub const CURRENT: &[&str] = &[
         QUEUED_ATTACHMENTS_V1,
@@ -35,6 +36,7 @@ pub mod capabilities {
         PROVIDER_SESSION_CONTROL_V1,
         THREAD_WORK_STOP_V1,
         PROVIDER_SESSION_RESET_V1,
+        THREAD_INHERITED_HISTORY_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -120,7 +122,8 @@ mod tests {
                     "thread-transfers-v1",
                     "provider-session-control-v1",
                     "thread-work-stop-v1",
-                    "provider-session-reset-v1"
+                    "provider-session-reset-v1",
+                    "thread-inherited-history-v1"
                 ],
             })
         );

@@ -18,6 +18,7 @@ the chat's owner device and sending `targetDeviceId`.
 | RPC | Params | Result |
 | --- | --- | --- |
 | `GetThreadTransferState` | `{chatId}` | `ThreadTransferState` |
+| `GetThreadInheritedHistory` | `{chatId, before?, limit?}` | `InheritedHistoryPage` |
 | `ForkThread` | `{chatId, commandId, targetChatId, sourcePoint, title?}` | `ThreadTransferResult` |
 | `MergeThreadBack` | `{chatId, commandId, targetChatId, sourcePoint}` | `ThreadTransferResult` |
 | `PreviewFileCheckpointRestore` | `{chatId, checkpointId}` | `RestorePreview` |
@@ -52,7 +53,18 @@ Example passive response (collections abbreviated):
   `deliveryStatus`, and empty `summaryText`. No private historical payload or
   native delivery record is published in a replica.
 - `inheritedItems`: passive source items with `inherited: true`, `sourceThreadId`,
-  and `sourceItemId`. Their original thread/run/item identity is retained.
+  and `sourceItemId`. Their original thread/run/item identity is retained. The
+  Details payload carries only a capped text preview of these.
+- `GetThreadInheritedHistory` (capability `thread-inherited-history-v1`): the full
+  read-only inherited transcript, newest page first. `entries` are
+  `SessionMessageEntry`-shaped (user prompt, or one agent entry per run with text,
+  reasoning, tool calls/results, diffs and viewed-image refs; approvals, input
+  requests and handoff/fork markers are omitted). Text, tool output and diffs are
+  capped per part and a page stops at a byte budget (`shortened` counts cuts);
+  `limit` is clamped to 1..=50. `nextBefore` is the id of the oldest entry returned
+  and is the only cursor: the inherited list is frozen at the fork's source run, so
+  new parent runs never move it. An unknown cursor is refused. Images are fetched
+  by the client through the host's `ReadAttachmentChunk` transport, never inlined.
 - `checkpoints`: `FileCheckpoint {checkpoint, scope, cwd, headSha, treeSha,
   indexTreeSha, phase}`. `checkpoint` and `scope` are generated V2 types; phases
   are `started`, `completed`, and `backup`.

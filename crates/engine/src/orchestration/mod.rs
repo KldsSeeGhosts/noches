@@ -37,6 +37,7 @@ mod tests;
 pub mod thread_service;
 pub mod threads;
 pub mod transfer;
+mod inherited_history;
 pub mod transfer_service;
 pub mod ui;
 pub(crate) mod ui_details;

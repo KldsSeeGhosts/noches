@@ -1278,6 +1278,7 @@ fn forwardable(method: &str) -> bool {
             | methods::CHANGE_THREAD_PULL_REQUEST
             | methods::HANDOFF_THREAD_WORKTREE
             | methods::GET_THREAD_TRANSFER_STATE
+            | methods::GET_THREAD_INHERITED_HISTORY
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
             | methods::DISCONNECT_THREAD_SESSION
@@ -1651,6 +1652,7 @@ impl RpcService for EngineRpc {
                 | methods::FORK_THREAD
                 | methods::MERGE_THREAD_BACK
                 | methods::GET_THREAD_TRANSFER_STATE
+                | methods::GET_THREAD_INHERITED_HISTORY
         ) && params.get("targetDeviceId").is_none()
             && let Some(chat) = params["chatId"]
                 .as_str()
@@ -1912,6 +1914,7 @@ impl RpcService for EngineRpc {
             }
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::GET_THREAD_TRANSFER_STATE
+            | methods::GET_THREAD_INHERITED_HISTORY
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
@@ -3812,6 +3815,7 @@ mod tests {
             methods::CONTROL_WORKTREE_SETUP,
             methods::HANDOFF_THREAD_WORKTREE,
             methods::GET_THREAD_TRANSFER_STATE,
+            methods::GET_THREAD_INHERITED_HISTORY,
             methods::PREVIEW_FILE_CHECKPOINT_RESTORE,
             methods::RESTORE_FILE_CHECKPOINT,
             methods::MUTATE_QUEUED_RUN,

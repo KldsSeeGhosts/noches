@@ -99,6 +99,43 @@ pub struct TransferStateParams {
     pub chat_id: String,
 }
 
+/// One page of a fork's inherited history, newest page first. Entries are
+/// `SessionMessageEntry`-shaped (bounded text, tool summaries, media refs) so
+/// the client renders them with the ordinary transcript row builders.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedHistoryParams {
+    #[serde(default)]
+    pub chat_id: String,
+    /// Opaque cursor from a previous page's `nextBefore`; absent = newest page.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Entries per page; the host clamps it.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InheritedHistoryPage {
+    pub thread_id: String,
+    /// Oldest first within the page.
+    #[serde(default)]
+    pub entries: Vec<Value>,
+    /// Pass back as `before` for the next older page; absent at the start.
+    #[serde(default)]
+    pub next_before: Option<String>,
+    /// Entries older than this page.
+    #[serde(default)]
+    pub remaining: u64,
+    /// Every inherited entry, so the boundary can say how much is above.
+    #[serde(default)]
+    pub total: u64,
+    /// Entries or parts the host shortened or left out to stay in budget.
+    #[serde(default)]
+    pub shortened: u32,
+}
+
 /// Stable conversation boundary; choosing a fork never starts an agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -56,6 +56,8 @@ pub mod methods {
     pub const GET_ORCHESTRATION_STATE: &str = "GetOrchestrationState";
     /// Passive `{chatId}` -> proto::transfer::ThreadTransferState.
     pub const GET_THREAD_TRANSFER_STATE: &str = "GetThreadTransferState";
+    /// Passive `{chatId,before?,limit?}` -> proto::transfer::InheritedHistoryPage.
+    pub const GET_THREAD_INHERITED_HISTORY: &str = "GetThreadInheritedHistory";
     pub const FORK_THREAD: &str = "ForkThread";
     pub const MERGE_THREAD_BACK: &str = "MergeThreadBack";
     pub const DISCONNECT_THREAD_SESSION: &str = "DisconnectThreadSession";
