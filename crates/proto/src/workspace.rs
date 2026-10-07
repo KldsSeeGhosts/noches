@@ -118,7 +118,9 @@ mod tests {
                     "canonical-queue-v1",
                     "runtime-policy-v1",
                     "thread-transfers-v1",
-                    "provider-session-control-v1"
+                    "provider-session-control-v1",
+                    "thread-work-stop-v1",
+                    "provider-session-reset-v1"
                 ],
             })
         );
