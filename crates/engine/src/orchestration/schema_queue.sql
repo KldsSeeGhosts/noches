@@ -28,3 +28,7 @@ CREATE TABLE IF NOT EXISTS orchestration_queue_user_requests (
     command_id TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS orchestration_session_user_requests (
+    command_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+) STRICT;

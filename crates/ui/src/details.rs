@@ -45,6 +45,10 @@ pub struct DetailsModel {
     pub fork_run_id: Option<String>,
     pub merge_run_id: Option<String>,
     pub merge_target: Option<String>,
+    pub session_control_supported: bool,
+    pub session_busy: bool,
+    pub session_retry: bool,
+    pub attached_provider_sessions: Vec<zeron_proto::transfer::ProviderSessionRef>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -162,6 +166,13 @@ pub struct Checkpoint {
 pub const FIXTURE_ENV: &str = "NOCHES_DETAILS_FIXTURE";
 
 impl DetailsModel {
+    pub(crate) fn can_disconnect_session(&self) -> bool {
+        self.session_control_supported
+            && !self.session_busy
+            && !self.transfer_busy
+            && (self.session_retry || !self.attached_provider_sessions.is_empty())
+    }
+
     fn can_fork(&self) -> bool {
         self.transfers_supported && !self.transfer_busy && self.fork_run_id.is_some()
     }
@@ -190,6 +201,13 @@ impl DetailsModel {
             model.transfers_supported =
                 state.chat_host_supports(chat_id, zeron_proto::capabilities::THREAD_TRANSFERS_V1);
             model.transfer_busy = state.details.transfer_busy(chat_id);
+            model.session_control_supported = state.chat_host_supports(
+                chat_id,
+                zeron_proto::capabilities::PROVIDER_SESSION_CONTROL_V1,
+            );
+            let key = (chat.device_id.clone(), chat.id.clone());
+            model.session_busy = state.details.session_actions.contains(&key);
+            model.session_retry = state.details.session_retries.contains_key(&key);
             model.lineage = crate::delegation::related_rows(&state.delegation, chat_id, |id| {
                 state
                     .chats
@@ -311,6 +329,7 @@ pub struct DetailsActions {
     pub open_thread: ShellAction<String>,
     pub fork_thread: ShellAction<Option<String>>,
     pub merge_back: ShellAction<()>,
+    pub disconnect_session: ShellAction<()>,
     pub toggle_lineage: ShellAction<()>,
     pub toggle_transfers: ShellAction<()>,
     pub open_url: ShellAction<String>,
@@ -348,7 +367,7 @@ pub fn details_panel_body(
 ) -> AnyElement {
     let mut sections: Vec<AnyElement> =
         vec![workspace_section(chat_id, model, now, theme, actions, cx)];
-    if model.transfers_supported || !model.lineage.is_empty() {
+    if model.transfers_supported || model.session_control_supported || !model.lineage.is_empty() {
         sections.push(lineage_section(chat_id, model, ui, theme, actions, cx));
     }
     if !model.transfers.is_empty() {
@@ -523,6 +542,33 @@ fn lineage_section(
                     fork(this, None, cx);
                 }
             })),
+        );
+    }
+    if model.session_control_supported
+        && (!model.attached_provider_sessions.is_empty()
+            || model.session_retry
+            || model.session_busy)
+    {
+        let disconnect = actions.disconnect_session.clone();
+        let enabled = model.can_disconnect_session();
+        body = body.child(
+            row(format!("details-{chat_id}-disconnect").into(), Some(icons::STOP), theme)
+                .role(gpui::Role::Button)
+                .aria_label("Disconnect agent session")
+                .when(enabled, |el| hover_row(el, theme))
+                .when(!enabled, |el| el.opacity(0.45))
+                .tooltip(crate::tooltip::text(
+                    "Stops the live agent session. Keeps this conversation and native history for the next message."))
+                .child(label(if model.session_busy {
+                    "Disconnecting agent session…"
+                } else if model.session_retry {
+                    "Retry disconnect"
+                } else {
+                    "Disconnect agent session"
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if enabled { disconnect(this, (), cx); }
+                })),
         );
     }
     let shown = if ui.lineage_expanded {
@@ -1353,6 +1399,31 @@ mod tests {
             relative_future(now - chrono::Duration::hours(5), now),
             "in <1m"
         );
+    }
+
+    #[test]
+    fn session_disconnect_requires_capability_observed_attachment_or_exact_retry() {
+        let mut model = DetailsModel::default();
+        assert!(!model.can_disconnect_session());
+        model
+            .attached_provider_sessions
+            .push(zeron_proto::transfer::ProviderSessionRef {
+                id: "session".into(),
+                attachment_sequence: 7,
+            });
+        assert!(!model.can_disconnect_session());
+        model.session_control_supported = true;
+        assert!(model.can_disconnect_session());
+        model.session_busy = true;
+        assert!(!model.can_disconnect_session());
+        model.session_busy = false;
+        model.transfer_busy = true;
+        assert!(!model.can_disconnect_session());
+        model.transfer_busy = false;
+        model.attached_provider_sessions.clear();
+        assert!(!model.can_disconnect_session());
+        model.session_retry = true;
+        assert!(model.can_disconnect_session());
     }
 
     #[test]

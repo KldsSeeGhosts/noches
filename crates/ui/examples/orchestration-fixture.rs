@@ -435,13 +435,48 @@ fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(rows.len() == 2 && rows.iter().all(|row| row.id != "message:automation-queue"), "Canonical cancellation did not reach the tray");
                 anyhow::ensure!(renderer_core.doc_host.open("fixture-queue")?.doc().read_queue()?.len() == 1, "Synthetic rows leaked into Loro");
                 capture(window.into(), cx, &output, &format!("queue-managed-{mode}-960"))?;
+                for row in rows {
+                    window.update(cx, |shell, _, cx| shell.fixture_queue_remove(row.id.clone(), cx))?;
+                }
+                pause(cx, 800).await;
+                anyhow::ensure!(window.update(cx, |shell, _, cx| shell.fixture_queue_rows(cx))?.is_empty(),
+                    "Queued work must be cleared before isolated disconnect QA");
+                window.update(cx, |shell, window, cx| {
+                    window.resize(size(px(1320.), px(900.)));
+                    shell.fixture_orchestration_open("fixture-queue".into(), cx);
+                })?;
+                state.update(cx, |state, cx| state.refresh_details("fixture-queue", true, cx));
+                pause(cx, 1000).await;
+                let model = state.read_with(cx, |state, _| details::DetailsModel::for_chat(state, "fixture-queue"));
+                anyhow::ensure!(model.session_control_supported && !model.attached_provider_sessions.is_empty(),
+                    "The real attached-session control did not load");
+                capture(window.into(), cx, &output, &format!("disconnect-ready-{mode}"))?;
+                window.update(cx, |shell, _, cx| shell.fixture_orchestration_disconnect("fixture-queue".into(), cx))?;
+                let stop_core = renderer_core.clone();
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while stop_core.sessions.has_live_runtime("fixture-queue") {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }).await?;
+                    anyhow::ensure!(stop_core.orchestration.store.transfer_ui_state(&"fixture-queue".into())?
+                        .attached_provider_sessions.is_empty(), "Disconnect did not remove its attachment");
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                state.update(cx, |state, cx| state.refresh_details("fixture-queue", true, cx));
+                pause(cx, 800).await;
+                let model = state.read_with(cx, |state, _| details::DetailsModel::for_chat(state, "fixture-queue"));
+                anyhow::ensure!(!model.session_busy && !model.session_retry && model.attached_provider_sessions.is_empty(),
+                    "The disconnect UI retained an attachment or uncertain retry");
+                capture(window.into(), cx, &output, &format!("disconnected-{mode}"))?;
                 anyhow::ensure!(std::fs::read_to_string(checkout.join("README.md"))? == "# Fixture checkout\n",
                     "A conversation transfer changed working files");
                 std::fs::write(output.join(format!("result-{mode}.txt")),
                     format!("PASS ({mode}): production UI fork/merge handlers and RPCs; idle fork; \
                         inherited lineage/text; continued fork; context-only merge; native GPUI \
                         regular/narrow render; live mixed document/canonical queue; composer text edit; \
-                        reorder and cancel through production handlers. Mock provider only; no live-provider or physical-device claims.\n"))?;
+                        reorder and cancel; owner-fenced session disconnect through production handlers. \
+                        Mock provider only; no live-provider or physical-device claims.\n"))?;
                 Ok(())
             }.await;
             if let Err(error) = run {

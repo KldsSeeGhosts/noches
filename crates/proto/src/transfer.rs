@@ -83,6 +83,9 @@ pub struct ThreadTransferState {
     pub latest_forkable_run_id: Option<String>,
     #[serde(default)]
     pub latest_mergeable_run_id: Option<String>,
+    /// Passive identities only: no credentials or native provider payload.
+    #[serde(default)]
+    pub attached_provider_sessions: Vec<ProviderSessionRef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -128,6 +131,30 @@ pub struct MergeThreadBackParams {
     pub target_chat_id: String,
     #[serde(default)]
     pub source_point: ThreadSourcePoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectThreadSessionParams {
+    pub chat_id: String,
+    pub client_request_id: String,
+    /// Pin the observed sessions. Retrying must never target a replacement.
+    pub provider_sessions: Vec<ProviderSessionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSessionRef {
+    pub id: String,
+    /// Attachment-local revision, unaffected by transcript token updates.
+    pub attachment_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectThreadSessionResult {
+    pub sequence: i64,
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

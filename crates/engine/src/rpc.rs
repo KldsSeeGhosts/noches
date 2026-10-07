@@ -1280,6 +1280,7 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_THREAD_TRANSFER_STATE
             | methods::FORK_THREAD
             | methods::MERGE_THREAD_BACK
+            | methods::DISCONNECT_THREAD_SESSION
             | methods::PREVIEW_FILE_CHECKPOINT_RESTORE
             | methods::RESTORE_FILE_CHECKPOINT
             | methods::LIST_LAUNCH_PROJECTS | methods::GET_LAUNCH_STATE | methods::CONTROL_WORKTREE_SETUP
@@ -1640,6 +1641,7 @@ impl RpcService for EngineRpc {
             methods::ORGANIZE_THREAD
                 | methods::ACKNOWLEDGE_THREAD_WOKE
                 | methods::MUTATE_QUEUED_RUN
+                | methods::DISCONNECT_THREAD_SESSION
         ) && params.get("targetDeviceId").is_none()
             && let Some(chat) = params["chatId"]
                 .as_str()
@@ -1762,6 +1764,19 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                 };
                 RpcReply::value(&state)
+            }
+            methods::DISCONNECT_THREAD_SESSION => {
+                let _admission = self
+                    .sessions
+                    .admit_work()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let request: zeron_proto::transfer::DisconnectThreadSessionParams =
+                    parse_params(params)?;
+                let service = self.delegation.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Provider session control is unavailable.".into())
+                })?;
+                let domain = crate::orchestration::queue::QueueDomain::new(service.kernel.clone());
+                RpcReply::value(&domain.disconnect_for_user(&self.doc_host, request).await?)
             }
             methods::MUTATE_QUEUED_RUN => {
                 let request: zeron_proto::MutateQueuedRunParams = parse_params(params)?;
@@ -3734,6 +3749,7 @@ mod tests {
             methods::PREVIEW_FILE_CHECKPOINT_RESTORE,
             methods::RESTORE_FILE_CHECKPOINT,
             methods::MUTATE_QUEUED_RUN,
+            methods::DISCONNECT_THREAD_SESSION,
         ] {
             assert!(forwardable(method), "{method}");
             assert!(!is_stream_method(method), "{method}");

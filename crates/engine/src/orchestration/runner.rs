@@ -690,6 +690,7 @@ impl RunnerBridge {
                 super::launch::deletion::execute(self, effect).await
             }
             EffectRequest::ProviderSessionDetach { .. }
+            | EffectRequest::ProviderSessionDisconnect { .. }
             | EffectRequest::RuntimeRequestRespond { .. }
             | EffectRequest::ThreadTitleGenerate { .. } => {
                 super::queue::effects::execute(self, effect).await

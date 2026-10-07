@@ -91,6 +91,8 @@ impl Store {
                     )
                 })
                 .map(|r| r.id.0.clone()),
+            attached_provider_sessions: self
+                .read(|conn| super::queue::session_control::attached_sessions(conn, &projection))?,
         })
     }
 }

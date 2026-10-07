@@ -676,9 +676,15 @@ impl SettingsSection {
                 "working",
             ],
             SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
-            SettingsSection::Automations => {
-                &["schedule", "scheduled", "task", "cron", "recurring", "timer", "run"]
-            }
+            SettingsSection::Automations => &[
+                "schedule",
+                "scheduled",
+                "task",
+                "cron",
+                "recurring",
+                "timer",
+                "run",
+            ],
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
             SettingsSection::Import => &["import", "cli", "history", "claude", "codex", "sessions"],
             SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
@@ -5210,9 +5216,10 @@ impl Shell {
             SettingsSection::Automations => {
                 if self.automations_page.is_none() {
                     let state = self.state.clone();
-                    self.automations_page = Some(cx.new(|cx| {
-                        crate::settings::automations::AutomationsPage::new(state, cx)
-                    }));
+                    self.automations_page =
+                        Some(cx.new(|cx| {
+                            crate::settings::automations::AutomationsPage::new(state, cx)
+                        }));
                 }
                 match &self.automations_page {
                     Some(page) => page.clone().into_any_element(),
@@ -5233,12 +5240,19 @@ impl Shell {
                 if self.import_page.is_none() {
                     let state = self.state.clone();
                     let page = cx.new(|cx| crate::settings::import::ImportPage::new(state, cx));
-                    self.import_page_events = Some(cx.subscribe(&page, |this, _, event: &crate::settings::import::OpenChat, cx| {
-                        this.open_chat(event.0.clone(), cx);
-                    }));
+                    self.import_page_events = Some(cx.subscribe(
+                        &page,
+                        |this, _, event: &crate::settings::import::OpenChat, cx| {
+                            this.open_chat(event.0.clone(), cx);
+                        },
+                    ));
                     self.import_page = Some(page);
                 }
-                self.import_page.as_ref().unwrap().clone().into_any_element()
+                self.import_page
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .into_any_element()
             }
         }
     }
@@ -15375,21 +15389,30 @@ impl Shell {
     pub fn fixture_queue_edit(&self, id: String, text: String, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
             composer.begin_queue_edit(id, cx);
-            assert!(composer.canonical_queue_edit.is_some(), "fixture must edit a real SQL-only row");
-            composer.input.update(cx, |input, cx| input.set_text(text, cx));
+            assert!(
+                composer.canonical_queue_edit.is_some(),
+                "fixture must edit a real SQL-only row"
+            );
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text(text, cx));
         });
     }
 
     pub fn fixture_queue_save(&self, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| { assert!(composer.commit_queue_edit(cx)); });
+        self.composer.update(cx, |composer, cx| {
+            assert!(composer.commit_queue_edit(cx));
+        });
     }
 
     pub fn fixture_queue_remove(&self, id: String, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| composer.remove_queued(id, cx));
+        self.composer
+            .update(cx, |composer, cx| composer.remove_queued(id, cx));
     }
 
     pub fn fixture_queue_move(&self, from: usize, to: usize, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| composer.move_queued(from, to, cx));
+        self.composer
+            .update(cx, |composer, cx| composer.move_queued(from, to, cx));
     }
 
     pub fn fixture_orchestration_fork(&mut self, chat: String, cx: &mut Context<Self>) {
@@ -15399,6 +15422,11 @@ impl Shell {
     pub fn fixture_orchestration_merge(&mut self, chat: String, cx: &mut Context<Self>) {
         let actions = self.live_details_actions(chat);
         (actions.merge_back)(self, (), cx);
+    }
+
+    pub fn fixture_orchestration_disconnect(&mut self, chat: String, cx: &mut Context<Self>) {
+        let actions = self.live_details_actions(chat);
+        (actions.disconnect_session)(self, (), cx);
     }
 
     pub fn fixture_orchestration_transcript_start(&self, cx: &mut Context<Self>) {

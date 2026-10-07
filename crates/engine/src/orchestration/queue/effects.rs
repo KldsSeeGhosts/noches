@@ -81,6 +81,26 @@ impl QueueThreadDelivery for HostThreadDelivery {
 
 pub(crate) async fn execute(bridge: &RunnerBridge, effect: &Effect) -> Result<EffectOutcome> {
     match &effect.request {
+        EffectRequest::ProviderSessionDisconnect { run_id, .. } => {
+            let _guards = bridge
+                .kernel
+                .locks
+                .acquire([effect.thread_id.clone()])
+                .await;
+            let p = bridge
+                .kernel
+                .store
+                .thread(&effect.thread_id)?
+                .ok_or_else(|| Error::Invariant("Thread was not found.".into()))?;
+            // Canonical replacement admission advances the credential scope
+            // before publishing a runtime. This fences active AND idle sessions.
+            if super::session_control::target_still_disconnected(&p, &effect.request) {
+                bridge
+                    .sessions
+                    .request_orchestration_disconnect(&effect.thread_id.0, run_id);
+            }
+            Ok(EffectOutcome::Succeeded)
+        }
         EffectRequest::ProviderSessionDetach {
             provider_session_id,
         } => {

@@ -6,6 +6,7 @@ pub mod mcp;
 mod planner;
 pub(crate) mod runtime;
 mod search;
+pub(crate) mod session_control;
 #[cfg(test)]
 mod tests;
 mod title;
@@ -52,6 +53,7 @@ impl QueueCommand {
             "t3_queue_reorder" => "queued-run.reorder",
             "t3_queue_promote_to_steer" => "queued-message.promote-to-steer",
             "t3_pending_request_respond" => "runtime-request.respond",
+            "host.disconnect_provider_sessions" => "provider-session.detach",
             "t3_thread_update" => "thread.metadata.update",
             "t3_thread_organize" => match self.input["action"].as_str() {
                 Some("pin") => "thread.pin",

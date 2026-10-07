@@ -17,6 +17,7 @@ pub mod capabilities {
     pub const CANONICAL_QUEUE_V1: &str = "canonical-queue-v1";
     pub const RUNTIME_POLICY_V1: &str = "runtime-policy-v1";
     pub const THREAD_TRANSFERS_V1: &str = "thread-transfers-v1";
+    pub const PROVIDER_SESSION_CONTROL_V1: &str = "provider-session-control-v1";
 
     pub const CURRENT: &[&str] = &[
         QUEUED_ATTACHMENTS_V1,
@@ -29,6 +30,7 @@ pub mod capabilities {
         CANONICAL_QUEUE_V1,
         RUNTIME_POLICY_V1,
         THREAD_TRANSFERS_V1,
+        PROVIDER_SESSION_CONTROL_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -111,7 +113,8 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "canonical-queue-v1",
                     "runtime-policy-v1",
-                    "thread-transfers-v1"
+                    "thread-transfers-v1",
+                    "provider-session-control-v1"
                 ],
             })
         );

@@ -35,6 +35,15 @@ pub enum EffectRequest {
     ProviderSessionDetach {
         provider_session_id: ProviderSessionId,
     },
+    /// User disconnect is pinned to the runtime's canonical run, including
+    /// idle replacement protection. Native conversation history is retained.
+    #[serde(rename = "provider-session.disconnect")]
+    ProviderSessionDisconnect {
+        provider_session_id: ProviderSessionId,
+        run_id: RunId,
+        run_attempt_id: RunAttemptId,
+        provider_thread_id: ProviderThreadId,
+    },
     #[serde(rename = "provider-turn.start")]
     ProviderTurnStart { run_id: RunId },
     #[serde(rename = "provider-turn.interrupt")]

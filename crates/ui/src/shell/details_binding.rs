@@ -93,6 +93,7 @@ impl Shell {
         let merge_chat = chat.clone();
         let lineage_chat = chat.clone();
         let transfers_chat = chat.clone();
+        let disconnect_chat = chat.clone();
         crate::details::DetailsActions {
             open_thread: std::rc::Rc::new(|this, chat, cx| {
                 if this.state.read(cx).chats.iter().any(|c| c.id == chat) {
@@ -104,6 +105,9 @@ impl Shell {
             }),
             merge_back: std::rc::Rc::new(move |this, (), cx| {
                 this.transfer_conversation(merge_chat.clone(), TransferIntent::Merge, cx)
+            }),
+            disconnect_session: std::rc::Rc::new(move |this, (), cx| {
+                this.disconnect_agent_session(disconnect_chat.clone(), cx);
             }),
             toggle_lineage: std::rc::Rc::new(move |this, (), cx| {
                 let ui = this.details_ui.entry(lineage_chat.clone()).or_default();
@@ -188,6 +192,99 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.transfer_conversation(chat, TransferIntent::Fork(checkpoint), cx);
+    }
+
+    pub(super) fn disconnect_agent_session(&mut self, chat: String, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let model = crate::details::DetailsModel::for_chat(state, &chat);
+        if !model.can_disconnect_session() {
+            return;
+        }
+        let Some(owner) = state
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .map(|c| c.device_id.clone())
+        else {
+            return;
+        };
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let key = (owner.clone(), chat.clone());
+        let request = state
+            .details
+            .session_retries
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| zeron_proto::transfer::DisconnectThreadSessionParams {
+                chat_id: chat.clone(),
+                client_request_id: uuid::Uuid::new_v4().to_string(),
+                provider_sessions: model.attached_provider_sessions,
+            });
+        self.state.update(cx, |state, cx| {
+            state.details.session_actions.insert(key.clone());
+            state
+                .details
+                .session_retries
+                .insert(key.clone(), request.clone());
+            cx.notify();
+        });
+        let app_state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .disconnect_thread_session(request, &owner)
+                .await;
+            let mut succeeded = false;
+            let mut notice = String::new();
+            app_state.update(cx, |state, cx| {
+                state.details.session_actions.remove(&key);
+                match result {
+                    Ok(reply) => {
+                        state.details.session_retries.remove(&key);
+                        if let Some(refusal) = reply.refusal {
+                            notice = refusal;
+                        } else {
+                            succeeded = true;
+                            notice =
+                                "Agent session disconnect requested. Conversation history is kept."
+                                    .into();
+                        }
+                    }
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            zeron_rpc::RpcError::BadParams(_)
+                                | zeron_rpc::RpcError::UnknownMethod(_)
+                        ) {
+                            state.details.session_retries.remove(&key);
+                        }
+                        notice = format!(
+                            "{error}{}",
+                            if state.details.session_retries.contains_key(&key) {
+                                " Retry targets the same sessions, not a replacement."
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                state.refresh_details(&chat, true, cx);
+                cx.notify();
+            });
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(if succeeded {
+                    SidebarNotice::information(notice)
+                } else {
+                    notice.into()
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn transfer_conversation(

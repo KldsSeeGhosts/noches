@@ -22,6 +22,9 @@ pub struct DetailsStore {
     pub notice: Option<String>,
     pub(crate) transfer_actions: HashSet<String>,
     pub(crate) transfer_retries: HashMap<String, ConversationTransfer>,
+    pub(crate) session_actions: HashSet<(String, String)>,
+    pub(crate) session_retries:
+        HashMap<(String, String), zeron_proto::transfer::DisconnectThreadSessionParams>,
 }
 
 #[derive(Clone)]
@@ -306,6 +309,7 @@ pub fn apply_snapshot(model: &mut DetailsModel, row: &DetailsSnapshot) {
         model.merge_run_id = transfer.latest_mergeable_run_id.clone();
         model.merge_target = fork_source(transfer).map(str::to_owned);
         model.transfers = map_transfers(transfer);
+        model.attached_provider_sessions = transfer.attached_provider_sessions.clone();
     }
 }
 

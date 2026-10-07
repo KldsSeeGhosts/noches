@@ -42,6 +42,14 @@ pub(crate) fn plan(
     match op.name.as_str() {
         "host.sync_loro_queue" => sync_loro(conn, &mut plan, command, &p, &op.input, now)?,
         "host.adopt_loro_delivery" => adopt_delivery(&mut plan, command, &p, &op.input, now)?,
+        "host.disconnect_provider_sessions" => {
+            if op.caller.is_some() {
+                return Err(refuse(
+                    "Provider session disconnect requires user authority.",
+                ));
+            }
+            super::session_control::plan(conn, &mut plan, command, &p, &op.input, now)?;
+        }
         "host.title_generated" => {
             let mut thread = serde_json::to_value(&p.thread)?;
             if thread["titleRegeneration"]["requestId"] != op.input["requestId"] {

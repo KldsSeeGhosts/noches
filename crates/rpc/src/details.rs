@@ -10,6 +10,18 @@ use zeron_proto::{
 };
 
 impl crate::RpcClient {
+    pub async fn disconnect_thread_session(
+        &self,
+        params: zeron_proto::transfer::DisconnectThreadSessionParams,
+        owner: &str,
+    ) -> Result<zeron_proto::transfer::DisconnectThreadSessionResult, crate::RpcError> {
+        let mut value =
+            serde_json::to_value(params).map_err(|e| crate::RpcError::BadParams(e.to_string()))?;
+        value["targetDeviceId"] = json!(owner);
+        self.call_as(crate::methods::DISCONNECT_THREAD_SESSION, value)
+            .await
+    }
+
     pub async fn fork_thread(
         &self,
         params: ForkThreadParams,

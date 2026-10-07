@@ -11,6 +11,69 @@ use crate::orchestration::queue_service::QueueService;
 
 const NOW: i64 = 1_800_000_000_000;
 
+#[tokio::test]
+async fn disconnect_fences_cover_reattachment_attempt_and_generation() {
+    use crate::orchestration::effects::EffectRequest;
+    let fixture = Fixture::new();
+    let run = fixture.start_target().await;
+    let mut p = fixture
+        .service
+        .kernel
+        .store
+        .thread(&run.thread_id)
+        .unwrap()
+        .unwrap();
+    p.records.remove("provider-session");
+    let provider = run.provider_thread_id.clone().unwrap();
+    let session = format!(
+        "provider-session:{}",
+        crate::orchestration::event::encode_component(&run.id.0)
+    );
+    let request = EffectRequest::ProviderSessionDisconnect {
+        provider_session_id: session.clone().into(),
+        run_id: run.id.clone(),
+        run_attempt_id: run.active_attempt_id.clone().unwrap(),
+        provider_thread_id: provider.clone(),
+    };
+    assert!(super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.records
+        .insert("provider-session".into(), vec![json!({"id":session})]);
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.records.remove("provider-session");
+    let index = p
+        .runs
+        .iter()
+        .position(|candidate| candidate.id == run.id)
+        .unwrap();
+    p.runs[index].active_attempt_id = Some("replacement-attempt".into());
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.runs[index].active_attempt_id = run.active_attempt_id;
+    let mut replacement = p.runs[index].clone();
+    replacement.id = "replacement-run".into();
+    p.runs.push(replacement);
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+    p.runs.pop();
+    let row = p
+        .records
+        .get_mut("provider-thread")
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["id"] == provider.0)
+        .unwrap();
+    row["id"] = json!("replacement-provider-generation");
+    assert!(!super::session_control::target_still_disconnected(
+        &p, &request
+    ));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     service: QueueDomain,

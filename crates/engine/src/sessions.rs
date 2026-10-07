@@ -207,6 +207,8 @@ impl RuntimeConfig {
 
 struct RunHandle {
     run_id: String,
+    /// Host-owned lifecycle identity, independent of MCP credential expiry.
+    canonical_run_id: Option<zeron_proto::orchestration::RunId>,
     steerable: bool,
     steering_mode: zeron_proto::SteeringMode,
     runtime_config: RuntimeConfig,
@@ -653,6 +655,12 @@ impl SessionsEngine {
         !lock(&self.inner.runs).is_empty()
     }
 
+    /// Runtime presence includes an idle, parked adapter. Unlike visible turn
+    /// status, this can verify session teardown without spawning or polling it.
+    pub fn has_live_runtime(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
@@ -862,6 +870,16 @@ impl SessionsEngine {
                         .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
             }
+            if steerable
+                && same_runtime
+                && let Some(scope) = self.bound_mcp_scope(chat_id)
+                && let Some(handle) = lock(&self.inner.runs).get_mut(chat_id)
+                && handle.run_id == run_id
+            {
+                // Includes a pre-admitted queue turn on the same process,
+                // not only a turn admitted by the ordinary-session bridge.
+                handle.canonical_run_id = Some(scope.caller.run_id);
+            }
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
@@ -993,7 +1011,8 @@ impl SessionsEngine {
                 .is_none_or(|thread| {
                     !thread.runs.iter().any(|run| {
                         run.user_message_id.0 == user_id
-                            && run.status == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
+                            && run.status
+                                == zeron_proto::orchestration::OrchestrationV2RunStatus::Starting
                     })
                 })
         });
@@ -1102,7 +1121,12 @@ impl SessionsEngine {
             }
             if ordinary && let Some(runner) = runner.as_ref() {
                 runner
-                    .prepare_external_turn(&chat_id.into(), &canonical_run, &mut request, harness.as_ref())
+                    .prepare_external_turn(
+                        &chat_id.into(),
+                        &canonical_run,
+                        &mut request,
+                        harness.as_ref(),
+                    )
                     .await
                     .map_err(|e| EngineError::Other(e.to_string()))?;
             }
@@ -1163,11 +1187,15 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
             computer_use_socket: cua_socket,
         };
+        let canonical_run_id = self
+            .bound_mcp_scope(chat_id)
+            .map(|scope| scope.caller.run_id);
 
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
+                canonical_run_id,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
@@ -1380,6 +1408,33 @@ impl SessionsEngine {
             }
             handle.interrupt_token.cancel();
         }
+    }
+
+    /// Called under the kernel ownership lane. A stale outbox effect cannot
+    /// cancel a replacement runtime, even if that replacement is already idle.
+    /// Like T3's nonterminal detach, keep the native handle and MCP credential
+    /// so the next user input can resume the conversation normally.
+    pub(crate) fn request_orchestration_disconnect(
+        &self,
+        chat_id: &str,
+        expected_run: &zeron_proto::orchestration::RunId,
+    ) -> bool {
+        let runs = lock(&self.inner.runs);
+        let Some(handle) = runs
+            .get(chat_id)
+            .filter(|handle| handle.canonical_run_id.as_ref() == Some(expected_run))
+        else {
+            return false;
+        };
+        // Signal the exact handle while retaining the map lock: a concurrent
+        // replacement can never receive the old session's cancellation.
+        let _ = handle.cancel.send(true);
+        expire_permissions(&handle.pending_permissions, &handle.engine_tx);
+        for (_, answer) in lock(&handle.pending_inputs).drain() {
+            let _ = answer.send(Vec::new());
+        }
+        handle.interrupt_token.cancel();
+        true
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such

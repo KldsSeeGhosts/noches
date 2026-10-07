@@ -434,6 +434,7 @@ struct HeldHarness {
     /// Park the first turn on a question instead of just hanging, so the chat
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
+    park_after_done: bool,
 }
 
 impl HeldHarness {
@@ -455,6 +456,7 @@ impl HeldHarness {
                 prompts: prompts.clone(),
                 requests: Mutex::new(Vec::new()),
                 asks,
+                park_after_done: false,
             }),
             prompts,
         )
@@ -536,7 +538,14 @@ impl Harness for HeldHarness {
                 }
             }
         });
-        Ok(started.chain(done).boxed())
+        if self.park_after_done {
+            Ok(started
+                .chain(done)
+                .chain(futures::stream::pending())
+                .boxed())
+        } else {
+            Ok(started.chain(done).boxed())
+        }
     }
 }
 
@@ -653,6 +662,286 @@ async fn create_chat(core: &EngineCore) {
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
+}
+
+async fn attached_sessions(core: &EngineCore) -> Vec<zeron_proto::transfer::ProviderSessionRef> {
+    wait_for(
+        || {
+            core.orchestration
+                .store
+                .transfer_ui_state(&CHAT.into())
+                .is_ok_and(|state| !state.attached_provider_sessions.is_empty())
+        },
+        "accepted session attachment",
+    )
+    .await;
+    core.orchestration
+        .store
+        .transfer_ui_state(&CHAT.into())
+        .unwrap()
+        .attached_provider_sessions
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_disconnect_stops_the_observed_session_preserves_history_and_cannot_retarget_a_retry()
+{
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    let sessions = attached_sessions(&core).await;
+    assert_eq!(sessions.len(), 1);
+    let request = DisconnectThreadSessionParams {
+        chat_id: CHAT.into(),
+        client_request_id: "disconnect-once".into(),
+        provider_sessions: sessions.clone(),
+    };
+    let mut stale_revision = request.clone();
+    stale_revision.client_request_id = "stale-attachment-revision".into();
+    stale_revision.provider_sessions[0].attachment_sequence += 1;
+    assert!(
+        client
+            .disconnect_thread_session(stale_revision, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("changed")
+    );
+    assert!(core.sessions.has_live_runtime(CHAT));
+    let first = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(first.refusal.is_none(), "{:?}", first.refusal);
+    wait_for(
+        || !core.sessions.has_live_runtime(CHAT),
+        "disconnected runtime teardown",
+    )
+    .await;
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "disconnect must not start another provider"
+    );
+    assert!(
+        core.orchestration
+            .store
+            .transfer_ui_state(&CHAT.into())
+            .unwrap()
+            .attached_provider_sessions
+            .is_empty()
+    );
+    let p = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        p.records["provider-thread"]
+            .iter()
+            .any(|provider| provider["nativeThreadRef"]["nativeId"] == "sess-queue"),
+        "disconnect must keep the accepted native conversation"
+    );
+
+    core.doc_host
+        .queue_message(CHAT, "continue after disconnect", vec![])
+        .unwrap();
+    let replacement = attached_sessions(&core).await;
+    wait_for(|| prompts.lock().unwrap().len() == 2, "replacement input").await;
+    assert_eq!(
+        harness.requests.lock().unwrap()[1].resume.as_deref(),
+        Some("sess-queue")
+    );
+    assert_ne!(sessions, replacement);
+    let replay = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(first.sequence, replay.sequence);
+    assert!(replay.refusal.is_none());
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "replay cannot disconnect a replacement"
+    );
+    let mut stale = request.clone();
+    stale.client_request_id = "stale-panel".into();
+    assert!(
+        client
+            .disconnect_thread_session(stale, &core.device_id)
+            .await
+            .unwrap()
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("changed")
+    );
+    let mut collision = request;
+    collision.provider_sessions = replacement;
+    assert!(
+        client
+            .disconnect_thread_session(collision, &core.device_id)
+            .await
+            .expect_err("a request identity cannot target different sessions")
+            .to_string()
+            .contains("different sessions")
+    );
+    core.workspace
+        .create_chat("replica", None, Some("foreign-owner"), None, None)
+        .unwrap();
+    assert!(
+        client
+            .disconnect_thread_session(
+                DisconnectThreadSessionParams {
+                    chat_id: "replica".into(),
+                    client_request_id: "foreign".into(),
+                    provider_sessions: sessions,
+                },
+                &core.device_id
+            )
+            .await
+            .is_err()
+    );
+    assert!(core.sessions.has_live_runtime(CHAT));
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_disconnect_does_not_require_a_live_agent_credential() {
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (core, harness, _) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "long-running session", vec![])
+        .unwrap();
+    let provider_sessions = attached_sessions(&core).await;
+    // Credential liveness and the user's authority to stop their runtime are
+    // different boundaries. Never fabricate an agent scope for this action.
+    core.sessions.mcp_server().credentials.revoke_thread(CHAT);
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .disconnect_thread_session(
+            DisconnectThreadSessionParams {
+                chat_id: CHAT.into(),
+                client_request_id: "user-not-agent".into(),
+                provider_sessions,
+            },
+            &core.device_id,
+        )
+        .await
+        .unwrap();
+    assert!(reply.refusal.is_none(), "{:?}", reply.refusal);
+    wait_for(
+        || !core.sessions.has_live_runtime(CHAT),
+        "user-authorized teardown",
+    )
+    .await;
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_disconnect_survives_response_loss_rebuild_and_does_not_stop_an_idle_replacement() {
+    use zeron_engine::orchestration::{
+        WriteBoundary,
+        effects::{EffectExecutor, EffectRequest},
+    };
+    use zeron_proto::transfer::DisconnectThreadSessionParams;
+    let (mut harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    Arc::get_mut(&mut harness).unwrap().park_after_done = true;
+    let (core, harness, _) = setup_with((harness, prompts)).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "first runtime", vec![])
+        .unwrap();
+    let sessions = attached_sessions(&core).await;
+    core.orchestration_host.as_ref().unwrap().shutdown().await;
+    let request = DisconnectThreadSessionParams {
+        chat_id: CHAT.into(),
+        client_request_id: "after-commit-loss".into(),
+        provider_sessions: sessions,
+    };
+    // First commit reserves the payload; second accepts detach plus its outbox.
+    core.orchestration
+        .store
+        .inject_failure(WriteBoundary::AfterCommit, 2);
+    assert!(
+        client
+            .disconnect_thread_session(request.clone(), &core.device_id)
+            .await
+            .is_err()
+    );
+    let accepted = client
+        .disconnect_thread_session(request.clone(), &core.device_id)
+        .await
+        .unwrap();
+    assert!(accepted.refusal.is_none());
+    core.orchestration.store.rebuild().unwrap();
+    let replay = client
+        .disconnect_thread_session(request, &core.device_id)
+        .await
+        .unwrap();
+    assert_eq!(accepted.sequence, replay.sequence);
+    let effect = core
+        .orchestration
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|effect| {
+            matches!(
+                effect.request,
+                EffectRequest::ProviderSessionDisconnect { .. }
+            )
+        })
+        .unwrap();
+
+    core.sessions.interrupt(CHAT).await.unwrap();
+    let mut next = harness.requests.lock().unwrap()[0].clone();
+    next.prompt = "replacement runtime".into();
+    next.resume = None;
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            next,
+            Some("replacement-input".into()),
+        )
+        .await
+        .unwrap();
+    attached_sessions(&core).await;
+    let _ = harness.finish.send(());
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|status| status.status == zeron_proto::SessionStatus::Idle)
+        },
+        "idle replacement",
+    )
+    .await;
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "fixture must retain a parked provider process"
+    );
+    let bridge = core.orchestration_host.as_ref().unwrap().bridge.clone();
+    assert_eq!(
+        bridge
+            .execute(&effect, tokio_util::sync::CancellationToken::new())
+            .await,
+        zeron_engine::orchestration::effects::EffectOutcome::Succeeded
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        core.sessions.has_live_runtime(CHAT),
+        "a delayed disconnect must not cancel an idle replacement"
+    );
+    assert_eq!(harness.requests.lock().unwrap().len(), 2);
+    core.shutdown().await;
 }
 
 /// Nothing is running, so a queued message is just a message: it goes out at
