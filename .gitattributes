@@ -1,0 +1,3 @@
+# This prompt is included verbatim and verified against the pinned T3 hash.
+# Its bytes must not depend on Git for Windows' core.autocrlf setting.
+crates/engine/src/mcp/instructions.md text eol=lf
