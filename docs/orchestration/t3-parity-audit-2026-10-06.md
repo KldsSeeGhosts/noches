@@ -165,10 +165,15 @@ is not an acceptable substitute.
   mailbox. Successful adapter acknowledgement records a durable per-message
   receipt; explicit refusal fails the effect, while a dropped receipt channel
   or ten-second timeout leaves acceptance uncertain. Codex confirms after its
-  native steering RPC. Claude confirms only after its stdin writer successfully
-  writes and flushes the user line, not when the writer mailbox accepts it.
-  This Claude boundary proves adapter transport delivery, not CLI prompt echo
-  or completed provider work.
+  native steering RPC. Claude's stdin writer answers the mailbox acknowledgement
+  only after it successfully writes and flushes the user line (transport
+  delivery, not the writer mailbox). The exact native receipt is separate: every
+  Claude stdin line carries a host-chosen `uuid` and the CLI runs with
+  `--replay-user-messages`, whose `isReplay` echo of that `uuid` (verified on CLI
+  2.1.292) becomes `InputAcceptedFor`, so Claude retires pending input only by
+  that echo. A duplicate or unknown echo accepts nothing; an echo that never
+  arrives stays unaccepted for the host's recovery. Not proven live: echo timing
+  for a steer queued past a turn boundary.
 - Canonical receipts survive projection rebuild and process restart. An exact
   late `InputAcceptedFor` can record confirmation in the provider-event
   transaction and release only its own uncertainty barrier. Persisted proof
@@ -259,3 +264,11 @@ inherited tool/media history, whole-thread Stop, context-window/compact policy,
 and live-provider and non-Mac verification). Older builds stored false
 acceptance at session initialization; those rows cannot retrospectively prove
 provider submission, so no speculative migration or historical replay is done.
+
+Legacy-row policy: steering effects admitted before the per-input receipt
+contract have no `orchestration_steering_inputs` row. They are never joined into
+unconfirmed-input recovery (not replayed as historical context), never gain an
+`orchestration_steering_acceptances` row without an exact provider receipt, and
+are never reinterpreted as rejected; acceptance of a run's root is likewise
+derived only from a bound provider-turn record, never from session start.
+Regression: `legacy_steering_rows_are_never_replayed_or_speculatively_accepted`.

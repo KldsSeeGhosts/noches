@@ -193,14 +193,23 @@ not live installed-provider verification.
 
 Remaining parity work, not claimed complete:
 
-- Claude/Pi/negotiated ACP native fork hooks; Codex legacy paginated fork/revert
-  fallback; lifecycle operations are not inferred from native resume support.
+- Claude/Pi/negotiated ACP native fork hooks (Claude's `--fork-session` writes no
+  session until a turn runs and the adapter exposes no turn refs; ACP
+  `session/fork` is head-only); lifecycle operations are not inferred from native
+  resume support. Codex cursor-less (legacy) source turns do fork natively: head
+  fork, then paginated `thread/revert` of the counted settled later turns,
+  refused (portable fallback or uncertain fork) when a later turn is live or the
+  fork uses legacy history.
 - Loaded-process native history injection (the optional lifecycle hook currently
   defaults to unsupported, so production delivery falls back to bounded inline).
-- Live model-catalog context-window lookup. Accepted-root/native-identity usage
-  reports are wired; unknown windows retain T3's 128k fallback.
+- Handoff budgets prefer the adapter-declared catalog window
+  (`Harness::model_context_window`; Claude 200K/1M by the `contextWindow`
+  option), then accepted-root usage reports; undeclared windows retain T3's 128k
+  fallback. Codex/OpenCode/ACP catalogs do not declare one yet.
 - Cross-instance native-account resume compatibility, missing-native-input
-  reconstruction, `/compact` handoff deferral, and conversation rewind.
+  reconstruction, and conversation rewind. A bare `/compact` turn defers inline
+  handoff delivery (the next ordinary turn still owes it) and is refused on a
+  thread with no conversation.
 - Exact project-root lookup for legacy null-worktree threads at the launch-slice
   seam: currently uncertainty conservatively refuses restore.
 - Sparse checkout/submodule checkpoint parity: capture/restore explicitly refuse

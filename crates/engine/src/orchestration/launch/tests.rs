@@ -1418,3 +1418,68 @@ async fn deleted_launch_is_not_reprepared_or_continued_after_restart() {
     assert!(rig.intake.trace.lock().unwrap().is_empty());
     assert!(rig.scope.caller.workspace_root.join("base.txt").exists());
 }
+
+/// A claimed attachment is deleted exactly by its owning thread's cleanup:
+/// another thread's cleanup never removes it, a retried cleanup is
+/// idempotent, and a rejected claim batch leaves no half-claimed files.
+#[tokio::test]
+async fn attachment_cleanup_is_owner_scoped_idempotent_and_leaves_no_partial_claims() {
+    let rig = Rig::new().await;
+    let dir = rig.service.data_dir.join("attachments");
+    let files = || {
+        std::fs::read_dir(&dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let (claimed, paths) = rig
+        .service
+        .claim("parent", vec![upload(&rig).await])
+        .unwrap();
+    let id = claimed[0]["id"].as_str().unwrap().to_owned();
+    assert!(paths[0].exists());
+    // Staged uploads count too, so measure after staging the batch members.
+    let staged = upload(&rig).await;
+    let before = files();
+
+    // A batch with a later invalid member removes its earlier claims.
+    let rejected = rig.service.claim(
+        "parent",
+        vec![
+            staged,
+            json!({"id":"pending-00000000-0000-4000-8000-000000000000","type":"image",
+                "name":"missing.png","mimeType":"image/png","sizeBytes":1}),
+        ],
+    );
+    assert!(rejected.is_err());
+    assert_eq!(files(), before, "a rejected batch leaves no partial claims");
+
+    // Another thread cannot clean it up, and its claim row survives.
+    rig.service
+        .cleanup_owned("other", Some(vec![id.clone()]))
+        .unwrap();
+    assert!(paths[0].exists());
+    assert!(
+        rig.service
+            .kernel
+            .store
+            .launch_attachment_path(&id, "parent")
+            .unwrap()
+            .is_some()
+    );
+
+    // The owner removes the file and its claim; a replayed cleanup is a no-op.
+    for _ in 0..2 {
+        rig.service
+            .cleanup_owned("parent", Some(vec![id.clone()]))
+            .unwrap();
+        assert!(!paths[0].exists());
+        assert!(
+            rig.service
+                .kernel
+                .store
+                .launch_attachment_path(&id, "parent")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
