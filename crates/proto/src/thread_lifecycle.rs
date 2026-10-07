@@ -287,7 +287,7 @@ mod tests {
     fn queue_attachment_edits_are_additive_and_fenced_by_a_fingerprint() {
         let value = serde_json::json!({"chatId":"thread","queuedRunId":"run",
             "clientRequestId":"stable", "action":{"type":"edit","text":"new","expectedText":"old",
-            "attachments":{"expected":"claims=a|paths=/x.png","paths":["/y.png"]}}});
+            "attachments":{"expected":"claims=1:a|paths=6:/x.png","paths":["/y.png"]}}});
         let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
         let super::QueuedRunAction::Edit { attachments, .. } = request.action else {
             panic!("edit expected");
