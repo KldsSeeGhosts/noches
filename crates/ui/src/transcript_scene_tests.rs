@@ -11,7 +11,10 @@ mod scene_regressions {
 
     impl Render for Surface {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let children = div().size_full().flex().children(self.transcripts.iter().map(|transcript| {
+            let children = div()
+                .size_full()
+                .flex()
+                .children(self.transcripts.iter().map(|transcript| {
                     div()
                         .flex_1()
                         .min_w_0()
@@ -21,9 +24,13 @@ mod scene_regressions {
                             self.reuse,
                         ))
                 }));
-            div().size_full().opacity(self.opacity).child(
-                crate::transcript_scene::scope(self.opacity == 1.0, children)
-            )
+            div()
+                .size_full()
+                .opacity(self.opacity)
+                .child(crate::transcript_scene::scope(
+                    self.opacity == 1.0,
+                    children,
+                ))
         }
     }
 
@@ -145,6 +152,54 @@ mod scene_regressions {
                 revision
             );
         }
+    }
+
+    #[gpui::test]
+    fn cached_list_wheel_cancels_competing_rail_glide(cx: &mut TestAppContext) {
+        let _dir = setup(cx);
+        let (surface, visual) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state.transcript_replayed = true;
+                state
+            });
+            Surface {
+                transcripts: vec![cx.new(|cx| settled(state, false, cx))],
+                reuse: true,
+                opacity: 1.0,
+            }
+        });
+        let transcript = surface.read_with(visual, |s, _| s.transcripts[0].clone());
+        transcript.update(visual, |t, cx| {
+            t.rows = (0..100)
+                .map(|i| viewport_row(&format!("row-{i}"), "entry"))
+                .collect();
+            t.list.reset(t.rows.len());
+            cx.notify();
+        });
+        visual.update(|w, cx| w.draw(cx).clear());
+        transcript.update(visual, |t, cx| {
+            t.scroll_to_row(0, cx);
+            assert!(t.scroll_anim.is_some());
+        });
+        visual.update(|w, cx| {
+            w.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: gpui::point(px(300.), px(300.)),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(40.))),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        transcript.read_with(visual, |t, _| {
+            assert!(
+                t.scroll_anim.is_none(),
+                "the list's real input callback must cancel the rail task synchronously"
+            );
+            assert!(!t.pinned);
+        });
     }
 
     #[gpui::test]

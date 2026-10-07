@@ -53,18 +53,11 @@ fn user_text(entry: &SessionMessageEntry) -> String {
     crate::attachments::user_message_rail_text(&raw)
 }
 
-fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
-    entries
-        .iter()
-        .find(|e| e.role == MessageRole::Assistant)
-        .and_then(|entry| {
-            entry.parts.iter().find_map(|part| match part {
-                MessagePart::Text { text, .. } if !text.trim().is_empty() => {
-                    Some(text.trim().to_string())
-                }
-                _ => None,
-            })
-        })
+fn reply_text(entry: &SessionMessageEntry) -> Option<&str> {
+    entry.parts.iter().find_map(|part| match part {
+        MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    })
 }
 
 /// Extract rail ticks from the transcript: one per user entry (doc entries
@@ -75,27 +68,83 @@ pub fn rail_ticks(
     entries: &[SessionMessageEntry],
     echoes: &[SessionMessageEntry],
 ) -> Vec<RailTick> {
-    let mut ticks: Vec<RailTick> = Vec::new();
-    for (ix, entry) in entries.iter().enumerate() {
-        if entry.role != MessageRole::User {
-            continue;
+    collect_ticks(entries, echoes, false)
+}
+
+fn collect_ticks(
+    entries: &[SessionMessageEntry],
+    echoes: &[SessionMessageEntry],
+    previews_only: bool,
+) -> Vec<RailTick> {
+    let prompt = |entry| {
+        let text = user_text(entry);
+        if previews_only {
+            truncate_preview(&text, PREVIEW_PROMPT_CHARS)
+        } else {
+            text
         }
-        ticks.push(RailTick {
-            message_id: entry.id.clone(),
-            prompt: user_text(entry),
-            reply: first_reply_text(&entries[ix + 1..]),
-        });
+    };
+    let mut ticks: Vec<RailTick> = Vec::new();
+    // The next assistant is shared by consecutive prompts. A reverse pass
+    // avoids rescanning an arbitrarily long suffix for every user entry.
+    let mut reply = None;
+    for entry in entries.iter().rev() {
+        if entry.role == MessageRole::Assistant {
+            reply = reply_text(entry);
+        } else if entry.role == MessageRole::User {
+            ticks.push(RailTick {
+                message_id: entry.id.clone(),
+                prompt: prompt(entry),
+                reply: reply.map(|text| {
+                    if previews_only {
+                        truncate_preview(text, PREVIEW_REPLY_CHARS)
+                    } else {
+                        text.to_owned()
+                    }
+                }),
+            });
+        }
     }
+    ticks.reverse();
+    let mut ids: std::collections::HashSet<_> =
+        ticks.iter().map(|tick| tick.message_id.clone()).collect();
     for echo in echoes {
-        if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
+        if echo.role == MessageRole::User && ids.insert(echo.id.clone()) {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
-                prompt: user_text(echo),
+                prompt: prompt(echo),
                 reply: None,
             });
         }
     }
     ticks
+}
+
+/// Content-derived outline, retained across scroll/hover/layout frames. Stores
+/// bounded previews and row identities, never rich history payloads.
+#[derive(Default)]
+pub(crate) struct RailModel {
+    pub(crate) pairs: Vec<(RailTick, usize)>,
+    tick_rows: Vec<usize>,
+}
+
+impl RailModel {
+    pub(crate) fn build<'a>(
+        entries: &[SessionMessageEntry],
+        echoes: &[SessionMessageEntry],
+        rows: impl Iterator<Item = (&'a str, usize)>,
+    ) -> Self {
+        let rows: std::collections::HashMap<_, _> = rows.collect();
+        let pairs: Vec<_> = collect_ticks(entries, echoes, true)
+            .into_iter()
+            .filter_map(|tick| {
+                let row = *rows.get(tick.message_id.as_str())?;
+                Some((tick, row))
+            })
+            .collect();
+        let tick_rows = pairs.iter().map(|(_, row)| *row).collect();
+        Self { pairs, tick_rows }
+    }
 }
 
 /// The active tick for a scroll position: the last tick whose transcript row is
@@ -163,12 +212,29 @@ pub fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
 /// prompts and replies are free text) collapse to single spaces first: the
 /// preview card's title is a one-line surface (message-rail.tsx line-clamp-1).
 pub fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let flat = crate::transcript::single_line(text);
-    if flat.chars().count() <= max_chars {
-        return flat;
+    // Normalize only the prefix we actually display. A multi-megabyte reply
+    // must not be copied/scanned in full to paint a 200-character tooltip.
+    let mut flat = String::new();
+    let mut count = 0;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !flat.is_empty();
+            continue;
+        }
+        if pending_space {
+            flat.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        flat.push(ch);
+        count += 1;
+        if count > max_chars {
+            let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+            return format!("{}…", cut.trim_end());
+        }
     }
-    let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
+    flat
 }
 
 // ---------------------------------------------------------------------------
@@ -412,28 +478,13 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
-            let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
-        };
-        let ticks = rail_ticks(&entries, &echoes);
-        // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize)> = ticks
-            .into_iter()
-            .filter_map(|tick| {
-                let row = self
-                    .rows()
-                    .iter()
-                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
-                Some((tick, row))
-            })
-            .collect();
+        let model = self.rail_model(cx);
+        let pairs = &model.pairs;
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
         // Active detection reads from the READING line, not the raw clip top:
         // the titlebar overlays the list, so a row whose top sits within that
         // chrome band is what you're reading — the sliver of the previous row
@@ -454,7 +505,7 @@ impl Transcript {
                 break;
             }
         }
-        let active = active_tick(&tick_rows, top_row);
+        let active = active_tick(&model.tick_rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();
 
@@ -497,11 +548,6 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                let reply = tick
-                    .reply
-                    .as_deref()
-                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                 let card: Option<AnyElement> = is_hovered.then(|| {
                     let theme = theme.for_popup();
                     let card = popover::popover_card(&theme)
@@ -514,9 +560,9 @@ impl Transcript {
                             div()
                                 .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text)
-                                .child(SharedString::from(prompt.clone())),
+                                .child(SharedString::from(tick.prompt.clone())),
                         )
-                        .when_some(reply.clone(), |el, reply| {
+                        .when_some(tick.reply.clone(), |el, reply| {
                             el.child(
                                 div()
                                     .text_size(crate::typography::ui_rems(11.0))
@@ -590,6 +636,86 @@ mod tests {
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn outline_maps_rows_linearly_and_bounds_preview_storage() {
+        let entries = vec![
+            entry("one", MessageRole::User, &"Prompt ".repeat(500)),
+            entry("reply", MessageRole::Assistant, &"Answer ".repeat(2000)),
+            entry("two", MessageRole::User, "Second"),
+        ];
+        let echoes = vec![
+            entry("two", MessageRole::User, "Duplicate"),
+            entry("pending", MessageRole::User, "Not yet acknowledged"),
+        ];
+        let model = RailModel::build(
+            &entries,
+            &echoes,
+            [
+                ("one", 0),
+                ("reply#text.0", 1),
+                ("two", 12),
+                ("pending", 13),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(model.tick_rows, vec![0, 12, 13]);
+        assert_eq!(
+            model.pairs[0].0.prompt.chars().count(),
+            PREVIEW_PROMPT_CHARS
+        );
+        assert_eq!(
+            model.pairs[0].0.reply.as_ref().unwrap().chars().count(),
+            PREVIEW_REPLY_CHARS
+        );
+        assert_eq!(model.pairs[1].0.prompt, "Second");
+        assert!(model.pairs[1].0.reply.is_none());
+        assert_eq!(model.pairs[2].0.message_id, "pending");
+    }
+
+    #[test]
+    fn next_reply_semantics_survive_consecutive_prompts_and_empty_assistants() {
+        let entries = vec![
+            entry("one", MessageRole::User, "First"),
+            entry("two", MessageRole::User, "Second"),
+            entry("empty", MessageRole::Assistant, ""),
+            entry("three", MessageRole::User, "Third"),
+            entry("answer", MessageRole::Assistant, "Answer"),
+        ];
+        let ticks = rail_ticks(&entries, &[]);
+        assert_eq!(
+            ticks
+                .iter()
+                .map(|t| t.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"]
+        );
+        assert!(ticks[0].reply.is_none() && ticks[1].reply.is_none());
+        assert_eq!(ticks[2].reply.as_deref(), Some("Answer"));
+    }
+
+    #[test]
+    fn bounded_preview_matches_whitespace_and_unicode_semantics() {
+        for text in [
+            "",
+            "   ",
+            "a",
+            " a\tb\n c  ",
+            "é 日🙂\u{2003}last",
+            "a          b",
+        ] {
+            let flat = crate::transcript::single_line(text);
+            for cap in 0..20 {
+                let expected = if flat.chars().count() <= cap {
+                    flat.clone()
+                } else {
+                    let cut: String = flat.chars().take(cap.saturating_sub(1)).collect();
+                    format!("{}…", cut.trim_end())
+                };
+                assert_eq!(truncate_preview(text, cap), expected, "{text:?} cap={cap}");
+            }
         }
     }
 

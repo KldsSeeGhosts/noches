@@ -3032,6 +3032,7 @@ pub struct Transcript {
     selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
+    rail_model: Option<Rc<crate::rail::RailModel>>,
     /// Height of the shell's composer/status/terminal stack overlaying the
     /// transcript's bottom (measured last frame): the last row pads past it
     /// so pinned content rests above the glass chrome it scrolls under.
@@ -3306,6 +3307,7 @@ impl Transcript {
             selection_drag_position: None,
             selection_scroll_task: None,
             rail_enabled,
+            rail_model: None,
             bottom_clearance: 0.0,
             rail_hover: None,
             hovered_entry: None,
@@ -3347,6 +3349,36 @@ impl Transcript {
         self.rail_enabled
     }
 
+    pub(crate) fn rail_model(&mut self, cx: &gpui::App) -> Rc<crate::rail::RailModel> {
+        if let Some(model) = &self.rail_model {
+            return model.clone();
+        }
+        let started = crate::perf_trace::enabled().then(Instant::now);
+        let state = self.state.read(cx);
+        let entries = match &self.doc_override {
+            Some(doc_id) => state.sub_transcript(doc_id),
+            None => &state.transcript,
+        };
+        let echoes = match &self.doc_override {
+            Some(doc_id) if self.interactive_override => state.pending_echoes_for(doc_id),
+            None => state.pending_echoes(),
+            _ => &[],
+        };
+        let model = Rc::new(crate::rail::RailModel::build(
+            entries,
+            echoes,
+            self.rows
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| (row.id.as_ref(), ix)),
+        ));
+        if let Some(started) = started {
+            crate::perf_trace::rail_build(started.elapsed());
+        }
+        self.rail_model = Some(model.clone());
+        model
+    }
+
     /// Shell-driven: the measured height of the bottom chrome stack the
     /// transcript scrolls under. Sub-pixel jitter is ignored so steady-state
     /// frames don't re-notify.
@@ -3367,10 +3399,6 @@ impl Transcript {
 
     pub(crate) fn set_rail_hover(&mut self, hover: Option<usize>) {
         self.rail_hover = hover;
-    }
-
-    pub(crate) fn rows(&self) -> &[Row] {
-        &self.rows
     }
 
     pub(crate) fn list_state(&self) -> &ListState {
@@ -3467,10 +3495,6 @@ impl Transcript {
         }
     }
 
-    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
-        &self.state
-    }
-
     /// Hand viewport ownership to explicit rail/navigation input before its
     /// reduced-motion or animated branch moves the list.
     pub(crate) fn begin_scroll_navigation(&mut self) {
@@ -3529,6 +3553,10 @@ impl Transcript {
     }
 
     fn handle_scroll(&mut self, _event: &ListScrollEvent, cx: &mut Context<Self>) {
+        // Wheel/touch input owns the viewport, including while a rail click's
+        // 500ms glide is still running. Cancel before deferred ListState reads
+        // so the next timer tick cannot overwrite the user's gesture.
+        self.scroll_anim = None;
         // Cancel synchronously, before a queued animation frame can undo the
         // wheel/touch input. Neither operation reads the borrowed ListState.
         self.user_collapse_scroll = None;
@@ -4513,6 +4541,7 @@ impl Transcript {
             return;
         }
         self.last_source = Some(source);
+        self.rail_model = None;
 
         let attached = selected != self.chat_id;
         // Arm the replay baseline before classifying tool arrivals. Selection
@@ -6369,6 +6398,7 @@ impl Transcript {
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        crate::perf_trace::row_render();
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
@@ -7644,6 +7674,31 @@ impl Transcript {
                 )
             })
             .into_any_element()
+    }
+}
+
+#[cfg(feature = "ui-response-fixture")]
+impl Transcript {
+    pub fn fixture_response_position(&self) -> serde_json::Value {
+        let top = self.list.logical_scroll_top();
+        serde_json::json!({
+            "row": top.item_ix,
+            "offset": f32::from(top.offset_in_item),
+            "distance": self.distance_from_bottom(),
+            "rows": self.rows.len(),
+            "pinned": self.pinned,
+            "jump": self.show_jump_button,
+            "navigation": self.scroll_anim.is_some(),
+        })
+    }
+
+    pub fn fixture_response_seek(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        self.stop_automatic_scrolling();
+        self.list.scroll_to(ListOffset {
+            item_ix: ((self.rows.len().saturating_sub(1) as f32) * fraction) as usize,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
     }
 }
 
@@ -9479,6 +9534,81 @@ mod tests {
                 assert!(transcript.rows.is_empty());
                 assert!(transcript.chat_id.is_none());
                 assert!(!transcript.route_exit_pending(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn outline_is_reused_for_scrolls_but_invalidated_for_content_and_session_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(Default::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+            let prompt = |id: &str, text: &str| SessionMessageEntry {
+                id: id.into(),
+                role: MessageRole::User,
+                parts: vec![text_part("text", text)],
+                created_at: 0,
+                device_id: "local".into(),
+                status: None,
+                continuation_of: None,
+            };
+            state.update(cx, |s, _| {
+                s.selected_chat = Some("a".into());
+                s.apply_transcript(vec![prompt("one", "Original"), prompt("two", "Second")]);
+            });
+            transcript.update(cx, |t, cx| {
+                t.sync(cx);
+                let first = t.rail_model(cx);
+                for _ in 0..100 {
+                    assert!(
+                        Rc::ptr_eq(&first, &t.rail_model(cx)),
+                        "scroll frames must not rebuild history"
+                    );
+                }
+                t.state
+                    .update(cx, |s, _| s.push_echo("a", prompt("echo", "Pending")));
+                t.sync(cx);
+                let echo = t.rail_model(cx);
+                assert!(!Rc::ptr_eq(&first, &echo));
+                assert_eq!(echo.pairs.last().unwrap().0.message_id, "echo");
+                t.state.update(cx, |s, _| {
+                    s.apply_transcript(vec![
+                        prompt("one", "Replaced"),
+                        prompt("two", "Second"),
+                        prompt("echo", "Pending"),
+                    ]);
+                });
+                t.sync(cx);
+                let changed = t.rail_model(cx);
+                assert!(!Rc::ptr_eq(&echo, &changed));
+                assert_eq!(changed.pairs[0].0.prompt, "Replaced");
+                assert_eq!(
+                    changed.pairs.len(),
+                    3,
+                    "acknowledged echoes must not duplicate"
+                );
+                t.state.update(cx, |s, _| {
+                    s.selected_chat = Some("b".into());
+                    s.apply_transcript(vec![]);
+                });
+                t.sync(cx);
+                assert!(t.rail_model(cx).pairs.is_empty());
+            });
+            state.update(cx, |s, _| {
+                s.set_subagent_snapshot(
+                    "fixed".into(),
+                    vec![prompt("fixed-prompt", "Fixed session")],
+                );
+            });
+            let fixed = cx.new(|cx| Transcript::for_session(state, "fixed".into(), cx));
+            fixed.update(cx, |t, cx| {
+                assert_eq!(t.rail_model(cx).pairs[0].0.message_id, "fixed-prompt");
             });
         });
     }
@@ -12237,6 +12367,37 @@ mod tests {
                 );
             })
             .unwrap();
+        }
+
+        #[test]
+        fn wheel_input_cancels_rail_navigation_before_its_next_timer_tick() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |t, cx| {
+                    t.rows = (0..100)
+                        .map(|i| viewport_row(&format!("row-{i}"), "entry"))
+                        .collect();
+                    t.list.reset(t.rows.len());
+                    t.rail_enabled = false;
+                    t.pinned = false;
+                    cx.notify();
+                });
+                draw(window, cx);
+                transcript.update(cx, |t, cx| {
+                    t.scroll_to_row(0, cx);
+                    assert!(t.scroll_anim.is_some(), "exercise an actual rail glide");
+                });
+                wheel(window, 40., cx);
+                assert!(
+                    transcript.read(cx).scroll_anim.is_none(),
+                    "wheel input must immediately cancel the competing navigation task"
+                );
+                draw(window, cx);
+                assert!(!transcript.read(cx).pinned);
+                // A direction reversal remains ordinary user scrolling.
+                wheel(window, -20., cx);
+                draw(window, cx);
+                assert!(transcript.read(cx).scroll_anim.is_none());
+            });
         }
 
         #[test]
