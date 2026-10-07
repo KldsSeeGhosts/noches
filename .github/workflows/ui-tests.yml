@@ -110,6 +110,52 @@ jobs:
       - name: Unified build and durable session regressions
         run: python3 scripts/ci/run-session-sync.py
 
+  # Every engine integration target, not the sync-gate slice above: several
+  # fixtures once passed only on hosts with matching CLIs, logins and catalogs.
+  # Tests must stay hermetic (no reliance on HOME, auth or installed CLIs).
+  engine-integration:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-engine-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          # Debug engine test binaries share dependencies with the sync gate,
+          # which saves this cache on dev.
+          shared-key: linux-debug
+          save-if: false
+      - name: Engine unit and integration tests
+        run: cargo test --locked --no-fail-fast -p zeron-engine --tests
+
+  macos-engine-integration:
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: macos-latest
+    concurrency:
+      group: ci-macos-engine-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: macos-engine
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Engine unit and integration tests
+        run: cargo test --locked --no-fail-fast -p zeron-engine --tests
+
   ui-tests:
     needs: changes
     if: needs.changes.outputs.native == 'true'
