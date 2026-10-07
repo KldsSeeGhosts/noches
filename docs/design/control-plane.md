@@ -141,10 +141,10 @@ never polls account usage. Its fill is `text_muted`, turning
 "Context window" with the percent in mono, a 4px usage bar, then mono
 11px lines - `used / window tokens`, `left`, `Auto-compacts at ~N%`
 (only when the harness reports the threshold), and session totals
-(`in · out · cache`) when available. Pi reports through the Noches Pi
-extension (`crates/harness/src/pi/noches-context-usage.ts`), which writes
-snapshots the harness polls; `tokens: null` after compaction reads as
-"Waiting for context usage", never 0%.
+(`in · out · cache`) when available. Pi reports through its own RPC
+`get_session_stats` (read at every settled turn and after compaction; the
+threshold is `contextWindow - reserveTokens` from Pi's settings);
+`tokens: null` after compaction reads as "Waiting for context usage", never 0%.
 
 ## Tool rows
 

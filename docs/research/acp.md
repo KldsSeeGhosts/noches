@@ -38,13 +38,9 @@
   `_session/steering` extension and no effort config advertised (Hermes 4's
   hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
   the model list is discovered over ACP (below), with the Nous flagships as
-  the static fallback. `AcpHarness::pi()` runs the pi coding
-  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.34,
-  managed-install fallback; requires the pi CLI itself,
-  `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
-  ride pi's own provider config (catalog advertises a `default` pass-through
-  entry); thinking ladder minimal→max maps onto zeron's levels via the
-  generic `thought_level` preference ladder ("off" has no zeron tier).
+  the static fallback. Pi was registered here through the community `pi-acp`
+  adapter; **that path is retired** - Pi now has a native driver over
+  `pi --mode rpc` (`docs/orchestration/pi-native-rpc.md`).
 - **Devin registered** (2026-08-15): `AcpHarness::devin()` runs Cognition's
   native ACP server (`devin acp`; install via
   `curl -fsSL https://cli.devin.ai/install.sh | bash` or
@@ -201,22 +197,8 @@ agent, and structured error details. The engine test checks Working status and
 transcript boundaries with a 100ms watchdog, then verifies autonomous activity
 still settles.
 
-For real-model testing, configure an isolated authenticated Pi agent directory,
-select a model in its settings, and load
-`crates/harness/tests/fixtures/pi-slow-model.ts` (for example, symlink it into that
-agent directory's `extensions/` directory). The extension waits 35 seconds before
-sending the next model request after a completed tool. It does not delay tool
-results or synthesize an ACP completion. Then run:
-
-```sh
-PI_CODING_AGENT_DIR=/path/to/isolated/pi-agent \
-PI_ACP_PI_COMMAND=/path/to/pi \
-ACP_TEST_RUNS=3 \
-cargo test -p zeron-harness --test real_acp_lifecycle -- --ignored --nocapture
-```
-
-These tests require successful real calls; missing authentication or an unloaded
-delay extension fails rather than skips. Verified locally with pi-acp 0.0.33,
-Pi 0.85.1, and `gpt-5.6-luna`: three sessions each completed the original turn and
-two queued follow-ups after 36.6–36.8-second post-tool gaps; cancellation during a
-32-second post-tool gap also completed as Interrupted.
+The real-model variant of this regression (Pi behind `pi-acp`, with a 35s
+post-tool delay extension) was retired together with the adapter: native Pi
+settles on its own `agent_settled` record, so a quiet model gap cannot park a
+turn. The engine test now runs the Python peer through the generic Devin spec;
+Pi's live coverage is `crates/harness/tests/pi_live.rs`.

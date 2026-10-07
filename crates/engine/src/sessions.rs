@@ -1012,7 +1012,13 @@ impl SessionsEngine {
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
-                h.steerable,
+                // A handle whose teardown was already requested (Stop, session
+                // reset or disconnect) stays in the map until its process has
+                // exited. Its mailbox is still open, so routing a prompt into
+                // it would accept the message and then lose it with the dying
+                // run. Treat it as mid-teardown instead: the fallthrough below
+                // waits for retirement and starts a fresh run.
+                h.steerable && !h.interrupt_token.is_cancelled(),
                 h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),

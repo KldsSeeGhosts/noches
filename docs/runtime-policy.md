@@ -49,7 +49,7 @@ These are provider/client enforcement boundaries, not universal OS sandboxes.
 | Antigravity ACP | native `default` | `auto_edit` | native `default` (T3's intentional mapping) | `yolo` | refused |
 | Generic ACP (Devin/Hermes) | advertised default/ask mode required | advertised acceptEdits/auto_edit mode required | refused: no classifier | advertised bypass if present | refused |
 | OpenCode 1/2 | T3 ask/read rules | T3 edit-allow rules | T3 ask rules, no invented classifier | explicit wildcard allow | refused until plan agent/path rules implemented |
-| Pi via pi-acp | refused | refused | refused | current unrestricted adapter | refused |
+| Pi native RPC | `noches-policy.ts` confirms every non-read-only tool | same, minus `edit`/`write` | refused: no classifier | no hook | refused: no plan gate |
 
 ACP missing/rejected required mode selection fails before `session/prompt`.
 Grok retains Noches's `--no-auto-update` and `--no-leader` safeguards and sets
@@ -57,8 +57,14 @@ initialize `_meta.clientType=extension`. Model options cannot overwrite a
 permission mode. OpenCode installs native rules on create/resume and children;
 a failed child-policy install aborts that child. Unsupported provider versions
 must reject policy-critical RPCs, never silently continue with defaults.
-Pi needs a verified blocking native tool extension/native RPC before restricted
-modes can be enabled; merely requesting approvals from pi-acp is not sufficient.
+Pi enforces Supervised and Auto-accept through its public blocking `tool_call`
+extension hook (`crates/harness/src/pi/noches-policy.ts`): a refused tool never
+runs (`pi_live::live_supervised_mode_blocks_tools_until_the_gate_allows_them`
+verifies this against the real binary). The hook raises an ordinary `confirm`
+dialog whose message is the structured request; the host routes it through its
+permission gate, so Allow-for-session grants are exact per tool input. Host
+pre-approved MCP tools skip the prompt. This is a client boundary, not an OS
+sandbox. Plan and Auto stay refused until Pi has a native plan gate/classifier.
 Cursor follows T3's SDK flag mapping but has no public approval/question-answer
 channel; it does not offer Noches approval-modal parity.
 

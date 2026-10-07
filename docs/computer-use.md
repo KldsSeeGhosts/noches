@@ -1,6 +1,6 @@
 # Managed computer use
 
-Noches owns computer use for Pi sessions on Linux. A Pi run loads `crates/harness/src/pi/noches-cua.ts` through a private `pi` wrapper (`PI_ACP_PI_COMMAND`) so the community `pi-acp` adapter still launches Pi. The extension exposes `noches_cua`. The engine authorizes requests and launches `cua-driver`. The driver draws the session-colored agent cursor and performs desktop inspection and input. Cua's synthetic seat stays off the physical Wayland seat because `vendor/gpui_linux` is part of every Noches build.
+Noches owns computer use for Pi sessions on Linux. A Pi run loads `crates/harness/src/pi/noches-cua.ts` with `pi -e` (the native RPC driver passes it, the policy hook and the session-MCP extension as explicit extensions). The extension exposes `noches_cua`. The engine authorizes requests and launches `cua-driver`. The driver draws the session-colored agent cursor and performs desktop inspection and input. Cua's synthetic seat stays off the physical Wayland seat because `vendor/gpui_linux` is part of every Noches build.
 
 The driver patches in `scripts/cua/` are applied to a Cua source checkout. They are not compiled into the Noches package. After this branch is on `dev`, build them with:
 

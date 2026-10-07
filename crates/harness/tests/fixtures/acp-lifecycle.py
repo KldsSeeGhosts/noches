@@ -52,7 +52,9 @@ while True:
         reply(request, {"sessionId": "s-1"})
     elif method == "session/prompt":
         turn += 1
-        scenario = request["params"]["prompt"][0]["text"]
+        # Non-Pi ACP agents get the session's orchestration instructions as a
+        # preamble to the first prompt; the scenario is the last paragraph.
+        scenario = request["params"]["prompt"][0]["text"].split("\n\n")[-1]
         if scenario == "error":
             error(request, {"reason": "A prompt is already running", "retryable": False})
             continue

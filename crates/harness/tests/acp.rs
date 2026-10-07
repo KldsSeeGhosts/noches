@@ -590,14 +590,14 @@ async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
     // after launch, and the static catalog is served instead.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let broken = dir.path().join("broken-pi-acp");
+    let broken = dir.path().join("broken-hermes");
     std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let harness = AcpHarness::pi().with_executable(broken);
+    let harness = AcpHarness::hermes().with_executable(broken);
     assert!(harness.installed());
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["default"], "{models:?}");
+    assert!(ids.contains(&"hermes-4-70b"), "static catalog served: {models:?}");
 }
 
 #[tokio::test]
@@ -605,7 +605,7 @@ async fn missing_override_is_not_installed_and_fails_discovery() {
     // An override that points at nothing is not an installed agent: the
     // registry must not offer it, and discovery names the problem instead of
     // quietly serving a catalog for a binary that can never launch.
-    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
+    let harness = AcpHarness::hermes().with_executable("/nonexistent/never-a-hermes");
     assert!(!harness.installed());
     let err = harness.models().await.expect_err("missing override");
     assert!(
@@ -658,23 +658,6 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert!(hermes.supports_steering());
     assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
     assert!(hermes.reasoning_levels().is_empty());
-
-    let pi = AcpHarness::pi();
-    assert_eq!(pi.id(), HarnessId::Pi);
-    assert_eq!(pi.display_name(), "Pi");
-    assert!(pi.supports_steering());
-    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
-    assert_eq!(
-        pi.reasoning_levels(),
-        &[
-            zeron_proto::ReasoningLevel::Minimal,
-            zeron_proto::ReasoningLevel::Low,
-            zeron_proto::ReasoningLevel::Medium,
-            zeron_proto::ReasoningLevel::High,
-            zeron_proto::ReasoningLevel::XHigh,
-            zeron_proto::ReasoningLevel::Max,
-        ]
-    );
 }
 
 fn antigravity_harness() -> AcpHarness {
@@ -1420,7 +1403,7 @@ async fn registers_browser_mcp_in_session_new() {
 }
 
 fn pi_fixture() -> AcpHarness {
-    AcpHarness::pi()
+    AcpHarness::hermes()
         .with_executable(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi-acp.sh"),
         )
@@ -1610,7 +1593,7 @@ async fn pi_dropping_stream_terminates_tool_tree() {
 async fn cancel_watchdog_ignores_late_settlement_for_all_acp_specs() {
     for adapter in [
         AcpHarness::grok(),
-        AcpHarness::pi(),
+        AcpHarness::hermes(),
         AcpHarness::antigravity(),
     ] {
         let adapter = adapter
@@ -1647,75 +1630,4 @@ async fn cancel_watchdog_ignores_late_settlement_for_all_acp_specs() {
             );
         }
     }
-}
-
-/// The Pi context-usage snapshot must land BEFORE the terminal Done on a
-/// normal turn, and must not be emitted at all after a cancellation (the
-/// ring is torn down with the turn).
-#[tokio::test]
-async fn pi_usage_snapshot_precedes_done_and_is_dropped_on_cancel() {
-    use zeron_proto::ContextUsage;
-
-    let dir = tempfile::tempdir().unwrap();
-    let usage_file = dir.path().join("context-usage.json");
-    std::fs::write(&usage_file, r#"{"tokens": 1234, "contextWindow": 200000}"#).unwrap();
-
-    // Normal completion: snapshot arrives before Done.
-    let mut harness = pi_fixture();
-    harness.pi_usage_file_override = Some(usage_file.clone());
-    let (ctl, steer, _token) = controls();
-    drop(steer);
-    let events = run_to_end(&harness, request("fresh"), ctl).await;
-    let snapshot_idx = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::ContextUsageSnapshot { .. }));
-    let done_idx = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::Done { .. }));
-    assert!(
-        snapshot_idx.is_some(),
-        "expected a ContextUsageSnapshot before Done: {events:?}"
-    );
-    assert!(
-        snapshot_idx < done_idx,
-        "snapshot must precede the terminal Done: {events:?}"
-    );
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)],);
-
-    // Cancellation: no snapshot after the interrupted Done.
-    std::fs::write(&usage_file, r#"{"tokens": 9999, "contextWindow": 200000}"#).unwrap();
-    let mut harness = pi_fixture();
-    harness.pi_usage_file_override = Some(usage_file);
-    let (ctl, _steer, token) = controls();
-    let mut stream = harness.run(request("interrupt-error"), ctl).await.unwrap();
-    let events = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            let event = event.unwrap();
-            if matches!(&event, AgentEvent::TextDelta { text } if text == "working") {
-                token.cancel();
-            }
-            events.push(event);
-        }
-        events
-    })
-    .await
-    .unwrap();
-    assert_eq!(dones(&events), vec![(DoneStatus::Interrupted, None)]);
-    let done_idx = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::Done { .. }))
-        .unwrap();
-    assert!(
-        !events[done_idx..].iter().any(|e| matches!(
-            e,
-            AgentEvent::ContextUsageSnapshot {
-                usage: ContextUsage {
-                    tokens: Some(9999),
-                    ..
-                }
-            }
-        )),
-        "cancel must not emit the post-Done snapshot: {events:?}"
-    );
 }

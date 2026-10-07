@@ -13,6 +13,8 @@ pub(crate) mod controls;
 mod delegation_live_tests;
 #[cfg(test)]
 mod delegation_tests;
+#[cfg(test)]
+mod pi_native_tests;
 pub mod effects;
 pub mod event;
 pub mod git_actions;

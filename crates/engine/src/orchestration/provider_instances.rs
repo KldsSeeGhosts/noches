@@ -182,16 +182,13 @@ fn config_problem(config: &ProviderInstanceConfig) -> Option<String> {
     if object.get("customModels").is_some_and(|v| !v.is_array()) {
         return Some("customModels must be an array.".into());
     }
-    // Never mistake T3's native Pi binary for pi-acp. Transport migration
-    // belongs to the native Pi slice; configured native overrides fail closed.
+    // Pi owns RPC mode and the native session: launch arguments that would
+    // change either are rejected here, not at the first prompt.
     if config.driver.as_ref() == "pi"
-        && (config_string(config, "binaryPath").is_some()
-            || config_string(config, "launchArgs").is_some())
+        && let Some(args) = config_string(config, "launchArgs")
+        && let Err(error) = zeron_harness::PiHarness::validate_launch_args(&tokenize(args))
     {
-        return Some(
-            "Native Pi RPC launch overrides require a native Pi driver; this build uses pi-acp."
-                .into(),
-        );
+        return Some(error);
     }
     if config_string(config, "shadowHomePath").is_some() {
         return Some("Codex auth-overlay shadow homes are not supported by this build; use a private homePath.".into());
@@ -331,7 +328,7 @@ fn executable_key(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "GROK_EXECUTABLE",
         HarnessId::Devin => "DEVIN_EXECUTABLE",
         HarnessId::Hermes => "HERMES_EXECUTABLE",
-        HarnessId::Pi => "PI_ACP_EXECUTABLE",
+        HarnessId::Pi => "PI_EXECUTABLE",
         HarnessId::Antigravity => "ANTIGRAVITY_ACP_EXECUTABLE",
         HarnessId::Opencode => "OPENCODE_EXECUTABLE",
         HarnessId::Mock => "",
@@ -381,7 +378,7 @@ fn build(
         HarnessId::Grok => native!(zeron_harness::AcpHarness::grok()),
         HarnessId::Devin => native!(zeron_harness::AcpHarness::devin()),
         HarnessId::Hermes => native!(zeron_harness::AcpHarness::hermes()),
-        HarnessId::Pi => native!(zeron_harness::AcpHarness::pi()),
+        HarnessId::Pi => native!(zeron_harness::PiHarness::new()),
         HarnessId::Antigravity => native!(zeron_harness::AcpHarness::antigravity()),
         HarnessId::Mock => Arc::new(zeron_harness::mock::MockHarness { script: Vec::new() }),
     }
@@ -1024,6 +1021,82 @@ mod tests {
         );
         catalog.load(&registry, root.path()).unwrap();
         assert_eq!(catalog.config(&"future".into()).unwrap(), unknown);
+    }
+
+    #[test]
+    fn pi_launch_args_are_validated_when_the_instance_is_written() {
+        let registry = HarnessRegistry::new();
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Pi,
+                name: "Pi".into(),
+                supports_steering: true,
+                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                reasoning_levels: Vec::new(),
+                installed: true,
+                enabled: None,
+            },
+            Box::new(|| true),
+            Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()))),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let catalog = &registry.provider_instances;
+        catalog.load(&registry, root.path()).unwrap();
+        let config = |value: Value| -> ProviderInstanceConfig {
+            serde_json::from_value(json!({"driver":"pi","config":value})).unwrap()
+        };
+        // The binary and launch resources are configurable...
+        let binary = root.path().join(if cfg!(windows) { "pi.exe" } else { "pi" });
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        catalog
+            .write_instance(
+                "pi-ok".into(),
+                config(json!({"binaryPath":binary,
+                    "launchArgs":"--provider cpa --model gemini-3.8-flash --no-skills --my-ext-flag v"})),
+                true,
+            )
+            .unwrap();
+        // ...but Noches owns RPC mode and the native session.
+        for (name, args, reason) in [
+            ("pi-session", "--session /tmp/x.jsonl", "'--session' is controlled by Noches"),
+            ("pi-mode", "--mode text", "'--mode' is controlled by Noches"),
+            ("pi-prompt", "write a poem", "positional prompt"),
+            ("pi-provider", "--provider openrouter", "'--provider' requires '--model'"),
+        ] {
+            let result = catalog.write_instance(
+                name.into(),
+                config(json!({"launchArgs":args})),
+                true,
+            );
+            let rows = catalog.snapshot(&registry);
+            let constrained = rows
+                .iter()
+                .find(|r| r.provider_instance_id.as_ref() == name)
+                .map(|r| r.constraints().join(" "))
+                .unwrap_or_default();
+            assert!(
+                result.is_err() || constrained.contains(reason),
+                "{name}: {result:?} {constrained}"
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains(reason))
+                    .unwrap_or(true),
+                "{name}: {result:?}"
+            );
+        }
+        assert!(
+            catalog
+                .resolve_runtime(&registry, &"pi-ok".into(), true)
+                .is_ok()
+        );
     }
 
     #[test]

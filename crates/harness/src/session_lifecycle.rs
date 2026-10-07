@@ -37,6 +37,13 @@ pub trait SessionLifecycle: Send + Sync {
     async fn can_fork_now(&self, _request: &NativeForkRequest) -> Result<bool, HarnessError> {
         Ok(true)
     }
+    /// Definite pre-flight: this native thread can still be resumed on this
+    /// device. False routes the next run to portable context (like
+    /// `can_fork_now` does for forks) instead of silently starting a fresh
+    /// session that has lost the conversation.
+    async fn can_resume_now(&self, _native_thread_id: &str, _cwd: &str) -> Result<bool, HarnessError> {
+        Ok(true)
+    }
     /// A failed/ambiguous response must not be retried against source head.
     async fn fork_thread(&self, request: NativeForkRequest) -> Result<String, HarnessError>;
     /// Explicit unsupported fallback, not inferred success. Native delivery

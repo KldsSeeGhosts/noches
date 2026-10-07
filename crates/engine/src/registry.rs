@@ -560,15 +560,16 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
-    // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
+    // pi over its NATIVE RPC protocol (`pi --mode rpc`), same lazy pattern:
+    // the static descriptor mirrors PiHarness exactly — step-boundary
+    // steering (Pi injects a steer after the current turn's tool calls),
     // pi's thinking ladder minus its "off" tier.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
@@ -580,8 +581,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::PiHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()) as Arc<dyn Harness>)),
     );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
@@ -727,7 +728,7 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
-        // Cursor, Devin, Hermes and Pi mirror their specs the same way.
+        // Cursor, Devin, Hermes and Pi mirror their drivers the same way.
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
@@ -765,7 +766,8 @@ mod tests {
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
+        assert!(pi.confirms_steered_inputs());
         assert_eq!(
             pi.reasoning_levels(),
             &[

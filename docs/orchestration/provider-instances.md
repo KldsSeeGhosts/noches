@@ -127,9 +127,10 @@ availability/constraint ordering and selection/options inheritance.
 auth contexts: distinct homes, models, readiness and native resume ownership.
 
 This slice does not add provider login flows or the designer's Settings/grouping
-UI. Drivers without an auth probe report unknown. Native Pi RPC transport is
-still a separate migration: native Pi `binaryPath`/`launchArgs` are explicitly
-constrained instead of mislaunching them as pi-acp. Codex `shadowHomePath`
+UI. Drivers without an auth probe report unknown. Pi runs over its native RPC
+transport: `binaryPath` selects the `pi` binary and `launchArgs` are validated
+as T3 does (`--mode`, `--session*`, `--fork`, `--continue`, positional prompts
+and a lone `--provider` are rejected when the instance is written). Codex `shadowHomePath`
 auth-overlay symlinks are also explicitly constrained; private `homePath` works.
 Explicit title-driver preferences remain harness-based; automatic titles follow
 the session's instance. No live paid-provider or headed visual QA is claimed.

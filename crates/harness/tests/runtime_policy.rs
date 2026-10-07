@@ -350,19 +350,17 @@ async fn acp_full_access_still_refuses_unknown_permission_kinds() {
 }
 
 #[tokio::test]
-async fn pi_restricted_modes_refuse_before_launch() {
-    for mode in [
-        RuntimeMode::ApprovalRequired,
-        RuntimeMode::AutoAcceptEdits,
-        RuntimeMode::Auto,
-    ] {
+async fn pi_modes_without_a_native_gate_refuse_before_launch() {
+    // Pi enforces Supervised/Auto-accept through its blocking tool hook, but
+    // has no Auto classifier; plan mode is refused below.
+    for mode in [RuntimeMode::Auto] {
         let request: RunRequest = serde_json::from_value(json!({
             "prompt":"policy", "model":null, "reasoning":null, "cwd":"/tmp",
             "sandbox":"workspace-write", "resume":null, "runtimeMode":mode
         }))
         .unwrap();
         let (_, steering) = mpsc::channel(1);
-        let result = AcpHarness::pi()
+        let result = zeron_harness::PiHarness::new()
             .with_executable("/not/a/provider")
             .run(
                 request,

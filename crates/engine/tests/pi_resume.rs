@@ -1,18 +1,57 @@
-//! Pi's native session id survives an idle adapter crash through dispatch.
+//! Pi's native session (its session file path) survives an idle process death:
+//! the next dispatch resumes the stored session via `--session`, through the
+//! real engine dispatch path.
+#![cfg(unix)]
 use std::{sync::Arc, time::Duration};
 use zeron_engine::{EngineCore, HarnessRegistry};
-use zeron_harness::AcpHarness;
+use zeron_harness::{PiHarness, instance::InstanceLaunch};
 use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 
+fn request(prompt: &str, cwd: &std::path::Path) -> RunRequest {
+    RunRequest {
+        instance_id: None,
+        prompt: prompt.into(),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        runtime_mode: Default::default(),
+        interaction_mode: Default::default(),
+        auto_approve: true,
+        attachments: Vec::new(),
+        worktree: None,
+        resume: None,
+    }
+}
+
 #[tokio::test]
-async fn pi_idle_crash_next_dispatch_loads_stored_session() {
+async fn pi_idle_crash_next_dispatch_resumes_the_stored_session_file() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../harness/tests/fixtures/fake-pi-acp.sh");
+        .join("../harness/tests/fixtures/fake-pi.py");
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sessions = dir.path().join("pi-sessions");
+    let launch = InstanceLaunch::new(
+        [
+            ("FAKE_PI_SESSIONS", sessions.display().to_string()),
+            // Where real Pi keeps sessions; resume only trusts files under it.
+            ("PI_CODING_AGENT_SESSION_DIR", sessions.display().to_string()),
+            ("PI_CODING_AGENT_DIR", dir.path().join("agent").display().to_string()),
+            ("FAKE_PI_LOG", dir.path().join("pi.log").display().to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect(),
+        Vec::new(),
+    );
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(
-        AcpHarness::pi()
+        PiHarness::new()
             .with_executable(fixture)
+            .with_instance_launch(launch)
             .with_graces(Duration::from_millis(50), Duration::from_millis(100)),
     ));
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
@@ -38,37 +77,34 @@ async fn pi_idle_crash_next_dispatch_loads_stored_session() {
     );
     let chat = "pi-idle-crash";
     let handle = core.doc_host.open(chat).unwrap();
-    for prompt in ["idle-crash", "require-resume"] {
-        let req = RunRequest {
-            instance_id: None,
-            prompt: prompt.into(),
-            harness: None,
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            cwd: dir.path().display().to_string(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            runtime_mode: Default::default(),
-            interaction_mode: Default::default(),
-            auto_approve: true,
-            attachments: Vec::new(),
-            worktree: None,
-            resume: None,
-        };
+    for (prompt, expected) in [
+        ("idle-crash", "reply:idle-crash"),
+        // The fixture answers NOT-RESUMED unless it was launched with --session.
+        ("require-resume", "reply:require-resume"),
+    ] {
         core.sessions
-            .dispatch(chat, HarnessId::Pi, req, None)
+            .dispatch(chat, HarnessId::Pi, request(prompt, dir.path()), None)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let entries = handle.doc().read_entries().unwrap();
-                if entries.iter().any(|entry| entry.parts.iter().any(|part|
-                    matches!(part, zeron_doc::MessagePart::Text { text, .. } if text == &format!("reply:{prompt}"))
-                )) { break; }
+                if entries.iter().any(|entry| {
+                    entry.parts.iter().any(|part| {
+                        matches!(part, zeron_doc::MessagePart::Text { text, .. }
+                            if text.trim_end() == expected)
+                    })
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("fixture requires session/load on the next dispatch");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{prompt}: no `{expected}` (resume not honored?)"));
         // Let the fixture exit and the driver remove its live mailbox.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    // One session file served both turns.
+    assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 1);
 }
