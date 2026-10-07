@@ -1462,8 +1462,58 @@ pub struct PanelActions {
     pub open_chat: Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>,
     /// `task_cancel` for one task.
     pub stop: Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>,
+    /// Whole-thread Stop: the run, background work and every owned task.
+    pub stop_all: Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>,
     pub toggle_previous: Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>,
     pub show_more: Rc<dyn Fn(&mut Shell, LineageGroup, &mut Context<Shell>)>,
+}
+
+/// Whether the Active header offers "Stop all" (the host supports it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAll {
+    Unavailable,
+    Ready,
+    Stopping,
+}
+
+/// The header's quiet 20px Stop target, sized like a row's Stop.
+fn stop_all_button(state: StopAll, theme: &Theme, actions: &PanelActions, cx: &Context<Shell>) -> AnyElement {
+    let stop_all = actions.stop_all.clone();
+    let stopping = state == StopAll::Stopping;
+    div()
+        .id("agents-stop-all")
+        .role(gpui::Role::Button)
+        .aria_label("Stop all agents")
+        .size(px(20.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .when(!stopping, |el| {
+            el.cursor_pointer()
+                .hover(|el| el.bg(crate::theme::wash(0.10)))
+                .tab_index(0)
+                .focus_visible(|el| el.bg(crate::theme::wash(0.10)))
+        })
+        .when(stopping, |el| el.opacity(0.45))
+        .tooltip(crate::tooltip::text(if stopping {
+            "Stopping…"
+        } else {
+            "Stop all agents and background work in this thread"
+        }))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            if !stopping {
+                stop_all(this, cx);
+            }
+        }))
+        .child(
+            icons::icon(icons::STOP)
+                .size(px(9.0))
+                .text_color(theme.text_muted),
+        )
+        .into_any_element()
 }
 
 /// A parent / fork row (T3's non-agent relationship rows): relation glyph,
@@ -1494,6 +1544,21 @@ fn relation_row(
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(|el| el.bg(crate::theme::wash(0.06)))
+        // Keyboard: Tab reaches the row, ↑/↓ step between rows, Enter opens.
+        .tab_index(0)
+        .focus_visible(|el| el.bg(crate::theme::wash(0.10)))
+        .on_key_down(|event, window, cx| {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control || modifiers.alt || modifiers.platform {
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "down" => window.focus_next(cx),
+                "up" => window.focus_prev(cx),
+                _ => return,
+            }
+            cx.stop_propagation();
+        })
         .tooltip(crate::tooltip::text(format!(
             "Open {} in this chat",
             row.relation.label().to_lowercase()
@@ -1514,6 +1579,17 @@ fn relation_row(
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text)
                 .child(row.title.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .invisible()
+                .group_hover("relation-row", |style| style.visible())
+                .child(
+                    icons::icon(icons::ARROW_RIGHT)
+                        .size(px(12.0))
+                        .text_color(theme.text_faint),
+                ),
         )
         .child(
             div()
@@ -1784,6 +1860,7 @@ pub fn agents_panel_body(
     summaries: &[SubagentSummary],
     seen: &HashSet<String>,
     ui: &PanelUi,
+    stop_all: StopAll,
     theme: &Theme,
     view: gpui::EntityId,
     actions: &PanelActions,
@@ -1831,9 +1908,13 @@ pub fn agents_panel_body(
         } else {
             "Active".to_owned()
         };
-        children.push(
-            agents_section(label, SessionState::Working.color(theme), theme).into_any_element(),
-        );
+        let mut header = agents_section(label, SessionState::Working.color(theme), theme);
+        if running > 0 && stop_all != StopAll::Unavailable {
+            header = header
+                .child(div().flex_1())
+                .child(stop_all_button(stop_all, theme, actions, cx));
+        }
+        children.push(header.into_any_element());
         children.extend(
             rows.iter()
                 .map(|s| agent_row(s, chat_id, seen, theme, view, actions, cx)),

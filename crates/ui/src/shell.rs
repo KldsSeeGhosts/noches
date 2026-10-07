@@ -72,6 +72,8 @@ mod chat_rename;
 mod chat_rename_tests;
 mod command_palette;
 mod details_binding;
+#[cfg(test)]
+mod lineage_keyboard_tests;
 mod file_mutations;
 mod lifecycle;
 mod panes;
@@ -4080,9 +4082,29 @@ impl Shell {
         self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
     }
 
+    fn stop_all_state(&self, chat_id: &str, cx: &App) -> crate::subagents::StopAll {
+        use crate::subagents::StopAll;
+        let state = self.state.read(cx);
+        if !state.chat_host_supports(chat_id, zeron_proto::capabilities::THREAD_WORK_STOP_V1) {
+            return StopAll::Unavailable;
+        }
+        let stopping = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| {
+                state
+                    .details
+                    .stop_actions
+                    .contains(&(chat.device_id.clone(), chat.id.clone()))
+            });
+        if stopping { StopAll::Stopping } else { StopAll::Ready }
+    }
+
     /// The Agents panel's click behaviour for `chat_id`.
     fn agents_panel_actions(&self, chat_id: String) -> crate::subagents::PanelActions {
         let toggle_chat = chat_id.clone();
+        let stop_chat = chat_id.clone();
         let more_chat = chat_id;
         crate::subagents::PanelActions {
             open: std::rc::Rc::new(|this, chat, summary, cx| {
@@ -4090,6 +4112,9 @@ impl Shell {
             }),
             open_chat: std::rc::Rc::new(|this, chat, cx| this.open_chat(chat, cx)),
             stop: std::rc::Rc::new(|this, task_id, cx| this.stop_delegated_task(task_id, cx)),
+            stop_all: std::rc::Rc::new(move |this, cx| {
+                this.stop_thread_work(stop_chat.clone(), cx)
+            }),
             toggle_previous: std::rc::Rc::new(move |this, cx| {
                 let ui = this.agents_ui.entry(toggle_chat.clone()).or_default();
                 ui.previous_open = !ui.previous_open;
@@ -10328,12 +10353,14 @@ impl Shell {
                     let related = self.details_related_rows(&chat_id, cx);
                     let ui = self.agents_ui.get(&chat_id).cloned().unwrap_or_default();
                     let actions = self.agents_panel_actions(chat_id.clone());
+                    let stop_all = self.stop_all_state(&chat_id, cx);
                     crate::subagents::agents_panel_body(
                         &chat_id,
                         &related,
                         &summaries,
                         &self.subagent_seen.borrow(),
                         &ui,
+                        stop_all,
                         &theme,
                         cx.entity_id(),
                         &actions,

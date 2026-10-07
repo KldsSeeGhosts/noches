@@ -32,6 +32,14 @@ pub struct DetailsStore {
     pub(crate) session_actions: HashSet<(String, String)>,
     pub(crate) session_retries:
         HashMap<(String, String), zeron_proto::transfer::DisconnectThreadSessionParams>,
+    /// A reset and a whole-thread Stop each pin one request per (owner, chat),
+    /// so a retry after a lost response repeats the same request identity.
+    pub(crate) reset_actions: HashSet<(String, String)>,
+    pub(crate) reset_retries:
+        HashMap<(String, String), zeron_proto::transfer::ResetThreadSessionParams>,
+    pub(crate) stop_actions: HashSet<(String, String)>,
+    pub(crate) stop_retries:
+        HashMap<(String, String), zeron_proto::transfer::StopThreadWorkParams>,
 }
 
 /// What the user asked for; keys a pinned retry together with the chat.
@@ -362,6 +370,7 @@ pub fn apply_snapshot(model: &mut DetailsModel, row: &DetailsSnapshot) {
         model.merge_target = fork_source(transfer).map(str::to_owned);
         model.transfers = map_transfers(transfer);
         model.attached_provider_sessions = transfer.attached_provider_sessions.clone();
+        model.latest_started_run_id = transfer.latest_started_run_id.clone();
     }
 }
 

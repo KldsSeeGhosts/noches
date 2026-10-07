@@ -115,6 +115,7 @@ impl Shell {
         let lineage_chat = chat.clone();
         let transfers_chat = chat.clone();
         let disconnect_chat = chat.clone();
+        let reset_chat = chat.clone();
         crate::details::DetailsActions {
             open_thread: std::rc::Rc::new(|this, chat, cx| {
                 if this.state.read(cx).chats.iter().any(|c| c.id == chat) {
@@ -129,6 +130,9 @@ impl Shell {
             }),
             disconnect_session: std::rc::Rc::new(move |this, (), cx| {
                 this.disconnect_agent_session(disconnect_chat.clone(), cx);
+            }),
+            reset_session: std::rc::Rc::new(move |this, (), cx| {
+                this.reset_agent_session(reset_chat.clone(), cx);
             }),
             toggle_lineage: std::rc::Rc::new(move |this, (), cx| {
                 let ui = this.details_ui.entry(lineage_chat.clone()).or_default();
@@ -296,6 +300,198 @@ impl Shell {
             });
             this.update(cx, |shell, cx| {
                 shell.sidebar_notice = Some(if succeeded {
+                    SidebarNotice::information(notice)
+                } else {
+                    SidebarNotice::failure(notice)
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Forced reconstruction: pinned to the newest started run and the observed
+    /// attachments, so a retry repeats one request and a stale panel is refused.
+    pub(super) fn reset_agent_session(&mut self, chat: String, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let model = crate::details::DetailsModel::for_chat(state, &chat);
+        if !model.can_reset_session() {
+            return;
+        }
+        let Some(owner) = state
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .map(|c| c.device_id.clone())
+        else {
+            return;
+        };
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let key = (owner.clone(), chat.clone());
+        let request = state
+            .details
+            .reset_retries
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| zeron_proto::transfer::ResetThreadSessionParams {
+                chat_id: chat.clone(),
+                client_request_id: uuid::Uuid::new_v4().to_string(),
+                observed_run_id: model.latest_started_run_id,
+                provider_sessions: model.attached_provider_sessions,
+            });
+        self.state.update(cx, |state, cx| {
+            state.details.reset_actions.insert(key.clone());
+            state
+                .details
+                .reset_retries
+                .insert(key.clone(), request.clone());
+            cx.notify();
+        });
+        let app_state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().reset_thread_session(request, &owner).await;
+            let mut succeeded = false;
+            let mut notice = String::new();
+            app_state.update(cx, |state, cx| {
+                state.details.reset_actions.remove(&key);
+                match result {
+                    Ok(reply) => {
+                        // A definite refusal is final; only an uncertain
+                        // transport failure keeps the pinned request.
+                        state.details.reset_retries.remove(&key);
+                        if let Some(refusal) = reply.refusal {
+                            notice = refusal;
+                        } else {
+                            succeeded = true;
+                            notice = "Agent session reset. The next message starts fresh from this conversation's history.".into();
+                        }
+                    }
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            zeron_rpc::RpcError::BadParams(_)
+                                | zeron_rpc::RpcError::UnknownMethod(_)
+                        ) {
+                            state.details.reset_retries.remove(&key);
+                        }
+                        notice = format!(
+                            "{error}{}",
+                            if state.details.reset_retries.contains_key(&key) {
+                                " Retry repeats the same reset."
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                state.refresh_details(&chat, true, cx);
+                cx.notify();
+            });
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(if succeeded {
+                    SidebarNotice::information(notice)
+                } else {
+                    SidebarNotice::failure(notice)
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// One durable Stop for this thread's run, native background work and every
+    /// app-owned delegated task under it. Plain Stop is unchanged.
+    pub(crate) fn stop_thread_work(&mut self, chat: String, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if !state.chat_host_supports(&chat, zeron_proto::capabilities::THREAD_WORK_STOP_V1) {
+            return;
+        }
+        let Some(owner) = state
+            .chats
+            .iter()
+            .find(|c| c.id == chat)
+            .map(|c| c.device_id.clone())
+        else {
+            return;
+        };
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let key = (owner.clone(), chat.clone());
+        if state.details.stop_actions.contains(&key) {
+            return;
+        }
+        let request = state
+            .details
+            .stop_retries
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| zeron_proto::transfer::StopThreadWorkParams {
+                chat_id: chat.clone(),
+                client_request_id: uuid::Uuid::new_v4().to_string(),
+            });
+        self.state.update(cx, |state, cx| {
+            state.details.stop_actions.insert(key.clone());
+            state
+                .details
+                .stop_retries
+                .insert(key.clone(), request.clone());
+            cx.notify();
+        });
+        let app_state = self.state.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().stop_thread_work(request, &owner).await;
+            let mut stopped = false;
+            let mut notice = String::new();
+            app_state.update(cx, |state, cx| {
+                state.details.stop_actions.remove(&key);
+                match result {
+                    Ok(reply) => {
+                        state.details.stop_retries.remove(&key);
+                        if let Some(refusal) = reply.refusal {
+                            notice = refusal;
+                        } else if reply.stopped_runs == 0 {
+                            stopped = true;
+                            notice = "Nothing was running to stop.".into();
+                        } else {
+                            stopped = true;
+                            notice = format!(
+                                "Stop requested for {} run{}.",
+                                reply.stopped_runs,
+                                if reply.stopped_runs == 1 { "" } else { "s" }
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            zeron_rpc::RpcError::BadParams(_)
+                                | zeron_rpc::RpcError::UnknownMethod(_)
+                        ) {
+                            state.details.stop_retries.remove(&key);
+                        }
+                        notice = format!(
+                            "{error}{}",
+                            if state.details.stop_retries.contains_key(&key) {
+                                " Retry stops the same work, not anything started since."
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                // The terminal states arrive with the next delegation read.
+                state.nudge_delegation();
+                cx.notify();
+            });
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(if stopped {
                     SidebarNotice::information(notice)
                 } else {
                     SidebarNotice::failure(notice)
