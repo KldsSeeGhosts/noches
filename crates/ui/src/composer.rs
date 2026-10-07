@@ -4963,8 +4963,12 @@ impl Composer {
         if self.queue_edit_finishing {
             return;
         }
-        if self.canonical_queue_edit.is_some() {
-            self.failure = Some("This queue edit changes text only; the original attachments are kept".into());
+        if self
+            .canonical_queue_edit
+            .as_ref()
+            .is_some_and(|edit| !edit.attachments_editable())
+        {
+            self.failure = Some("The queued attachments are still loading; try again in a moment".into());
             cx.notify();
             return;
         }
@@ -5450,8 +5454,12 @@ impl Composer {
     /// Paperclip: the native image picker (the original's hidden
     /// `<input type=file accept=image/* multiple>`).
     fn open_file_picker(&mut self, cx: &mut Context<Self>) {
-        if self.canonical_queue_edit.is_some() {
-            self.failure = Some("This queue edit changes text only; the original attachments are kept".into());
+        if self
+            .canonical_queue_edit
+            .as_ref()
+            .is_some_and(|edit| !edit.attachments_editable())
+        {
+            self.failure = Some("The queued attachments are still loading; try again in a moment".into());
             cx.notify();
             return;
         }

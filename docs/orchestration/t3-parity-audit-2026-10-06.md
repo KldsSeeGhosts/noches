@@ -103,7 +103,9 @@ is not an acceptable substitute.
   completion and notification rows are excluded, matching T3's user-queue selector.
 - Canonical actions use the owning host's user authority and the existing kernel
   planner. Stable request reservations prevent a retry from changing its content
-  or target. SQL-only text edits preserve attachments, context and provenance;
+  or target. SQL-only edits preserve context and provenance and keep attachments unless the
+  edit replaces them (host-validated uploads, fingerprint-fenced; dropped files
+  are cleaned up once unreferenced);
   stale text or an already-started run is refused without overwriting it. An
   automatic drain retains both the edit and the composer's previous draft.
 - Typed rows retain explicit interrupting **Send now** and their host edit leases.

@@ -76,6 +76,8 @@ keep the rendered order and `sidebar_visible_order` in sync.
     "text": "Continue after this turn",
     "attachments": [],
     "attachmentPaths": ["/uploads/image.png"],
+    "context": [{"contextId": "ctx_1", "kind": "terminal", "label": "build.log",
+                 "detail": "zsh L10-20"}],
     "held": true,
     "deliveryGate": null,
     "automatic": false
@@ -100,7 +102,10 @@ Queue entries are untruncated and in delivery order (automatic completion first,
 then queue position/ordinal). Hide `automatic` entries in the user queue.
 `deliveryGate` retains the existing Loro `editing|reviewRequired` JSON; its
 presence blocks MCP mutations. `attachments` retains canonical T3 attachment
-objects; `attachmentPaths` retains Noches uploads without changing T3 schemas.
+objects; `attachmentPaths` retains Noches uploads without changing T3 schemas
+(for a SQL-only row, the uploads its last edit committed). `context` is a bounded
+summary of the message's retained context records (every T3 kind; unknown kinds
+keep their label): never the terminal text, diff or HTML bodies.
 Pending questions exclude approvals; `responseType=not_resumable` remains
 readable but `answerable=false`. Reads never acknowledge tasks, answer questions,
 approve permissions, deliver messages, or execute on replicas.
@@ -141,6 +146,25 @@ uses **Steer** for direct delivery and **Send now** with the tooltip
 {"type":"promoteToSteer","targetRunId":"run:chat:1","expectedSelection":null}
 {"type":"promoteToRestart","targetRunId":"run:chat:1","handoff":false,"expectedSelection":null}
 ```
+
+An edit is text-only unless it carries an `attachments` change:
+
+```json
+{"type":"edit","text":"...","expectedText":"...",
+ "attachments":{"expected":"claims=a|paths=/u/1.png","paths":["/u/2.png"],"removeIds":["a"]}}
+```
+
+`paths` is the full set of host-owned uploads after the edit (kept plus files
+the client committed with `UploadCommit` on the host); `removeIds` drops claimed
+(agent) attachments. `expected` is `queue_attachment_fingerprint` of the entry
+the editor saw (`QueueUiEntry::attachment_fingerprint`); a changed set is
+refused without applying the text either. New paths must be files this host
+committed and no other queued row names; at most 8 attachments remain. Files an
+edit drops, and files of a cancelled queued message, are deleted by a durable
+`queued-attachment.cleanup` effect only when no queue row references them
+(claims no other message references use the existing `attachment.cleanup`).
+The retry identity must be pinned to the staged set so a replay recommits the
+same uploads. Document-backed rows keep their edit leases.
 
 `handoff` names `interrupt_restart_with_handoff`; `expectedSelection` is the
 `promotionSelection` the client displayed. The host rechecks both, plus the
@@ -189,8 +213,12 @@ next admission re-validates). A config written on another device reaches the
 thread at its next admission; it is not mirrored while a turn runs.
 The native typed-row **Send now** still uses its existing document command/edit
 lease path; this is not a claim that every typed-row interaction uses canonical
-promotion. Context metadata is retained, but full native rendering of every
-context record type is not implemented by this change.
+promotion. Context records are retained on the message and shown in the row as
+compact monospace chips (`context`); `[label](t3-context://v1/<kind>/<id>)`
+references in the text display as their labels. Steering carries host-owned
+image files natively where the adapter supports image input (Codex `localImage`,
+Claude image blocks); every path also stays a text reference for adapters that
+do not.
 
 ## Merge seams and validation scope
 

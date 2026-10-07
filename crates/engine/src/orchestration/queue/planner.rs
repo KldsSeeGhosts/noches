@@ -73,7 +73,7 @@ pub(crate) fn plan(
             plan.emit(command, "thread.metadata-updated", &thread, now)?;
         }
         "t3_queue_edit" | "t3_queue_cancel" | "t3_queue_reorder" | "t3_queue_promote_to_steer" => {
-            queue_mutation(&mut plan, command, &p, op, now)?
+            queue_mutation(conn, &mut plan, command, &p, op, now)?
         }
         "t3_pending_request_respond" => respond(&mut plan, command, &p, &op.input, false, now)?,
         "t3_thread_update" => metadata(&mut plan, command, &p, op, now)?,
@@ -161,6 +161,7 @@ fn cancel_graph(
 }
 
 fn queue_mutation(
+    conn: &Connection,
     plan: &mut Plan,
     command: &Command,
     p: &ThreadProjection,
@@ -178,6 +179,7 @@ fn queue_mutation(
     match op.name.as_str() {
         "t3_queue_cancel" => {
             cancel(plan, command, p, run, now)?;
+            super::attachments::release_run(conn, plan, p, run)?;
             plan.queue_patch = Some(json!({"action":"cancel","messageId":run.user_message_id}));
             Ok(())
         }
@@ -201,6 +203,10 @@ fn queue_mutation(
                     "This queued message changed; your edit was not applied.",
                 ));
             }
+            let attachments_changed = match op.input.get("attachments").filter(|v| !v.is_null()) {
+                Some(edit) => super::attachments::plan_edit(conn, plan, p, &mut message, edit)?,
+                None => false,
+            };
             message["text"] = json!(text);
             message["updatedAt"] = json!(iso(now)?);
             plan.emit(command, "message.updated", &message, now)?;
@@ -212,6 +218,12 @@ fn queue_mutation(
             {
                 let mut item = item.clone();
                 item["text"] = json!(text);
+                if attachments_changed {
+                    item["attachments"] = message["attachments"].clone();
+                    if !message["context"].is_null() {
+                        item["context"] = message["context"].clone();
+                    }
+                }
                 item["updatedAt"] = json!(iso(now)?);
                 plan.emit(command, "turn-item.updated", &item, now)?;
             }
@@ -1099,6 +1111,7 @@ fn sync_loro(
             && !rows.iter().any(|i| i.id == r.user_message_id.0)
     }) {
         cancel_graph(plan, command, p, run, now)?;
+        super::attachments::release_run(conn, plan, p, run)?;
     }
     let mut ordinal = p.runs.iter().map(|r| r.ordinal).max().unwrap_or(0);
     for (index, row) in rows.iter().enumerate() {
@@ -1106,6 +1119,16 @@ fn sync_loro(
         if let Some(run) = known {
             if run.status != OrchestrationV2RunStatus::Queued {
                 continue;
+            }
+            // A device that replaced attachments in its edit lease dropped files.
+            if let Some(before) = previous.iter().find(|item| item.id == row.id) {
+                let dropped: Vec<String> = before
+                    .attachments
+                    .iter()
+                    .filter(|path| !row.attachments.contains(path))
+                    .cloned()
+                    .collect();
+                super::attachments::cleanup_effects(plan, dropped, Vec::new());
             }
             let message = records(p, "message").iter().find(|m| m["id"] == row.id);
             if let Some(old) = message {

@@ -693,6 +693,9 @@ impl RunnerBridge {
             EffectRequest::TerminalCleanup | EffectRequest::AttachmentCleanup { .. } => {
                 super::launch::deletion::execute(self, effect).await
             }
+            EffectRequest::QueuedAttachmentCleanup { paths } => {
+                super::queue::attachments::execute_cleanup(self, paths).await
+            }
             EffectRequest::ProviderSessionDetach { .. }
             | EffectRequest::ProviderSessionDisconnect { .. }
             | EffectRequest::RuntimeRequestRespond { .. }

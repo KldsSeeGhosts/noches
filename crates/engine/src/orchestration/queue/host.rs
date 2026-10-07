@@ -64,6 +64,37 @@ pub struct HostQueue {
 }
 
 impl HostQueue {
+    /// Refuse an attachment edit naming uploads this host did not commit.
+    fn check_new_attachments(
+        &self,
+        current: &crate::orchestration::projection::ThreadProjection,
+        queued_run_id: &str,
+        edit: &zeron_proto::QueueAttachmentEdit,
+    ) -> Result<(), String> {
+        let Some(run) = super::queued(current)
+            .into_iter()
+            .find(|run| run.id.0 == queued_run_id)
+        else {
+            return Ok(());
+        };
+        let Some(uploads) = self.docs.uploads() else {
+            return Ok(());
+        };
+        self.domain
+            .kernel
+            .store
+            .read(|conn| {
+                super::attachments::validate_new_paths(
+                    conn,
+                    uploads,
+                    &current.thread.id,
+                    &run.user_message_id.0,
+                    &edit.paths,
+                )
+            })
+            .unwrap_or_else(|_| Err("Couldn't check the attachments; try again.".into()))
+    }
+
     /// Validate the thread's saved selection through the trusted live catalog
     /// when promoting it would move the running run onto a different one, and
     /// freeze the result (exact custom model id/options plus the target driver)
@@ -362,10 +393,14 @@ impl HostQueue {
             QueuedRunAction::Edit {
                 text,
                 expected_text,
-            } => (
-                "t3_queue_edit",
-                json!({"text":text,"expectedText":expected_text}),
-            ),
+                attachments,
+            } => {
+                let mut input = json!({"text":text,"expectedText":expected_text});
+                if let Some(attachments) = attachments {
+                    input["attachments"] = json!(attachments);
+                }
+                ("t3_queue_edit", input)
+            }
             QueuedRunAction::Cancel => ("t3_queue_cancel", json!({})),
             QueuedRunAction::Reorder { before_run_id } => {
                 ("t3_queue_reorder", json!({"beforeRunId":before_run_id}))
@@ -442,6 +477,20 @@ impl HostQueue {
                     "Document-backed messages require an edit lease.",
                 ));
             }
+        }
+        // New uploads are checked against this host's files, which a replay
+        // (answered from its receipt) must not depend on either.
+        if !replay
+            && let QueuedRunAction::Edit {
+                attachments: Some(edit),
+                ..
+            } = &request.action
+            && let Err(refusal) = self.check_new_attachments(&current, &request.queued_run_id, edit)
+        {
+            return Ok(zeron_proto::MutateQueuedRunResult {
+                sequence: current.through_sequence,
+                refusal: Some(refusal),
+            });
         }
         // After the identity is reserved from the caller's content: a replay
         // resolves to its stored receipt and must not depend on today's catalog.

@@ -105,6 +105,9 @@ pub enum EffectRequest {
     TerminalCleanup,
     #[serde(rename = "attachment.cleanup")]
     AttachmentCleanup { attachment_ids: Vec<String> },
+    /// Committed upload files of a queued message that was cancelled or edited.
+    #[serde(rename = "queued-attachment.cleanup")]
+    QueuedAttachmentCleanup { paths: Vec<String> },
     #[serde(rename = "thread-title.generate")]
     ThreadTitleGenerate { kind: TitleKind },
 }

@@ -2906,3 +2906,384 @@ async fn failed_work_stays_visible_after_later_queue_cancellation() {
     assert!(!page.result.thread.settled);
     assert!(page.result.thread.settled_at.is_none());
 }
+
+fn cleanup_paths(f: &Fixture) -> Vec<Vec<String>> {
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|effect| match effect.request {
+            crate::orchestration::effects::EffectRequest::QueuedAttachmentCleanup { paths } => {
+                Some(paths)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn typed_attachment_changes_and_cancellation_queue_cleanup_effects_once() {
+    let f = Fixture::new();
+    let sync = |rows: Vec<zeron_doc::QueuedMessage>, id: &str| {
+        let f = &f;
+        let id = id.to_string();
+        async move {
+            let result = f
+                .service
+                .mutate(
+                    None,
+                    ThreadId("target".into()),
+                    "host.sync_loro_queue",
+                    json!({"items":rows,"driver":"mock"}),
+                    CommandId(id),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, ReceiptStatus::Accepted, "{:?}", result.error);
+        }
+    };
+    let mut row = zeron_doc::QueuedMessage::new("queue-one", "first", "host");
+    row.attachments = vec!["/uploads/a.png".into(), "/uploads/b.png".into()];
+    sync(vec![row.clone()], "sync-1").await;
+    assert!(cleanup_paths(&f).is_empty(), "a new row owns its files");
+    // A lease edit that replaced b with c drops exactly b.
+    row.attachments = vec!["/uploads/a.png".into(), "/uploads/c.png".into()];
+    sync(vec![row.clone()], "sync-2").await;
+    assert_eq!(cleanup_paths(&f), vec![vec!["/uploads/b.png".to_string()]]);
+    // The same state replayed under a new identity drops nothing more.
+    sync(vec![row.clone()], "sync-3").await;
+    assert_eq!(cleanup_paths(&f).len(), 1);
+    // Removing the row cancels the queued run and releases what is left.
+    sync(vec![], "sync-4").await;
+    assert_eq!(
+        cleanup_paths(&f),
+        vec![
+            vec!["/uploads/b.png".to_string()],
+            vec!["/uploads/a.png".to_string(), "/uploads/c.png".to_string()],
+        ]
+    );
+    let owned = f
+        .service
+        .kernel
+        .store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(
+        owned.is_empty(),
+        "the released row no longer names its files"
+    );
+}
+
+#[tokio::test]
+async fn shared_claims_survive_a_cancelled_message_and_unowned_files_are_never_deleted() {
+    let f = Fixture::new();
+    let first = f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let claim =
+        json!({"type":"image","id":"shared","name":"a.png","mimeType":"image/png","sizeBytes":1});
+    let own =
+        json!({"type":"image","id":"own","name":"b.png","mimeType":"image/png","sizeBytes":1});
+    for (id, claims) in [
+        ("queue-one", vec![claim.clone(), own]),
+        ("queue-two", vec![claim]),
+    ] {
+        let mut message = task::records(&p, "message")
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()
+            .clone();
+        message["attachments"] = json!(claims);
+        f.seed("target", "message.updated", message);
+    }
+    f.call(
+        "t3_queue_cancel",
+        json!({"threadId":"target","queuedRunId":first}),
+    )
+    .await
+    .unwrap();
+    let claimed: Vec<Vec<String>> = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|effect| match effect.request {
+            crate::orchestration::effects::EffectRequest::AttachmentCleanup { attachment_ids } => {
+                Some(attachment_ids)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![vec!["own".to_string()]],
+        "the claim another queued message still references stays"
+    );
+
+    // The guarded delete: owned + unreferenced files only, idempotently.
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+    std::fs::create_dir_all(uploads.dir()).unwrap();
+    let file = |name: &str| {
+        let path = uploads.dir().join(name);
+        std::fs::write(&path, b"x").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let (kept, dropped) = (file("kept.png"), file("dropped.png"));
+    let outside = dir.path().join("outside.png");
+    std::fs::write(&outside, b"x").unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO orchestration_queue_attachments VALUES('target','queue-two',?1)",
+                [serde_json::to_string(&vec![&kept])?],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let escaping = format!("{}/../outside.png", uploads.dir().display());
+    let paths = vec![
+        kept.clone(),
+        dropped.clone(),
+        outside.to_string_lossy().into_owned(),
+        escaping,
+    ];
+    for _ in 0..2 {
+        super::attachments::remove_unreferenced(&f.service.kernel.store, &uploads, &paths).unwrap();
+        assert!(
+            std::path::Path::new(&kept).exists(),
+            "another row still names it"
+        );
+        assert!(!std::path::Path::new(&dropped).exists());
+        assert!(
+            outside.exists(),
+            "files outside the uploads root are never touched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
+    use crate::orchestration::effects::EffectRequest;
+    let f = Fixture::new();
+    let id = f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let claim = json!({"type":"image","id":"claimed","name":"a.png","mimeType":"image/png","sizeBytes":1,"extra":true});
+    let mut message = task::records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    message["attachments"] = json!([claim]);
+    message["context"] = json!({"version":1,"records":[
+        {"version":1,"contextId":"img","label":"a.png","kind":"image","attachmentId":"claimed",
+         "name":"a.png","mimeType":"image/png","sizeBytes":1},
+        {"version":1,"contextId":"note","label":"Note","kind":"skill","name":"note"}]});
+    f.seed("target", "message.updated", message);
+    let edit = |expected: &str, paths: Value, remove: Value| {
+        json!({"queuedRunId":id,"text":"edited","expectedText":"first",
+            "attachments":{"expected":expected,"paths":paths,"removeIds":remove}})
+    };
+    let run = |input: Value, command: &str| {
+        let f = &f;
+        let command = CommandId(command.into());
+        async move {
+            f.service
+                .mutate(None, "target".into(), "t3_queue_edit", input, command, NOW)
+                .await
+                .unwrap()
+        }
+    };
+    let refused = run(
+        edit("claims=other|paths=", json!([]), json!([])),
+        "edit-stale",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    let refused = run(
+        edit("claims=claimed|paths=", json!([]), json!(["nope"])),
+        "edit-unknown",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    let too_many: Vec<String> = (0..9).map(|n| format!("/uploads/{n}.png")).collect();
+    let refused = run(
+        edit("claims=claimed|paths=", json!(too_many), json!([])),
+        "edit-many",
+    )
+    .await;
+    assert_eq!(refused.status, ReceiptStatus::Rejected);
+    assert!(cleanup_paths(&f).is_empty(), "refusals change nothing");
+    let before = f.service.kernel.store.projection_frontier().unwrap();
+
+    let input = edit(
+        "claims=claimed|paths=",
+        json!(["/uploads/new.png"]),
+        json!(["claimed"]),
+    );
+    let first = run(input.clone(), "edit-ok").await;
+    assert_eq!(first.status, ReceiptStatus::Accepted, "{:?}", first.error);
+    let replay = run(input, "edit-ok").await;
+    assert_eq!(
+        replay.result_sequence, first.result_sequence,
+        "response-loss replay"
+    );
+    assert!(f.service.kernel.store.projection_frontier().unwrap() > before);
+    let check = |f: &Fixture| {
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"target".into())
+            .unwrap()
+            .unwrap();
+        let message = task::records(&p, "message")
+            .iter()
+            .find(|m| m["id"] == "queue-one")
+            .unwrap()
+            .clone();
+        assert_eq!(message["text"], "edited");
+        assert_eq!(message["attachments"], json!([]));
+        let records = message["context"]["records"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "context bound to the dropped claim is dropped"
+        );
+        assert_eq!(records[0]["contextId"], "note");
+        let paths = f
+            .service
+            .kernel
+            .store
+            .read(|conn| {
+                crate::orchestration::ui_queue::attachment_paths(
+                    conn,
+                    &"target".into(),
+                    "queue-one",
+                )
+            })
+            .unwrap();
+        assert_eq!(paths, vec!["/uploads/new.png".to_string()]);
+    };
+    check(&f);
+    f.service.kernel.store.rebuild().unwrap();
+    check(&f);
+    // Another queued message and its text are untouched.
+    let other = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        task::records(&other, "message")
+            .iter()
+            .any(|m| m["id"] == "queue-two" && m["text"] == "second")
+    );
+    let claims: Vec<_> = f
+        .service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(&e.request, EffectRequest::AttachmentCleanup { attachment_ids } if attachment_ids == &vec!["claimed".to_string()]))
+        .collect();
+    assert_eq!(claims.len(), 1, "the dropped claim is cleaned exactly once");
+}
+
+#[tokio::test]
+async fn queue_state_summarizes_every_retained_context_kind_without_payloads() {
+    let f = Fixture::new();
+    f.sync("first").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap();
+    let mut message = task::records(&p, "message")
+        .iter()
+        .find(|m| m["id"] == "queue-one")
+        .unwrap()
+        .clone();
+    let big = "x".repeat(70_000);
+    message["context"] = json!({"version":1,"records":[
+        {"version":1,"contextId":"i","label":"shot","kind":"image","attachmentId":"a","name":"shot.png","mimeType":"image/png","sizeBytes":1},
+        {"version":1,"contextId":"f","label":"notes","kind":"file","attachmentId":"b","name":"notes.txt","mimeType":"text/plain","sizeBytes":1},
+        {"version":1,"contextId":"t","label":"tail","kind":"terminal","terminalId":"1","terminalLabel":"zsh","lineStart":10,"lineEnd":20,"text":big},
+        {"version":1,"contextId":"e","label":"btn","kind":"element","pageUrl":"http://x","pageTitle":null,"tagName":"button","selector":"#save","htmlPreview":"<b>","componentName":null,"source":null,"styles":""},
+        {"version":1,"contextId":"pa","label":"mark","kind":"preview-annotation","annotationId":"1","pageUrl":"http://x","pageTitle":"Page","comment":"c","targetSummary":"Header","styleChanges":[]},
+        {"version":1,"contextId":"rc","label":"cmt","kind":"review-comment","sectionId":"s","sectionTitle":"S","filePath":"src/lib.rs","startIndex":1,"endIndex":2,"rangeLabel":"lines 1-2","text":"t","diff":"d"},
+        {"version":1,"contextId":"m","label":"lib","kind":"mention","path":"src/lib.rs"},
+        {"version":1,"contextId":"s","label":"sk","kind":"skill","name":"design"},
+        {"version":1,"contextId":"th","label":"Th","kind":"thread","environmentId":"host","threadId":"parent","title":"Parent"},
+        {"version":1,"contextId":"u","label":"Opaque","kind":"future-kind","payload":{"k":1}}]});
+    f.seed("target", "message.updated", message);
+    let state = f
+        .service
+        .kernel
+        .store
+        .queue_ui_state(&"target".into())
+        .unwrap();
+    let entry = state
+        .queue
+        .iter()
+        .find(|e| e.message_id == "queue-one")
+        .unwrap();
+    let kinds: Vec<_> = entry
+        .context
+        .iter()
+        .map(|c| (c.kind.as_str(), c.detail.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("image", "shot.png"),
+            ("file", "notes.txt"),
+            ("terminal", "zsh L10-20"),
+            ("element", "button #save"),
+            ("preview-annotation", "Header"),
+            ("review-comment", "src/lib.rs lines 1-2"),
+            ("mention", "src/lib.rs"),
+            ("skill", "design"),
+            ("thread", "Parent"),
+            ("future-kind", ""),
+        ]
+    );
+    assert!(
+        serde_json::to_string(entry).unwrap().len() < 4_000,
+        "terminal bodies and diffs never ride the queue state"
+    );
+    assert!(
+        state
+            .queue
+            .iter()
+            .find(|e| e.message_id == "queue-two")
+            .unwrap()
+            .context
+            .is_empty()
+    );
+}

@@ -128,6 +128,72 @@ pub(crate) fn parking_blocked(p: &projection::ThreadProjection) -> bool {
         })
 }
 
+const MAX_CONTEXT_REFS: usize = 50;
+const MAX_CONTEXT_FIELD_CHARS: usize = 200;
+
+/// Bounded presentation of a message's context records. Every known kind
+/// names its identifying field; unknown kinds keep only their label.
+fn context_refs(message: &Value) -> Vec<zeron_proto::QueueContextRef> {
+    fn field(record: &Value, key: &str) -> String {
+        record[key]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(MAX_CONTEXT_FIELD_CHARS)
+            .collect()
+    }
+    let joined = |parts: &[String]| {
+        parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    message["context"]["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_CONTEXT_REFS)
+        .filter_map(|record| {
+            let kind = record["kind"].as_str().filter(|kind| !kind.is_empty())?;
+            let detail = match kind {
+                "image" | "file" => field(record, "name"),
+                "terminal" => joined(&[
+                    field(record, "terminalLabel"),
+                    format!(
+                        "L{}-{}",
+                        record["lineStart"].as_u64().unwrap_or(0),
+                        record["lineEnd"].as_u64().unwrap_or(0)
+                    ),
+                ]),
+                "element" => joined(&[field(record, "tagName"), field(record, "selector")]),
+                "preview-annotation" => {
+                    let summary = field(record, "targetSummary");
+                    if summary.is_empty() {
+                        field(record, "pageTitle")
+                    } else {
+                        summary
+                    }
+                }
+                "review-comment" => {
+                    joined(&[field(record, "filePath"), field(record, "rangeLabel")])
+                }
+                "mention" => field(record, "path"),
+                "skill" => field(record, "name"),
+                "thread" => field(record, "title"),
+                _ => String::new(),
+            };
+            Some(zeron_proto::QueueContextRef {
+                context_id: field(record, "contextId"),
+                kind: kind.chars().take(40).collect(),
+                label: field(record, "label"),
+                detail,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
     let Some(p) = projection::read_thread(conn, id)? else {
         return Ok(QueueUiState {
@@ -161,7 +227,12 @@ pub(crate) fn state(conn: &Connection, id: &ThreadId) -> Result<QueueUiState> {
                     .as_array()
                     .cloned()
                     .unwrap_or_default(),
-                attachment_paths: intent.map(|i| i.attachments.clone()).unwrap_or_default(),
+                // SQL-only rows keep edited uploads in the host attachment table.
+                context: context_refs(message),
+                attachment_paths: match intent {
+                    Some(intent) => intent.attachments.clone(),
+                    None => attachment_paths(conn, id, &run.user_message_id.0).unwrap_or_default(),
+                },
                 held: run.queue_held.as_ref().copied().unwrap_or(false)
                     || intent.is_some_and(|i| i.hold_for_turn_end),
                 delivery_gate: intent

@@ -451,6 +451,20 @@ impl Store {
                 plan.queue_lifecycle.as_ref(),
                 plan.queue_intents.as_deref(),
             )?;
+            for (message, paths) in &plan.queue_attachments {
+                if paths.is_empty() {
+                    tx.execute(
+                        "DELETE FROM orchestration_queue_attachments WHERE thread_id=?1 AND message_id=?2",
+                        params![command.thread_id.0, message],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO orchestration_queue_attachments VALUES(?1,?2,?3)
+                         ON CONFLICT(thread_id,message_id) DO UPDATE SET paths_json=excluded.paths_json",
+                        params![command.thread_id.0, message, serde_json::to_string(paths)?],
+                    )?;
+                }
+            }
             if let Some(patch) = &plan.queue_patch {
                 tx.execute(
                     "INSERT OR IGNORE INTO orchestration_queue_patches VALUES(?1,?2,?3,?4)",

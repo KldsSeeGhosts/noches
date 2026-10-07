@@ -385,6 +385,223 @@ async fn desktop_canonical_queue_is_live_editable_idempotent_and_owner_authorita
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_queue_promotion_steers_host_owned_images_natively() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let id = core
+        .doc_host
+        .queue_message(
+            CHAT,
+            "look at these",
+            vec!["/uploads/shot.png".into(), "/uploads/notes.txt".into()],
+        )
+        .unwrap();
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let snapshot = canonical_frame(&mut watch, |queue| {
+        queue.can_promote_to_steer && queue.queue.iter().any(|entry| entry.message_id == id)
+    })
+    .await;
+    let queued = snapshot
+        .queue
+        .iter()
+        .find(|entry| entry.message_id == id)
+        .unwrap()
+        .queued_run_id
+        .clone();
+    let reply = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            json!({"chatId":CHAT,"queuedRunId":queued,"clientRequestId":"promote-images",
+                "action":{"type":"promoteToSteer","targetRunId":snapshot.active_run_id.unwrap()}}),
+        )
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || !harness.steered_images.lock().unwrap().is_empty(),
+        "native steer",
+    )
+    .await;
+    assert_eq!(
+        *harness.steered_images.lock().unwrap(),
+        vec![vec!["/uploads/shot.png".to_string()]],
+        "only the image is inlined; every path stays a text reference"
+    );
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_canonical_edit_replaces_attachments_and_cleans_dropped_files_once() {
+    use serde_json::json;
+    use zeron_rpc::methods;
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|text| text == "opening"),
+        "active run",
+    )
+    .await;
+    let uploads = core.uploads.dir().to_path_buf();
+    std::fs::create_dir_all(&uploads).unwrap();
+    let file = |name: &str| {
+        let path = uploads.join(name);
+        std::fs::write(&path, b"png").unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let (first, second) = (file("v2-first-a.png"), file("v2-second-b.png"));
+    let claim = json!({"type":"image","id":"claimed","name":"agent.png","mimeType":"image/png","sizeBytes":3});
+    let run = canonical_input_with_attachments(&core, "agent work", vec![claim.clone()]).await;
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_QUEUE,
+            json!({"chatId":CHAT,"includeCanonical":true}),
+        )
+        .await
+        .unwrap();
+    let state = canonical_frame(&mut watch, |queue| {
+        queue.queue.iter().any(|entry| entry.queued_run_id == run)
+    })
+    .await;
+    let entry = state.queue.iter().find(|e| e.queued_run_id == run).unwrap();
+    let edit = |id: &str, expected: String, paths: Vec<String>, remove: Vec<&str>| {
+        json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":id,
+            "action":{"type":"edit","text":"agent work","expectedText":"agent work",
+                "attachments":{"expected":expected,"paths":paths,"removeIds":remove}}})
+    };
+    // A file the host never committed is refused before anything changes.
+    let refused = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            edit(
+                "outside",
+                entry.attachment_fingerprint(),
+                vec!["/etc/hosts".into()],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        refused["refusal"].as_str().unwrap().contains("not found"),
+        "{refused}"
+    );
+    // Add one upload, keep the claimed attachment.
+    let add = edit(
+        "add",
+        entry.attachment_fingerprint(),
+        vec![first.clone()],
+        vec![],
+    );
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, add.clone())
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    let frontier = core.orchestration.store.projection_frontier().unwrap();
+    assert_eq!(
+        client.call(methods::MUTATE_QUEUED_RUN, add).await.unwrap(),
+        reply,
+        "response-loss replay"
+    );
+    assert_eq!(
+        core.orchestration.store.projection_frontier().unwrap(),
+        frontier
+    );
+    let state = canonical_frame(&mut watch, |queue| {
+        queue
+            .queue
+            .iter()
+            .any(|e| e.attachment_paths == vec![first.clone()])
+    })
+    .await;
+    let entry = state
+        .queue
+        .iter()
+        .find(|e| e.queued_run_id == run)
+        .unwrap()
+        .clone();
+    assert_eq!(entry.attachments, vec![claim]);
+    // The first fingerprint is stale now.
+    let stale = client
+        .call(
+            methods::MUTATE_QUEUED_RUN,
+            edit(
+                "stale",
+                "claims=claimed|paths=".into(),
+                vec![second.clone()],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        stale["refusal"].as_str().unwrap().contains("changed"),
+        "{stale}"
+    );
+    assert!(std::path::Path::new(&first).exists());
+    // Replace the upload and drop the claimed attachment: the old file goes.
+    let replace = edit(
+        "replace",
+        entry.attachment_fingerprint(),
+        vec![second.clone()],
+        vec!["claimed"],
+    );
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, replace)
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || !std::path::Path::new(&first).exists(),
+        "dropped upload cleanup",
+    )
+    .await;
+    assert!(std::path::Path::new(&second).exists());
+    let state = canonical_frame(&mut watch, |queue| {
+        queue
+            .queue
+            .iter()
+            .any(|e| e.attachment_paths == vec![second.clone()] && e.attachments.is_empty())
+    })
+    .await;
+    assert_eq!(state.queue.len(), 1);
+    // Cancelling the queued message releases what it still owned.
+    let cancel = json!({"chatId":CHAT,"queuedRunId":run,"clientRequestId":"cancel","action":{"type":"cancel"}});
+    let reply = client
+        .call(methods::MUTATE_QUEUED_RUN, cancel)
+        .await
+        .unwrap();
+    assert!(reply["refusal"].is_null(), "{reply}");
+    wait_for(
+        || !std::path::Path::new(&second).exists(),
+        "cancelled upload cleanup",
+    )
+    .await;
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn desktop_mixed_queue_reorder_preserves_intents_and_edit_leases() {
     use serde_json::json;
     use zeron_rpc::methods;
@@ -1004,6 +1221,8 @@ struct HeldHarness {
     /// Keep each steer's ACK sender alive and unanswered (a hung adapter),
     /// instead of dropping it, which reads as an immediate uncertain result.
     held_receipts: Arc<Mutex<Option<Vec<tokio::sync::oneshot::Sender<bool>>>>>,
+    /// Image files that rode each steer into the live turn.
+    steered_images: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl HeldHarness {
@@ -1033,6 +1252,7 @@ impl HeldHarness {
                 released: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 steering_receipt: Arc::new(Mutex::new(Some(true))),
                 held_receipts: Arc::new(Mutex::new(None)),
+                steered_images: Arc::new(Mutex::new(Vec::new())),
             }),
             prompts,
         )
@@ -1084,6 +1304,7 @@ impl Harness for HeldHarness {
         let steering_receipt = self.steering_receipt.clone();
         let held_receipts = self.held_receipts.clone();
         let session = self.session.clone();
+        let steered_images = self.steered_images.clone();
         let mut opening = vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
@@ -1126,6 +1347,7 @@ impl Harness for HeldHarness {
                     }
                     steer = steering.recv() => {
                         if let Some(mut steer) = steer {
+                            steered_images.lock().unwrap().push(steer.attachments.clone());
                             if let Some(receipt) = steer.notification_acceptance.take() {
                                 if let Some(held) = held_receipts.lock().unwrap().as_mut() {
                                     held.push(receipt);

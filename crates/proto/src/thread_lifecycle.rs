@@ -87,6 +87,9 @@ pub struct QueueUiEntry {
     pub text: String,
     pub attachments: Vec<serde_json::Value>,
     pub attachment_paths: Vec<String>,
+    /// Compact summaries of the message's retained context records (T3
+    /// `OrchestrationMessageContext`); the payloads stay on the host.
+    pub context: Vec<QueueContextRef>,
     pub held: bool,
     pub delivery_gate: Option<serde_json::Value>,
     pub automatic: bool,
@@ -113,10 +116,13 @@ pub struct MutateQueuedRunParams {
     rename_all_fields = "camelCase"
 )]
 pub enum QueuedRunAction {
-    /// Text-only edit: attachments and context remain on the original message.
+    /// Edit the text; attachments and context stay on the original message
+    /// unless `attachments` replaces them.
     Edit {
         text: String,
         expected_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<QueueAttachmentEdit>,
     },
     Cancel,
     Reorder {
@@ -135,6 +141,50 @@ pub enum QueuedRunAction {
         #[serde(default)]
         expected_selection: Option<crate::provider_instance::ModelSelection>,
     },
+}
+
+/// One retained context record of a queued message, reduced to what a compact
+/// row shows. Bodies (terminal output, diffs, HTML) never ride the queue state.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueContextRef {
+    pub context_id: String,
+    /// Open set: image, file, terminal, element, preview-annotation,
+    /// review-comment, mention, skill, thread, or a kind this build lacks.
+    pub kind: String,
+    pub label: String,
+    /// What distinguishes the record from its label (path, range, title).
+    pub detail: String,
+}
+
+/// A queue edit's attachment change, fenced to the attachments the editor saw.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueueAttachmentEdit {
+    /// [`queue_attachment_fingerprint`] of the entry the edit started from.
+    pub expected: String,
+    /// Host-owned upload paths after the edit: kept ones plus newly committed
+    /// uploads. Dropped paths are cleaned up once nothing references them.
+    pub paths: Vec<String>,
+    /// Claimed attachment ids to drop from the message.
+    pub remove_ids: Vec<String>,
+}
+
+/// Stable identity of a queued message's attachment set: claimed attachment
+/// ids and upload paths in order. Clients echo it so the host can refuse an
+/// edit made against attachments that changed.
+pub fn queue_attachment_fingerprint(attachments: &[serde_json::Value], paths: &[String]) -> String {
+    let ids: Vec<&str> = attachments
+        .iter()
+        .filter_map(|attachment| attachment["id"].as_str())
+        .collect();
+    format!("claims={}|paths={}", ids.join(","), paths.join(","))
+}
+
+impl QueueUiEntry {
+    pub fn attachment_fingerprint(&self) -> String {
+        queue_attachment_fingerprint(&self.attachments, &self.attachment_paths)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -183,7 +233,38 @@ mod tests {
             super::QueuedRunAction::Edit {
                 text: "new".into(),
                 expected_text: "old".into(),
+                attachments: None,
             }
+        );
+    }
+
+    #[test]
+    fn queue_attachment_edits_are_additive_and_fenced_by_a_fingerprint() {
+        let value = serde_json::json!({"chatId":"thread","queuedRunId":"run",
+            "clientRequestId":"stable", "action":{"type":"edit","text":"new","expectedText":"old",
+            "attachments":{"expected":"claims=a|paths=/x.png","paths":["/y.png"]}}});
+        let request: super::MutateQueuedRunParams = serde_json::from_value(value).unwrap();
+        let super::QueuedRunAction::Edit { attachments, .. } = request.action else {
+            panic!("edit expected");
+        };
+        let edit = attachments.expect("attachment edit");
+        assert_eq!(edit.paths, vec!["/y.png".to_string()]);
+        assert!(edit.remove_ids.is_empty());
+        let entry = super::QueueUiEntry {
+            attachments: vec![serde_json::json!({"id":"a"})],
+            attachment_paths: vec!["/x.png".into()],
+            ..Default::default()
+        };
+        assert_eq!(entry.attachment_fingerprint(), edit.expected);
+        // A text-only edit stays byte-compatible with older hosts.
+        let text_only = super::QueuedRunAction::Edit {
+            text: "t".into(),
+            expected_text: "o".into(),
+            attachments: None,
+        };
+        assert!(
+            serde_json::to_value(&text_only).unwrap()["attachments"].is_null(),
+            "{text_only:?}"
         );
     }
 

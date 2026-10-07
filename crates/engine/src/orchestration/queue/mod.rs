@@ -1,5 +1,6 @@
 //! Queue/question/organization authority. All mutations are planned under the
 //! kernel SQL transaction; replicas publish intents, never provider effects.
+pub(crate) mod attachments;
 pub(crate) mod effects;
 pub mod host;
 pub mod mcp;
