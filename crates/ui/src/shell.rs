@@ -15505,6 +15505,11 @@ impl Shell {
             .update(cx, |composer, cx| composer.fixture_stop_background(cx));
     }
 
+    pub fn fixture_orchestration_load_earlier(&self, chat_id: String, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.load_more_inherited_history(&chat_id, cx));
+    }
+
     pub fn fixture_orchestration_transcript_start(&self, cx: &mut Context<Self>) {
         self.transcript.update(cx, |transcript, cx| {
             transcript.fixture_appshots_start(cx);

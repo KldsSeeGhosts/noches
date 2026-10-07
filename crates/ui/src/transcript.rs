@@ -1029,6 +1029,11 @@ pub enum RowKind {
         label: SharedString,
         source_chat_id: String,
     },
+    /// Click target above the inherited pages: loads the next older page.
+    InheritedMore {
+        label: SharedString,
+        chat_id: String,
+    },
     GeneratedImage {
         owner: String,
         path: String,
@@ -6482,6 +6487,29 @@ impl Transcript {
                     "Inherited from {source_chat_id}. Open the parent in Thread details for the full history."
                 )))
                 .into_any_element(),
+            RowKind::InheritedMore { label, chat_id } => {
+                let chat_id = chat_id.clone();
+                let state = self.state.clone();
+                div()
+                    .id(SharedString::from(format!("{}-more", row.id)))
+                    .w_full()
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .child(label.clone())
+                    .on_click(move |_, _, cx| {
+                        let chat_id = chat_id.clone();
+                        state.update(cx, |state, cx| {
+                            state.load_more_inherited_history(&chat_id, cx);
+                        });
+                    })
+                    .into_any_element()
+            }
             RowKind::User {
                 text,
                 mentions,
@@ -14916,6 +14944,8 @@ mod tests {
 #[cfg(any(feature = "appshots-fixture", feature = "orchestration-fixture"))]
 impl Transcript {
     pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
+        // Break the stick-to-bottom pin, or the next layout glues back to the end.
+        self.pinned = false;
         self.list.scroll_to(gpui::ListOffset::default());
         cx.notify();
     }
