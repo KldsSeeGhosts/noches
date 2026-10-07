@@ -45,6 +45,9 @@ pub struct DetailsModel {
     pub fork_run_id: Option<String>,
     pub merge_run_id: Option<String>,
     pub merge_target: Option<String>,
+    /// The parent already holds a pending merge-back from another fork;
+    /// the host would refuse its next start if a second one were added.
+    pub merge_blocked: bool,
     pub session_control_supported: bool,
     pub session_busy: bool,
     pub session_retry: bool,
@@ -173,14 +176,22 @@ impl DetailsModel {
             && (self.session_retry || !self.attached_provider_sessions.is_empty())
     }
 
+    /// Whether the action may be attempted. `fork_run_id` is a cached hint
+    /// that can lag a turn that just finished, so it only dims the row
+    /// (`fork_ready`); the submit path re-reads the state and refuses with a
+    /// notice when there is truly no finished turn.
     fn can_fork(&self) -> bool {
-        self.transfers_supported && !self.transfer_busy && self.fork_run_id.is_some()
+        self.transfers_supported && !self.transfer_busy
+    }
+
+    fn fork_ready(&self) -> bool {
+        self.can_fork() && self.fork_run_id.is_some()
     }
 
     fn can_merge_back(&self) -> bool {
         self.transfers_supported
             && !self.transfer_busy
-            && self.merge_run_id.is_some()
+            && !self.merge_blocked
             && self.merge_target.as_ref().is_some_and(|target| {
                 self.lineage
                     .iter()
@@ -292,6 +303,20 @@ impl DetailsModel {
             && let Some(row) = state.details.get(&chat.device_id, chat_id)
         {
             crate::details_data::apply_snapshot(&mut model, row);
+        }
+        // The parent's own transfer state names the merge-backs waiting on it.
+        if let Some(parent) = model
+            .merge_target
+            .as_deref()
+            .and_then(|id| state.chats.iter().find(|c| c.id == id))
+        {
+            model.merge_blocked = state
+                .details
+                .get(&parent.device_id, &parent.id)
+                .and_then(|row| row.transfer.as_ref())
+                .is_some_and(|transfer| {
+                    crate::details_data::pending_merge_from_other_fork(transfer, chat_id)
+                });
         }
         if let Some(parent) = &model.merge_target
             && !model.lineage.iter().any(|r| &r.chat_id == parent)
@@ -513,6 +538,7 @@ fn lineage_section(
 ) -> AnyElement {
     let fork = actions.fork_thread.clone();
     let can_fork = model.can_fork();
+    let fork_ready = model.fork_ready();
     let mut body = section("Lineage", vec![], theme);
     if model.transfers_supported {
         body = body.child(
@@ -524,13 +550,15 @@ fn lineage_section(
             .role(gpui::Role::Button)
             .aria_label("Fork conversation")
             .when(can_fork, |el| hover_row(el, theme))
-            .when(!can_fork, |el| el.opacity(0.45))
+            .when(!fork_ready, |el| el.opacity(0.45))
             .tooltip(crate::tooltip::text(if model.transfer_busy {
                 "Creating context transfer…"
-            } else if can_fork {
+            } else if fork_ready {
                 "Explore from the latest finished turn without changing this conversation"
+            } else if can_fork {
+                "No finished turn seen yet. Checks again when you fork."
             } else {
-                "Complete a turn before forking this conversation"
+                "Forking is unavailable on this device"
             }))
             .child(label(if model.transfer_busy {
                 "Preparing conversation…"
@@ -618,11 +646,17 @@ fn lineage_section(
                 el.child(
                     icon_action(
                         format!("details-{chat_id}-merge-back").into(),
-                        icons::ARROW_TURN_UP_RIGHT,
-                        "Merge conversation context back (does not merge files)",
+                        icons::RETURN,
+                        if model.merge_blocked {
+                            "The parent already has merged context from another fork waiting for its next message"
+                        } else {
+                            "Merge conversation context back (does not merge files)"
+                        },
                         theme,
                     )
-                    .when(!can_merge, |el| el.opacity(0.35))
+                    .when(!can_merge || model.merge_run_id.is_none(), |el| {
+                        el.opacity(0.35)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if can_merge {
@@ -659,6 +693,15 @@ fn lineage_section(
         );
     }
     body.into_any_element()
+}
+
+/// Fork and merge-back read as different operations; neutral colour either way.
+fn transfer_icon(transfer: &ContextTransferRow) -> &'static str {
+    match transfer.title.as_str() {
+        "Conversation fork" => icons::GIT_BRANCH,
+        "Merge-back context" => icons::RETURN,
+        _ => icons::ARROW_TURN_UP_RIGHT,
+    }
 }
 
 fn transfers_section(
@@ -722,7 +765,7 @@ fn transfers_section(
                             icon(if transfer.failed {
                                 icons::DANGER_TRIANGLE
                             } else {
-                                icons::ARROW_TURN_UP_RIGHT
+                                transfer_icon(transfer)
                             })
                             .size(px(14.0))
                             .text_color(if transfer.failed {
@@ -1427,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_actions_need_host_capability_finished_run_and_available_parent() {
+    fn transfer_actions_need_host_capability_and_available_parent_but_not_a_cached_run() {
         let mut model = DetailsModel::default();
         assert!(!model.can_fork());
         model.fork_run_id = Some("run".into());
@@ -1436,6 +1479,7 @@ mod tests {
         assert!(!model.can_fork());
         model.transfers_supported = true;
         assert!(model.can_fork());
+        assert!(model.fork_ready());
         assert!(!model.can_merge_back());
         model.lineage.push(ConversationRelation {
             chat_id: "parent".into(),
@@ -1449,7 +1493,15 @@ mod tests {
         model.transfer_busy = false;
         model.lineage[0].available = false;
         assert!(!model.can_merge_back());
+        model.lineage[0].available = true;
+        // A cached "no finished run" may predate the turn that just ended:
+        // it dims the action but must not disable it.
+        model.fork_run_id = None;
         model.merge_run_id = None;
+        assert!(model.can_fork() && !model.fork_ready());
+        assert!(model.can_merge_back());
+        // Another fork's pending merge-back would wedge the parent's next start.
+        model.merge_blocked = true;
         assert!(!model.can_merge_back());
     }
 }

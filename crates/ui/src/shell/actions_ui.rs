@@ -41,7 +41,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(error) = setup_error {
-            self.sidebar_notice = Some(format!("Setup action failed: {error}").into());
+            self.sidebar_notice = Some(SidebarNotice::failure(format!(
+                "Setup action failed: {error}"
+            )));
         }
         let Some(run) = setup_action else {
             cx.notify();
@@ -57,8 +59,9 @@ impl Shell {
             panel.attach_reserved_session(&chat_id, tab, run.terminal, target_device_id, cx)
         });
         if !attached {
-            self.sidebar_notice =
-                Some("Setup action started, but its terminal could not be attached".into());
+            self.sidebar_notice = Some(SidebarNotice::failure(
+                "Setup action started, but its terminal could not be attached",
+            ));
         }
 
         let selected = self.active_chat == chat_id;

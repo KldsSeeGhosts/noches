@@ -770,6 +770,10 @@ pub struct AppState {
     // Presence ticks also retire stale remote session indicators. Remember
     // their last published appearance even when the device rows stay online.
     session_presence_presentation: Vec<Indicator>,
+    /// Chats whose indicator just left Working. The watch loop drains this
+    /// into debounced transfer-state reads (fork/merge gating goes stale
+    /// when a turn completes).
+    turn_settled: Vec<String>,
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
@@ -986,6 +990,7 @@ impl AppState {
             devices: Vec::new(),
             device_presentation: None,
             session_presence_presentation: Vec::new(),
+            turn_settled: Vec::new(),
             connectivity: zeron_proto::Connectivity::default(),
             connectivity_observed: false,
             spaces: Vec::new(),
@@ -1289,6 +1294,7 @@ impl AppState {
         self.chats = chats;
         self.canonical_queues
             .retain(|id, _| self.chats.iter().any(|chat| &chat.id == id));
+        self.details.retain_chats(&self.chats);
         self.chats_synced = true;
         self.apply_lifecycle_fixture();
         // A new child chat or a parent's publication arrives as a chat row.
@@ -1339,8 +1345,27 @@ impl AppState {
         }
         self.session_presentation = Some(presentation);
         self.session_presence_presentation = presence;
+        // Few sessions are Working at once, so the per-turn lookup stays cheap.
+        for old in &self.sessions {
+            if effective_indicator(Some(old), now) != Indicator::Working {
+                continue;
+            }
+            let still_working = sessions.iter().any(|new| {
+                new.chat_id == old.chat_id && effective_indicator(Some(new), now) == Indicator::Working
+            });
+            if !still_working && !self.turn_settled.contains(&old.chat_id) {
+                self.turn_settled.push(old.chat_id.clone());
+            }
+        }
         self.replace_sessions(sessions);
         changed
+    }
+
+    /// Start the debounced transfer-state reads queued by a turn ending.
+    pub(crate) fn flush_settled_turns(&mut self, cx: &mut Context<Self>) {
+        for chat in std::mem::take(&mut self.turn_settled) {
+            self.schedule_transfer_refresh(&chat, cx);
+        }
     }
 
     /// Replace the session list wholesale, keeping the id -> slot index in
@@ -2272,6 +2297,7 @@ impl AppState {
         }
     }
 
+
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         // O(1): the index is rebuilt wherever `sessions` is replaced, and the
         // field is private so no caller can bypass that.
@@ -2763,9 +2789,9 @@ impl AppState {
     ) {
         if let Some(id) = &chat_id {
             self.focus_chat_sync(id, cx);
-            if self.chat_host_supports(id, zeron_proto::capabilities::THREAD_TRANSFERS_V1) {
-                self.refresh_details(id, false, cx);
-            }
+            // Only the inherited preview needs the transfer state here; the
+            // Details panel fetches the rest when it is actually open.
+            self.refresh_transfer_state(id, false, cx);
         }
         self.nudge_delegation();
         if self.selected_chat == chat_id {
@@ -3347,6 +3373,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 };
                 let alive = this.update(cx, |state, cx| {
                     let changed = apply(state, parsed);
+                    state.flush_settled_turns(cx);
                     state.apply_pending_deep_link(cx);
                     if changed {
                         if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
@@ -3516,9 +3543,19 @@ fn spawn_queue_watch(
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
+            // The chat's owning host decides; the local engine's own
+            // capabilities say nothing about a remote-owned chat.
+            let include_canonical = this
+                .read_with(cx, |state, _| {
+                    state.chat_host_supports(
+                        &chat_id,
+                        zeron_proto::capabilities::CANONICAL_QUEUE_V1,
+                    )
+                })
+                .unwrap_or(false);
             let params = serde_json::json!({
                 "chatId": chat_id,
-                "includeCanonical": handle.engine_info().supports(zeron_proto::capabilities::CANONICAL_QUEUE_V1),
+                "includeCanonical": include_canonical,
             });
             let mut rx = match handle
                 .client()
@@ -3581,9 +3618,19 @@ fn spawn_pane_queue_watch(
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
+            // The chat's owning host decides; the local engine's own
+            // capabilities say nothing about a remote-owned chat.
+            let include_canonical = this
+                .read_with(cx, |state, _| {
+                    state.chat_host_supports(
+                        &chat_id,
+                        zeron_proto::capabilities::CANONICAL_QUEUE_V1,
+                    )
+                })
+                .unwrap_or(false);
             let params = serde_json::json!({
                 "chatId": chat_id,
-                "includeCanonical": handle.engine_info().supports(zeron_proto::capabilities::CANONICAL_QUEUE_V1),
+                "includeCanonical": include_canonical,
             });
             let mut rx = match handle
                 .client()
@@ -4411,6 +4458,25 @@ mod tests {
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
         }
+    }
+
+    #[test]
+    fn a_session_leaving_working_queues_one_transfer_refresh() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.apply_sessions_at(vec![session("c", SessionStatus::Working, 1, now)], now);
+        assert!(state.turn_settled.is_empty(), "starting a turn queues nothing");
+        state.apply_sessions_at(vec![session("c", SessionStatus::Working, 0, now)], now);
+        assert!(state.turn_settled.is_empty(), "a heartbeat is not a completion");
+        state.apply_sessions_at(vec![session("c", SessionStatus::Idle, 0, now)], now);
+        assert_eq!(state.turn_settled, ["c"]);
+        state.apply_sessions_at(vec![session("c", SessionStatus::Idle, 0, now)], now);
+        assert_eq!(state.turn_settled, ["c"], "idle frames queue nothing more");
+        // A row that vanishes while Working also ended its turn.
+        state.turn_settled.clear();
+        state.apply_sessions_at(vec![session("d", SessionStatus::Working, 0, now)], now);
+        state.apply_sessions_at(Vec::new(), now);
+        assert_eq!(state.turn_settled, ["d"]);
     }
 
     fn user_entry(id: &str) -> SessionMessageEntry {

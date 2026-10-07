@@ -206,7 +206,7 @@ impl Shell {
             (state.engine().cloned(), host)
         };
         let Some(engine) = engine else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
             cx.notify();
             return;
         };
@@ -226,7 +226,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::ORGANIZE_THREAD, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
                     cx.notify();
                 })
                 .ok();
@@ -257,7 +257,7 @@ impl Shell {
                 .await
             {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
                     cx.notify();
                 })
                 .ok();

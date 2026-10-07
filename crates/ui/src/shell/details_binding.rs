@@ -1,68 +1,89 @@
 //! Wave-3 Details wiring, kept out of shell chrome.
 use super::*;
-use crate::details_data::ConversationTransfer;
+use crate::details_data::{ConversationTransfer, TransferIntent};
 use crate::details_dialog::{Closed, DetailsDialog, Kind};
 use zeron_proto::transfer::{ForkThreadParams, MergeThreadBackParams, ThreadSourcePoint};
-
-#[derive(Clone, PartialEq, Eq)]
-enum TransferIntent {
-    Fork(Option<String>),
-    Merge,
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_rpc::RpcError;
 
-    #[test]
-    fn successful_transfers_do_not_use_the_failure_notice_palette() {
-        let success = SidebarNotice::information("Conversation forked.");
-        assert!(!success.failed);
-        let failure: SidebarNotice = "Conversation transfer refused.".into();
-        assert!(failure.failed);
+    fn fork_request(point: ThreadSourcePoint) -> ConversationTransfer {
+        ConversationTransfer::Fork(ForkThreadParams {
+            chat_id: "source".into(),
+            command_id: "stable".into(),
+            target_chat_id: "one-child".into(),
+            source_point: point,
+            title: None,
+        })
     }
 
     #[test]
-    fn uncertain_retries_cannot_change_the_transfer_kind_or_checkpoint() {
-        let request = |point| {
-            ConversationTransfer::Fork(ForkThreadParams {
-                chat_id: "source".into(),
-                command_id: "stable".into(),
-                target_chat_id: "one-child".into(),
-                source_point: point,
-                title: None,
-            })
+    fn plain_notices_are_neutral_and_failures_are_explicit() {
+        let copied: SidebarNotice = "Path copied".into();
+        assert!(!copied.failed);
+        assert!(!SidebarNotice::information("Conversation forked.").failed);
+        assert!(SidebarNotice::failure("Conversation transfer refused.").failed);
+    }
+
+    #[test]
+    fn transfer_pins_are_keyed_by_chat_and_intent() {
+        let mut store = crate::details_data::DetailsStore::default();
+        let merge = ("chat".to_owned(), TransferIntent::Merge);
+        let fork = ("chat".to_owned(), TransferIntent::Fork(None));
+        store.transfer_retries.insert(
+            merge.clone(),
+            fork_request(ThreadSourcePoint::LatestStable),
+        );
+        // A stuck Merge does not shadow a Fork of the same chat.
+        assert!(store.transfer_retry("chat", &TransferIntent::Merge).is_some());
+        assert!(store.transfer_retry("chat", &TransferIntent::Fork(None)).is_none());
+        store.transfer_retries.insert(
+            fork.clone(),
+            fork_request(ThreadSourcePoint::Run {
+                run_id: "pinned".into(),
+            }),
+        );
+        let checkpoint = TransferIntent::Fork(Some("cp".into()));
+        assert!(store.transfer_retry("chat", &checkpoint).is_none());
+    }
+
+    #[test]
+    fn transfer_pin_survives_only_an_unknown_outcome() {
+        let mut store = crate::details_data::DetailsStore::default();
+        let pin = ("chat".to_owned(), TransferIntent::Merge);
+        let other = ("chat".to_owned(), TransferIntent::Fork(None));
+        let arm = |store: &mut crate::details_data::DetailsStore| {
+            for key in [&pin, &other] {
+                store
+                    .transfer_retries
+                    .insert(key.clone(), fork_request(ThreadSourcePoint::LatestStable));
+            }
         };
-        let run = request(ThreadSourcePoint::Run {
-            run_id: "pinned".into(),
-        });
-        assert!(TransferIntent::Fork(None).matches(&run));
-        assert!(!TransferIntent::Merge.matches(&run));
-        let checkpoint = request(ThreadSourcePoint::Checkpoint {
-            checkpoint_id: "cp".into(),
-        });
-        assert!(TransferIntent::Fork(Some("cp".into())).matches(&checkpoint));
-        assert!(!TransferIntent::Fork(Some("different".into())).matches(&checkpoint));
-        assert!(!TransferIntent::Fork(None).matches(&checkpoint));
-        assert!(!TransferIntent::Fork(None).matches(&request(ThreadSourcePoint::LatestStable)));
-    }
-}
-
-impl TransferIntent {
-    fn matches(&self, request: &ConversationTransfer) -> bool {
-        match (self, request) {
-            (Self::Fork(Some(id)), ConversationTransfer::Fork(p)) => {
-                p.source_point
-                    == ThreadSourcePoint::Checkpoint {
-                        checkpoint_id: id.clone(),
-                    }
-            }
-            (Self::Fork(None), ConversationTransfer::Fork(p)) => {
-                matches!(p.source_point, ThreadSourcePoint::Run { .. })
-            }
-            (Self::Merge, ConversationTransfer::Merge(_)) => true,
-            _ => false,
+        for unknown in [
+            RpcError::Transport("link dropped".into()),
+            RpcError::Closed,
+            RpcError::Failed("transport: no reply from device d for ForkThread within 30s".into()),
+        ] {
+            arm(&mut store);
+            store.settle_transfer_pin(&pin, Some(&unknown));
+            assert!(store.transfer_retries.contains_key(&pin), "{unknown}");
         }
+        for definite in [
+            RpcError::Failed("The transfer was refused by the host.".into()),
+            RpcError::BadParams("bad".into()),
+            RpcError::UnknownMethod("MergeThreadBack".into()),
+        ] {
+            arm(&mut store);
+            store.settle_transfer_pin(&pin, Some(&definite));
+            assert!(!store.transfer_retries.contains_key(&pin), "{definite}");
+            // Settling one intent never touches another's pin.
+            assert!(store.transfer_retries.contains_key(&other));
+        }
+        arm(&mut store);
+        store.settle_transfer_pin(&pin, None);
+        assert!(!store.transfer_retries.contains_key(&pin));
     }
 }
 
@@ -277,7 +298,7 @@ impl Shell {
                 shell.sidebar_notice = Some(if succeeded {
                     SidebarNotice::information(notice)
                 } else {
-                    notice.into()
+                    SidebarNotice::failure(notice)
                 });
                 cx.notify();
             })
@@ -310,15 +331,10 @@ impl Shell {
         let Some(engine) = state.engine().cloned() else {
             return;
         };
-        let retry = state.details.transfer_retries.get(&chat).cloned();
-        if retry.as_ref().is_some_and(|r| !intent.matches(r)) {
-            self.sidebar_notice = Some(
-                "Retry the previous conversation transfer first; its outcome is not confirmed."
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
+        // Pinned per (chat, intent): an unconfirmed Merge replays only itself
+        // and never blocks a Fork.
+        let retry = state.details.transfer_retry(&chat, &intent).cloned();
+        let pin = (chat.clone(), intent.clone());
         let app_state = self.state.clone();
         app_state.update(cx, |s, cx| {
             s.details.transfer_actions.insert(chat.clone());
@@ -363,7 +379,7 @@ impl Shell {
                 // Keep the exact target and source point across response loss,
                 // including a failure after the host has committed acceptance.
                 app_state.update(cx, |s, _| {
-                    s.details.transfer_retries.insert(chat.clone(), request.clone());
+                    s.details.transfer_retries.insert(pin.clone(), request.clone());
                 });
                 let merging = matches!(request, ConversationTransfer::Merge(_));
                 let result = match request {
@@ -379,7 +395,7 @@ impl Shell {
                 s.details.transfer_actions.remove(&chat);
                 match result {
                     Ok((reply, merging)) => {
-                        s.details.transfer_retries.remove(&chat);
+                        s.details.settle_transfer_pin(&pin, None);
                         if let Some(refusal) = reply.refusal {
                             notice = Some(refusal);
                         } else {
@@ -406,10 +422,8 @@ impl Shell {
                         }
                     }
                     Err(error) => {
-                        if matches!(error, zeron_rpc::RpcError::BadParams(_) | zeron_rpc::RpcError::UnknownMethod(_)) {
-                            s.details.transfer_retries.remove(&chat);
-                        }
-                        notice = Some(format!("{error}{}", if s.details.transfer_retries.contains_key(&chat) {
+                        s.details.settle_transfer_pin(&pin, Some(&error));
+                        notice = Some(format!("{error}{}", if s.details.transfer_retries.contains_key(&pin) {
                             " Retry uses the same request to avoid duplicate forks or merges."
                         } else { "" }));
                     }
@@ -421,7 +435,7 @@ impl Shell {
                 if let Some(notice) = notice {
                     view.sidebar_notice = Some(if succeeded {
                         SidebarNotice::information(notice)
-                    } else { notice.into() });
+                    } else { SidebarNotice::failure(notice) });
                 }
                 if let Some(target) = open_target { view.open_chat(target, cx); }
                 cx.notify();

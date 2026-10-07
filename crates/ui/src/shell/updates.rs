@@ -332,7 +332,8 @@ impl Shell {
                                 shell.update_status =
                                     format!("Could not install: {error:#}").into();
                                 shell.update_flow = UpdateFlow::Ready(staged);
-                                shell.sidebar_notice = Some(shell.update_status.clone().into());
+                                shell.sidebar_notice =
+                                    Some(SidebarNotice::failure(shell.update_status.clone()));
                             }
                         }
                     }
@@ -342,7 +343,8 @@ impl Shell {
                             Err(error) => error.to_string().into(),
                             _ => unreachable!(),
                         };
-                        shell.sidebar_notice = Some(shell.update_status.clone().into());
+                        shell.sidebar_notice =
+                                    Some(SidebarNotice::failure(shell.update_status.clone()));
                         shell.update_flow = UpdateFlow::Ready(staged);
                     }
                 }

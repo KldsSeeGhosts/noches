@@ -676,15 +676,9 @@ impl SettingsSection {
                 "working",
             ],
             SettingsSection::Appshots => &["screenshot", "capture", "screen", "window"],
-            SettingsSection::Automations => &[
-                "schedule",
-                "scheduled",
-                "task",
-                "cron",
-                "recurring",
-                "timer",
-                "run",
-            ],
+            SettingsSection::Automations => {
+                &["schedule", "scheduled", "task", "cron", "recurring", "timer", "run"]
+            }
             SettingsSection::Archived => &["archive", "restore", "history", "delete"],
             SettingsSection::Import => &["import", "cli", "history", "claude", "codex", "sessions"],
             SettingsSection::Updates => &["version", "update", "release", "upgrade", "check"],
@@ -1749,11 +1743,20 @@ impl SidebarNotice {
             failed: false,
         }
     }
+
+    /// An action that did not happen. The only notice painted in the danger
+    /// hue: colour encodes state, so plain text converts to the neutral style.
+    fn failure(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            failed: true,
+        }
+    }
 }
 
 impl From<SharedString> for SidebarNotice {
     fn from(text: SharedString) -> Self {
-        Self { text, failed: true }
+        Self::information(text)
     }
 }
 
@@ -2663,7 +2666,7 @@ impl Shell {
         self.sidebar_source_dirty.set(true);
         self.sync_voice_context(cx);
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(notice.into());
+            self.sidebar_notice = Some(SidebarNotice::failure(notice));
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -4816,7 +4819,9 @@ impl Shell {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
             self.sidebar_notice = Some("Zeron conversation link copied".into());
         } else {
-            self.sidebar_notice = Some("Conversation link is not ready yet".into());
+            self.sidebar_notice = Some(SidebarNotice::failure(
+                "Conversation link is not ready yet",
+            ));
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5216,10 +5221,9 @@ impl Shell {
             SettingsSection::Automations => {
                 if self.automations_page.is_none() {
                     let state = self.state.clone();
-                    self.automations_page =
-                        Some(cx.new(|cx| {
-                            crate::settings::automations::AutomationsPage::new(state, cx)
-                        }));
+                    self.automations_page = Some(cx.new(|cx| {
+                        crate::settings::automations::AutomationsPage::new(state, cx)
+                    }));
                 }
                 match &self.automations_page {
                     Some(page) => page.clone().into_any_element(),
@@ -5240,19 +5244,12 @@ impl Shell {
                 if self.import_page.is_none() {
                     let state = self.state.clone();
                     let page = cx.new(|cx| crate::settings::import::ImportPage::new(state, cx));
-                    self.import_page_events = Some(cx.subscribe(
-                        &page,
-                        |this, _, event: &crate::settings::import::OpenChat, cx| {
-                            this.open_chat(event.0.clone(), cx);
-                        },
-                    ));
+                    self.import_page_events = Some(cx.subscribe(&page, |this, _, event: &crate::settings::import::OpenChat, cx| {
+                        this.open_chat(event.0.clone(), cx);
+                    }));
                     self.import_page = Some(page);
                 }
-                self.import_page
-                    .as_ref()
-                    .unwrap()
-                    .clone()
-                    .into_any_element()
+                self.import_page.as_ref().unwrap().clone().into_any_element()
             }
         }
     }
@@ -5262,14 +5259,14 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::failure("Engine not connected"));
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::failure(format!("{err}")));
                     cx.notify();
                 })
                 .ok();
@@ -5574,8 +5571,9 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.sidebar_notice = Some(SidebarNotice::failure(format!(
+                            "Could not cancel sign-in: {err}"
+                        )));
                     }
                 }
                 cx.notify();
@@ -5910,7 +5908,8 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.sidebar_notice =
+                        Some(SidebarNotice::failure(format!("Sign in failed: {err}")));
                     cx.notify();
                 }
             })
@@ -8934,7 +8933,7 @@ impl Shell {
                                     this.fork_conversation(fork_id.clone(), None, cx);
                                 }))
                                 .child(
-                                    icon(icons::ARROW_TURN_UP_RIGHT)
+                                    icon(icons::GIT_BRANCH)
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
@@ -10350,7 +10349,8 @@ impl Shell {
                         .state
                         .update(cx, |state, _| state.details.notice.take())
                     {
-                        self.sidebar_notice = Some(notice.into());
+                        // Only failed watch/setup actions set this notice.
+                        self.sidebar_notice = Some(SidebarNotice::failure(notice));
                     }
                     let pull_space = self
                         .state

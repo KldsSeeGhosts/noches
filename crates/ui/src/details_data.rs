@@ -19,12 +19,26 @@ pub struct DetailsStore {
     rows: HashMap<(String, String), DetailsSnapshot>,
     pending: HashSet<(String, String)>,
     refresh_again: HashSet<(String, String)>,
+    /// Transfer-state-only reads (selection, turn completion) are tracked
+    /// apart from the full Details read so neither blocks the other.
+    transfer_pending: HashSet<(String, String)>,
+    transfer_again: HashSet<(String, String)>,
+    transfer_debounce: HashSet<(String, String)>,
     pub notice: Option<String>,
     pub(crate) transfer_actions: HashSet<String>,
-    pub(crate) transfer_retries: HashMap<String, ConversationTransfer>,
+    /// One pinned request per (chat, intent): an unresolved Merge never blocks
+    /// a Fork, and a retry can only replay the request it was minted for.
+    pub(crate) transfer_retries: HashMap<(String, TransferIntent), ConversationTransfer>,
     pub(crate) session_actions: HashSet<(String, String)>,
     pub(crate) session_retries:
         HashMap<(String, String), zeron_proto::transfer::DisconnectThreadSessionParams>,
+}
+
+/// What the user asked for; keys a pinned retry together with the chat.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TransferIntent {
+    Fork(Option<String>),
+    Merge,
 }
 
 #[derive(Clone)]
@@ -36,6 +50,41 @@ pub(crate) enum ConversationTransfer {
 impl DetailsStore {
     pub(crate) fn transfer_busy(&self, chat: &str) -> bool {
         self.transfer_actions.contains(chat)
+    }
+
+    pub(crate) fn transfer_retry(
+        &self,
+        chat: &str,
+        intent: &TransferIntent,
+    ) -> Option<&ConversationTransfer> {
+        self.transfer_retries
+            .get(&(chat.to_owned(), intent.clone()))
+    }
+
+    /// Settle a transfer's pinned request after the RPC returned. The pin
+    /// survives only while the host may have committed the request (transport
+    /// loss or timeout); any answer the host itself gave, success, refusal or
+    /// error, is definite and releases it.
+    pub(crate) fn settle_transfer_pin(
+        &mut self,
+        pin: &(String, TransferIntent),
+        error: Option<&zeron_rpc::RpcError>,
+    ) {
+        if error.is_none_or(|error| !rpc_outcome_unknown(error)) {
+            self.transfer_retries.remove(pin);
+        }
+    }
+
+    /// Drop everything keyed by a chat that no longer exists.
+    pub(crate) fn retain_chats(&mut self, chats: &[zeron_proto::Chat]) {
+        let live: HashSet<(&str, &str)> = chats
+            .iter()
+            .map(|c| (c.device_id.as_str(), c.id.as_str()))
+            .collect();
+        self.rows
+            .retain(|(owner, id), _| live.contains(&(owner.as_str(), id.as_str())));
+        let ids: HashSet<&str> = chats.iter().map(|c| c.id.as_str()).collect();
+        self.transfer_retries.retain(|(id, _), _| ids.contains(id.as_str()));
     }
 }
 
@@ -49,6 +98,9 @@ pub struct DetailsSnapshot {
     /// The API has no start timestamp: keep first observation stable across reads.
     setup_observed: Option<(String, DateTime<Utc>)>,
     pub error: Option<String>,
+    /// Set once a full Details read has completed; a transfer-only row
+    /// (chat selection) does not satisfy the panel.
+    full: bool,
 }
 
 impl DetailsStore {
@@ -390,6 +442,34 @@ pub fn map_transfers(state: &ThreadTransferState) -> Vec<crate::details::Context
     transfers
 }
 
+/// Did the request possibly reach the host without its answer coming back?
+/// Only then may a minted request be replayed. Wire errors reach the client as
+/// `Failed(text)`, so a relayed transport failure is recognised by its prefix.
+pub(crate) fn rpc_outcome_unknown(error: &zeron_rpc::RpcError) -> bool {
+    use zeron_rpc::RpcError;
+    match error {
+        RpcError::Transport(_) | RpcError::Closed => true,
+        RpcError::Failed(text) => rpc_message_outcome_unknown(text),
+        RpcError::BadParams(_) | RpcError::UnknownMethod(_) => false,
+    }
+}
+
+/// [`rpc_outcome_unknown`] for an error already rendered with `to_string()`.
+pub(crate) fn rpc_message_outcome_unknown(message: &str) -> bool {
+    message.starts_with("transport: ") || message == "connection closed"
+}
+
+/// Does `parent` hold a pending merge-back from a fork other than `fork`?
+/// The host refuses the parent's next start while two forks are pending.
+pub fn pending_merge_from_other_fork(parent: &ThreadTransferState, fork: &str) -> bool {
+    parent.transfers.iter().any(|t| {
+        t["type"] == "merge_back"
+            && t["status"] == "pending"
+            && t["targetThreadId"] == parent.thread_id.0.as_str()
+            && t["sourceThreadId"].as_str().is_some_and(|source| source != fork)
+    })
+}
+
 pub fn fork_source(state: &ThreadTransferState) -> Option<&str> {
     state
         .forked_from
@@ -401,6 +481,18 @@ pub fn fork_source(state: &ThreadTransferState) -> Option<&str> {
                 .flatten()
         })
 }
+
+/// Does the frozen inherited preview need rebuilding for `next`? Compares the
+/// inputs, so an unchanged parent history is never re-parsed or re-synced.
+fn inherited_changed(current: Option<&ThreadTransferState>, next: &ThreadTransferState) -> bool {
+    current.is_none_or(|current| {
+        fork_source(current) != fork_source(next) || current.inherited_items != next.inherited_items
+    })
+}
+
+/// Delay that coalesces the burst of session frames around a turn ending
+/// into one transfer-state read.
+const TRANSFER_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl AppState {
     pub fn refresh_details(&mut self, chat_id: &str, force: bool, cx: &mut Context<Self>) {
@@ -414,7 +506,7 @@ impl AppState {
             }
             return;
         }
-        if !force && self.details.rows.contains_key(&key) {
+        if !force && self.details.rows.get(&key).is_some_and(|row| row.full) {
             return;
         }
         let Some(engine) = self.engine().cloned() else {
@@ -427,35 +519,29 @@ impl AppState {
                 engine.client().launch_state(&key.1, Some(&key.0)),
                 engine.client().thread_transfer_state(&key.1, &key.0),
             );
-            let (transfer, inherited) = cx
-                .background_executor()
-                .spawn(async move {
-                    let inherited = transfer.as_ref().ok().and_then(prepare_inherited);
-                    (transfer, inherited)
-                })
-                .await;
+            let inherited = prepare_if_changed(&this, cx, &key, &transfer).await;
             this.update(cx, |state, cx| {
                 state.details.pending.remove(&key);
                 let row = state.details.rows.entry(key.clone()).or_default();
                 row.error = None;
+                row.full = true;
                 match prs {
                     Ok(v) => row.prs = Some(v),
                     Err(e) => row.error = Some(e.to_string()),
                 }
-                match transfer {
-                    Ok(v) => {
-                        if row
-                            .transfer
-                            .as_ref()
-                            .is_none_or(|current| current.version <= v.version)
-                        {
-                            row.transfer = Some(v);
-                            row.inherited = inherited;
-                            state.transcript_revision = state.transcript_revision.wrapping_add(1);
-                        }
-                    }
-                    Err(e) => row.error = Some(e.to_string()),
+                state.apply_transfer_state(&key, transfer, inherited);
+                let parent = state
+                    .details
+                    .rows
+                    .get(&key)
+                    .and_then(|row| row.transfer.as_ref())
+                    .and_then(fork_source)
+                    .map(str::to_owned);
+                if let Some(parent) = parent {
+                    // The panel's merge gating reads the parent's pending list.
+                    state.fetch_transfer_state(&parent, true, false, cx);
                 }
+                let row = state.details.rows.entry(key.clone()).or_default();
                 match launch {
                     Ok(v) => {
                         let run = v.as_ref().and_then(|l| l.setup.as_ref()).map(|s| &s.run_id);
@@ -480,6 +566,141 @@ impl AppState {
             .ok();
         })
         .detach();
+    }
+
+    /// Fetch only the thread transfer state: what chat selection needs for the
+    /// inherited preview, and what keeps the fork/merge gating current. Without
+    /// `force`, a chat whose transfer state is already cached is left alone.
+    /// A fork's parent state is read once too (merge-back conflicts live there).
+    pub fn refresh_transfer_state(&mut self, chat_id: &str, force: bool, cx: &mut Context<Self>) {
+        self.fetch_transfer_state(chat_id, force, true, cx);
+    }
+
+    fn fetch_transfer_state(
+        &mut self,
+        chat_id: &str,
+        force: bool,
+        follow_parent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.chat_host_supports(chat_id, zeron_proto::capabilities::THREAD_TRANSFERS_V1) {
+            return;
+        }
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            return;
+        };
+        let key = (chat.device_id.clone(), chat.id.clone());
+        if self.details.pending.contains(&key) {
+            // The full read carries the transfer state; rerun it afterwards
+            // only when the caller knows the cached value is out of date.
+            if force {
+                self.details.refresh_again.insert(key);
+            }
+            return;
+        }
+        if self.details.transfer_pending.contains(&key) {
+            if force {
+                self.details.transfer_again.insert(key);
+            }
+            return;
+        }
+        if !force
+            && self
+                .details
+                .rows
+                .get(&key)
+                .is_some_and(|row| row.transfer.is_some())
+        {
+            return;
+        }
+        let Some(engine) = self.engine().cloned() else {
+            return;
+        };
+        self.details.transfer_pending.insert(key.clone());
+        cx.spawn(async move |this, cx| {
+            let transfer = engine.client().thread_transfer_state(&key.1, &key.0).await;
+            let inherited = prepare_if_changed(&this, cx, &key, &transfer).await;
+            this.update(cx, |state, cx| {
+                state.details.transfer_pending.remove(&key);
+                let parent = transfer
+                    .as_ref()
+                    .ok()
+                    .and_then(fork_source)
+                    .filter(|_| follow_parent)
+                    .map(str::to_owned);
+                state.apply_transfer_state(&key, transfer, inherited);
+                if let Some(parent) = parent {
+                    state.fetch_transfer_state(&parent, false, false, cx);
+                }
+                if state.details.transfer_again.remove(&key) {
+                    state.fetch_transfer_state(&key.1, true, follow_parent, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A turn just ended (indicator left Working): re-read the transfer state
+    /// of every chat that already has a Details row, once per burst. Event
+    /// driven; nothing is armed while idle.
+    pub(crate) fn schedule_transfer_refresh(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            return;
+        };
+        let key = (chat.device_id.clone(), chat.id.clone());
+        let tracked = self.selected_chat.as_deref() == Some(chat_id)
+            || self.details.rows.contains_key(&key);
+        if !tracked || !self.details.transfer_debounce.insert(key.clone()) {
+            return;
+        }
+        let chat = chat_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(TRANSFER_REFRESH_DEBOUNCE)
+                .await;
+            this.update(cx, |state, cx| {
+                state.details.transfer_debounce.remove(&key);
+                state.refresh_transfer_state(&chat, true, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Store a transfer-state read. The inherited preview and the transcript
+    /// revision only change when the inherited inputs did.
+    fn apply_transfer_state(
+        &mut self,
+        key: &(String, String),
+        transfer: Result<ThreadTransferState, zeron_rpc::RpcError>,
+        inherited: Option<std::sync::Arc<Vec<crate::transcript::Row>>>,
+    ) {
+        let row = self.details.rows.entry(key.clone()).or_default();
+        let mut bump = false;
+        match transfer {
+            Ok(v) => {
+                if row
+                    .transfer
+                    .as_ref()
+                    .is_none_or(|current| current.version <= v.version)
+                {
+                    if inherited_changed(row.transfer.as_ref(), &v) {
+                        // `None` here means the read raced a change after the
+                        // up-front comparison; build it now.
+                        let next = inherited.or_else(|| prepare_inherited(&v));
+                        bump = row.inherited.is_some() || next.is_some();
+                        row.inherited = next;
+                    }
+                    row.transfer = Some(v);
+                }
+            }
+            Err(e) => row.error = Some(e.to_string()),
+        }
+        if bump {
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
     }
 
     pub fn control_details_setup(&mut self, chat: &str, action: &str, cx: &mut Context<Self>) {
@@ -560,10 +781,150 @@ impl AppState {
     }
 }
 
+/// Parse the inherited preview off the UI thread, and only when the transfer
+/// state's inherited inputs differ from what the row already holds.
+async fn prepare_if_changed(
+    this: &gpui::WeakEntity<AppState>,
+    cx: &mut gpui::AsyncApp,
+    key: &(String, String),
+    transfer: &Result<ThreadTransferState, zeron_rpc::RpcError>,
+) -> Option<std::sync::Arc<Vec<crate::transcript::Row>>> {
+    let Ok(next) = transfer else {
+        return None;
+    };
+    let changed = this
+        .update(cx, |state, _| {
+            inherited_changed(
+                state
+                    .details
+                    .rows
+                    .get(key)
+                    .and_then(|row| row.transfer.as_ref()),
+                next,
+            )
+        })
+        .unwrap_or(false);
+    if !changed {
+        return None;
+    }
+    let next = next.clone();
+    cx.background_executor()
+        .spawn(async move { prepare_inherited(&next) })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn transfer_state(version: i64, items: Vec<Value>) -> ThreadTransferState {
+        serde_json::from_value(json!({
+            "threadId": "child",
+            "version": version,
+            "lineage": {"relationshipToParent": "fork", "parentThreadId": "parent"},
+            "inheritedItems": items,
+        }))
+        .unwrap()
+    }
+
+    fn inherited_message(id: &str) -> Value {
+        json!({"type": "user_message", "sourceThreadId": "parent", "sourceItemId": id, "text": id})
+    }
+
+    #[test]
+    fn unchanged_inherited_history_does_not_resync_the_transcript() {
+        let mut state = AppState::new();
+        let key = ("dev".to_owned(), "child".to_owned());
+        let first = transfer_state(1, vec![inherited_message("m1")]);
+        let prepared = prepare_inherited(&first);
+        assert!(prepared.is_some());
+        state.apply_transfer_state(&key, Ok(first), prepared);
+        let revision = state.transcript_revision;
+        // A later read with identical inherited inputs keeps the preview.
+        let second = transfer_state(2, vec![inherited_message("m1")]);
+        assert!(!inherited_changed(
+            state.details.rows[&key].transfer.as_ref(),
+            &second
+        ));
+        state.apply_transfer_state(&key, Ok(second), None);
+        assert_eq!(state.transcript_revision, revision);
+        assert!(state.details.rows[&key].inherited.is_some());
+        assert_eq!(state.details.rows[&key].transfer.as_ref().unwrap().version, 2);
+        // New inherited history rebuilds the preview and resyncs once.
+        let third = transfer_state(3, vec![inherited_message("m1"), inherited_message("m2")]);
+        state.apply_transfer_state(&key, Ok(third), None);
+        assert_eq!(state.transcript_revision, revision.wrapping_add(1));
+    }
+
+    #[test]
+    fn a_chat_without_inherited_history_never_bumps_the_revision() {
+        let mut state = AppState::new();
+        let key = ("dev".to_owned(), "plain".to_owned());
+        let revision = state.transcript_revision;
+        let plain: ThreadTransferState =
+            serde_json::from_value(json!({"threadId": "plain", "version": 4})).unwrap();
+        state.apply_transfer_state(&key, Ok(plain), None);
+        assert_eq!(state.transcript_revision, revision);
+        assert!(state.details.rows[&key].inherited.is_none());
+    }
+
+    #[test]
+    fn removed_chats_are_evicted_from_the_details_store() {
+        let mut store = DetailsStore::default();
+        for id in ["keep", "gone"] {
+            store
+                .rows
+                .insert(("dev".into(), id.into()), DetailsSnapshot::default());
+            store
+                .transfer_retries
+                .insert((id.into(), TransferIntent::Merge), unreachable_retry());
+        }
+        let mut keep = crate::state::AppState::new();
+        keep.chats = vec![serde_json::from_value(json!({
+            "id": "keep", "deviceId": "dev", "archived": false,
+            "createdAt": "2026-07-19T12:00:00Z"
+        }))
+        .unwrap()];
+        store.retain_chats(&keep.chats);
+        assert!(store.rows.contains_key(&("dev".into(), "keep".into())));
+        assert!(!store.rows.contains_key(&("dev".into(), "gone".into())));
+        assert_eq!(store.transfer_retries.len(), 1);
+    }
+
+    fn unreachable_retry() -> ConversationTransfer {
+        ConversationTransfer::Merge(zeron_proto::transfer::MergeThreadBackParams {
+            chat_id: "c".into(),
+            command_id: "k".into(),
+            target_chat_id: "p".into(),
+            source_point: zeron_proto::transfer::ThreadSourcePoint::LatestStable,
+        })
+    }
+
+    #[test]
+    fn another_forks_pending_merge_back_blocks_a_second_merge() {
+        let parent = |transfers: Value| -> ThreadTransferState {
+            serde_json::from_value(json!({"threadId": "parent", "transfers": transfers})).unwrap()
+        };
+        let merge = |source: &str, status: &str| {
+            json!({"type": "merge_back", "status": status,
+                   "sourceThreadId": source, "targetThreadId": "parent"})
+        };
+        assert!(!pending_merge_from_other_fork(&parent(json!([])), "fork-a"));
+        // The fork's own pending merge is superseded by merging again.
+        assert!(!pending_merge_from_other_fork(
+            &parent(json!([merge("fork-a", "pending")])),
+            "fork-a"
+        ));
+        assert!(pending_merge_from_other_fork(
+            &parent(json!([merge("fork-b", "pending")])),
+            "fork-a"
+        ));
+        assert!(!pending_merge_from_other_fork(
+            &parent(json!([merge("fork-b", "consumed")])),
+            "fork-a"
+        ));
+    }
 
     #[test]
     fn api_pr_json_maps_chain_checks_state_and_watch() {
