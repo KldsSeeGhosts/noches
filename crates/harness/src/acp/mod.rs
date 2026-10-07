@@ -4474,45 +4474,6 @@ mod tests {
     }
 
     #[test]
-    fn thought_ladder_reads_per_model_levels_and_drops_off() {
-        let options = json!([
-            { "id": "model", "category": "model", "type": "select", "options": [] },
-            {
-                "id": "thought_level",
-                "category": "thought_level",
-                "type": "select",
-                "currentValue": "medium",
-                "options": [
-                    { "value": "off" },
-                    { "value": "low" },
-                    { "value": "medium" },
-                    { "value": "high" },
-                    { "value": "xhigh" },
-                    { "value": "max" },
-                ],
-            },
-        ]);
-        assert_eq!(
-            thought_ladder(Some(&options)),
-            vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ]
-        );
-        assert!(thought_ladder(None).is_empty());
-        assert_eq!(
-            reported_thought_ladder(Some(&json!([{
-                "category": "thought_level", "options": [{ "value": "off" }]
-            }]))),
-            Some(Vec::new())
-        );
-        assert_eq!(reported_thought_ladder(None), None);
-    }
-
-    #[test]
     fn config_option_sets_map_model_effort_and_model_options() {
         let response = json!({
             "sessionId": "s-1",

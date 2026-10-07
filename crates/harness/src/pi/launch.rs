@@ -473,13 +473,19 @@ pub(crate) fn expand_skill_references(
             if !name.is_empty() && skills.contains(name) {
                 body.push_str(&text[last..index]);
                 last = index + 1 + end;
+                // Take one separating space with the token so removing it
+                // mid-sentence does not leave a double space behind.
+                if let Some(space) = text[last..].chars().next().filter(|c| c.is_whitespace()) {
+                    last += space.len_utf8();
+                }
                 if !ordered.contains(&name) {
                     ordered.push(name);
                 }
                 while chars.peek().is_some_and(|(i, _)| *i < last) {
                     chars.next();
                 }
-                previous_blank = false;
+                // A consumed separator leaves the next token at a word start.
+                previous_blank = last > index + 1 + end;
                 continue;
             }
         }
@@ -660,27 +666,28 @@ mod tests {
 
     #[test]
     fn session_roots_follow_pi_precedence() {
-        let env = BTreeMap::from([("PI_CODING_AGENT_SESSION_DIR".to_owned(), "/env".to_owned())]);
+        // Absolute paths are built from a real directory so the assertions
+        // hold on every platform's path semantics.
+        let base = tempfile::tempdir().unwrap();
+        let (flag, from_env, agent, cwd) = (
+            base.path().join("flag"),
+            base.path().join("env"),
+            base.path().join("agent"),
+            base.path().join("work"),
+        );
+        let env = BTreeMap::from([(
+            "PI_CODING_AGENT_SESSION_DIR".to_owned(),
+            from_env.display().to_string(),
+        )]);
         let settings = PiSettings {
             session_dir: Some("rel-sessions".into()),
             ..Default::default()
         };
-        let cwd = Path::new("/work");
-        let roots = session_roots(
-            &args("--session-dir /flag"),
-            &env,
-            &settings,
-            Path::new("/agent"),
-            cwd,
-        );
+        let launch = vec!["--session-dir".to_owned(), flag.display().to_string()];
+        let roots = session_roots(&launch, &env, &settings, &agent, &cwd);
         assert_eq!(
             roots,
-            [
-                PathBuf::from("/flag"),
-                PathBuf::from("/env"),
-                cwd.join("rel-sessions"),
-                PathBuf::from("/agent/sessions"),
-            ]
+            [flag, from_env, cwd.join("rel-sessions"), agent.join("sessions")]
         );
     }
 

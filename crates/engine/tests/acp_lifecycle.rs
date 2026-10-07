@@ -30,16 +30,16 @@ async fn quiet_acp_prompt_stays_working_until_response() {
     let registry = HarnessRegistry::new();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../harness/tests/fixtures/acp-lifecycle.py");
-    registry.register(Arc::new(AcpHarness::pi().with_executable(fixture)));
-    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
-    // The fixture stands in for a signed-in Pi. An explicit instance keeps the
-    // run independent of this host's Pi login and of account discovery.
+    registry.register(Arc::new(AcpHarness::devin().with_executable(fixture)));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Devin, None).unwrap();
+    // The fixture stands in for a signed-in ACP agent. An explicit instance
+    // keeps the run independent of this host's login and account discovery.
     core.registry
         .provider_instances
         .configure(vec![
             serde_json::from_value(serde_json::json!({
-                "providerInstanceId": "pi", "driverKind": "pi", "harnessId": "pi",
-                "displayName": "Pi", "enabled": true, "installed": true,
+                "providerInstanceId": "devin", "driverKind": "devin", "harnessId": "devin",
+                "displayName": "Devin", "enabled": true, "installed": true,
                 "authentication": "authenticated", "adapterRegistered": true
             }))
             .unwrap(),

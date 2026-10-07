@@ -312,6 +312,14 @@ def agent(prompt):
             yield steered + [{"type": "turn_end"}], 0
         yield [{"type": "agent_end", "messages": [], "willRetry": False}], 0
         return
+    if prompt == "require-resume" and not args.get("session"):
+        yield assistant_events("NOT-RESUMED"), 0
+        yield [{"type": "turn_end"}, {"type": "agent_end", "messages": [], "willRetry": False}], 0
+        return
+    if prompt == "idle-crash":
+        # Settle normally, then die while idle (an adapter/process crash
+        # between turns); the next dispatch must resume the stored session.
+        exit_when_idle[0] = True
     if prompt == "tool":
         yield tool_events("call|1", "bash", {"command": "echo hi"}, "hi\n"), 0
         yield tool_events("call|2", "write", {"path": "a.txt", "content": "A"}, "Successfully wrote to a.txt",
