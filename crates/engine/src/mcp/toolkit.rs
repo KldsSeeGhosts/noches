@@ -53,6 +53,19 @@ impl Toolkit {
         }
     }
 
+    /// Drop every injected domain service (runtime retirement). They hold the
+    /// doc host and kernel, which in turn hold this server's owner.
+    pub fn clear_services(&self) {
+        *self.service.write().unwrap_or_else(PoisonError::into_inner) =
+            Arc::new(UnavailableOrchestratorService);
+        *self.transfer.write().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.queue_service.write().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.scheduler.write().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.threads.write().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.launch_service.write().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.pull_requests.write().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     pub fn set_service(&self, service: Arc<dyn OrchestratorService>) {
         *self.service.write().unwrap_or_else(PoisonError::into_inner) = service;
     }
