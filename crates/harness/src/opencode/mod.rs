@@ -1511,6 +1511,31 @@ impl TurnState {
     }
 }
 
+/// Submissions whose blocking POST (a slash command runs for the whole turn)
+/// had not returned when their turn settled or was replaced. A late ack must
+/// still produce the receipt, or the engine redispatches an executed input.
+#[derive(Default)]
+struct UnackedSubmissions(VecDeque<(uuid::Uuid, String)>);
+
+impl UnackedSubmissions {
+    const CAP: usize = 64;
+
+    fn track(&mut self, turn: &TurnState) {
+        let Some(message_id) = turn.message_id.clone().filter(|_| turn.post_pending) else {
+            return;
+        };
+        if self.0.len() == Self::CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back((turn.submission_id, message_id));
+    }
+
+    fn take(&mut self, submission_id: uuid::Uuid) -> Option<String> {
+        let at = self.0.iter().position(|(id, _)| *id == submission_id)?;
+        self.0.remove(at).map(|(_, message_id)| message_id)
+    }
+}
+
 async fn run_session(session: Session) {
     let Session {
         mut server,
@@ -1758,6 +1783,7 @@ async fn run_session(session: Session) {
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
     let mut queued_steers: VecDeque<crate::SteerMessage> = VecDeque::new();
+    let mut unacked = UnackedSubmissions::default();
     let mut steering_open = true;
     let mut interrupt_requested = false;
     let mut pending_usage: Option<AgentEvent> = None;
@@ -1778,6 +1804,18 @@ async fn run_session(session: Session) {
                 continue $label;
             }
             turn.active = false;
+            // Session activity after the prompt proves the server accepted it
+            // even though a blocking command POST is still open.
+            if turn.post_pending
+                && turn.saw_activity
+                && !interrupt_requested
+                && let Some(message_id) = turn.message_id.clone()
+            {
+                turn.post_pending = false;
+                if !send(&event_tx, crate::input_accepted_event(Some(message_id))).await {
+                    break $label;
+                }
+            }
             if let Some(usage) = pending_usage.take()
                 && !interrupt_requested
                 && !send(&event_tx, usage).await
@@ -1822,6 +1860,7 @@ async fn run_session(session: Session) {
                 .await
                 {
                     Ok(()) => {
+                        unacked.track(&turn);
                         turn = next_turn;
                         continue $label;
                     }
@@ -1946,6 +1985,7 @@ async fn run_session(session: Session) {
                             .await
                             .is_ok()
                             {
+                                unacked.track(&turn);
                                 turn = next_turn;
                             }
                         }
@@ -2012,10 +2052,17 @@ async fn run_session(session: Session) {
                                 &event_tx,
                                 crate::input_accepted_event(turn.message_id.clone()),
                             ).await;
+                        } else if let Some(message_id) = unacked.take(submission_id) {
+                            let _ = send(
+                                &event_tx,
+                                crate::input_accepted_event(Some(message_id)),
+                            ).await;
                         }
                     }
                     BusMsg::CommandFailed { submission_id, .. }
-                        if interrupt_requested || !turn.active || submission_id != turn.submission_id => {}
+                        if interrupt_requested || !turn.active || submission_id != turn.submission_id => {
+                        unacked.take(submission_id);
+                    }
                     BusMsg::CommandFailed { message, .. } => {
                         let _ = send(&event_tx, AgentEvent::Done {
                             status: DoneStatus::Errored, result: None,
