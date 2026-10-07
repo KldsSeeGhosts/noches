@@ -1226,6 +1226,772 @@ async fn late_steering_becomes_one_receipted_followup_with_the_same_message() {
     );
 }
 
+async fn steering_effect(f: &Fixture, key: &str) -> crate::orchestration::effects::Effect {
+    let sent = f
+        .send(
+            json!({"threadId":"parent","message":format!("steering input {key}"),
+        "mode":"steer","clientRequestId":key}),
+        )
+        .await;
+    f.service
+        .kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            matches!(&e.request,
+        crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. }
+            if *message_id == sent.message_id)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn steering_target_fences_session_generation_attempt_root_and_message_ownership() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "target-fences").await;
+    let original = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(crate::orchestration::steering::target(&original, &effect.request).is_some());
+    for field in [
+        "providerSessionId",
+        "lastRunOrdinal",
+        "providerInstanceId",
+        "id",
+    ] {
+        let mut p = original.clone();
+        let provider = p
+            .records
+            .get_mut("provider-thread")
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        provider[field] = if field == "lastRunOrdinal" {
+            json!(99)
+        } else {
+            json!("replacement")
+        };
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+    for field in ["activeAttemptId", "rootNodeId", "providerThreadId"] {
+        let mut p = original.clone();
+        let mut run = json!(p.runs[0]);
+        run[field] = json!("replacement");
+        p.runs[0] = serde_json::from_value(run).unwrap();
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    for field in ["runId", "nodeId"] {
+        let mut p = original.clone();
+        p.records
+            .get_mut("message")
+            .unwrap()
+            .iter_mut()
+            .find(|m| m["id"] == message_id.0)
+            .unwrap()[field] = json!("foreign");
+        assert!(
+            crate::orchestration::steering::target(&p, &effect.request).is_none(),
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_steering_cannot_reopen_interrupted_failed_or_cancelled_work() {
+    for status in [
+        zeron_proto::DoneStatus::Interrupted,
+        zeron_proto::DoneStatus::Errored,
+    ] {
+        let f = Fixture::new();
+        f.running(false);
+        let effect = steering_effect(&f, "stopped").await;
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Done {
+                status,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        );
+        let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+            &effect.request
+        else {
+            panic!()
+        };
+        let before = f.service.kernel.store.projection_frontier().unwrap();
+        assert!(
+            super::runner::late_steer(&f.service.kernel, &effect, message_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.service.kernel.store.projection_frontier().unwrap(),
+            before
+        );
+        assert_eq!(
+            f.service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "cancelled").await;
+    f.service.kernel.recover(1_800_000_000_010).await.unwrap();
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_steering_cannot_follow_up_after_session_replacement() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "replacement").await;
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["providerSessionId"] = json!("replacement-session");
+    f.emit("parent", "provider-thread.updated", provider);
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn owner_cancelled_steering_cannot_follow_up_even_after_normal_completion() {
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "cancelled-after-completion").await;
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    f.service
+        .kernel
+        .store
+        .write(|conn| {
+            crate::orchestration::effects::cancel_process(
+                conn,
+                &"parent".into(),
+                1_800_000_000_005,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    let before = f.service.kernel.store.projection_frontier().unwrap();
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err(),
+        "normal completion must not override the owner's later cancellation"
+    );
+    assert_eq!(
+        f.service.kernel.store.projection_frontier().unwrap(),
+        before
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_provider_turn_cannot_revive_a_later_stopped_run() {
+    for status in ["interrupted", "failed", "cancelled", "rolled_back"] {
+        let f = Fixture::new();
+        f.running(false);
+        let effect = steering_effect(&f, status).await;
+        f.provider_event(
+            "parent",
+            zeron_proto::AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        );
+        let p = f
+            .service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap();
+        let mut run = json!(p.runs[0]);
+        run["status"] = json!(status);
+        f.emit("parent", "run.updated", run);
+        let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+            &effect.request
+        else {
+            panic!()
+        };
+        assert!(
+            super::runner::late_steer(&f.service.kernel, &effect, message_id)
+                .await
+                .is_err(),
+            "{status} must not reopen because its root finished before the run stopped"
+        );
+        assert_eq!(
+            f.service
+                .kernel
+                .store
+                .thread(&"parent".into())
+                .unwrap()
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn steering_receipts_are_correlated_durable_and_release_only_their_uncertainty_barrier() {
+    use crate::orchestration::effects::{EffectRequest, EffectStatus};
+    let f = Fixture::new();
+    f.running(false);
+    let first = steering_effect(&f, "confirmed").await;
+    let second = steering_effect(&f, "unconfirmed").await;
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            tx.execute(
+                "UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1
+            WHERE effect_id IN (?1,?2)",
+                rusqlite::params![first.id, second.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: "unrelated".into(),
+        },
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&first.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    let EffectRequest::ProviderTurnSteer { message_id, .. } = &first.request else {
+        panic!()
+    };
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&first.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Succeeded
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&second.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    f.service.kernel.store.rebuild().unwrap();
+    let reopened = Kernel::open(Arc::new(DocsStore::open(f._dir.path()).unwrap()), "host").unwrap();
+    reopened.recover(1_800_000_000_020).await.unwrap();
+    assert!(
+        reopened
+            .store
+            .read(|conn| crate::orchestration::steering::confirmed(conn, &first.id))
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .store
+            .read(|conn| crate::orchestration::steering::confirmed(conn, &second.id))
+            .unwrap()
+    );
+    assert_eq!(
+        reopened
+            .store
+            .read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM orchestration_steering_acceptances",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn provider_confirmation_wins_a_worker_timeout_without_replaying_steering() {
+    use crate::orchestration::effects::{EffectOutcome, EffectStatus};
+    let f = Fixture::new();
+    f.running(false);
+    let mut effect = steering_effect(&f, "timeout-race").await;
+    f.service
+        .kernel
+        .store
+        .write(|tx| {
+            tx.execute(
+                "UPDATE orchestration_effect_outbox SET status='running',dispatch_started=1,
+            attempt_count=1,lease_owner='worker',lease_expires_at=?2 WHERE effect_id=?1",
+                rusqlite::params![effect.id, 1_800_000_100_000_i64],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    effect = f.service.kernel.store.effect(&effect.id).unwrap().unwrap();
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.service
+            .kernel
+            .store
+            .write(|tx| crate::orchestration::steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .unwrap()
+    );
+    assert!(
+        f.service
+            .kernel
+            .store
+            .finish_effect(&effect, &EffectOutcome::Uncertain, 1_800_000_000_006, 5)
+            .unwrap()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Succeeded
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let crate::orchestration::effects::EffectRequest::ProviderTurnSteer { message_id, .. } =
+        &effect.request
+    else {
+        panic!()
+    };
+    super::runner::late_steer(&f.service.kernel, &effect, message_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn steering_receipt_write_failure_and_replaced_session_cannot_fabricate_acceptance() {
+    use crate::orchestration::{steering, store::WriteBoundary};
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "write-fence").await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    f.service
+        .kernel
+        .store
+        .inject_failure(WriteBoundary::BeforeCommit, 1);
+    assert!(
+        f.service
+            .kernel
+            .store
+            .write(|tx| steering::confirm(tx, &p, &effect, 1_800_000_000_005))
+            .is_err()
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    let mut provider = records(&p, "provider-thread")[0].clone();
+    provider["providerSessionId"] = json!("replacement-session");
+    f.emit("parent", "provider-thread.updated", provider);
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .write(|tx| steering::confirm(tx, &p, &effect, 1_800_000_000_006))
+            .unwrap()
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn legacy_steering_without_the_receipt_contract_is_not_speculatively_replayed() {
+    use crate::orchestration::steering;
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "legacy").await;
+    f.service.kernel.store.write(|tx| {
+        tx.execute("DELETE FROM orchestration_steering_inputs WHERE effect_id=?1", [&effect.id])?;
+        tx.execute("UPDATE orchestration_effect_outbox SET status='failed',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        Ok(())
+    }).unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    f.send(json!({"threadId":"parent","message":"explicit next turn"}))
+        .await;
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.service
+            .kernel
+            .store
+            .read(|conn| steering::unconfirmed_messages(conn, &p, p.runs.last().unwrap()))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn replacement_process_with_same_logical_attempt_cannot_accept_or_follow_up_an_old_steer() {
+    use crate::orchestration::{
+        effects::{EffectRequest, EffectStatus},
+        steering,
+    };
+    let f = Fixture::new();
+    f.running(false);
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let target = steering::RuntimeTarget::for_run(&p.runs[0]).unwrap();
+    f.service
+        .kernel
+        .store
+        .write(|tx| steering::bind_runtime(tx, &p.thread.id, &target, "old-runtime"))
+        .unwrap();
+    let effect = steering_effect(&f, "process-incarnation").await;
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .read(|conn| steering::admitted_runtime(conn, &effect.id))
+            .unwrap()
+            .as_deref(),
+        Some("old-runtime")
+    );
+    f.service.kernel.store.write(|tx| {
+        tx.execute("UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        steering::bind_runtime(tx, &p.thread.id, &target, "replacement-runtime")
+    }).unwrap();
+    let EffectRequest::ProviderTurnSteer { message_id, .. } = &effect.request else {
+        panic!()
+    };
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::InputAcceptedFor {
+            message_id: message_id.0.clone(),
+        },
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Uncertain
+    );
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    assert!(
+        super::runner::late_steer(&f.service.kernel, &effect, message_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .thread(&"parent".into())
+            .unwrap()
+            .unwrap()
+            .runs
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn explicit_provider_switch_retires_old_steer_uncertainty_without_claiming_acceptance() {
+    use crate::orchestration::{
+        effects::{EffectRequest, EffectStatus},
+        steering,
+    };
+    let f = Fixture::new();
+    f.running(false);
+    let effect = steering_effect(&f, "old-provider-unknown").await;
+    f.service.kernel.store.write(|tx| {
+        tx.execute("UPDATE orchestration_effect_outbox SET status='succeeded' WHERE effect_type='provider-turn.start'", [])?;
+        tx.execute("UPDATE orchestration_effect_outbox SET status='uncertain',dispatch_started=1 WHERE effect_id=?1", [&effect.id])?;
+        Ok(())
+    }).unwrap();
+    f.provider_event(
+        "parent",
+        zeron_proto::AgentEvent::Done {
+            status: zeron_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        },
+    );
+    let p = f
+        .service
+        .kernel
+        .store
+        .thread(&"parent".into())
+        .unwrap()
+        .unwrap();
+    let mut selection = p.thread.model_selection.clone();
+    selection.instance_id = ProviderInstanceId("other-provider".into());
+    let receipt = f
+        .service
+        .kernel
+        .dispatch(
+            &Command {
+                id: "explicit-provider-switch".into(),
+                thread_id: "parent".into(),
+                operation: Operation::Thread(Box::new(super::planner::ThreadOperation::Send(
+                    super::planner::Send {
+                        message_id: "explicit-new-input".into(),
+                        text: "explicit provider switch".into(),
+                        mode: T3ThreadSendInputMode::Auto,
+                        driver: "mock".into(),
+                        sender: "parent".into(),
+                        target_run: None,
+                        metadata: Some(super::planner::SendMetadata {
+                            scheduled_task_id: None,
+                            sender_thread_id: None,
+                            attachments: vec![],
+                            model_selection: Some(selection),
+                            created_by: OrchestrationV2Actor::User,
+                            creation_source: OrchestrationV2CreationSource::Web,
+                        }),
+                    },
+                ))),
+            },
+            1_800_000_000_005,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Accepted, "{receipt:?}");
+    assert_eq!(
+        f.service
+            .kernel
+            .store
+            .effect(&effect.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EffectStatus::Cancelled
+    );
+    assert!(
+        !f.service
+            .kernel
+            .store
+            .read(|conn| steering::confirmed(conn, &effect.id))
+            .unwrap()
+    );
+    let claimed = f
+        .service
+        .kernel
+        .store
+        .claim_effect("new-worker", 1_800_000_000_006, 30_000)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(claimed.request, EffectRequest::ProviderTurnStart { .. }),
+        "old steering uncertainty cannot permanently block an explicitly admitted provider turn"
+    );
+}
+
 #[tokio::test]
 async fn empty_wait_and_terminal_explicit_run_do_not_wait_for_a_newer_run() {
     let f = Fixture::new();

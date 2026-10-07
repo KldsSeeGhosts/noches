@@ -253,6 +253,9 @@ pub(crate) fn enqueue(
     request: &EffectRequest,
     now: i64,
 ) -> Result<()> {
+    if let EffectRequest::ProviderTurnStart { run_id } = request {
+        super::steering::retire_for_start(conn, thread, run_id, now)?;
+    }
     conn.execute(
         "INSERT INTO orchestration_effect_outbox
          (effect_id,command_id,thread_id,effect_type,lane,payload_json,process_bound,
@@ -269,6 +272,23 @@ pub(crate) fn enqueue(
             now
         ],
     )?;
+    if matches!(request, EffectRequest::ProviderTurnSteer { .. }) {
+        let runtime_id = if let Some(p) = super::projection::read_thread(conn, thread)?
+            && let Some((run, _)) = super::steering::target(&p, request)
+        {
+            super::steering::runtime_id(
+                conn,
+                thread,
+                &super::steering::RuntimeTarget::for_run(run).unwrap(),
+            )?
+        } else {
+            None
+        };
+        conn.execute(
+            "INSERT INTO orchestration_steering_inputs(effect_id,runtime_id) VALUES(?1,?2)",
+            params![id, runtime_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -280,7 +300,9 @@ pub(crate) fn cancel_process(
     let mut stmt = conn.prepare(
         "UPDATE orchestration_effect_outbox SET status='cancelled',lease_owner=NULL,
          lease_expires_at=NULL,completed_at=?2,last_error='Process work retired by owner.'
-         WHERE thread_id=?1 AND process_bound=1 AND status IN ('pending','running')
+         WHERE thread_id=?1 AND process_bound=1
+           AND (status IN ('pending','running')
+                OR (effect_type='provider-turn.steer' AND status='uncertain'))
          RETURNING effect_id",
     )?;
     Ok(stmt
@@ -378,6 +400,16 @@ impl Store {
             EffectOutcome::Retry => ("failed", now, Some("Effect retry budget exhausted.")),
         };
         self.write(|tx| {
+            // A correlated provider ACK can beat timeout/lease settlement.
+            // Persisted proof wins over an uncertain/failed local observation.
+            let (status, error) =
+                if matches!(&effect.request, EffectRequest::ProviderTurnSteer { .. })
+                    && super::steering::confirmed(tx, &effect.id)?
+                {
+                    ("succeeded", None)
+                } else {
+                    (status, error)
+                };
             let changed = tx.execute(
                 "UPDATE orchestration_effect_outbox SET status=?5,available_at=?6,
                     lease_owner=NULL,lease_expires_at=NULL,last_error=?7,
@@ -421,6 +453,17 @@ impl Store {
     /// owner's claim. This also durably records timeout uncertainty immediately.
     pub fn abandon_effect(&self, effect: &Effect, now: i64) -> Result<bool> {
         self.write(|tx| {
+            if matches!(&effect.request, EffectRequest::ProviderTurnSteer { .. })
+                && super::steering::confirmed(tx, &effect.id)?
+            {
+                return Ok(tx.execute(
+                    "UPDATE orchestration_effect_outbox
+                     SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
+                         completed_at=?4,last_error=NULL
+                     WHERE effect_id=?1 AND status='running' AND lease_owner=?2 AND attempt_count=?3",
+                    params![effect.id, effect.lease_owner, effect.attempt_count, now],
+                )? == 1);
+            }
             let changed = tx.execute(
                 "UPDATE orchestration_effect_outbox
                  SET status=CASE WHEN process_bound=1 THEN 'uncertain' ELSE 'pending' END,

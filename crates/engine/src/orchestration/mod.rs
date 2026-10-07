@@ -25,6 +25,7 @@ pub mod recovery;
 pub mod runner;
 pub mod scheduler;
 pub mod service;
+pub(crate) mod steering;
 pub mod store;
 pub mod sync_publish;
 pub mod task;

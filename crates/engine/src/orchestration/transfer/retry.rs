@@ -1,5 +1,6 @@
 //! ProviderTurnStartService's missed-input delta. An initialized native session
-//! is not an accepted turn; recover only failed/interrupted untold root attempts.
+//! is not an accepted turn. Recover untold root attempts and individually
+//! unconfirmed steers, without replaying an accepted root's other history.
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::{Value, json};
@@ -75,10 +76,24 @@ pub(super) async fn prepare(
                     .is_some_and(|id| !accepted.contains(id))
         })
         .collect();
-    let Some(last) = missed.iter().max_by_key(|r| r.ordinal).copied() else {
+    let unconfirmed = kernel
+        .store
+        .read(|conn| crate::orchestration::steering::unconfirmed_messages(conn, projection, run))?;
+    let steering_sources: Vec<_> = projection
+        .runs
+        .iter()
+        .filter(|source| {
+            records(projection, "message").iter().any(|m| {
+                m["runId"] == source.id.0
+                    && m["id"].as_str().is_some_and(|id| unconfirmed.contains(id))
+            })
+        })
+        .collect();
+    let sources: Vec<_> = missed.iter().copied().chain(steering_sources).collect();
+    let Some(last) = sources.iter().max_by_key(|r| r.ordinal).copied() else {
         return Ok(None);
     };
-    let from = missed.iter().map(|r| r.ordinal).min().unwrap();
+    let from = sources.iter().map(|r| r.ordinal).min().unwrap();
     let missed_ids: HashSet<_> = missed.iter().map(|r| r.id.0.as_str()).collect();
     let mut covered: BTreeSet<&str> = BTreeSet::new();
     for h in records(projection, "context-handoff").iter().filter(|h| {
@@ -118,9 +133,13 @@ pub(super) async fn prepare(
     let items: Vec<_> = local_items(projection, last.ordinal)
         .into_iter()
         .filter(|i| {
-            i["runId"]
+            (i["runId"]
                 .as_str()
                 .is_some_and(|id| missed_ids.contains(id))
+                || (i["type"] == "user_message"
+                    && i["messageId"]
+                        .as_str()
+                        .is_some_and(|id| unconfirmed.contains(id))))
                 && !i["id"].as_str().is_some_and(|id| covered.contains(id))
         })
         .collect();
@@ -131,7 +150,14 @@ pub(super) async fn prepare(
     if messages.is_empty() {
         return Ok(None);
     }
-    let coverage = context::coverage(&run.thread_id.0, from, last.ordinal, &items);
+    let mut coverage = context::coverage(&run.thread_id.0, from, last.ordinal, &items);
+    if !unconfirmed.is_empty() {
+        coverage.push_str(
+            "\nSteering acceptance was not confirmed before the previous runtime stopped. \
+             These inputs are recovered as historical user context, not proof of completed work. \
+             Missing confirmation does not prove rejection.",
+        );
+    }
     let selected = context::select_history(&messages, &coverage, 0, context::token_cap());
     let handoff_id = format!("handoff:{}", encode_component(&id));
     let now = iso(crate::now_ms())?;

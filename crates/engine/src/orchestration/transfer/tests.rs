@@ -774,6 +774,133 @@ fn request(cwd: &std::path::Path) -> zeron_proto::RunRequest {
     .unwrap()
 }
 
+#[tokio::test]
+async fn restart_recovers_only_unconfirmed_steering_not_the_accepted_root_or_other_steers() {
+    use crate::orchestration::{
+        command::{Command, Operation},
+        effects::{EffectRequest, EffectStatus},
+        steering,
+        threads::planner::{Send, ThreadOperation},
+    };
+    let cwd = tempfile::tempdir().unwrap();
+    let (db, kernel, _) = fixture(cwd.path());
+    let source = start_text(
+        &kernel,
+        "source",
+        "accepted-root",
+        "Already accepted root input.",
+    )
+    .await;
+    accept(&kernel, &source, cwd.path(), "native-steering").await;
+    for (id, text) in [
+        ("accepted-steer", "Already accepted steering."),
+        ("untold-steer", "Unconfirmed steering 日本語 🧪."),
+    ] {
+        let receipt = kernel
+            .dispatch(
+                &Command {
+                    id: format!("steer:{id}").into(),
+                    thread_id: "source".into(),
+                    operation: Operation::Thread(Box::new(ThreadOperation::Send(Send {
+                        message_id: id.into(),
+                        text: text.into(),
+                        mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+                        driver: "mock".into(),
+                        sender: "source".into(),
+                        target_run: Some(source.id.clone()),
+                        metadata: None,
+                    }))),
+                },
+                crate::now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Accepted, "{receipt:?}");
+    }
+    let effects: Vec<_> = kernel
+        .store
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(&e.request, EffectRequest::ProviderTurnSteer { .. }))
+        .collect();
+    let accepted = effects
+        .iter()
+        .find(|e| {
+            matches!(&e.request,
+        EffectRequest::ProviderTurnSteer {message_id,..} if message_id.0 == "accepted-steer")
+        })
+        .unwrap();
+    let unknown = effects
+        .iter()
+        .find(|e| {
+            matches!(&e.request,
+        EffectRequest::ProviderTurnSteer {message_id,..} if message_id.0 == "untold-steer")
+        })
+        .unwrap();
+    let p = kernel.store.thread(&"source".into()).unwrap().unwrap();
+    kernel
+        .store
+        .write(|tx| {
+            steering::confirm(tx, &p, accepted, crate::now_ms())?;
+            tx.execute(
+                "UPDATE orchestration_effect_outbox SET status='running',dispatch_started=1
+            WHERE effect_id IN (?1,?2)",
+                rusqlite::params![accepted.id, unknown.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let reopened = Kernel::open(Arc::new(DocsStore::open(db.path()).unwrap()), "host").unwrap();
+    reopened.recover(crate::now_ms()).await.unwrap();
+    assert_eq!(
+        reopened.store.effect(&accepted.id).unwrap().unwrap().status,
+        EffectStatus::Succeeded
+    );
+    assert_eq!(
+        reopened.store.effect(&unknown.id).unwrap().unwrap().status,
+        EffectStatus::Cancelled
+    );
+    reopened.store.rebuild().unwrap();
+    let next = start(&reopened, "source", "current-input").await;
+    let mut input = request(cwd.path());
+    prepare(&reopened, &next, &mut input).await.unwrap();
+    assert!(input.prompt.contains("Unconfirmed steering 日本語 🧪."));
+    assert!(
+        input
+            .prompt
+            .contains("Steering acceptance was not confirmed")
+    );
+    assert!(!input.prompt.contains("Already accepted root input."));
+    assert!(!input.prompt.contains("Already accepted steering."));
+    assert!(input.prompt.ends_with("Current request stays intact.\n🧪"));
+    let mut retry = request(cwd.path());
+    let before = reopened.store.thread_transfers(&"source".into()).unwrap();
+    assert!(
+        prepare(&reopened, &next, &mut retry)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains(UNCERTAIN_ERROR),
+        "an unacknowledged native context preparation cannot be blindly injected again"
+    );
+    assert_eq!(
+        reopened.store.thread_transfers(&"source".into()).unwrap(),
+        before
+    );
+    accept(&reopened, &next, cwd.path(), "native-steering").await;
+    observe(&reopened, &next, done(zeron_proto::DoneStatus::Completed)).await;
+    let later = start(&reopened, "source", "later-input").await;
+    let mut later_input = request(cwd.path());
+    prepare(&reopened, &later, &mut later_input).await.unwrap();
+    assert!(
+        !later_input
+            .prompt
+            .contains("Unconfirmed steering 日本語 🧪."),
+        "settled coverage prevents replay of recovered steering"
+    );
+}
+
 async fn prepare(
     kernel: &Kernel,
     run: &OrchestrationV2Run,

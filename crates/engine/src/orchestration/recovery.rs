@@ -281,6 +281,16 @@ impl Kernel {
         // The host epoch increments atomically with effect retirement. A crash
         // after this transaction leaves accepted source intent intact.
         let (epoch, retired, uncertain, requeued, cancelled_ids) = self.store.write(|tx| {
+            // A receipt committed before process death remains authoritative
+            // even when the worker never acknowledged its outbox lease.
+            tx.execute(
+                "UPDATE orchestration_effect_outbox
+                 SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,completed_at=?1,last_error=NULL
+                 WHERE effect_type='provider-turn.steer' AND status IN ('running','uncertain')
+                   AND EXISTS(SELECT 1 FROM orchestration_steering_acceptances a
+                              WHERE a.effect_id=orchestration_effect_outbox.effect_id)",
+                [now],
+            )?;
             let mut cancelled_ids = vec![];
             let mut stmt = tx.prepare(
                 "SELECT effect_id FROM orchestration_effect_outbox WHERE process_bound=1 AND status IN ('pending','running')",
@@ -295,13 +305,23 @@ impl Kernel {
                 [],
             )?;
             self.store.boundary(WriteBoundary::RecoveryEffects)?;
-            let retired = tx.execute(
+            let mut retired = tx.execute(
                 "UPDATE orchestration_effect_outbox SET status='cancelled',lease_owner=NULL,
                  lease_expires_at=NULL,completed_at=?1,last_error='Process work retired on startup.'
                  WHERE process_bound=1 AND status IN ('pending','running')",
                 [now],
             )?;
             self.store.boundary(WriteBoundary::RecoveryEffects)?;
+            // There is no live old adapter after startup reconciliation.
+            // Preserve each unconfirmed input for next-turn context instead
+            // of permanently blocking this provider lane or resending it.
+            retired += tx.execute(
+                "UPDATE orchestration_effect_outbox
+                 SET status='cancelled',completed_at=?1,
+                     last_error='Unconfirmed steering retained on startup.'
+                 WHERE effect_type='provider-turn.steer' AND status='uncertain'",
+                [now],
+            )?;
             let requeued = tx.execute(
                 "UPDATE orchestration_effect_outbox SET status='pending',lease_owner=NULL,
                  lease_expires_at=NULL,dispatch_started=0,available_at=?1,
@@ -310,6 +330,7 @@ impl Kernel {
                 [now],
             )?;
             self.store.boundary(WriteBoundary::RecoveryEffects)?;
+            tx.execute("DELETE FROM orchestration_runtime_targets", [])?;
             tx.execute("UPDATE orchestration_host SET epoch=epoch+1 WHERE singleton=1", [])?;
             self.store.boundary(WriteBoundary::EpochAdvanced)?;
             let epoch: i64 = tx.query_row("SELECT epoch FROM orchestration_host WHERE singleton=1", [], |row| row.get(0))?;

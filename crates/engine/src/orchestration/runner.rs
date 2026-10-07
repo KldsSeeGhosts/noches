@@ -775,53 +775,13 @@ impl RunnerBridge {
                 self.settle(&effect.thread_id, &run).await?;
                 Ok(EffectOutcome::Succeeded)
             }
-            EffectRequest::ProviderTurnSteer {
-                message_id,
-                provider_turn_id,
-                ..
-            } => {
+            EffectRequest::ProviderTurnSteer { .. } => {
                 // Promotion consumes an existing queued message, and must
                 // never inherit ordinary send's late-steer/start fallback.
                 if super::queue::effects::is_promotion(&self.kernel.store, effect)? {
                     return super::queue::effects::execute(self, effect).await;
                 }
-                let guards = self.kernel.locks.acquire([effect.thread_id.clone()]).await;
-                let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
-                let turn = records(&projection, "provider-turn")
-                    .iter()
-                    .find(|t| t["id"] == provider_turn_id.0 && t["status"] == "running");
-                if turn.is_none() {
-                    drop(guards);
-                    super::threads::runner::late_steer(&self.kernel, effect, message_id).await?;
-                    return Ok(EffectOutcome::Succeeded);
-                }
-                let message = records(&projection, "message")
-                    .iter()
-                    .find(|m| m["id"] == message_id.0)
-                    .ok_or_else(|| Error::Invariant("Steering message missing.".into()))?;
-                let outcome = self
-                    .sessions
-                    .steer(
-                        &effect.thread_id.0,
-                        message["text"].as_str().unwrap_or_default(),
-                        Some(message_id.0.clone()),
-                    )
-                    .await
-                    .map_err(|e| Error::Invariant(e.to_string()))?;
-                drop(guards);
-                match outcome {
-                    SteerOutcome::Accepted => Ok(EffectOutcome::Succeeded),
-                    SteerOutcome::NotSteerable
-                        if !self.sessions.turn_in_flight(&effect.thread_id.0) =>
-                    {
-                        super::threads::runner::late_steer(&self.kernel, effect, message_id)
-                            .await?;
-                        Ok(EffectOutcome::Succeeded)
-                    }
-                    SteerOutcome::NotSteerable => Err(Error::Invariant(
-                        "Live provider refused active steering.".into(),
-                    )),
-                }
+                super::steering::execute(self, effect, true).await
             }
             EffectRequest::ProviderTurnRestart { run_id, .. } => {
                 let projection = self.kernel.store.thread(&effect.thread_id)?.unwrap();
@@ -1030,7 +990,7 @@ fn attach_session(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_event(
-    _conn: &Connection,
+    conn: &Connection,
     projection: &ThreadProjection,
     command: &Command,
     plan: &mut Plan,
@@ -1055,6 +1015,9 @@ pub(crate) fn plan_event(
     }) else {
         return Ok(());
     };
+    if let AgentEvent::InputAcceptedFor { message_id } = event {
+        super::steering::accept_input(conn, projection, run_id, attempt_id, message_id, now)?;
+    }
     if run_terminal(&run.status)
         && !(run.status == OrchestrationV2RunStatus::Completed
             && matches!(event, AgentEvent::Subagent { .. }))
@@ -1124,7 +1087,7 @@ pub(crate) fn plan_event(
         if let Some(native) = native {
             attempt["nativeThreadId"] = json!(native);
             super::transfer::delivery::accepted(
-                _conn,
+                conn,
                 projection,
                 command,
                 plan,

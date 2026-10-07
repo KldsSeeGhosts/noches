@@ -51,6 +51,12 @@ fn message_metadata(message: &mut Value, input: &Send) {
 #[derive(Debug, Clone)]
 pub enum ThreadOperation {
     Send(Send),
+    /// Host-only late-steer recovery. Validation and dispatch planning share
+    /// one SQL snapshot; this cannot silently retarget an ordinary Send.
+    SteerFollowUp {
+        effect: Box<crate::orchestration::effects::Effect>,
+        message_id: MessageId,
+    },
     Interrupt {
         run_id: RunId,
         reason: Option<String>,
@@ -61,6 +67,7 @@ impl ThreadOperation {
     pub fn command_type(&self) -> &'static str {
         match self {
             Self::Send(_) => "message.dispatch",
+            Self::SteerFollowUp { .. } => "message.steer-follow-up",
             Self::Interrupt { .. } => "run.interrupt",
         }
     }
@@ -222,6 +229,133 @@ pub(crate) fn plan(
         .ok_or_else(|| unsupported(command, "Missing thread"))?;
     let mut plan = Plan::default();
     match op {
+        ThreadOperation::SteerFollowUp { effect, message_id } => {
+            if effect.thread_id != command.thread_id {
+                return Err(unsupported(command, "Foreign steering effect"));
+            }
+            let saved = crate::orchestration::effects::get(conn, &effect.id)?
+                .filter(|saved| {
+                    saved.request == effect.request && saved.command_id == effect.command_id
+                })
+                .ok_or_else(|| unsupported(command, "Steering effect changed"))?;
+            if crate::orchestration::steering::confirmed(conn, &effect.id)? {
+                // The kernel requires a receipted event even for a no-op.
+                plan.emit(command, "thread.metadata-updated", &projection.thread, now)?;
+                return Ok(plan);
+            }
+            let EffectRequest::ProviderTurnSteer {
+                message_id: expected,
+                ..
+            } = &saved.request
+            else {
+                return Err(unsupported(command, "Not a steering effect"));
+            };
+            if expected != message_id {
+                return Err(unsupported(command, "Steering message changed"));
+            }
+            if !matches!(
+                saved.status,
+                crate::orchestration::effects::EffectStatus::Pending
+                    | crate::orchestration::effects::EffectStatus::Running
+            ) {
+                return Err(unsupported(
+                    command,
+                    "Steering effect is no longer dispatchable",
+                ));
+            }
+            let (run, turn) =
+                crate::orchestration::steering::target(&projection, &saved.request)
+                    .ok_or_else(|| unsupported(command, "Recorded steering target changed"))?;
+            if let Some(expected) =
+                crate::orchestration::steering::admitted_runtime(conn, &effect.id)?
+                && crate::orchestration::steering::runtime_id(
+                    conn,
+                    &command.thread_id,
+                    &crate::orchestration::steering::RuntimeTarget::for_run(run).unwrap(),
+                )?
+                .as_ref()
+                    != Some(&expected)
+            {
+                return Err(unsupported(command, "Steering runtime was replaced"));
+            }
+            // Only normal completion authorizes T3's late follow-up. Stop,
+            // cancellation, supersession, failure and missing turns do not.
+            if turn["status"] != "completed"
+                || !matches!(
+                    run.status,
+                    OrchestrationV2RunStatus::Running
+                        | OrchestrationV2RunStatus::Waiting
+                        | OrchestrationV2RunStatus::Completed
+                )
+            {
+                return Err(unsupported(command, "Steering target did not complete"));
+            }
+            let message = records(&projection, "message")
+                .iter()
+                .find(|m| m["id"] == message_id.0)
+                .unwrap();
+            let delegated = message["delegatedCompletion"].is_object();
+            let provider_instance = if delegated {
+                &run.provider_instance_id
+            } else {
+                &projection.thread.provider_instance_id
+            };
+            let driver = records(&projection, "provider-thread")
+                .iter()
+                .filter(|p| p["providerInstanceId"] == provider_instance.0)
+                .max_by_key(|p| p["generation"].as_i64().unwrap_or(0))
+                .and_then(|p| p["driver"].as_str())
+                .ok_or_else(|| unsupported(command, "Follow-up provider missing"))?;
+            let mut follow_up = self::plan(
+                conn,
+                command,
+                &ThreadOperation::Send(Send {
+                    message_id: message_id.clone(),
+                    text: message["text"].as_str().unwrap_or_default().into(),
+                    mode: T3ThreadSendInputMode::Auto,
+                    driver: driver.into(),
+                    sender: message["senderThreadId"]
+                        .as_str()
+                        .unwrap_or(&command.thread_id.0)
+                        .into(),
+                    target_run: None,
+                    metadata: Some(SendMetadata {
+                        scheduled_task_id: serde_json::from_value(
+                            message["scheduledTaskId"].clone(),
+                        )
+                        .ok()
+                        .flatten(),
+                        sender_thread_id: serde_json::from_value(message["senderThreadId"].clone())
+                            .ok()
+                            .flatten(),
+                        attachments: serde_json::from_value(message["attachments"].clone())
+                            .unwrap_or_default(),
+                        model_selection: delegated.then(|| run.model_selection.clone()),
+                        created_by: serde_json::from_value(message["createdBy"].clone())
+                            .unwrap_or(OrchestrationV2Actor::Agent),
+                        creation_source: serde_json::from_value(message["creationSource"].clone())
+                            .unwrap_or(OrchestrationV2CreationSource::Mcp),
+                    }),
+                }),
+                now,
+            )?;
+            // Keep composer references and automatic-mail ownership, not just
+            // the text/attachments. The accepted message identity is unchanged.
+            for event in &mut follow_up.events {
+                if let OrchestrationV2DomainEvent::MessageUpdated(updated) = event {
+                    let mut payload = serde_json::to_value(&updated.payload)?;
+                    if payload["id"] == message_id.0 {
+                        for key in ["context", "delegatedCompletion", "notification"] {
+                            if let Some(value) = message.get(key) {
+                                payload[key] = value.clone();
+                            }
+                        }
+                        updated.payload = serde_json::from_value(payload)?;
+                    }
+                }
+            }
+            return Ok(follow_up);
+        }
         ThreadOperation::Send(input) => {
             // Refuse native children BEFORE unparking or writing any message.
             if native_child(conn, &projection)? {

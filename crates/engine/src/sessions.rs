@@ -55,6 +55,15 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
+/// Strict app-owned steering never enters the legacy mailbox/fresh-turn
+/// fallback. Success means an adapter acknowledgement, not local enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalSteerOutcome {
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 type PendingPermissions = Arc<
     Mutex<
@@ -209,6 +218,7 @@ struct RunHandle {
     run_id: String,
     /// Host-owned lifecycle identity, independent of MCP credential expiry.
     canonical_run_id: Option<zeron_proto::orchestration::RunId>,
+    canonical_target: Option<crate::orchestration::steering::RuntimeTarget>,
     steerable: bool,
     steering_mode: zeron_proto::SteeringMode,
     confirms_steered_inputs: bool,
@@ -597,6 +607,88 @@ impl SessionsEngine {
         }
     }
 
+    fn canonical_target(
+        &self,
+        chat_id: &str,
+        run_id: &zeron_proto::orchestration::RunId,
+        runtime_id: &str,
+    ) -> Result<Option<crate::orchestration::steering::RuntimeTarget>, EngineError> {
+        let Some(store) = lock(&self.inner.orchestration_store).clone() else {
+            return Ok(None);
+        };
+        let projection = store
+            .thread(&chat_id.into())
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let mut target = projection.as_ref().and_then(|p| {
+            p.runs
+                .iter()
+                .find(|run| &run.id == run_id)
+                .and_then(crate::orchestration::steering::RuntimeTarget::for_run)
+        });
+        if let Some(target) = &mut target {
+            store
+                .write(|conn| {
+                    crate::orchestration::steering::bind_runtime(
+                        conn,
+                        &chat_id.into(),
+                        target,
+                        runtime_id,
+                    )
+                })
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            target.runtime_id = Some(runtime_id.into());
+        }
+        Ok(target)
+    }
+
+    /// The caller holds the owning thread's kernel lane. Pin the private live
+    /// runtime under its map lock as well: a stale canonical projection must
+    /// never steer an ordinary-session replacement or a newer attempt.
+    pub(crate) async fn steer_canonical(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+        prompt: &str,
+        message_id: String,
+    ) -> Result<CanonicalSteerOutcome, EngineError> {
+        let _admission = self.admit_work()?;
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_user_message(&message_id, prompt, now_ms())?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        {
+            let statuses = lock(&self.inner.statuses);
+            let runs = lock(&self.inner.runs);
+            let Some(run) = runs.get(chat_id).filter(|run| {
+                run.canonical_target.as_ref() == Some(expected)
+                    && run.steerable
+                    && run.steering_mode == zeron_proto::SteeringMode::StepBoundary
+                    && statuses
+                        .get(chat_id)
+                        .is_some_and(|s| s.status == SessionStatus::Working)
+            }) else {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            };
+            if run
+                .steer_tx
+                .try_send(SteerMessage {
+                    prompt: prompt.into(),
+                    message_id: Some(message_id.clone()),
+                    notification_acceptance: Some(accepted_tx),
+                })
+                .is_err()
+            {
+                return Ok(CanonicalSteerOutcome::Rejected);
+            }
+        }
+        // The canonical effect/receipt owns recovery, never routed_steers'
+        // detached legacy redispatch (which can select a replacement config).
+        match tokio::time::timeout(std::time::Duration::from_secs(10), accepted_rx).await {
+            Ok(Ok(true)) => Ok(CanonicalSteerOutcome::Accepted),
+            Ok(Ok(false)) => Ok(CanonicalSteerOutcome::Rejected),
+            _ => Ok(CanonicalSteerOutcome::Uncertain),
+        }
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
         self.inner.mcp_server.credentials.touch(chat_id);
         if let Some(listener) = self.inner.turn_listener.get() {
@@ -872,15 +964,24 @@ impl SessionsEngine {
                         .await.map_err(|e| EngineError::Other(e.to_string()))?;
                 }
             }
+            let canonical = self
+                .bound_mcp_scope(chat_id)
+                .map(|scope| scope.caller.run_id);
+            let canonical_target = canonical
+                .as_ref()
+                .map(|id| self.canonical_target(chat_id, id, &run_id))
+                .transpose()?
+                .flatten();
             if steerable
                 && same_runtime
-                && let Some(scope) = self.bound_mcp_scope(chat_id)
+                && let Some(canonical) = canonical
                 && let Some(handle) = lock(&self.inner.runs).get_mut(chat_id)
                 && handle.run_id == run_id
             {
                 // Includes a pre-admitted queue turn on the same process,
                 // not only a turn admitted by the ordinary-session bridge.
-                handle.canonical_run_id = Some(scope.caller.run_id);
+                handle.canonical_run_id = Some(canonical);
+                handle.canonical_target = canonical_target;
             }
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
@@ -1192,12 +1293,18 @@ impl SessionsEngine {
         let canonical_run_id = self
             .bound_mcp_scope(chat_id)
             .map(|scope| scope.caller.run_id);
+        let canonical_target = canonical_run_id
+            .as_ref()
+            .map(|id| self.canonical_target(chat_id, id, &run_id))
+            .transpose()?
+            .flatten();
 
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
                 canonical_run_id,
+                canonical_target,
                 steerable: harness.supports_steering(),
                 steering_mode: harness.steering_mode(),
                 confirms_steered_inputs: harness.confirms_steered_inputs(),
@@ -4068,6 +4175,148 @@ mod tests {
     /// and decides when the stream ends.
     struct FeedHarness {
         feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+    }
+
+    struct CapturingSteerHarness {
+        mailbox: Arc<Mutex<Option<mpsc::Receiver<SteerMessage>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for CapturingSteerHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Steering identity fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            *lock(&self.mailbox) = Some(controls.steering);
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_steer_cannot_target_a_replacement_attempt_even_with_the_same_run() {
+        use crate::orchestration::steering::RuntimeTarget;
+        let mailbox = Arc::new(Mutex::new(None));
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(CapturingSteerHarness {
+            mailbox: mailbox.clone(),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        core.sessions
+            .dispatch("canonical-target", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while lock(&mailbox).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let original = RuntimeTarget {
+            run_id: "same-run".into(),
+            attempt_id: "old-attempt".into(),
+            root_node_id: "old-root".into(),
+            provider_thread_id: "same-provider".into(),
+            runtime_id: Some("old-runtime".into()),
+        };
+        let mut replacement = original.clone();
+        replacement.attempt_id = "replacement-attempt".into();
+        replacement.root_node_id = "replacement-root".into();
+        lock(&core.sessions.inner.runs)
+            .get_mut("canonical-target")
+            .unwrap()
+            .canonical_target = Some(replacement.clone());
+        let mut mailbox = lock(&mailbox).take().unwrap();
+        assert_eq!(
+            core.sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &original,
+                    "stale input",
+                    "stale-message".into()
+                )
+                .await
+                .unwrap(),
+            CanonicalSteerOutcome::Rejected
+        );
+        assert!(
+            matches!(mailbox.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "replacement mailbox must remain untouched"
+        );
+        // A process replacement may even reuse the canonical attempt/root.
+        // Only its private incarnation differs.
+        replacement = original.clone();
+        replacement.runtime_id = Some("replacement-runtime".into());
+        lock(&core.sessions.inner.runs)
+            .get_mut("canonical-target")
+            .unwrap()
+            .canonical_target = Some(replacement.clone());
+        assert_eq!(
+            core.sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &original,
+                    "stale process input",
+                    "stale-process-message".into()
+                )
+                .await
+                .unwrap(),
+            CanonicalSteerOutcome::Rejected
+        );
+        assert!(matches!(
+            mailbox.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let sessions = core.sessions.clone();
+        let accepted = tokio::spawn(async move {
+            sessions
+                .steer_canonical(
+                    "canonical-target",
+                    &replacement,
+                    "current input",
+                    "current-message".into(),
+                )
+                .await
+                .unwrap()
+        });
+        let mut submitted = tokio::time::timeout(std::time::Duration::from_secs(2), mailbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(submitted.prompt, "current input");
+        submitted
+            .notification_acceptance
+            .take()
+            .unwrap()
+            .send(true)
+            .unwrap();
+        assert_eq!(accepted.await.unwrap(), CanonicalSteerOutcome::Accepted);
+        core.sessions.shutdown().await;
     }
 
     #[async_trait::async_trait]

@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_launch.sql"),
     include_str!("schema_transfer.sql"),
     include_str!("schema_queue.sql"),
+    include_str!("schema_steering.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

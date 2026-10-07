@@ -18,6 +18,12 @@ The next four commits through `bfec2387` change device fold controls, lineage
 card density, Markdown anchors and Pi discovered-model provider identity.
 They do not change these audited orchestration services; complete equivalent
 device, lineage and native Pi behavior remains unverified.
+The current steering follow-up also compares
+[`ProviderTurnControlService`](https://github.com/pingdotgg/t3code/blob/bfec2387b8102975c84690f99be0f5f834fd0cbe/apps/server/src/orchestration-v2/ProviderTurnControlService.ts)
+and
+[`EffectWorker`](https://github.com/pingdotgg/t3code/blob/bfec2387b8102975c84690f99be0f5f834fd0cbe/apps/server/src/orchestration-v2/EffectWorker.ts):
+ordinary steering pins the recorded session/thread/turn, and only an exactly
+completed turn can authorize late follow-up. Failure or Stop is not completion.
 
 T3's refinement comes from separating the app conversation, logical run,
 provider attempt, native provider conversation, child task, completion mail,
@@ -48,7 +54,7 @@ it is not alone evidence that a feature works in either application.
 | Disconnect agent session | `ThreadRelationshipsControl.stopSession`, client-runtime `stopThreadSession`, `Orchestrator.dispatchProviderSessionDetach`, `ProviderSessionManager` | **Added:** passive attachment revisions, owner-routed user RPC, atomic detach plan and durable exact-run teardown. Conversation/native history and app-owned child threads are preserved. Reattachment, changed attempts/generations and active or idle replacement runtimes fence delayed effects. |
 | Inherited transcript | `threadHistoryPaging`, client-runtime conversation projection | **Added:** frozen text preview in the child transcript with unique source-qualified IDs and explicit boundary. No document duplication or historical live controls. Full inherited tool/media projection is still a gap. |
 | Delivery visibility | V2 context transfers/handoffs and provider acceptance | **Added:** strategy, provider IDs, run coverage, omitted-item counts and Pending/Ready/Prepared/Delivered/Failed/Superseded statuses. Both source and target can see the redacted target acceptance receipt. Consumption alone is never displayed as delivery. |
-| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering and capability-fenced active steering. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding and exact admitted-run transfer preparation. Interrupt/restart promotion and queued merge-back remain gaps. |
+| Queue, steering, questions | [threadWorkflows](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/packages/client-runtime/src/state/threadWorkflows.ts), [QueuedRunsControl](https://github.com/pingdotgg/t3code/blob/fbe5df2d4b630d13adc8fe2d38cab354e6d66d67/apps/web/src/components/chat/QueuedRunsControl.tsx), `ProviderTurnControlService`, `RuntimeRequestService` | **Added:** one native tray for typed intents and SQL-only agent/automation work, with composer text edit, cancellation, mixed reordering and capability-fenced active steering. Automatic completions/notifications stay out of the user tray. **Fixed:** coherent queued run/attempt/root rebinding, exact admitted-run transfer preparation, adapter-confirmed canonical steering and durable per-input uncertainty/recovery. Exact completed-turn follow-up cannot override owner cancellation or target a replacement process. Interrupt/restart promotion and queued merge-back remain gaps. |
 | Scheduler | server scheduler and launch/intake dispatch | `scheduler`, Settings Automations: persistent claims, recurring/manual/webhook work, bound/unbound dispatch, restart/deduplication. Existing. |
 | PR association and settlement | `PullRequestWatchReactor`, `PullRequestSyncReactor`, `ThreadSettlementService` | `pull_requests`, `git_actions`, Details/lifecycle: authenticated linking, stable watch receipts, wake/settlement fences. Some environment/project settlement policy UI remains incomplete. |
 | Checkpoints | `CheckpointService`, `CheckpointRollbackService` | files-only checkpoint preview/checksum/HEAD/ownership/backup safety. No conversation rewind; sparse/submodule support is explicitly refused. |
@@ -147,8 +153,43 @@ is not an acceptable substitute.
   A receipt from a replaced runtime is not published, and an older message's
   receipt cannot bind the next canonical root or settle its context. Ordinary
   provider failure redelivers only unacknowledged mailbox inputs with their
-  original transcript identity. This is not a claim of restart-durable
-  per-message steering reconciliation or equivalent receipts for every adapter.
+  original transcript identity. This legacy mailbox ledger is distinct from
+  the canonical steering receipt contract below; equivalent native receipts
+  for every legacy adapter are not claimed.
+- Ordinary canonical steering and queue promotion now share an exact-target
+  adapter: recorded provider session/thread/turn, message ownership, run/attempt/
+  root, provider ordinal and the private physical process incarnation all
+  participate. Admission captures the physical runtime before dispatch.
+  A process replacement cannot receive or confirm the old effect even when
+  it reuses the logical attempt. Queue promotion never starts a late follow-up.
+- Strict canonical steering does not enter the legacy detached-redelivery
+  mailbox. Successful adapter acknowledgement records a durable per-message
+  receipt; explicit refusal fails the effect, while a dropped receipt channel
+  or ten-second timeout leaves acceptance uncertain. Codex confirms after its
+  native steering RPC. Claude confirms only after its stdin writer successfully
+  writes and flushes the user line, not when the writer mailbox accepts it.
+  This Claude boundary proves adapter transport delivery, not CLI prompt echo
+  or completed provider work.
+- Canonical receipts survive projection rebuild and process restart. An exact
+  late `InputAcceptedFor` can record confirmation in the provider-event
+  transaction and release only its own uncertainty barrier. Persisted proof
+  wins over worker timeout/lease settlement. Startup retires unknown old
+  process effects without resending input or permanently blocking their lane.
+  An explicit next turn or owner cancellation can retire terminal-run steering
+  uncertainty without pretending the input was rejected or accepted.
+- Next-turn recovery selects only unconfirmed steering messages, not the
+  accepted root's entire transcript. The saved bounded snapshot, settled
+  coverage, omitted-item suppression and uncertain native-injection refusal
+  remain intact. Recovery labels missing confirmation as uncertainty, not
+  proof of rejection or completion. New-contract markers avoid speculatively
+  replaying legacy effects with older acceptance semantics.
+- A late follow-up is planned atomically against saved effect/current thread
+  state under the owning kernel lock, with a stable command identity and the
+  same original message. Attachments, context and automatic-mail/provenance
+  metadata are preserved. Only normal target-turn completion can authorize it;
+  owner-cancelled/settled effects, stopped runs, changed sessions/attempts and
+  replaced physical processes cannot. An already-confirmed input is a
+  receipted no-op, never another provider run.
 - An engine question/approval callback may precede native-session metadata.
   Such a request is projected as not resumable, never as a live capability with
   a null/fabricated session ID. A later real attachment upgrades only pending
@@ -187,9 +228,13 @@ is not an acceptable substitute.
    interrupt/restart promotion and queued merge-back consumption remain unsupported.
    Codex/OpenCode mailbox recovery now retires only at an exact native input
    receipt. Other legacy adapters retain boundary-based retirement.
-   Restart-durable per-steered-input recovery, native acknowledgement of every
-   canonical steering effect and complete rejection/late-follow-up fencing
-   remain gaps distinct from verified root-turn recovery and this host ledger.
+   Canonical active steering has durable per-input receipts/recovery and exact
+   rejection/late-follow-up fences. Claude's receipt is a successful adapter
+   pipe write/flush, not native prompt echo or proof of exact native-turn
+   consumption. Equivalent native busy-turn correlation, multimodal steering
+   parts (current canonical steering supplies host-owned file references),
+   legacy-boundary and delegated `steer_notification` receipt semantics
+   remain incomplete or unverified.
 4. Live catalog context-window lookup, cross-account native continuation,
    `/compact` handoff deferral, conversation rollback and driver-authorized
    cross-checkout native continuation.
@@ -203,6 +248,8 @@ is not an acceptable substitute.
    no speculative migration or historical duplicate replay is performed.
 8. The latest upstream interruption/attachment cleanup and relationship-panel
    app-owned subagent Stop interaction require further parity verification.
+   Ordinary interrupt/restart and delegated-notification effects do not yet
+   share the new steering path's complete physical-process target fence.
 
 ## Verification
 
@@ -222,11 +269,11 @@ of this later acceptance/retry follow-up combined with the performance changes.
 
 | Final local check | Result |
 | --- | --- |
-| Engine library | 645 passed, 0 failed, 2 ignored |
-| Selected engine integration suites | 92 passed, 0 failed, 3 ignored |
+| Engine library | 658 passed, 0 failed, 2 ignored |
+| Selected engine integration suites | 93 passed, 0 failed, 3 ignored |
 | Desktop library, including pane/sidebar regressions | 1,506 passed, 0 failed, 1 ignored |
 | Doc/proto/RPC libraries and integration suites | 244 passed, 0 failed, 2 ignored |
-| Full harness library, integrations and doctest | 433 passed, 0 failed, 12 ignored |
+| Full harness library, integrations and doctest | 435 passed, 0 failed, 12 ignored |
 | Production `zeron` desktop build (`--locked`) | Passed |
 | Native orchestration fixture, dark and light launches | Passed; 1320×900 and 960×720 layouts inspected |
 | Broader session-sync gate (`scripts/ci/run-session-sync.py`) | Passed; all 14 selected targets plus doctests, stable source |
@@ -236,7 +283,7 @@ The selected engine integrations are `thread_transfers_rpc`,
 `orchestration_bootstrap`, `orchestration_mcp`, `registry_adoption`,
 `restart_resume`, `message_queue`, `queue_lifecycle_rpc`,
 `scheduler_bootstrap`, `codex_subagents`, `e2e`, `turn_quiesce` and
-`self_continued_quiesce`. These checks total 2,920 distinct
+`self_continued_quiesce`. These checks total 2,936 distinct
 passing tests. Focused transfer coverage is included in the engine library
 count, not counted a second time. The session-sync gate supplies additional
 coverage; its overlapping engine/restart/child tests are not added to this total.
@@ -256,10 +303,26 @@ coverage; its overlapping engine/restart/child tests are not added to this total
   acceptance, and distinguish untold retry from accepted interrupted history.
 - A→B→A with/without restart, changed model/options/checkout, legacy history,
   accepted-current-run replay and native delivery receipt cases pass.
-- All 31 message-queue tests pass, including shared native session with
+- All 32 message-queue tests pass, including shared native session with
   coherent run/attempt/root binding and changed-selection reconstruction.
-  The final correlated-receipt source also passes all 31 with default
+  The final canonical-steering source also passes all 32 with default
   parallelism, separately from the full serial engine batch.
+- Canonical steering regressions cover exact session/attempt/root/message/
+  provider-ordinal/process fences, including replacement of a process with
+  the same logical attempt; refused Stop/failure/cancelled-target follow-up;
+  owner cancellation after normal turn completion; one stable completed-turn
+  follow-up; exact durable ACK correlation and late receipt; worker
+  timeout versus persisted confirmation; receipt transaction rollback;
+  legacy-contract non-replay; startup/explicit-turn uncertainty retirement;
+  only-unconfirmed bounded recovery and uncertain native-injection refusal.
+  The production queue fixture verifies accepted/refused/dropped adapter
+  responses, no legacy automatic redispatch, no second provider start and
+  unconfirmed-only context on the explicit next turn. It waits for actual
+  canonical steering admission/completion, not just session attachment.
+- Claude writer regressions verify that the acknowledgement remains pending
+  before the writer runs and returns false on a closed provider pipe. They
+  are included in the full harness count, not counted again. They prove the
+  adapter write/flush boundary, not an installed CLI's prompt echo.
 - Production disconnect tests cover active teardown, preserved native history
   on the next input, no dependency on an unexpired agent MCP credential, stable
   response-loss retries, request collisions, foreign ownership and delayed
@@ -335,6 +398,14 @@ switching exposed `RefCell already borrowed` in the unchanged GPUI macOS
 this PR. The final separate-mode transfer runs emit no such error. A readiness
 probe also emits an incomplete WebSocket-handshake warning before successful
 IPC attachment. Existing compiler/Objective-C/linker warnings remain.
+The fresh steering verification exposed a fixture-only IPC port reservation
+race: the fixture dropped its ephemeral listener before rebinding the server.
+It now retains that listener and passes it directly to the same production
+RPC server loop; both final appearance runs pass on that source. A dark run
+also logged `Orchestration snapshot is not yet durable` from the existing
+publication worker and still passed its workflow assertions. That worker
+retries publication; this batch does not claim to eliminate that deferral
+or its error-level logging.
 
 Whole-workspace `cargo fmt --all --check` reports pre-existing formatting
 differences in untouched files. Task-owned Rust files use scoped `rustfmt`
@@ -368,6 +439,13 @@ CI on `005ad0a6` completed successfully for all executed jobs, including
 Mac UI/browser/frame recovery, Windows UI/harness/engine/packaging,
 session-sync, networking, layout and policy. Windows native GUI and iOS were
 skipped. A new-head run remains required for the later changes in this audit.
+
+CI on the last published root-acceptance/mailbox revision `3f6c7ff0` has also
+completed successfully for every executed job, including the Mac/Windows UI,
+harness/engine/packaging, session-sync, networking, layout, policy and browser
+checks. Windows native GUI and iOS were skipped. Those results do not cover
+the later canonical-steering/process-fence source verified locally above;
+new-head CI remains required after pushing it.
 
 The byte-pinned MCP instruction fixture retains its narrowly scoped LF checkout
 rule; the SHA/length tests are unchanged. These CI results do not prove a later

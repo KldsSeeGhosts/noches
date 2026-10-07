@@ -39,6 +39,21 @@ async fn canonical_input_with_attachments(
     key: &str,
     attachments: Vec<serde_json::Value>,
 ) -> String {
+    canonical_message(
+        core,
+        key,
+        attachments,
+        zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Queue,
+    )
+    .await
+}
+
+async fn canonical_message(
+    core: &EngineCore,
+    key: &str,
+    attachments: Vec<serde_json::Value>,
+    mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode,
+) -> String {
     use zeron_engine::orchestration::thread_service::ThreadSendRequest;
     use zeron_proto::orchestration::{OrchestrationV2Actor, OrchestrationV2CreationSource};
     let thread = core
@@ -61,7 +76,7 @@ async fn canonical_input_with_attachments(
             text: key.into(),
             attachments,
             model_selection: None,
-            mode: zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Queue,
+            mode,
             created_by: OrchestrationV2Actor::Agent,
             creation_source: OrchestrationV2CreationSource::Mcp,
         })
@@ -69,6 +84,122 @@ async fn canonical_input_with_attachments(
         .unwrap()
         .run_id
         .0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_steering_waits_for_adapter_confirmation_and_recovers_only_unconfirmed_input() {
+    use zeron_engine::orchestration::effects::{EffectRequest, EffectStatus};
+    for response in [Some(true), Some(false), None] {
+        let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+        *harness.steering_receipt.lock().unwrap() = response;
+        core.doc_host
+            .queue_message(CHAT, "opening", vec![])
+            .unwrap();
+        // Attachment is projected at SessionStarted, before InputAccepted
+        // binds the running provider turn. Wait for the actual admission
+        // predicate rather than racing that later provider observation.
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .queue_ui_state(&CHAT.into())
+                    .is_ok_and(|state| state.can_promote_to_steer)
+            },
+            "running, steerable canonical turn",
+        )
+        .await;
+        let original_run = core
+            .orchestration
+            .store
+            .queue_ui_state(&CHAT.into())
+            .unwrap()
+            .active_run_id
+            .unwrap();
+        let key = format!("canonical-steer-{response:?}");
+        canonical_message(
+            &core,
+            &key,
+            vec![],
+            zeron_proto::orchestration_mcp::T3ThreadSendInputMode::Steer,
+        )
+        .await;
+        let effect = core.orchestration.store.effects().unwrap().into_iter().find(|effect| matches!(&effect.request,
+            EffectRequest::ProviderTurnSteer { message_id, .. } if message_id.0 == format!("message:{key}"))).unwrap();
+        wait_for(
+            || {
+                core.orchestration
+                    .store
+                    .effect(&effect.id)
+                    .unwrap()
+                    .is_some_and(|effect| {
+                        matches!(
+                            effect.status,
+                            EffectStatus::Succeeded
+                                | EffectStatus::Failed
+                                | EffectStatus::Uncertain
+                        )
+                    })
+            },
+            "canonical steering receipt outcome",
+        )
+        .await;
+        assert_eq!(
+            core.orchestration
+                .store
+                .effect(&effect.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            match response {
+                Some(true) => EffectStatus::Succeeded,
+                Some(false) => EffectStatus::Failed,
+                None => EffectStatus::Uncertain,
+            }
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "canonical steering must not start a second provider"
+        );
+        let _ = harness.finish.send(());
+        wait_for(
+            || {
+                !core.sessions.turn_in_flight(CHAT)
+                    && core
+                        .orchestration
+                        .store
+                        .thread(&CHAT.into())
+                        .unwrap()
+                        .unwrap()
+                        .runs
+                        .iter()
+                        .any(|run| {
+                            run.id.0 == original_run
+                                && run.status
+                                    == zeron_proto::orchestration::OrchestrationV2RunStatus::Completed
+                        })
+            },
+            "original turn runtime and canonical completion",
+        )
+        .await;
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "failed or uncertain input cannot auto-redispatch through the legacy ledger"
+        );
+        core.doc_host
+            .queue_message(CHAT, "explicit next turn", vec![])
+            .unwrap();
+        wait_for(
+            || prompts.lock().unwrap().len() == 2,
+            "explicit next turn after steering",
+        )
+        .await;
+        let prompt = prompts.lock().unwrap()[1].clone();
+        assert_eq!(prompt.contains(&key), response != Some(true), "{prompt}");
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
 }
 
 async fn canonical_frame(
@@ -435,6 +566,7 @@ struct HeldHarness {
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
     park_after_done: bool,
+    steering_receipt: Arc<Mutex<Option<bool>>>,
 }
 
 impl HeldHarness {
@@ -457,6 +589,7 @@ impl HeldHarness {
                 requests: Mutex::new(Vec::new()),
                 asks,
                 park_after_done: false,
+                steering_receipt: Arc::new(Mutex::new(Some(true))),
             }),
             prompts,
         )
@@ -505,6 +638,7 @@ impl Harness for HeldHarness {
             }]);
         }
         let mut steering = controls.steering;
+        let steering_receipt = self.steering_receipt.clone();
         let started = futures::stream::iter(vec![
             Ok(AgentEvent::SessionStarted {
                 instance_id: None,
@@ -529,7 +663,13 @@ impl Harness for HeldHarness {
                         });
                     }
                     steer = steering.recv() => {
-                        if steer.is_none() {
+                        if let Some(mut steer) = steer {
+                            if let Some(receipt) = steer.notification_acceptance.take()
+                                && let Some(accepted) = *steering_receipt.lock().unwrap()
+                            {
+                                let _ = receipt.send(accepted);
+                            }
+                        } else {
                             return Ok(AgentEvent::Done {
                                 status: DoneStatus::Completed,
                                 result: None,

@@ -283,10 +283,14 @@ fn main() -> anyhow::Result<()> {
         core.workspace.rename_chat("fixture-queue", "Arrange queued work")?;
         send(&core, "fixture-parent", "initial", "Review how conversation forks and agent handoffs preserve context.").await
     })?;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    let _ipc = runtime.block_on(zeron_engine::serve_ipc(port, core.rpc_service()))?;
+    // Keep the actual listener through server startup: dropping a port probe
+    // lets another host worker claim it before the fixture's IPC bind.
+    let (port, _ipc) = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let ipc = tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
+        Ok::<_, std::io::Error>((port, ipc))
+    })?;
     let data = scratch.path().join("ui");
     std::fs::create_dir(&data)?;
     let boot = EngineBootConfig {
