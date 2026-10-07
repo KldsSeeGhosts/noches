@@ -4531,7 +4531,12 @@ async fn cross_instance_composer_switch_restarts_with_portable_history_and_a_to_
                 .provider_instances
                 .snapshot(&core.registry)
                 .iter()
-                .any(|p| p.harness_id == Some(HarnessId::Codex) && !p.models.is_empty())
+                .filter(|p| {
+                    matches!(p.harness_id, Some(HarnessId::Codex | HarnessId::Grok))
+                        && !p.models.is_empty()
+                })
+                .count()
+                == 2
         },
         "startup provider discovery",
     )
@@ -4542,11 +4547,13 @@ async fn cross_instance_composer_switch_restarts_with_portable_history_and_a_to_
             zeron_engine::provider_instances::Authentication::Authenticated,
         );
     }
+    // One model per instance, resolved once: both turns on A must agree.
+    let a_model = first_model(HarnessId::Grok, "a-model");
     // Turn 1 completes on instance A and leaves its native conversation.
     core.workspace
         .set_chat_config(
             CHAT,
-            &composer_config(HarnessId::Grok, &first_model(HarnessId::Grok, "a-model")),
+            &composer_config(HarnessId::Grok, &a_model),
         )
         .unwrap();
     core.doc_host
@@ -4612,7 +4619,6 @@ async fn cross_instance_composer_switch_restarts_with_portable_history_and_a_to_
     })
     .await;
     // Back to A mid-run: the hint is a handoff restart on the earlier instance.
-    let a_model = first_model(HarnessId::Grok, "a-model");
     set_composer(&core, &composer_config(HarnessId::Grok, &a_model)).await;
     let hint = canonical_frame(&mut watch, |state| {
         state.promotion_mode == Some(QueuePromotionMode::InterruptRestartWithHandoff)
