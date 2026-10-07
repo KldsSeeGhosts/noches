@@ -828,3 +828,269 @@ async fn registers_conversation_browser_mcp_at_process_start() {
         "{args}"
     );
 }
+
+// ---- lazy native fork (`--resume <parent> --fork-session`) ----
+
+mod lazy_fork {
+    use super::*;
+    use std::collections::BTreeMap;
+    use zeron_harness::instance::InstanceLaunch;
+    use zeron_harness::session_lifecycle::{NativeForkRequest, SessionLifecycle};
+
+    struct Fixture {
+        config: tempfile::TempDir,
+        cwd: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// A config root whose parent session recorded two top-level
+        /// assistant messages (`a1`, `a2`) and one subagent message in `cwd`.
+        fn new() -> Self {
+            let fixture = Self {
+                config: tempfile::tempdir().unwrap(),
+                cwd: tempfile::tempdir().unwrap(),
+            };
+            let cwd = fixture.cwd();
+            let body = format!(
+                "{{\"type\":\"user\",\"uuid\":\"u1\",\"cwd\":{cwd:?}}}\n\
+                 {{\"type\":\"assistant\",\"uuid\":\"a1\",\"cwd\":{cwd:?}}}\n\
+                 {{\"type\":\"assistant\",\"uuid\":\"side\",\"isSidechain\":true}}\n\
+                 {{\"type\":\"user\",\"uuid\":\"u2\",\"cwd\":{cwd:?}}}\n\
+                 {{\"type\":\"assistant\",\"uuid\":\"a2\",\"cwd\":{cwd:?}}}\n"
+            );
+            fixture.write_session("parent", &body);
+            fixture
+        }
+        fn cwd(&self) -> String {
+            self.cwd.path().to_string_lossy().into_owned()
+        }
+        fn session_path(&self, id: &str) -> PathBuf {
+            self.config
+                .path()
+                .join("projects")
+                .join("-proj")
+                .join(format!("{id}.jsonl"))
+        }
+        fn write_session(&self, id: &str, body: &str) {
+            let path = self.session_path(id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        fn harness(&self) -> ClaudeHarness {
+            let env = BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                self.config.path().to_string_lossy().into_owned(),
+            )]);
+            harness().with_instance_launch(InstanceLaunch::new(env, Vec::new()))
+        }
+        fn fork(&self, turn: Option<&str>) -> NativeForkRequest {
+            NativeForkRequest {
+                source_thread_id: "parent".into(),
+                source_turn_id: turn.map(str::to_owned),
+                source_next_turn_id: None,
+                rollback_turns: None,
+                cwd: self.cwd(),
+                model: "claude-fable-5".into(),
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
+                mcp: Default::default(),
+            }
+        }
+        fn run_request(&self, prompt: &str, resume: &str) -> RunRequest {
+            RunRequest {
+                resume: Some(resume.into()),
+                cwd: self.cwd(),
+                ..request(prompt)
+            }
+        }
+    }
+
+    fn started(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SessionStarted { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .expect("session started")
+    }
+
+    fn flags(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Done { result, .. } => result.clone(),
+                _ => None,
+            })
+            .expect("done")
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_reports_its_last_top_level_assistant_message_as_the_turn_ref() {
+        let (controls, _steer, _token) = controls("A");
+        let events = run_to_end(&harness(), request("scenario:turnref"), controls).await;
+        let refs: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::NativeReference { .. }))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![&AgentEvent::NativeReference {
+                thread_id: "sess-ref".into(),
+                turn_id: Some("asst-2".into()),
+            }],
+            "{events:?}"
+        );
+        // Ordered before the terminal event so the turn is attributed.
+        let reference = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::NativeReference { .. }))
+            .unwrap();
+        let done = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Done { .. }))
+            .unwrap();
+        assert!(reference < done);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_or_failed_turn_has_no_fork_boundary() {
+        let (controls, _steer, _token) = controls("A");
+        let events = run_to_end(&harness(), request("scenario:error"), controls).await;
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NativeReference { .. })));
+    }
+
+    #[tokio::test]
+    async fn fork_boundaries_are_pinned_recorded_assistant_messages_in_the_same_directory() {
+        let fixture = Fixture::new();
+        let harness = fixture.harness();
+        assert!(harness.can_fork_from_turn());
+        assert!(harness.can_fork_now(&fixture.fork(Some("a1"))).await.unwrap());
+        assert!(harness.can_fork_now(&fixture.fork(Some("a2"))).await.unwrap());
+        // A moving head, an unrecorded/user/subagent message, a counted legacy
+        // boundary or another directory are all refused before anything runs.
+        assert!(!harness.can_fork_now(&fixture.fork(None)).await.unwrap());
+        for refused in ["missing", "u1", "side"] {
+            assert!(!harness.can_fork_now(&fixture.fork(Some(refused))).await.unwrap());
+        }
+        let mut legacy = fixture.fork(Some("a1"));
+        legacy.rollback_turns = Some(1);
+        assert!(!harness.can_fork_now(&legacy).await.unwrap());
+        let mut elsewhere = fixture.fork(Some("a1"));
+        elsewhere.cwd = tempfile::tempdir().unwrap().path().to_string_lossy().into_owned();
+        assert!(!harness.can_fork_now(&elsewhere).await.unwrap());
+        let mut gone = fixture.fork(Some("a1"));
+        gone.source_thread_id = "no-such-session".into();
+        assert!(!harness.can_fork_now(&gone).await.unwrap());
+        assert!(harness.fork_thread(fixture.fork(Some("missing"))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn head_and_earlier_turn_forks_expand_on_the_first_run_and_leave_the_parent_alone() {
+        let fixture = Fixture::new();
+        let harness = fixture.harness();
+        let parent_before = std::fs::read(fixture.session_path("parent")).unwrap();
+        for (turn, at) in [("a2", "a2"), ("a1", "a1")] {
+            let token = harness.fork_thread(fixture.fork(Some(turn))).await.unwrap();
+            // Forking spawns nothing: the child does not exist yet.
+            let child = token.split(':').nth(2).unwrap().to_owned();
+            assert!(!fixture.session_path(&child).exists());
+            let (controls, _steer, _token) = controls("A");
+            let events = run_to_end(
+                &harness,
+                fixture.run_request("scenario:fork", &token),
+                controls,
+            )
+            .await;
+            assert_eq!(
+                flags(&events),
+                format!(
+                    "flags: --resume=parent --fork-session --session-id={child} --resume-session-at={at}"
+                )
+            );
+            // The adopted id is the child's, never the parent's.
+            assert_eq!(started(&events), child);
+        }
+        assert_eq!(std::fs::read(fixture.session_path("parent")).unwrap(), parent_before);
+    }
+
+    #[tokio::test]
+    async fn a_start_that_dies_before_init_retries_the_same_fork_then_resumes_the_child() {
+        let fixture = Fixture::new();
+        let harness = fixture.harness();
+        let token = harness.fork_thread(fixture.fork(Some("a1"))).await.unwrap();
+        let child = token.split(':').nth(2).unwrap().to_owned();
+        let fork_flags = format!(
+            "flags: --resume=parent --fork-session --session-id={child} --resume-session-at=a1"
+        );
+
+        // Nothing is accepted and nothing is written when the CLI dies early.
+        let (controls_1, _steer, _token) = controls("A");
+        let died = run_to_end(
+            &harness,
+            fixture.run_request("scenario:forkdie", &token),
+            controls_1,
+        )
+        .await;
+        assert!(!died
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. })));
+        assert!(!fixture.session_path(&child).exists());
+
+        // The retry replays the identical fork (same child id): no second
+        // fork identity, no lost parent.
+        let (controls_2, _steer, _token) = controls("A");
+        let retried = run_to_end(
+            &harness,
+            fixture.run_request("scenario:fork", &token),
+            controls_2,
+        )
+        .await;
+        assert_eq!(flags(&retried), fork_flags);
+        assert_eq!(started(&retried), child);
+
+        // Once the CLI has written the child, the token resolves to it: a
+        // replay can never fork the parent a second time.
+        fixture.write_session(&child, "");
+        let (controls_3, _steer, _token) = controls("A");
+        let resumed = run_to_end(
+            &harness,
+            fixture.run_request("scenario:fork", &token),
+            controls_3,
+        )
+        .await;
+        assert_eq!(flags(&resumed), format!("flags: --resume={child}"));
+    }
+
+    #[tokio::test]
+    async fn a_fork_whose_parent_vanished_is_a_definite_refusal_not_a_blind_start() {
+        let fixture = Fixture::new();
+        let harness = fixture.harness();
+        let token = harness.fork_thread(fixture.fork(Some("a1"))).await.unwrap();
+        std::fs::remove_file(fixture.session_path("parent")).unwrap();
+        let (controls, _steer, _token) = controls("A");
+        let refused = harness
+            .run(fixture.run_request("scenario:fork", &token), controls)
+            .await;
+        assert!(
+            matches!(&refused, Err(HarnessError::Protocol(m)) if m.contains("forked from")),
+            "{:?}",
+            refused.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_session_id_resumes_exactly_as_before() {
+        let fixture = Fixture::new();
+        let (controls, _steer, _token) = controls("A");
+        let events = run_to_end(
+            &fixture.harness(),
+            fixture.run_request("scenario:fork", "parent"),
+            controls,
+        )
+        .await;
+        assert_eq!(flags(&events), "flags: --resume=parent");
+    }
+}

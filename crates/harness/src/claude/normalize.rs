@@ -208,6 +208,10 @@ pub(crate) struct Normalizer {
     assistant_message_id: String,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
+    /// uuid of the latest top-level assistant frame of the running turn: the
+    /// message `--resume-session-at` can cut the conversation after. Reported
+    /// as the turn's native ref when the turn succeeds.
+    turn_cursor: Option<String>,
 }
 
 impl Normalizer {
@@ -220,6 +224,7 @@ impl Normalizer {
             agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
+            turn_cursor: None,
         }
     }
 
@@ -514,6 +519,9 @@ impl Normalizer {
                         self.agent_spawn_tools.insert(b.id.clone());
                     }
                 }
+                if let Some(uuid) = f.uuid.as_deref().filter(|u| !u.is_empty()) {
+                    self.turn_cursor = Some(uuid.to_owned());
+                }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
@@ -760,6 +768,18 @@ impl Normalizer {
                     }
                 };
                 let mut out = Vec::new();
+                // Only a finished turn is a fork boundary; a failed or
+                // interrupted one may end mid-message.
+                let cursor = self.turn_cursor.take();
+                if f.subtype == "success"
+                    && !interrupted
+                    && let (Some(thread_id), Some(turn_id)) = (self.session_id.clone(), cursor)
+                {
+                    out.push(AgentEvent::NativeReference {
+                        thread_id,
+                        turn_id: Some(turn_id),
+                    });
+                }
                 if let Some(window) = window {
                     out.push(AgentEvent::ContextUsage {
                         tokens: None,

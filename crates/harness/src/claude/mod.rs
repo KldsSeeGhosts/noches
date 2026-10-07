@@ -40,6 +40,7 @@
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
+mod fork;
 mod normalize;
 mod wire;
 
@@ -161,7 +162,29 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    /// The CLI's config root as the child will see it, including login-shell
+    /// values in packaged GUI builds, not only the engine's environment.
+    fn config_root(&self, exe: &PathBuf) -> PathBuf {
+        let mut cmd = Command::new(exe);
+        crate::compose_child_environment(&mut cmd, exe);
+        self.launch.apply_launch(&mut cmd);
+        #[cfg(not(windows))]
+        let command_env = cmd.as_std().get_envs();
+        #[cfg(windows)]
+        let command_env = cmd.as_std_mut().get_envs();
+        command_env
+            .filter(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
+            .find_map(|(_, value)| value.filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| crate::executable::home_or_current_dir().join(".claude"))
+    }
+
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest, resume: &ResumeLaunch) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_environment(&mut cmd, exe);
         self.launch.apply_launch(&mut cmd);
@@ -216,8 +239,20 @@ impl ClaudeHarness {
         if policy.claude_permission_mode == "bypassPermissions" {
             cmd.arg("--dangerously-skip-permissions");
         }
-        if let Some(resume) = &request.resume {
-            cmd.arg(format!("--resume={resume}"));
+        match resume {
+            ResumeLaunch::None => {}
+            ResumeLaunch::Session(session) => {
+                cmd.arg(format!("--resume={session}"));
+            }
+            ResumeLaunch::Fork(token) => {
+                // The child id is ours, so a start that dies before `init`
+                // resolves to the same session instead of forking again.
+                cmd.arg(format!("--resume={}", token.parent));
+                cmd.args(["--fork-session", "--session-id", &token.child]);
+                if let Some(at) = &token.at {
+                    cmd.args(["--resume-session-at", at]);
+                }
+            }
         }
         let mut settings = serde_json::Map::new();
         if option_is_on(&request.model_options, "fastMode") {
@@ -359,6 +394,9 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
 
 #[async_trait]
 impl Harness for ClaudeHarness {
+    fn session_lifecycle(&self) -> Option<&dyn crate::session_lifecycle::SessionLifecycle> {
+        Some(self)
+    }
     fn id(&self) -> HarnessId {
         HarnessId::ClaudeCode
     }
@@ -499,7 +537,9 @@ impl ClaudeHarness {
             request.interaction_mode,
         )?;
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let config_root = self.config_root(&exe);
+        let resume = ResumeLaunch::resolve(&config_root, request.resume.as_deref())?;
+        let mut cmd = self.build_command(&exe, &request, &resume);
         let mcp_config = controls.mcp.claude_config()?;
         if let Some(config) = &mcp_config {
             cmd.arg("--mcp-config").arg(config.path());
@@ -527,26 +567,11 @@ impl ClaudeHarness {
                 "",
             ]);
         }
-        let normalizer = if let Some(session_id) = &request.resume {
-            // Match the child's environment, including login-shell values in
-            // packaged GUI builds, rather than only the engine's environment.
-            #[cfg(not(windows))]
-            let command_env = cmd.as_std().get_envs();
-            #[cfg(windows)]
-            let command_env = cmd.as_std_mut().get_envs();
-            let config = command_env
-                .filter(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
-                .find_map(|(_, value)| value.filter(|value| !value.is_empty()))
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("CLAUDE_CONFIG_DIR")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                })
-                .unwrap_or_else(|| crate::executable::home_or_current_dir().join(".claude"));
-            Normalizer::for_resume(&config, session_id).await
-        } else {
-            Normalizer::new()
+        // Spawn identity comes from the history the child continues: the
+        // parent's, for a first fork run.
+        let normalizer = match resume.history_session() {
+            Some(session_id) => Normalizer::for_resume(&config_root, session_id).await,
+            None => Normalizer::new(),
         };
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -624,6 +649,90 @@ impl ClaudeHarness {
             rx.recv().await.map(|ev| (ev, rx))
         })
         .boxed())
+    }
+}
+
+/// How a run attaches to native history.
+enum ResumeLaunch {
+    None,
+    Session(String),
+    /// First run of a lazy fork (see [`fork`]).
+    Fork(fork::ForkToken),
+}
+
+impl ResumeLaunch {
+    fn resolve(config_root: &std::path::Path, resume: Option<&str>) -> Result<Self, HarnessError> {
+        let Some(resume) = resume else {
+            return Ok(Self::None);
+        };
+        let Some(token) = fork::ForkToken::parse(resume) else {
+            return Ok(Self::Session(resume.to_owned()));
+        };
+        match fork::plan(config_root, &token) {
+            fork::ForkPlan::ResumeChild => Ok(Self::Session(token.child)),
+            fork::ForkPlan::Fork => Ok(Self::Fork(token)),
+            // Definite: nothing has been written for this fork, so the host
+            // may rebuild from portable context rather than guess.
+            fork::ForkPlan::Unavailable => Err(HarnessError::Protocol(
+                "The Claude conversation this thread was forked from is no longer on this device."
+                    .into(),
+            )),
+        }
+    }
+
+    /// The session whose history the process continues.
+    fn history_session(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Session(id) => Some(id),
+            Self::Fork(token) => Some(&token.parent),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::session_lifecycle::SessionLifecycle for ClaudeHarness {
+    /// Turn refs are the CLI's assistant message uuids, which
+    /// `--resume-session-at` cuts at.
+    fn can_fork_from_turn(&self) -> bool {
+        true
+    }
+
+    /// Only a recorded assistant message of a parent transcript in the child's
+    /// own working directory can be forked: a moving head, a legacy turn with
+    /// no uuid, or a parent that is gone all fall back to portable context.
+    async fn can_fork_now(
+        &self,
+        request: &crate::session_lifecycle::NativeForkRequest,
+    ) -> Result<bool, HarnessError> {
+        let (Some(at), true) = (request.source_turn_id.clone(), request.rollback_turns.is_none())
+        else {
+            return Ok(false);
+        };
+        let config_root = self.config_root(&self.resolve_executable()?);
+        let (parent, cwd) = (request.source_thread_id.clone(), request.cwd.clone());
+        Ok(tokio::task::spawn_blocking(move || {
+            fork::can_fork_at(&config_root, &parent, &at, &cwd)
+        })
+        .await
+        .unwrap_or(false))
+    }
+
+    /// Forking only mints the child's identity: the CLI writes the child when
+    /// its first turn runs, and that run expands the token. No process starts
+    /// here, so there is no acceptance to lose; a retry reuses the token.
+    async fn fork_thread(
+        &self,
+        request: crate::session_lifecycle::NativeForkRequest,
+    ) -> Result<String, HarnessError> {
+        if !self.can_fork_now(&request).await? {
+            return Err(HarnessError::Protocol(
+                "Cannot fork Claude here: the source turn is not in a local transcript for this directory.".into(),
+            ));
+        }
+        fork::ForkToken::mint(&request.source_thread_id, request.source_turn_id.as_deref())
+            .map(|token| token.encode())
+            .ok_or_else(|| HarnessError::Protocol("Claude fork source id is malformed.".into()))
     }
 }
 

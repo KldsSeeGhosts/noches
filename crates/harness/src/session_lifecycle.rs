@@ -30,6 +30,13 @@ pub trait SessionLifecycle: Send + Sync {
     fn supports_fork_rollback(&self) -> bool {
         false
     }
+    /// Definite pre-flight: the adapter can fork exactly this boundary right
+    /// now. False routes to portable context before any fork is attempted
+    /// (nothing is recorded as in flight), unlike a failed `fork_thread`,
+    /// which must be treated as uncertain.
+    async fn can_fork_now(&self, _request: &NativeForkRequest) -> Result<bool, HarnessError> {
+        Ok(true)
+    }
     /// A failed/ambiguous response must not be retried against source head.
     async fn fork_thread(&self, request: NativeForkRequest) -> Result<String, HarnessError>;
     /// Explicit unsupported fallback, not inferred success. Native delivery

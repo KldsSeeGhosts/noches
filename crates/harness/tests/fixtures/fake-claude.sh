@@ -65,6 +65,36 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"done!","errors":[],"usage":{"input_tokens":10,"output_tokens":20},"session_id":"sess-1","total_cost_usd":0.01}'
   ;;
 
+*scenario:turnref*)
+  # A finished turn names the assistant message the CLI can cut a fork after:
+  # the LAST top-level assistant frame (subagent frames never count).
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-ref"}'
+  emit '{"type":"assistant","uuid":"asst-1","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+  emit '{"type":"assistant","uuid":"asst-sub","parent_tool_use_id":"t1","message":{"content":[{"type":"text","text":"sub"}]}}'
+  emit '{"type":"assistant","uuid":"asst-2","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"done"}]}}'
+  emit '{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ref"}'
+  ;;
+
+*scenario:forkdie*)
+  # The CLI dies before `init`: no session is written, nothing was accepted.
+  exit 1
+  ;;
+
+*scenario:fork*)
+  # Reports the resume/fork flags it was launched with and adopts the
+  # host-chosen --session-id, as a forked first turn does.
+  sid=""; prev=""; flags=""
+  for a in "$@"; do
+    case "$a" in --resume=*|--fork-session) flags="$flags $a" ;; esac
+    case "$prev" in --session-id) sid="$a"; flags="$flags --session-id=$a" ;; --resume-session-at) flags="$flags --resume-session-at=$a" ;; esac
+    prev="$a"
+  done
+  [ -n "$sid" ] || sid="sess-resumed"
+  emit "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-fable-5\",\"tools\":[],\"cwd\":\"/tmp\",\"session_id\":\"$sid\"}"
+  emit "{\"type\":\"assistant\",\"uuid\":\"asst-fork\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"flags:$flags\"}]}}"
+  emit "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"flags:$flags\",\"errors\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"session_id\":\"$sid\"}"
+  ;;
+
 *scenario:wake*)
   # Eager-done + wake, the live-verified 2.1.228 background-subagent shape:
   # the parent turn settles with result #1 while the subagent still runs;
