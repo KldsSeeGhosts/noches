@@ -6183,10 +6183,10 @@ impl Composer {
             });
             // `target_queue` is this composer's own projection - selected or
             // pane-fixed - so removal markers verify against its rows without
-            // involving the selection.
-            let queue = Self::target_queue_rows(&self.target, state);
+            // involving the selection. Membership only: this runs on every
+            // state notification, so it must not build display rows.
             self.queue_removing
-                .retain(|id| queue.iter().any(|item| item.id == *id));
+                .retain(|id| Self::target_queue_contains(&self.target, state, id));
         }
         self.interrupt_tasks
             .retain(|chat_id, _| self.interrupting.contains(chat_id));
@@ -6200,11 +6200,9 @@ impl Composer {
             (
                 self.target.key(s),
                 pending_input_request(self.target.transcript(s)),
-                editing_id.as_ref().is_none_or(|id| {
-                    Self::target_queue_rows(&self.target, s)
-                        .iter()
-                        .any(|item| item.id == *id)
-                }),
+                editing_id
+                    .as_ref()
+                    .is_none_or(|id| Self::target_queue_contains(&self.target, s, id)),
             )
         };
 

@@ -141,6 +141,52 @@ fn queue_rows_for_display(
     rows
 }
 
+/// Map a display-row move onto the document slice the legacy RPC targets:
+/// the moved row's id plus its document index and the final document index.
+/// The destination is the display row currently at `to` (after the moved row
+/// is lifted out); no such row means "to the end".
+fn doc_move_indices(
+    rows: &[QueuedMessage],
+    document: &[QueuedMessage],
+    from: usize,
+    to: usize,
+) -> Option<(String, usize, usize)> {
+    let id = rows.get(from)?.id.clone();
+    let from_doc = document.iter().position(|row| row.id == id)?;
+    let anchor = rows
+        .iter()
+        .filter(|row| row.id != id)
+        .nth(to)
+        .and_then(|row| document.iter().position(|doc| doc.id == row.id));
+    let to_doc = match anchor {
+        Some(position) => position - usize::from(from_doc < position),
+        None => document.len() - 1,
+    };
+    Some((id, from_doc, to_doc))
+}
+
+/// Would [`queue_rows_for_display`] list `id`? The allocation-free twin for
+/// the state-notification path, which only needs to know a row still exists.
+fn queue_contains(
+    document: &[QueuedMessage],
+    canonical: Option<&zeron_proto::QueueUiState>,
+    id: &str,
+) -> bool {
+    let in_document = document.iter().any(|row| row.id == id);
+    let Some(canonical) = canonical.filter(|queue| queue.schema_version == 1) else {
+        return in_document;
+    };
+    let mut listed = false;
+    for entry in canonical.queue.iter().filter(|entry| entry.message_id == id) {
+        listed = true;
+        if !entry.automatic && (in_document || !entry.document_backed) {
+            return true;
+        }
+    }
+    // Document rows the snapshot has not caught up with are appended last.
+    !listed && in_document
+}
+
 /// Typed document rows use Send now. Only host support and edit/review gates
 /// determine whether the action is available.
 fn available_queue_primary_action(
@@ -351,6 +397,16 @@ impl Composer {
             target
                 .chat_id(state)
                 .and_then(|id| state.canonical_queues.get(id)),
+        )
+    }
+
+    pub(crate) fn target_queue_contains(target: &ChatTarget, state: &AppState, id: &str) -> bool {
+        queue_contains(
+            Self::target_queue(target, state),
+            target
+                .chat_id(state)
+                .and_then(|chat| state.canonical_queues.get(chat)),
+            id,
         )
     }
 
@@ -1259,18 +1315,23 @@ impl Composer {
             );
             return;
         }
-        let (id, chat_id) = {
+        // `from`/`to` index the display rows, but the host and the optimistic
+        // mutate address the document order, which canonical ordering can
+        // differ from. Resolve the row by id against the document slice.
+        let (id, from, to, chat_id) = {
             let state = self.state.read(cx);
-            let Some(id) = Self::target_queue(&self.target, state)
-                .get(from)
-                .map(|item| item.id.clone())
-            else {
+            let Some((id, from, to)) = doc_move_indices(
+                &rows,
+                Self::target_queue(&self.target, state),
+                from,
+                to,
+            ) else {
                 return;
             };
             let Some(chat_id) = self.target.chat_id(state).map(str::to_owned) else {
                 return;
             };
-            (id, chat_id)
+            (id, from, to, chat_id)
         };
         self.state.update(cx, |state, cx| {
             state.mutate_chat_queue(&chat_id, |queue| {
@@ -2085,7 +2146,9 @@ impl Composer {
         action: zeron_proto::QueuedRunAction,
         cx: &mut Context<Self>,
     ) {
-        if self.queue_removing.contains(&message_id) {
+        // Single flight per queue (T3's `busyRunId`): a second mutation would
+        // carry `before_run_id`s from the same stale snapshot as the first.
+        if !self.queue_removing.is_empty() {
             return;
         }
         let state = self.state.read(cx);
@@ -2110,9 +2173,12 @@ impl Composer {
         cx.notify();
         cx.spawn(async move |this, cx| {
             // One safe retry of the exact identity covers after-commit response
-            // loss. Never retarget or mint another steering command.
+            // loss. Never retarget or mint another steering command. A definite
+            // answer from the host is final; only an unknown outcome is replayed.
             let result = match engine.mutate_queued_run(request.clone()).await {
-                Err(_) => engine.mutate_queued_run(request).await,
+                Err(error) if crate::details_data::rpc_message_outcome_unknown(&error) => {
+                    engine.mutate_queued_run(request).await
+                }
                 result => result,
             };
             this.update(cx, |composer, cx| {
@@ -2311,6 +2377,83 @@ mod tests {
             doc,
             "old hosts retain the legacy path"
         );
+    }
+
+    #[test]
+    fn queue_contains_agrees_with_the_display_rows() {
+        use zeron_doc::QueuedMessage;
+        use zeron_proto::{QueueUiEntry, QueueUiState};
+        let entry = |id: &str, document_backed, automatic| QueueUiEntry {
+            message_id: id.into(),
+            document_backed,
+            automatic,
+            ..Default::default()
+        };
+        let canonical = QueueUiState {
+            schema_version: 1,
+            queue: vec![
+                entry("automatic", false, true),
+                entry("sql-only", false, false),
+                entry("typed", true, false),
+                entry("consumed", true, false),
+                entry("auto-in-doc", true, true),
+            ],
+            ..Default::default()
+        };
+        let doc = vec![
+            QueuedMessage::new("typed", "t", "device"),
+            QueuedMessage::new("not-admitted-yet", "p", "device"),
+            QueuedMessage::new("auto-in-doc", "a", "device"),
+        ];
+        for canonical in [Some(&canonical), None] {
+            let shown: Vec<_> = super::queue_rows_for_display(&doc, canonical)
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            for id in [
+                "automatic",
+                "sql-only",
+                "typed",
+                "consumed",
+                "not-admitted-yet",
+                "auto-in-doc",
+                "missing",
+            ] {
+                assert_eq!(
+                    super::queue_contains(&doc, canonical, id),
+                    shown.iter().any(|shown| shown == id),
+                    "{id} (canonical: {})",
+                    canonical.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_moves_resolve_by_id_against_the_document_slice() {
+        use zeron_doc::QueuedMessage;
+        let row = |id: &str| QueuedMessage::new(id, id, "device");
+        // Document order a, b, c; the canonical display order is c, a, b.
+        let doc = vec![row("a"), row("b"), row("c")];
+        let shown = vec![row("c"), row("a"), row("b")];
+        // `a` (display 1) before `c` (display 0): the final document order
+        // must be b, a, c, not a swap of document slots 1 and 0.
+        assert_eq!(
+            super::doc_move_indices(&shown, &doc, 1, 0),
+            Some(("a".into(), 0, 1))
+        );
+        // `c` (display 0) to the end: document slot 2 stays last.
+        assert_eq!(
+            super::doc_move_indices(&shown, &doc, 0, 2),
+            Some(("c".into(), 2, 2))
+        );
+        // `b` (display 2) to the front, before `c`.
+        assert_eq!(
+            super::doc_move_indices(&shown, &doc, 2, 0),
+            Some(("b".into(), 1, 1))
+        );
+        // A display row the document lacks cannot be moved through the doc.
+        assert_eq!(super::doc_move_indices(&shown, &doc[..1], 0, 1), None);
     }
 
     #[test]
