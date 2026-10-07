@@ -13,7 +13,7 @@
 //! entry the client already holds, never a position. Every part is bounded
 //! here (the Details state stays text-only and small), and a page stops early
 //! once its byte budget is spent.
-use super::{Error, Result, Store};
+use super::{Error, Result, Store, task::records};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry, ToolDiffStat};
@@ -453,25 +453,45 @@ fn rich_runs(store: &Store, items: &[Value], docs: DocEntries) -> Result<RichRun
         else {
             continue;
         };
+        // A run owns every user message recorded against it: a steer adds one,
+        // and a restart-steer moves `user_message_id` onto the steer message.
+        let owner: HashMap<&str, &str> = records(&projection, "message")
+            .iter()
+            .filter_map(|m| Some((m["id"].as_str()?, m["runId"].as_str()?)))
+            .collect();
         for run in &projection.runs {
-            let Some(at) = entries.iter().position(|e| e.id == run.user_message_id.0) else {
-                continue;
+            let owned = |entry: &SessionMessageEntry| {
+                entry.id == run.user_message_id.0
+                    || owner.get(entry.id.as_str()).is_some_and(|id| *id == run.id.0)
             };
-            let end = entries[at + 1..]
-                .iter()
-                .position(|e| e.role == MessageRole::User)
-                .map_or(entries.len(), |next| at + 1 + next);
-            let agent: Vec<_> = entries[at + 1..end]
-                .iter()
-                .filter(|e| e.role != MessageRole::User)
-                .cloned()
-                .collect();
+            let agent = run_agent_entries(&entries, owned);
             if agent.iter().any(|e| !e.parts.is_empty()) {
                 out.insert((thread.to_owned(), run.id.0.clone()), agent);
             }
         }
     }
     Ok(out)
+}
+
+/// A run's agent entries from its chat doc: everything after its first user
+/// message up to the next user entry that belongs to a different run (steer
+/// messages the run owns do not end it).
+fn run_agent_entries(
+    entries: &[SessionMessageEntry],
+    owned: impl Fn(&SessionMessageEntry) -> bool,
+) -> Vec<SessionMessageEntry> {
+    let Some(at) = entries
+        .iter()
+        .position(|e| e.role == MessageRole::User && owned(e))
+    else {
+        return Vec::new();
+    };
+    entries[at + 1..]
+        .iter()
+        .take_while(|e| e.role != MessageRole::User || owned(e))
+        .filter(|e| e.role != MessageRole::User)
+        .cloned()
+        .collect()
 }
 
 fn rich_entries(thread: &str, doc: &[SessionMessageEntry]) -> Vec<Entry> {
@@ -774,5 +794,46 @@ mod tests {
         assert_eq!(cut, 2);
         let input = MessagePart::Input { id: "i".into(), request_id: "r".into(), questions: vec![], resolved: false };
         assert!(bound_part(&input, &mut cut).is_none());
+    }
+
+    fn doc_entry(id: &str, role: MessageRole) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: vec![MessagePart::Text { id: "t".into(), text: id.into() }],
+            created_at: 0,
+            device_id: String::new(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn steered_runs_keep_work_before_and_after_their_steer_messages() {
+        use MessageRole::{Assistant as A, User as U};
+        let doc = [
+            doc_entry("u1", U),
+            doc_entry("before", A),
+            doc_entry("steer", U),
+            doc_entry("after", A),
+            doc_entry("u2", U),
+            doc_entry("next", A),
+        ];
+        let ids = |entries: Vec<SessionMessageEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.id).collect()
+        };
+        // Active steer: the run keeps its first message and gains the steer.
+        let active = |e: &SessionMessageEntry| matches!(e.id.as_str(), "u1" | "steer");
+        assert_eq!(ids(run_agent_entries(&doc, active)), ["before", "after"]);
+        // Restart-steer: `user_message_id` is now the steer message, but the
+        // original message is still recorded against the run.
+        let restarted = |e: &SessionMessageEntry| matches!(e.id.as_str(), "steer" | "u1");
+        assert_eq!(ids(run_agent_entries(&doc, restarted)), ["before", "after"]);
+        // The next run is cut at its own prompt and never inherits the steer's.
+        let next = |e: &SessionMessageEntry| e.id == "u2";
+        assert_eq!(ids(run_agent_entries(&doc, next)), ["next"]);
+        // A user entry nobody owns ends the run rather than being swallowed.
+        let strict = |e: &SessionMessageEntry| e.id == "u1";
+        assert_eq!(ids(run_agent_entries(&doc, strict)), ["before"]);
     }
 }
