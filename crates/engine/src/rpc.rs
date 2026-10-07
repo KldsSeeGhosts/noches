@@ -1926,6 +1926,7 @@ impl RpcService for EngineRpc {
                     &self.sessions,
                     &self.workspace,
                     &self.registry,
+                    &self.doc_host,
                 )
                 .await
             }

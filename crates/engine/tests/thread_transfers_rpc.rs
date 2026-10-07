@@ -106,6 +106,20 @@ impl Harness for RecordingHarness {
                 session_id: Some(native),
             });
         } else {
+            if request.prompt.contains("use-a-tool") {
+                events.push(AgentEvent::ToolCall {
+                    id: "tool-1".into(),
+                    call: zeron_proto::ToolCall::Exec {
+                        command: "echo hello".into(),
+                    },
+                });
+                events.push(AgentEvent::ToolResult {
+                    id: "tool-1".into(),
+                    is_error: false,
+                    output: Some("hello".into()),
+                    diff: None,
+                });
+            }
             events.push(AgentEvent::TextDelta {
                 text: format!("Decision for {}", request.prompt),
             });
@@ -846,5 +860,37 @@ async fn inherited_history_pages_are_bounded_stable_and_follow_nested_forks() {
             .len()
             == 1
     );
+    core.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn inherited_history_carries_the_source_documents_tool_calls_and_survives_missing_docs() {
+    let root = tempfile::tempdir().unwrap();
+    let (core, client, _requests) = setup(root.path()).await;
+    let run = send(&core, "source", "use-a-tool please").await;
+    client
+        .fork_thread(fork(&run, "fork-tools", "toolchild"), &core.device_id)
+        .await
+        .unwrap();
+    let page = client
+        .thread_inherited_history("toolchild", &core.device_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 2, "prompt + one agent entry");
+    let parts = page.entries[1]["parts"].as_array().unwrap();
+    let tool = parts.iter().find(|p| p["kind"] == "tool").expect("tool part");
+    assert_eq!(tool["call"]["command"], "echo hello");
+    // Exactly what the parent transcript holds: the doc keeps no raw output here.
+    assert_eq!(tool["resolved"], true);
+    assert!(tool.get("subagentRef").is_none(), "no live subagent link");
+    assert!(parts.iter().any(|p| p["kind"] == "text"));
+    let ids: Vec<_> = page.entries.iter().map(|e| e["id"].clone()).collect();
+    // A cursor taken on the agent entry works the same on the document path.
+    let older = client
+        .thread_inherited_history("toolchild", &core.device_id, ids[1].as_str(), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(older.entries.len(), 1);
     core.shutdown().await;
 }

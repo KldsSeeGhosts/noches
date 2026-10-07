@@ -137,6 +137,7 @@ pub(crate) async fn rpc(
     sessions: &crate::SessionsEngine,
     workspace: &crate::WorkspaceHost,
     registry: &crate::HarnessRegistry,
+    docs: &crate::DocHost,
 ) -> std::result::Result<RpcReply, RpcError> {
     let store = store.ok_or_else(|| RpcError::Failed("Transfer service is unavailable.".into()))?;
     let service = super::checkpoint::FileCheckpointService {
@@ -332,11 +333,25 @@ pub(crate) async fn rpc(
         methods::GET_THREAD_INHERITED_HISTORY => {
             let p: zeron_proto::transfer::InheritedHistoryParams =
                 serde_json::from_value(params).map_err(|e| RpcError::BadParams(e.to_string()))?;
-            RpcReply::value(
-                &store
-                    .inherited_history_page(&p.chat_id.into(), p.before.as_deref(), p.limit)
-                    .map_err(error)?,
-            )
+            // The source chats' documents hold the tool calls and media; reading
+            // them is blocking work, so keep it off the async workers.
+            let (store, docs) = (store.clone(), docs.clone());
+            let page = tokio::task::spawn_blocking(move || {
+                store.inherited_history_page(
+                    &p.chat_id.into(),
+                    p.before.as_deref(),
+                    p.limit,
+                    &|chat| {
+                        let handle = docs.open(chat).ok()?;
+                        let entries = handle.doc().read_entries().ok()?;
+                        Some(zeron_doc::join_continuation_entries(entries))
+                    },
+                )
+            })
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .map_err(error)?;
+            RpcReply::value(&page)
         }
         methods::PREVIEW_FILE_CHECKPOINT_RESTORE => {
             let p: zeron_proto::transfer::CheckpointPreviewParams =

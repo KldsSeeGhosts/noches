@@ -1,6 +1,13 @@
 //! Paged, read-only view of the history a fork inherited. Passive: it never
 //! touches delivery, handoff context or either conversation's document.
 //!
+//! The canonical turn items fix the boundary and order and carry the prompts
+//! and reply text, but the runner projects only text into them. Tool calls,
+//! results, diffs and media live in the source chat's session document, so
+//! each inherited run's agent work is read from there (user entry id == the
+//! run's user message id; its agent entries follow until the next prompt) and
+//! the turn items stand in only when a document no longer has the run.
+//!
 //! The inherited items are frozen at the fork's source run, so the entry list
 //! is stable while the parent keeps running; a cursor is the id of the oldest
 //! entry the client already holds, never a position. Every part is bounded
@@ -8,6 +15,7 @@
 //! once its byte budget is spent.
 use super::{Error, Result, Store};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry, ToolDiffStat};
 use zeron_proto::ToolCall;
 use zeron_proto::orchestration::ThreadId;
@@ -24,6 +32,7 @@ const COMMAND_CHARS: usize = 2_000;
 /// Inline diff sides above this fall back to per-file stats.
 const DIFF_SIDE_CHARS: usize = 20_000;
 const LISTED_RESULTS: usize = 40;
+const MAX_PARTS: usize = 400;
 const REFS_MARKER: &str = "\n\nAttached images (local files";
 
 /// Cut to `limit` chars; reports whether anything was lost.
@@ -44,6 +53,18 @@ fn cap_prompt(text: &str) -> (String, bool) {
         }
         None => cap(text, TEXT_CHARS),
     }
+}
+
+/// Only rasters the client decodes; anything else stays an ordinary tool row.
+fn image_mime(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return None,
+    })
 }
 
 struct Entry {
@@ -279,14 +300,16 @@ fn part(item: &Value, shortened: &mut u32) -> Option<MessagePart> {
         }
         "dynamic_tool" => {
             let name = item["toolName"].as_str().unwrap_or("tool").to_owned();
-            if let Some(path) = item["viewedImagePath"].as_str() {
+            if let Some((path, mime_type)) = item["viewedImagePath"]
+                .as_str()
+                .and_then(|path| Some((path, image_mime(path)?)))
+            {
                 let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned();
                 return Some(MessagePart::Image {
                     id,
                     path: path.to_owned(),
                     name,
-                    // The client verifies the real type while decoding.
-                    mime_type: "image/png".into(),
+                    mime_type: mime_type.into(),
                 });
             }
             let output = match &item["output"] {
@@ -323,11 +346,169 @@ fn part(item: &Value, shortened: &mut u32) -> Option<MessagePart> {
     })
 }
 
+/// Doc parts that are live controls or private to the source conversation
+/// never render in an inherited view.
+fn bound_part(part: &MessagePart, shortened: &mut u32) -> Option<MessagePart> {
+    fn cut(text: &str, limit: usize, shortened: &mut u32) -> String {
+        let (text, was_cut) = cap(text, limit);
+        *shortened += u32::from(was_cut);
+        text
+    }
+    Some(match part {
+        MessagePart::Text { id, text } => MessagePart::Text {
+            id: id.clone(),
+            text: cut(text, TEXT_CHARS, shortened),
+        },
+        MessagePart::Reasoning { id, text } => MessagePart::Reasoning {
+            id: id.clone(),
+            text: cut(text, REASONING_CHARS, shortened),
+        },
+        MessagePart::Tool {
+            id,
+            call,
+            is_error,
+            resolved,
+            output,
+            diff,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            ..
+        } => {
+            let mut call = call.clone();
+            match &mut call {
+                ToolCall::Exec { command } => *command = cut(command, COMMAND_CHARS, shortened),
+                ToolCall::WriteFile { content, .. } => *content = None,
+                ToolCall::EditFile {
+                    old_string,
+                    new_string,
+                    ..
+                } => {
+                    *old_string = None;
+                    *new_string = None;
+                }
+                ToolCall::Mcp { input, .. } | ToolCall::Unknown { input, .. } => {
+                    if input.as_ref().is_some_and(|v| v.to_string().len() > COMMAND_CHARS) {
+                        *input = None;
+                        *shortened += 1;
+                    }
+                }
+                _ => {}
+            }
+            let (diff, stats) = match diff {
+                Some(d)
+                    if d.new_text.chars().count() <= DIFF_SIDE_CHARS
+                        && d.old_text
+                            .as_ref()
+                            .is_none_or(|o| o.chars().count() <= DIFF_SIDE_CHARS) =>
+                {
+                    (Some(d.clone()), diff_stats.clone())
+                }
+                Some(d) => {
+                    *shortened += 1;
+                    (None, Some(vec![zeron_doc::diff_stat(d)]))
+                }
+                None => (None, diff_stats.clone()),
+            };
+            MessagePart::Tool {
+                id: id.clone(),
+                call,
+                is_error: *is_error,
+                resolved: *resolved,
+                output: output.as_deref().map(|text| cut(text, OUTPUT_CHARS, shortened)),
+                diff,
+                output_ref: output_ref.clone(),
+                output_bytes: *output_bytes,
+                diff_ref: diff_ref.clone(),
+                diff_stats: stats,
+                // A spawn chip would link a live subagent doc.
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }
+        }
+        MessagePart::Image { .. } | MessagePart::Error { .. } => part.clone(),
+        MessagePart::Input { .. } | MessagePart::Permission { .. } => return None,
+    })
+}
+
+/// Agent entries per (source thread, run), read from the source chat's doc.
+type RichRuns = HashMap<(String, String), Vec<SessionMessageEntry>>;
+
+/// Source of a chat's joined session-doc entries; `None` when unavailable.
+pub(crate) type DocEntries<'a> = &'a dyn Fn(&str) -> Option<Vec<SessionMessageEntry>>;
+
+fn rich_runs(store: &Store, items: &[Value], docs: DocEntries) -> Result<RichRuns> {
+    let mut threads: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item["sourceThreadId"].as_str())
+        .collect();
+    threads.sort_unstable();
+    threads.dedup();
+    let mut out = RichRuns::new();
+    for thread in threads {
+        let (Some(entries), Some(projection)) =
+            (docs(thread), store.thread(&ThreadId(thread.to_owned()))?)
+        else {
+            continue;
+        };
+        for run in &projection.runs {
+            let Some(at) = entries.iter().position(|e| e.id == run.user_message_id.0) else {
+                continue;
+            };
+            let end = entries[at + 1..]
+                .iter()
+                .position(|e| e.role == MessageRole::User)
+                .map_or(entries.len(), |next| at + 1 + next);
+            let agent: Vec<_> = entries[at + 1..end]
+                .iter()
+                .filter(|e| e.role != MessageRole::User)
+                .cloned()
+                .collect();
+            if agent.iter().any(|e| !e.parts.is_empty()) {
+                out.insert((thread.to_owned(), run.id.0.clone()), agent);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rich_entries(thread: &str, doc: &[SessionMessageEntry]) -> Vec<Entry> {
+    doc.iter()
+        .filter_map(|entry| {
+            let mut shortened = 0;
+            let parts: Vec<_> = entry
+                .parts
+                .iter()
+                .take(MAX_PARTS)
+                .filter_map(|part| bound_part(part, &mut shortened))
+                .collect();
+            (!parts.is_empty()).then(|| Entry {
+                entry: SessionMessageEntry {
+                    id: format!(
+                        "inherited:{}",
+                        serde_json::to_string(&(thread, &entry.id)).unwrap_or_default()
+                    ),
+                    role: MessageRole::Assistant,
+                    parts,
+                    created_at: 0,
+                    device_id: String::new(),
+                    status: None,
+                    continuation_of: None,
+                },
+                shortened,
+            })
+        })
+        .collect()
+}
+
 /// Fold the flat, ordered item list into the entries the transcript renders:
 /// one per user prompt, and one per run of consecutive agent work.
-fn entries(items: &[Value]) -> Vec<Entry> {
+fn entries(items: &[Value], rich: &RichRuns) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut open: Option<Builder> = None;
+    let mut emitted: HashSet<(&str, &str)> = HashSet::new();
     for item in items {
         let Some(kind) = item["type"].as_str() else {
             continue;
@@ -361,6 +542,18 @@ fn entries(items: &[Value]) -> Vec<Entry> {
             continue;
         }
         let run = item["runId"].as_str();
+        let thread = item["sourceThreadId"].as_str().unwrap_or_default();
+        if let Some(doc) = run.and_then(|run| rich.get(&(thread.to_owned(), run.to_owned()))) {
+            // The document has this run's real agent work: emit it once, in
+            // place of the text-only items, and skip the rest of them.
+            if let Some(entry) = open.take().and_then(Builder::finish) {
+                out.push(entry);
+            }
+            if emitted.insert((thread, run.unwrap_or_default())) {
+                out.extend(rich_entries(thread, doc));
+            }
+            continue;
+        }
         if open.as_ref().is_some_and(|b| b.run != run) {
             if let Some(entry) = open.take().and_then(Builder::finish) {
                 out.push(entry);
@@ -397,11 +590,14 @@ impl Store {
         id: &ThreadId,
         before: Option<&str>,
         limit: Option<u32>,
+        docs: DocEntries,
     ) -> Result<InheritedHistoryPage> {
         let projection = self
             .thread(id)?
             .ok_or_else(|| Error::Invariant("The thread was not found.".into()))?;
-        let all = entries(&super::transfer::inherited_items(self, &projection)?);
+        let items = super::transfer::inherited_items(self, &projection)?;
+        let rich = rich_runs(self, &items, docs)?;
+        let all = entries(&items, &rich);
         let end = match before {
             None => all.len(),
             Some(cursor) => all
@@ -453,6 +649,10 @@ mod tests {
         base
     }
 
+    fn fold(items: &[Value]) -> Vec<Entry> {
+        entries(items, &RichRuns::new())
+    }
+
     fn sample() -> Vec<Value> {
         vec![
             item("user_message", "u1", "r1", json!({"text": "first"})),
@@ -468,7 +668,7 @@ mod tests {
 
     #[test]
     fn folds_agent_work_between_prompts_and_drops_controls() {
-        let folded = entries(&sample());
+        let folded = fold(&sample());
         assert_eq!(folded.len(), 4);
         assert!(matches!(folded[0].entry.role, MessageRole::User));
         let parts = &folded[1].entry.parts;
@@ -482,7 +682,7 @@ mod tests {
 
     #[test]
     fn a_new_run_never_merges_into_the_previous_agent_entry() {
-        let folded = entries(&[
+        let folded = fold(&[
             item("assistant_message", "a1", "r1", json!({"text": "one"})),
             item("assistant_message", "a2", "r2", json!({"text": "two"})),
         ]);
@@ -501,7 +701,7 @@ mod tests {
 
     #[test]
     fn oversized_tool_output_is_shortened_and_counted() {
-        let folded = entries(&[item(
+        let folded = fold(&[item(
             "command_execution",
             "c1",
             "r1",
@@ -517,12 +717,62 @@ mod tests {
 
     #[test]
     fn viewed_image_becomes_an_image_part() {
-        let folded = entries(&[item(
+        let folded = fold(&[item(
             "dynamic_tool",
             "d1",
             "r1",
             json!({"toolName": "view_image", "viewedImagePath": "/work/shot.png", "input": {}}),
         )]);
         assert!(matches!(&folded[0].entry.parts[0], MessagePart::Image { name, .. } if name == "shot.png"));
+    }
+
+    #[test]
+    fn document_parts_drop_live_links_controls_and_oversized_diffs() {
+        let mut cut = 0;
+        let spawn = MessagePart::Tool {
+            id: "s".into(),
+            call: ToolCall::Unknown { name: "Agent".into(), input: None },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: Some("sub-doc".into()),
+            subagent_status: Some(zeron_doc::SubagentStatus::Running),
+            subagent_tail: Some("working".into()),
+        };
+        let Some(MessagePart::Tool { subagent_ref, subagent_status, subagent_tail, .. }) =
+            bound_part(&spawn, &mut cut)
+        else {
+            panic!("tool part");
+        };
+        assert!(subagent_ref.is_none() && subagent_status.is_none() && subagent_tail.is_none());
+        let huge = MessagePart::Tool {
+            id: "e".into(),
+            call: ToolCall::EditFile { path: "a".into(), old_string: Some("x".into()), new_string: Some("y".into()) },
+            is_error: false,
+            resolved: true,
+            output: Some("z".repeat(OUTPUT_CHARS + 10)),
+            diff: Some(zeron_proto::ToolDiff { path: "a".into(), old_text: None, new_text: "n\n".repeat(DIFF_SIDE_CHARS) }),
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let Some(MessagePart::Tool { call, diff, diff_stats, output, .. }) = bound_part(&huge, &mut cut) else {
+            panic!("tool part");
+        };
+        assert!(diff.is_none() && diff_stats.is_some_and(|s| s.len() == 1));
+        assert!(matches!(call, ToolCall::EditFile { old_string: None, new_string: None, .. }));
+        assert_eq!(output.unwrap().chars().count(), OUTPUT_CHARS + 1);
+        assert_eq!(cut, 2);
+        let input = MessagePart::Input { id: "i".into(), request_id: "r".into(), questions: vec![], resolved: false };
+        assert!(bound_part(&input, &mut cut).is_none());
     }
 }

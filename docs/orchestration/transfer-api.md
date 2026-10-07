@@ -57,9 +57,11 @@ Example passive response (collections abbreviated):
   Details payload carries only a capped text preview of these.
 - `GetThreadInheritedHistory` (capability `thread-inherited-history-v1`): the full
   read-only inherited transcript, newest page first. `entries` are
-  `SessionMessageEntry`-shaped (user prompt, or one agent entry per run with text,
-  reasoning, tool calls/results, diffs and viewed-image refs; approvals, input
-  requests and handoff/fork markers are omitted). Text, tool output and diffs are
+  `SessionMessageEntry`-shaped: the user prompt, then each run's agent entries read
+  from the source chat's session document (text, reasoning, tool calls/results,
+  diffs, image refs; the turn items stand in when the document lacks the run).
+  Approvals, input requests, live subagent links and handoff/fork markers are
+  omitted. Text, tool output and diffs are
   capped per part and a page stops at a byte budget (`shortened` counts cuts);
   `limit` is clamped to 1..=50. `nextBefore` is the id of the oldest entry returned
   and is the only cursor: the inherited list is frozen at the fork's source run, so
