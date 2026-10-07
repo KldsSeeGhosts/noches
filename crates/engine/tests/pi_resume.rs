@@ -37,6 +37,9 @@ async fn pi_idle_crash_next_dispatch_resumes_the_stored_session_file() {
     let launch = InstanceLaunch::new(
         [
             ("FAKE_PI_SESSIONS", sessions.display().to_string()),
+            // Where real Pi keeps sessions; resume only trusts files under it.
+            ("PI_CODING_AGENT_SESSION_DIR", sessions.display().to_string()),
+            ("PI_CODING_AGENT_DIR", dir.path().join("agent").display().to_string()),
             ("FAKE_PI_LOG", dir.path().join("pi.log").display().to_string()),
         ]
         .into_iter()
