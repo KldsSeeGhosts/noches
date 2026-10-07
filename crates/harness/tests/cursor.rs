@@ -228,6 +228,7 @@ async fn steer_after_done_becomes_the_next_turn() {
                             prompt: "follow up".into(),
                             message_id: None,
                             notification_acceptance: None,
+                            ..Default::default()
                         })
                         .await
                         .expect("steer sent");
@@ -380,6 +381,7 @@ async fn followup_crash_is_not_hidden_by_a_previous_completed_turn() {
                             prompt: "follow up".into(),
                             message_id: None,
                             notification_acceptance: None,
+                            ..Default::default()
                         })
                         .await
                         .unwrap();
@@ -436,6 +438,7 @@ async fn steering_spam_preserves_every_turn_in_order_and_closes_cleanly() {
                         prompt: format!("ITEM-{n}"),
                         message_id: None,
                         notification_acceptance: None,
+                        ..Default::default()
                     })
                     .await
                     .unwrap();
@@ -504,6 +507,7 @@ async fn cancelling_a_saturated_steering_queue_never_starts_queued_turns() {
                     prompt: format!("MUST-NOT-RUN-{n}"),
                     message_id: None,
                     notification_acceptance: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

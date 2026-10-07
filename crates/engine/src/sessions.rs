@@ -622,6 +622,7 @@ impl SessionsEngine {
                 prompt: prompt.into(),
                 message_id: Some(message_id),
                 notification_acceptance: Some(accepted_tx),
+                ..Default::default()
             })
             .is_err()
         {
@@ -680,6 +681,19 @@ impl SessionsEngine {
         prompt: &str,
         message_id: String,
     ) -> Result<CanonicalSteerOutcome, EngineError> {
+        self.steer_canonical_with_attachments(chat_id, expected, prompt, message_id, Vec::new())
+            .await
+    }
+
+    /// [`Self::steer_canonical`] carrying host-owned local image files.
+    pub(crate) async fn steer_canonical_with_attachments(
+        &self,
+        chat_id: &str,
+        expected: &crate::orchestration::steering::RuntimeTarget,
+        prompt: &str,
+        message_id: String,
+        attachments: Vec<String>,
+    ) -> Result<CanonicalSteerOutcome, EngineError> {
         let _admission = self.admit_work()?;
         let handle = self.doc_handle(chat_id)?;
         let admissible = |run: &RunHandle, statuses: &HashMap<String, Session>| {
@@ -715,6 +729,7 @@ impl SessionsEngine {
                     prompt: prompt.into(),
                     message_id: Some(message_id.clone()),
                     notification_acceptance: Some(accepted_tx),
+                    attachments,
                 })
                 .is_err()
             {
@@ -1054,6 +1069,7 @@ impl SessionsEngine {
                     notification_acceptance: None,
                     prompt: request.prompt.clone(),
                     message_id: Some(user_id.clone()),
+                    ..Default::default()
                 };
                 if steer_tx.try_send(message).is_ok() {
                     // Same race as `steer`: the harness can consume this and
@@ -1395,6 +1411,19 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        self.steer_with_attachments(chat_id, prompt, message_id, Vec::new())
+            .await
+    }
+
+    /// [`Self::steer`] carrying host-owned local image files for harnesses
+    /// with native image input; their path references stay in `prompt`.
+    pub async fn steer_with_attachments(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+        attachments: Vec<String>,
+    ) -> Result<SteerOutcome, EngineError> {
         self.refuse_readonly_child(chat_id)?;
         let _admission = self.admit_work()?;
         let configured = self
@@ -1426,6 +1455,7 @@ impl SessionsEngine {
             notification_acceptance: None,
             prompt: prompt.to_string(),
             message_id: Some(user_id.clone()),
+            attachments,
         };
         {
             // Serialize mailbox acceptance with confirmation and Done-time

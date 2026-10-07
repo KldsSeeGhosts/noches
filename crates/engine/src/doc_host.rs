@@ -473,6 +473,40 @@ fn queued_message_prompt(text: &str, attachments: &[String]) -> String {
     format!("{body}{trailer}")
 }
 
+/// Absolute local image files among `paths` — the part of a steer harnesses
+/// with native image input can inline. Everything else stays a text reference.
+pub(crate) fn steer_image_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            let path = std::path::Path::new(path);
+            path.is_absolute()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext.to_ascii_lowercase().as_str(),
+                            "png" | "jpg" | "jpeg" | "webp" | "gif"
+                        )
+                    })
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The attachment trailer's paths in a composer steer prompt.
+fn prompt_attachment_paths(prompt: &str) -> Vec<String> {
+    let Some((_, trailer)) = prompt.split_once(ATTACHMENT_PROMPT_HEADER) else {
+        return Vec::new();
+    };
+    steer_image_paths(
+        trailer
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- ")),
+    )
+}
+
 fn queue_text_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -1323,6 +1357,10 @@ impl DocHost {
     /// and the transfer-read jail.
     pub fn set_uploads(&self, uploads: crate::uploads::Uploads) {
         let _ = self.inner.uploads.set(uploads);
+    }
+
+    pub(crate) fn uploads(&self) -> Option<&crate::uploads::Uploads> {
+        self.inner.uploads.get()
     }
 
     /// Wire the peer-link cache (engine assembly, edge runtimes only) — the
@@ -4442,7 +4480,12 @@ impl DocHost {
         let prompt = queued_message_prompt(&item.text, &item.attachments);
         if send == QueueSend::Steer {
             match sessions
-                .steer(chat_id, &prompt, Some(message_id.clone()))
+                .steer_with_attachments(
+                    chat_id,
+                    &prompt,
+                    Some(message_id.clone()),
+                    steer_image_paths(item.attachments.iter().map(String::as_str)),
+                )
                 .await?
             {
                 SteerOutcome::Accepted => return Ok(()),
@@ -5712,7 +5755,11 @@ impl DocHost {
         {
             tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
         }
-        match sessions.steer(chat_id, &prompt, message_id.clone()).await? {
+        let images = prompt_attachment_paths(&prompt);
+        match sessions
+            .steer_with_attachments(chat_id, &prompt, message_id.clone(), images)
+            .await?
+        {
             SteerOutcome::Accepted => {
                 handle.queue_paused.store(false, Ordering::Release);
                 Ok((SessionCommandStatus::Applied, None))

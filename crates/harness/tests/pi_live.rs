@@ -84,6 +84,7 @@ async fn real_pi_mock_lifecycle() {
                                     notification_acceptance: None,
                                     prompt: "second".into(),
                                     message_id: None,
+                                    ..Default::default()
                                 })
                                 .await
                                 .unwrap();

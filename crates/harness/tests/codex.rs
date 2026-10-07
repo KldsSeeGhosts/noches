@@ -457,6 +457,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
             prompt: "redirect please".into(),
             message_id: Some("direct-steer-message".into()),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .expect("steer queued");
@@ -497,6 +498,31 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
 }
 
 #[tokio::test]
+async fn steering_sends_host_owned_images_as_native_local_image_items() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "look at this".into(),
+            message_id: Some("image-steer-message".into()),
+            attachments: vec!["/tmp/steer-shot.png".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-image"), controls).await;
+    // The fake only emits this delta after seeing the text plus a localImage item.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "image-steered".into()
+        }),
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::InputAcceptedFor {
+        message_id: "image-steer-message".into(),
+    }));
+}
+
+#[tokio::test]
 async fn notification_steer_receipts_native_acceptance() {
     let (controls, steer, _token) = controls("Yes");
     let (receipt, response) = oneshot::channel();
@@ -505,6 +531,7 @@ async fn notification_steer_receipts_native_acceptance() {
             prompt: "redirect please".into(),
             message_id: Some("stable-completion-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -529,6 +556,7 @@ async fn rejected_notification_steer_does_not_start_a_native_follow_up() {
             prompt: "redirect please".into(),
             message_id: Some("stable-completion-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -569,6 +597,7 @@ async fn app_server_exit_during_steer_is_uncertain_not_a_rejection() {
             prompt: "redirect please".into(),
             message_id: Some("lost-transport-message".into()),
             notification_acceptance: Some(receipt),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -585,6 +614,7 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
             prompt: "redirect please".into(),
             message_id: Some("fallback-steer-message".into()),
             notification_acceptance: None,
+            ..Default::default()
         })
         .await
         .expect("steer queued");
@@ -1241,6 +1271,7 @@ async fn live_subagent_spawn_and_followup_keep_one_transcript() {
                 notification_acceptance: None,
                 prompt: "Reuse the SAME existing subagent for one more task: reply exactly child-second. Use followup_task if available, otherwise send_input. Do not spawn a new agent. Wait for it to finish, then reply exactly parent-second. Do not inspect or change files.".into(),
                 message_id: None,
+                ..Default::default()
             }).await.unwrap();
         }
         if turn == 2 {

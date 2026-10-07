@@ -146,6 +146,22 @@ case "$first" in
   esac
   ;;
 
+*scenario:steer-image*)
+  # A host-owned image rides the steer line as an inline base64 block ahead of
+  # the text, exactly like the first prompt's attachments.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer-image"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
+  read -r steer || exit 1
+  verdict=missing-image
+  case "$steer" in
+  *'"type":"image"'*'"text":"look at this"'*)
+    case "$steer" in *'"media_type":"image/png"'*) verdict=image-steered ;; esac
+    ;;
+  esac
+  emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"$verdict\"}}}"
+  emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer-image"}'
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'

@@ -317,6 +317,25 @@ case "$turnline" in
   fi
   ;;
 
+# A host-owned image rides turn/steer as a native localImage item after the text.
+*scenario:steer-image*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  if has "$steerline" '"method":"turn/steer"' &&
+    has "$steerline" '"type":"localImage"' &&
+    has "$steerline" '"path":"/tmp/steer-shot.png"' &&
+    has "$steerline" 'look at this'; then
+    emit "{\"id\":$sid,\"result\":{}}"
+    emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"image-steered"}}'
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  else
+    emit "{\"id\":$sid,\"error\":{\"code\":-32600,\"message\":\"bad steer\"}}"
+    emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"steer image missing"}}}}'
+  fi
+  ;;
+
 *scenario:steer*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'

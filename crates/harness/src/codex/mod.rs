@@ -1440,11 +1440,12 @@ async fn run_session(session: Session) {
                     let text = msg.prompt;
                     let message_id = msg.message_id;
                     let notification = msg.notification_acceptance;
+                    let images = msg.attachments;
                     if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
+                            "input": steer_input(&text, &images),
                         });
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {
@@ -1869,6 +1870,18 @@ fn mcp_elicitation_content(params: &Value) -> Option<Value> {
 
 /// Parse `item/tool/requestUserInput` questions into (wire id, question)
 /// pairs, tolerant of field spellings; answers key by the WIRE id.
+/// `turn/steer` input: the text, then each host-owned image as a native
+/// `localImage` item (the path refs also ride the text).
+fn steer_input(text: &str, images: &[String]) -> Value {
+    let mut input = vec![json!({ "type": "text", "text": text })];
+    input.extend(
+        images
+            .iter()
+            .map(|path| json!({ "type": "localImage", "path": path })),
+    );
+    Value::Array(input)
+}
+
 fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
     params
         .get("questions")

@@ -995,8 +995,12 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let uuid = new_input_uuid();
-                    let line = wire::user_message_line(
+                    // Same best-effort inlining as the first prompt: an
+                    // unreadable image keeps its path ref in the text.
+                    let images = load_image_blocks(&msg.attachments).await;
+                    let line = wire::user_message_line_with_images(
                         &apply_ultrathink(reasoning, &msg.prompt),
+                        &images,
                         &uuid,
                     );
                     let queued = if let Some(receipt) = msg.notification_acceptance {

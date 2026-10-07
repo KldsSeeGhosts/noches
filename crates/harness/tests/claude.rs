@@ -378,6 +378,7 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
             notification_acceptance: None,
             prompt: "redirect please".into(),
             message_id: None,
+            ..Default::default()
         })
         .await
         .expect("steer queued");
@@ -413,6 +414,33 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
 }
 
 #[tokio::test]
+async fn steering_inlines_host_owned_images_ahead_of_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, [0x89, b'P', b'N', b'G', 1, 2, 3]).unwrap();
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "look at this".into(),
+            // An unreadable file degrades to its path ref, never fails the steer.
+            attachments: vec![
+                image.to_string_lossy().into_owned(),
+                dir.path().join("gone.png").to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-image"), controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "image-steered".into()
+        }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn replayed_stdin_lines_are_the_exact_native_input_receipts() {
     let (controls, steer, _token) = controls("A");
     let (receipt, flushed) = oneshot::channel();
@@ -421,6 +449,7 @@ async fn replayed_stdin_lines_are_the_exact_native_input_receipts() {
             notification_acceptance: Some(receipt),
             prompt: "redirect".into(),
             message_id: Some("m-steer".into()),
+            ..Default::default()
         })
         .await
         .expect("steer queued");

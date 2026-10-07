@@ -209,9 +209,14 @@ impl std::fmt::Debug for HarnessError {
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
+#[derive(Default)]
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+    /// Host-owned local image files that ride this steer. Their path refs
+    /// already appear in `prompt`; harnesses with native image input (Codex,
+    /// Claude) also send them as image items, others keep the references.
+    pub attachments: Vec<String>,
     /// Host-local app mailbox delivery receipt. When present, a rejected/idle
     /// active steer must return false, not silently start a new native turn;
     /// the durable orchestration continuation owns that fallback.
