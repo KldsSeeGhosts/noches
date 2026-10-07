@@ -160,15 +160,37 @@ pub(super) fn plan_edit(
 
 /// Upload files the host can safely drop: under the uploads root, and not
 /// named by any queue row (another message, another thread, a live intent).
+/// An intent of a cancelled run does not count: its Loro row is only waiting
+/// to be dropped, and refusing here would leave the file orphaned for good.
 fn unreferenced(conn: &Connection, path: &str) -> Result<bool> {
-    let mut statement = conn.prepare(
-        "SELECT paths_json FROM orchestration_queue_attachments
-         UNION ALL SELECT payload_json FROM orchestration_queue_intents",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let needle = serde_json::to_string(path)?;
-    for raw in rows {
-        if raw?.contains(&needle) {
+    let committed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM orchestration_queue_attachments
+                       WHERE instr(paths_json, ?1) > 0)",
+        [&needle],
+        |row| row.get(0),
+    )?;
+    if committed {
+        return Ok(false);
+    }
+    let mut statement =
+        conn.prepare("SELECT thread_id, payload_json FROM orchestration_queue_intents")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (thread, raw) = row?;
+        if !raw.contains(&needle) {
+            continue;
+        }
+        let cancelled = ui_queue::cancelled_messages(conn, &ThreadId(thread))?;
+        // Unreadable intents stay conservative: the file is treated as named.
+        let Ok(intents) = serde_json::from_str::<Vec<zeron_doc::QueuedMessage>>(&raw) else {
+            return Ok(false);
+        };
+        if intents.iter().any(|intent| {
+            intent.attachments.iter().any(|a| a == path) && !cancelled.contains(&intent.id)
+        }) {
             return Ok(false);
         }
     }

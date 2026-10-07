@@ -3105,6 +3105,74 @@ async fn shared_claims_survive_a_cancelled_message_and_unowned_files_are_never_d
 }
 
 #[tokio::test]
+async fn a_cancelled_loro_rows_files_are_cleaned_even_while_its_intent_lags() {
+    let f = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+    std::fs::create_dir_all(uploads.dir()).unwrap();
+    let path = uploads.dir().join("lagging.png");
+    std::fs::write(&path, b"x").unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut row = zeron_doc::QueuedMessage::new("queue-one", "first", "host");
+    row.attachments = vec![path.clone()];
+    let sync = |rows: Vec<zeron_doc::QueuedMessage>, id: &str| {
+        let f = &f;
+        let id = id.to_string();
+        async move {
+            let result = f
+                .service
+                .mutate(
+                    None,
+                    ThreadId("target".into()),
+                    "host.sync_loro_queue",
+                    json!({"items":rows,"driver":"mock"}),
+                    CommandId(id),
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.status, ReceiptStatus::Accepted, "{:?}", result.error);
+        }
+    };
+    sync(vec![row.clone()], "sync-1").await;
+    let store = &f.service.kernel.store;
+    super::attachments::remove_unreferenced(store, &uploads, &[path.clone()]).unwrap();
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "a live queued row still owns its file"
+    );
+    // Cancelling through the planner commits before the Loro row is dropped:
+    // the intents table still names the file when the cleanup effect runs.
+    let run = store
+        .thread(&"target".into())
+        .unwrap()
+        .unwrap()
+        .runs
+        .into_iter()
+        .find(|r| r.user_message_id.0 == "queue-one")
+        .unwrap();
+    f.call(
+        "t3_queue_cancel",
+        json!({"threadId":"target","queuedRunId":run.id.0}),
+    )
+    .await
+    .unwrap();
+    super::attachments::remove_unreferenced(store, &uploads, &[path.clone()]).unwrap();
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "a cancelled row's file must not be orphaned by a lagging intent"
+    );
+    // The lagging row arriving in a later sync does not re-claim anything.
+    sync(vec![row], "sync-2").await;
+    let owned = store
+        .read(|conn| {
+            crate::orchestration::ui_queue::attachment_paths(conn, &"target".into(), "queue-one")
+        })
+        .unwrap();
+    assert!(owned.is_empty(), "{owned:?}");
+}
+
+#[tokio::test]
 async fn attachment_edit_is_fenced_atomic_and_survives_projection_rebuild() {
     use crate::orchestration::effects::EffectRequest;
     let f = Fixture::new();

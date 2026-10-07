@@ -42,7 +42,20 @@ pub(crate) fn persist(
     intents: Option<&[zeron_doc::QueuedMessage]>,
 ) -> Result<()> {
     if let Some(intents) = intents {
+        // A cancelled run released its files in its own transaction; a lagging
+        // Loro row must not re-claim them. A row without files owns no record.
+        let cancelled = cancelled_messages(conn, id)?;
         for intent in intents {
+            if cancelled.contains(&intent.id) {
+                continue;
+            }
+            if intent.attachments.is_empty() {
+                conn.execute(
+                    "DELETE FROM orchestration_queue_attachments WHERE thread_id=?1 AND message_id=?2",
+                    params![id.0, intent.id],
+                )?;
+                continue;
+            }
             conn.execute(
                 "INSERT INTO orchestration_queue_attachments VALUES(?1,?2,?3)
                  ON CONFLICT(thread_id,message_id) DO UPDATE SET paths_json=excluded.paths_json",
@@ -71,6 +84,25 @@ pub(crate) fn persist(
         }
     }
     Ok(())
+}
+
+/// User-message ids of this thread's cancelled runs: queued messages that
+/// will never start, whose Loro rows are only waiting to be dropped.
+pub(crate) fn cancelled_messages(
+    conn: &Connection,
+    thread: &ThreadId,
+) -> Result<std::collections::HashSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT json_extract(payload_json,'$.userMessageId')
+         FROM orchestration_projection_runs
+         WHERE thread_id=?1 AND json_extract(payload_json,'$.status')='cancelled'",
+    )?;
+    let rows = statement.query_map([&thread.0], |row| row.get::<_, Option<String>>(0))?;
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        ids.extend(row?);
+    }
+    Ok(ids)
 }
 
 pub(crate) fn attachment_paths(
