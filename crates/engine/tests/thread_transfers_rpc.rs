@@ -11,7 +11,7 @@ use futures::{stream, stream::BoxStream};
 use serde_json::{Value, json};
 use zeron_engine::{
     EngineCore, HarnessRegistry,
-    orchestration::{WriteBoundary, thread_service::ThreadSendRequest},
+    orchestration::{event::encode_component, thread_service::ThreadSendRequest},
 };
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
@@ -576,14 +576,31 @@ async fn lost_response_retry_materializes_exactly_one_fork_and_preserves_config_
     let first = send(&core, "source", "goal").await;
     core.orchestration_host.as_ref().unwrap().shutdown().await;
     let request = fork(&first, "stable-request", "one-child");
+    // Completed is published before the runner finishes settlement. Host
+    // shutdown joins outbox workers, not that observer, so target this RPC's
+    // command rather than whichever unrelated transaction commits next.
+    let command_id = CommandId(format!(
+        "ui:fork:{}:{}",
+        encode_component(&request.chat_id),
+        encode_component(&request.command_id)
+    ));
     core.orchestration
         .store
-        .inject_failure(WriteBoundary::AfterCommit, 1);
-    assert!(
-        client
-            .fork_thread(request.clone(), &core.device_id)
-            .await
-            .is_err()
+        .inject_lost_response(command_id.clone());
+    let error = client
+        .fork_thread(request.clone(), &core.device_id)
+        .await
+        .expect_err("the committed fork response must be lost");
+    assert!(error.to_string().contains("AfterCommit"), "{error}");
+    assert_eq!(
+        core.orchestration
+            .store
+            .receipt(&command_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        zeron_engine::orchestration::ReceiptStatus::Accepted,
+        "response loss must not roll back the fork"
     );
     let retried = client
         .fork_thread(request.clone(), &core.device_id)

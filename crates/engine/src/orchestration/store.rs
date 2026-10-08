@@ -85,6 +85,7 @@ pub struct Store {
     pub(crate) cancellations: Arc<Cancellations>,
     pub(crate) publication_lane: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<Mutex<Option<(WriteBoundary, usize)>>>,
+    lost_response: Arc<Mutex<Option<CommandId>>>,
     admission: Arc<OnceLock<super::adoption::RegistryAdmission>>,
     writes_committed: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
@@ -149,6 +150,7 @@ impl Store {
             cancellations: Arc::default(),
             publication_lane: Arc::default(),
             failure: Arc::default(),
+            lost_response: Arc::default(),
             admission: Arc::default(),
             writes_committed: tokio::sync::watch::channel(()).0,
             #[cfg(test)]
@@ -176,6 +178,15 @@ impl Store {
     pub fn inject_failure(&self, boundary: WriteBoundary, occurrence: usize) {
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
             Some((boundary, occurrence.max(1)));
+    }
+
+    /// Lose the response after this command commits, without letting unrelated
+    /// worker writes consume the one-shot seam. Not exposed through RPC/MCP.
+    pub fn inject_lost_response(&self, command_id: CommandId) {
+        *self
+            .lost_response
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(command_id);
     }
 
     pub(crate) fn boundary(&self, boundary: WriteBoundary) -> Result<()> {
@@ -509,6 +520,14 @@ impl Store {
             Ok((receipt, cancellations))
         })?;
         self.cancellations.cancel(&cancellations);
+        let mut lost_response = self
+            .lost_response
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if lost_response.as_ref() == Some(&command.id) {
+            *lost_response = None;
+            return Err(Error::Injected(WriteBoundary::AfterCommit));
+        }
         Ok(receipt)
     }
 
