@@ -1,0 +1,16 @@
+{
+  "name": "noches-zcode-oauth-acp",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "dependencies": {
+    "zcode-acp-server": "0.65.1"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "node --test oauth.test.mjs",
+    "start": "node launch.mjs"
+  }
+}
