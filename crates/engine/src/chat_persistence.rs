@@ -66,6 +66,10 @@ impl ChatPersistence {
         self.cursor.load(Ordering::Acquire)
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_clean(&self) -> bool {
         self.saved.load(Ordering::Acquire) == self.generation.load(Ordering::Acquire)
     }

@@ -378,14 +378,14 @@ pub(crate) fn native_child(conn: &Connection, projection: &ThreadProjection) -> 
     }))
 }
 
-fn clear_parking(
+pub(crate) fn clear_parking(
     projection: &ThreadProjection,
     command: &Command,
     plan: &mut Plan,
     now: i64,
 ) -> Result<()> {
     let mut thread = serde_json::to_value(&projection.thread)?;
-    if !thread["settledOverride"].is_null() {
+    if !thread["settledOverride"].is_null() || !thread["settledAt"].is_null() {
         if thread["settledOverride"] != "active" {
             thread["unsettledAt"] = json!(iso(now)?);
         }

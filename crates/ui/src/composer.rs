@@ -6760,6 +6760,11 @@ impl Composer {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
+            if let Some(lifecycle) = s.thread_lifecycles.get_mut(&chat_id) {
+                lifecycle.settled_at = None;
+                lifecycle.settled_by = None;
+                lifecycle.snoozed_until = None;
+            }
             if should_publish_optimistic_echo(queue) {
                 s.push_echo(&chat_id, echo);
                 // Working overlay until the host executes the queued command -

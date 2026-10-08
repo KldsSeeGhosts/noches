@@ -6183,8 +6183,9 @@ impl DocHost {
                 ));
             }
             if let Some(persistence) = &handle.persistence {
+                let target_gen = persistence.generation();
                 persistence.flush_sync();
-                if !persistence.is_clean() {
+                if !persistence.durable_through(target_gen) {
                     return Err(EngineError::Other(
                         "Orchestration snapshot is not yet durable.".into(),
                     ));

@@ -588,6 +588,15 @@ impl RunnerBridge {
         {
             projection.thread.archived_at = None;
         }
+        if projection.thread.settled_at.is_some() || projection.thread.settled_override.is_some() {
+            projection.thread.settled_at = None;
+            projection.thread.settled_override = None;
+            projection.thread.unsettled_at = zeron_proto::orchestration::Optional::Present(Some(crate::orchestration::event::iso(crate::now_ms())?));
+        }
+        if matches!(&projection.thread.snoozed_until, zeron_proto::orchestration::Optional::Present(Some(_))) {
+            projection.thread.snoozed_until = zeron_proto::orchestration::Optional::Present(None);
+            projection.thread.snoozed_at = zeron_proto::orchestration::Optional::Present(None);
+        }
         let project_root = self
             .workspace
             .space(&scope.project_id.0)
