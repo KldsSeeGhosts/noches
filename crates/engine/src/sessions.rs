@@ -987,12 +987,13 @@ impl SessionsEngine {
         }
         let harness_id = driver;
         let bound = lock(&self.inner.provider_bindings).get(chat_id).cloned();
-        if bound
-            .as_ref()
-            .is_some_and(|(id, _)| id != requested_instance.as_ref())
+        if lock(&self.inner.runs).contains_key(chat_id)
+            && bound
+                .as_ref()
+                .is_some_and(|(id, _)| id != requested_instance.as_ref())
         {
             return Err(EngineError::Other(
-                "Provider instance/driver mismatch.".into(),
+                "Cannot replace an active provider instance.".into(),
             ));
         }
         let harness = self.inner.registry.provider_instances.resolve_runtime(
@@ -1000,7 +1001,17 @@ impl SessionsEngine {
             &requested_instance,
             true,
         )?;
-        let harness = bound.map(|(_, harness)| harness).unwrap_or(harness);
+        let harness = bound
+            .filter(|(id, _)| id == requested_instance.as_ref())
+            .map(|(_, harness)| harness)
+            .unwrap_or_else(|| {
+                let harness = harness;
+                lock(&self.inner.provider_bindings).insert(
+                    chat_id.to_string(),
+                    (requested_instance.to_string(), harness.clone()),
+                );
+                harness
+            });
         request.instance_id = Some(requested_instance.clone());
         zeron_harness::policy::compile(harness_id, request.runtime_mode, request.interaction_mode)?;
         // Project-less chats store cwd `~` (the creating device can't know the

@@ -1064,9 +1064,10 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
-    fn harness_locked(&self, cx: &App) -> bool {
-        self.target.chat_id(self.state.read(cx)).is_some()
+    /// Harness switching is supported in existing sessions via T3 Code
+    /// provider switching and context handoffs.
+    fn harness_locked(&self, _cx: &App) -> bool {
+        false
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -1119,16 +1120,21 @@ impl Pickers {
             .and_then(|list| offered_harnesses_iter(list).next().map(|d| d.id))
     }
 
-    /// Effective model id: the draft pick, the selected chat's config, or (on
-    /// the new-chat canvas) the remembered last-used model for the harness.
+    /// Effective model id: the draft pick, the selected chat's config (when
+    /// matching the effective harness), or (on the new-chat canvas or harness
+    /// switch) the remembered last-used model for the harness.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
         }
-        if let Some(chat) = self.target.chat(self.state.read(cx)) {
-            return chat.config.as_ref().and_then(|c| c.model.as_deref());
+        let effective = self.effective_harness(cx);
+        if let Some(chat) = self.target.chat(self.state.read(cx))
+            && let Some(config) = chat.config.as_ref()
+            && effective == Some(config.harness)
+        {
+            return config.model.as_deref();
         }
-        let harness = self.effective_harness(cx)?;
+        let harness = effective?;
         self.defaults.model_for(harness).map(|m| m.id.as_str())
     }
 
@@ -1182,14 +1188,14 @@ impl Pickers {
     }
 
     fn raw_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        if let Some(chat) = self.target.chat(self.state.read(cx)) {
-            return chat
-                .config
-                .as_ref()
-                .map(|c| c.model_options.clone())
-                .unwrap_or_default();
+        let effective = self.effective_harness(cx);
+        if let Some(chat) = self.target.chat(self.state.read(cx))
+            && let Some(config) = chat.config.as_ref()
+            && effective == Some(config.harness)
+        {
+            return config.model_options.clone();
         }
-        let Some(harness) = self.effective_harness(cx) else {
+        let Some(harness) = effective else {
             return Default::default();
         };
         match self.selected_model(cx) {
@@ -1242,13 +1248,18 @@ impl Pickers {
 
     fn scalar_presentation(&self, cx: &App) -> std::sync::Arc<ModelPresentation> {
         let model = self.selected_model(cx);
+        let effective_harness = self.effective_harness(cx);
         let key = ModelPresentationKey {
             catalog_rev: self.catalog_rev,
-            harness: self.effective_harness(cx),
+            harness: effective_harness,
             model: self.effective_model_id(cx).map(str::to_owned),
             reasoning: self.config.reasoning.or_else(|| {
                 match self.target.chat(self.state.read(cx)) {
-                    Some(chat) => chat.config.as_ref().and_then(|config| config.reasoning),
+                    Some(chat) => chat
+                        .config
+                        .as_ref()
+                        .filter(|config| effective_harness == Some(config.harness))
+                        .and_then(|config| config.reasoning),
                     None => self.defaults.reasoning,
                 }
             }),
@@ -1299,21 +1310,28 @@ impl Pickers {
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
+        let effective_harness = self.effective_harness(cx);
+        let chat_config = self
+            .target
+            .chat(self.state.read(cx))
+            .and_then(|c| c.config.clone());
+        let instance_id = if let Some(config) = &chat_config {
+            if effective_harness == Some(config.harness) {
+                config.instance_id.clone().or_else(|| self.config.instance_id.clone())
+            } else {
+                self.config.instance_id.clone()
+            }
+        } else {
+            self.config.instance_id.clone()
+        };
         ResolvedRunConfig {
-            instance_id: self
-                .target
-                .chat(self.state.read(cx))
-                .and_then(|c| c.config.as_ref())
-                .and_then(|c| c.instance_id.clone())
-                .or_else(|| self.config.instance_id.clone()),
+            instance_id,
             runtime_mode: self.runtime_mode(cx),
-            interaction_mode: self
-                .target
-                .chat(self.state.read(cx))
-                .and_then(|c| c.config.as_ref())
+            interaction_mode: chat_config
+                .as_ref()
                 .map(|c| c.interaction_mode)
                 .unwrap_or_default(),
-            harness: self.effective_harness(cx),
+            harness: effective_harness,
             model: self
                 .selected_model(cx)
                 .map(|m| m.id.clone())
@@ -1984,9 +2002,6 @@ impl Pickers {
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.harness_locked(cx) {
-            return;
-        }
         if self.config.harness != Some(harness) {
             // The remembered model for this harness takes over via the
             // defaults fallback; a foreign pick must not linger.
@@ -1999,6 +2014,20 @@ impl Pickers {
         self.save_defaults();
         self.model_scroll_base().set_offset(gpui::Point::default());
         self.ensure_models(harness, false, cx);
+        if self.target.chat_id(self.state.read(cx)).is_some() {
+            let remembered_model = self.defaults.model_for(harness).map(|m| m.id.clone());
+            self.update_chat_config(cx, move |config| {
+                config.harness = harness;
+                config.instance_id = None;
+                config.model = remembered_model;
+                config.reasoning = None;
+                config.model_options.clear();
+            });
+            self.config.harness = None;
+            self.config.instance_id = None;
+            self.config.model = None;
+            self.config.reasoning = None;
+        }
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         self.presentation_changed(PickerPresentationChanged::Config, cx);
@@ -2012,9 +2041,6 @@ impl Pickers {
         instance_id: zeron_proto::provider_instance::ProviderInstanceId,
         cx: &mut Context<Self>,
     ) {
-        if self.harness_locked(cx) && self.effective_harness(cx) != Some(harness) {
-            return;
-        }
         if self.target.chat_id(self.state.read(cx)).is_some() {
             self.update_chat_config(cx, move |config| {
                 config.harness = harness;
@@ -2043,7 +2069,19 @@ impl Pickers {
         if self.target.chat_id(self.state.read(cx)).is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
-            self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            let model_id_clone = model_id.clone();
+            self.update_chat_config(cx, move |config| config.model = Some(model_id_clone));
+            if let Some(harness) = self.effective_harness(cx) {
+                let label = self
+                    .models
+                    .get(&harness)
+                    .and_then(|l| l.ready())
+                    .and_then(|_| self.catalog_model(harness, &model_id))
+                    .map(|m| m.label.clone())
+                    .unwrap_or_else(|| model_id.clone());
+                self.defaults.remember_model(harness, model_id, label);
+                self.save_defaults();
+            }
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
@@ -2371,9 +2409,6 @@ impl Pickers {
             return;
         }
         if self.effective_harness(cx) != Some(row.harness) {
-            if self.harness_locked(cx) {
-                return;
-            }
             self.pick_harness(row.harness, cx);
         }
         self.pick_model(row.model.id, cx);
