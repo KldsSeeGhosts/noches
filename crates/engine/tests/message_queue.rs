@@ -4913,3 +4913,133 @@ async fn composer_selection_sync_is_catalog_validated_idempotent_and_never_start
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_message_on_settled_thread_unsettles_and_clears_parking_across_harness_handoff() {
+    let (mut a, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    {
+        let a = Arc::get_mut(&mut a).unwrap();
+        a.id = HarnessId::Grok;
+        a.session = "sess-a".into();
+    }
+    let (mut b, _) = HeldHarness::new(SteeringMode::TurnBoundary);
+    {
+        let b = Arc::get_mut(&mut b).unwrap();
+        b.id = HarnessId::Codex;
+        b.session = "sess-b".into();
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let core = assemble_two(&tmp.keep().join("data"), a.clone(), b.clone());
+    create_chat(&core).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    wait_for(
+        || {
+            core.registry
+                .provider_instances
+                .snapshot(&core.registry)
+                .iter()
+                .filter(|p| {
+                    matches!(p.harness_id, Some(HarnessId::Codex | HarnessId::Grok))
+                        && !p.models.is_empty()
+                })
+                .count()
+                == 2
+        },
+        "startup provider discovery",
+    )
+    .await;
+    for driver in [HarnessId::Grok, HarnessId::Codex] {
+        core.registry.provider_instances.set_authentication(
+            driver,
+            zeron_engine::provider_instances::Authentication::Authenticated,
+        );
+    }
+
+    let a_model = core
+        .registry
+        .provider_instances
+        .snapshot(&core.registry)
+        .into_iter()
+        .find(|p| p.harness_id == Some(HarnessId::Grok))
+        .unwrap()
+        .models[0]
+        .id
+        .clone();
+    let b_model = core
+        .registry
+        .provider_instances
+        .snapshot(&core.registry)
+        .into_iter()
+        .find(|p| p.harness_id == Some(HarnessId::Codex))
+        .unwrap()
+        .models[0]
+        .id
+        .clone();
+
+    // Turn 1 completes on instance A
+    core.workspace
+        .set_chat_config(CHAT, &composer_config(HarnessId::Grok, &a_model))
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "turn 1 on a", vec![])
+        .unwrap();
+    wait_for(|| a.requests.lock().unwrap().len() == 1, "turn 1 on A").await;
+    let _ = a.finish.send(());
+    runs_completed(&core, 1).await;
+
+    // Settle the thread
+    client
+        .call(
+            zeron_rpc::methods::ORGANIZE_THREAD,
+            serde_json::json!({"chatId": CHAT, "action": "settle"}),
+        )
+        .await
+        .unwrap();
+
+    let projection = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert!(projection.thread.settled_at.is_some());
+    assert_eq!(
+        projection.thread.settled_override,
+        Some(zeron_proto::orchestration::OrchestrationV2AppThreadSettledOverride::Settled)
+    );
+
+    // Switch composer to harness B (Codex) and send turn 2
+    set_composer(&core, &composer_config(HarnessId::Codex, &b_model)).await;
+    core.doc_host
+        .queue_message(CHAT, "turn 2 on b", vec![])
+        .unwrap();
+    wait_for(|| b.requests.lock().unwrap().len() == 1, "turn 2 on B").await;
+    let _ = b.finish.send(());
+    runs_completed(&core, 2).await;
+
+    // Sending a message must have permanently unsettled the thread
+    let after = core
+        .orchestration
+        .store
+        .thread(&CHAT.into())
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.thread.settled_at.is_none(),
+        "settled_at must be cleared on send"
+    );
+    assert!(
+        after.thread.settled_override.is_none(),
+        "settled_override must be cleared on send"
+    );
+    assert!(
+        matches!(
+            after.thread.unsettled_at,
+            zeron_proto::orchestration::Optional::Present(Some(_))
+        ),
+        "unsettled_at must be recorded"
+    );
+
+    core.shutdown().await;
+}

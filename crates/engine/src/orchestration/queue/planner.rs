@@ -1204,6 +1204,9 @@ fn sync_loro(
     }
     // Store attachment paths and edit leases losslessly in our own read table.
     plan.queue_intents = Some(rows);
+    if plan.events.iter().any(|e| matches!(e, zeron_proto::orchestration::OrchestrationV2DomainEvent::RunCreated(_))) {
+        crate::orchestration::threads::planner::clear_parking(p, command, plan, now)?;
+    }
     if plan.events.is_empty() {
         plan.emit(command, "thread.metadata-updated", &p.thread, now)?;
     }
@@ -1223,6 +1226,7 @@ fn adopt_delivery(
     }) {
         return Err(refuse("Thread is not sendable."));
     }
+    crate::orchestration::threads::planner::clear_parking(p, command, plan, now)?;
     let run = queued(p)
         .into_iter()
         .find(|r| r.user_message_id.0 == input["messageId"].as_str().unwrap_or(""))

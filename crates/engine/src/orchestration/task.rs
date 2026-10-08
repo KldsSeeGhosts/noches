@@ -1083,6 +1083,7 @@ pub(crate) fn plan(
             {
                 return Err(Error::Invariant("Thread is not sendable.".into()));
             }
+            super::threads::planner::clear_parking(&projection, command, &mut plan, now)?;
             let ordinal = projection
                 .runs
                 .iter()
