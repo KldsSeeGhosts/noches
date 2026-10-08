@@ -319,6 +319,37 @@ fn transaction_rolls_back_at_each_acceptance_write_boundary() {
 }
 
 #[test]
+fn command_scoped_response_loss_ignores_unrelated_writes_and_survives_rollback() {
+    let fixture = Fixture::new();
+    let store = &fixture.kernel.store;
+    let command = create_thread("target");
+    store.inject_lost_response(command.id.clone());
+    let worker_store = store.clone();
+    worker_store.write(|_| Ok(())).unwrap();
+    accept(&worker_store, &create_thread("other"));
+
+    store.inject_failure(WriteBoundary::BeforeCommit, 1);
+    assert!(matches!(
+        store.dispatch(&command, NOW),
+        Err(Error::Injected(WriteBoundary::BeforeCommit))
+    ));
+    assert!(store.receipt(&command.id).unwrap().is_none());
+    assert!(matches!(
+        store.dispatch(&command, NOW),
+        Err(Error::Injected(WriteBoundary::AfterCommit))
+    ));
+    let committed = store.receipt(&command.id).unwrap().unwrap();
+    assert_eq!(committed.status, ReceiptStatus::Accepted);
+    let events = store.events().unwrap();
+    assert_eq!(accept(store, &command), committed);
+    assert_eq!(
+        store.events().unwrap(),
+        events,
+        "retry must not append events"
+    );
+}
+
+#[test]
 fn crash_after_commit_and_before_processed_mark_only_replays_source() {
     let mut fixture = Fixture::new();
     fixture.create("t");
